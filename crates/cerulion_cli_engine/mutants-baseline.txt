@@ -2,9 +2,10 @@
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
 # resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state, the verifier budget's pure decision functions, and how a
-# replay judges and re-executes a node that a `block` input in its own rank
-# holds.
+# does not state, the verifier budget's pure decision functions, the
+# decisions a replay makes about checkpoint window heads, those it makes about
+# a recorded node stop, and how a replay judges and re-executes a node that a
+# `block` input in its own rank holds.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -162,7 +163,77 @@ in prepare_pass_verification
   classify_label_reading) runs only for a topic in that empty set, so no
   output changes.
 
-# Fifth scope: the pure decisions a replay makes about a recorded node stop.
+# Fifth scope: the decisions a replay makes about checkpoint window heads.
+#
+# Scope: the pure decision functions on the lines the window-head change added
+# or changed. In src/replay_engine.rs: the recorder's trace format stamp
+# (`stamp_trace_format`) over the claims this build's recorder makes
+# (`RecorderClaims::of_this_recorder`); whether this build's recorder and a
+# bag's recorder name the writer at every checkpoint window
+# (`recorder_names_window_heads`, `recorder_names_window_heads_at`); a step
+# boundary record's decode (`StepBoundary::from_record`) and the refusal of a
+# flags word with a bit the bag's format does not define
+# (`boundary_flags_refusal`); and the reopen mirror's inputs and choice: the
+# flags and rank map each pass hands it (`reopen_flags`), a node's recorded
+# rank (`recorded_rank_of`) and whether a node is reopened (`reopens_node`). In
+# src/replay_feed.rs: the cause a read with no writer names on a bag that
+# begins mid-run (`absent_writer_cause`), and the code and text a feed refusal
+# renders (`FeedRefusalReason::code`, `<FeedRefusal as Display>::fmt`). The
+# change's other lines in the two files read the bag (the boundary walk and
+# the per-rank cursors, the feed planner's lookups), carry these answers
+# through a pass, or drive the replay loop (the mirror's call before each
+# step), which the mutation rule does not cover; the engine tests that fail
+# with the mirror off pin that call.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_feed.rs \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re '\babsent_writer_cause\b|\brecorder_names_window_heads_at\b|\bboundary_flags_refusal\b|\breopens_node\b|\bstamp_trace_format\b|\brecorder_names_window_heads\b|RecorderClaims::of_this_recorder|StepBoundary::from_record|\brecorded_rank_of\b|\breopen_flags\b' \
+#            --cap-lints true --in-place --timeout 600 --shard 0/7 \
+#            -- --lib -- replay_feed:: replay_engine::
+#          and the same with `--shard k/7 --baseline=skip` for k = 1 to 6
+#          (the unmutated baseline passed on shard 0/7)
+# Result:  shard 0/7: 7 mutants, 6 caught, 1 unviable; 1/7: 7 mutants,
+#          6 caught, 1 unviable; 2/7: 7 mutants, 4 caught, 3 unviable;
+#          3/7: 7 mutants, 1 caught, 6 unviable; 4/7: 7 mutants, 1 caught,
+#          6 unviable; 5/7: 7 mutants, 5 caught, 2 unviable; 6/7: 2 mutants,
+#          2 caught. Total: 44 mutants, 25 caught, 19 unviable, 0 missed.
+#          Four of the unviable replace `RecorderClaims::of_this_recorder`,
+#          `StepBoundary::from_record`, `boundary_flags_refusal` and
+#          `absent_writer_cause` with a default of a type that has none. The
+#          other 15 replaced `reopen_flags` with a rank map named `HashMap`,
+#          which the file did not import at that run.
+#
+# With `HashMap` imported, `reopen_flags`'s own mutants:
+#
+# Run:     the same with `--re '\breopen_flags\b'`, over
+#          crates/cerulion_cli_engine/src/replay_engine.rs alone, and
+#          `--shard k/3` (`--baseline=skip` for k = 1 and 2; the unmutated
+#          baseline passed on shard 0/3)
+# Result:  shard 0/3: 6 mutants, 2 caught, 4 unviable; 1/3: 6 mutants,
+#          2 caught, 4 unviable; 2/3: 6 mutants, 2 caught, 4 unviable.
+#          Total: 18 mutants, 6 caught, 12 unviable, 0 missed. Each flags
+#          value (empty, `[true]`, `[false]`) with no rank map and with an
+#          empty one is caught; the 12 unviable build a one-entry map keyed
+#          by `Arc::new("")` or `Arc::new("xyzzy")`, an `Arc<&str>` where the
+#          map's key is `Arc<str>`, so they do not compile.
+#
+# And the refusal's code and text:
+#
+# Run:     the same over crates/cerulion_cli_engine/src/replay_feed.rs alone,
+#          with `--re 'FeedRefusal>::fmt|FeedRefusalReason::code'` and no
+#          shard (the unmutated baseline passed)
+# Result:  3 mutants, 3 caught, 0 missed. Over the scope as it stands:
+#          47 mutants, 31 caught, 16 unviable, 0 missed.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Sixth scope: the pure decisions a replay makes about a recorded node stop.
 #
 # Scope: in src/replay_engine.rs the trace format stamp and its node stops
 # predicates (`stamp_trace_format`, `recorder_records_node_stops`,
@@ -213,6 +284,24 @@ in prepare_pass_verification
 #          `-- --lib -- replay_rederive::` (in 2 shards): 10 mutants, 9 caught,
 #          1 unviable (the same `Some(Default::default())`), 0 missed.
 #
+# The stamp over the claims this build's recorder makes, where the node stops
+# term also requires the window heads term (`stamp_trace_format`,
+# `RecorderClaims::of_this_recorder`), re-run on the lines a later change
+# added to the two:
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <that change's diff of the file> \
+#            --re '\bstamp_trace_format\b|RecorderClaims::of_this_recorder' \
+#            --exclude-re 'delete field' --timeout 600 \
+#            -- --lib -- replay_engine:: graph_cmd::
+#          (the unmutated baseline passed)
+# Result:  7 mutants: 6 caught, 1 unviable, 0 missed. The caught ones return
+#          0 or 1 from `stamp_trace_format` and replace each `&&` of the node
+#          stops term with `||`. The unviable one replaces
+#          `RecorderClaims::of_this_recorder` with `Default::default()`, and
+#          `RecorderClaims` has no default.
+#
 # The refusal an unknown stop cause gets from the bag's stamp
 # (`unknown_stop_cause_refusal` in src/replay_engine.rs), added after the runs
 # above. It maps the answer of
@@ -226,7 +315,7 @@ in prepare_pass_verification
 #          `Default::default()`, which cannot compile because `ReplayError` has
 #          no default, so it was not run.
 
-# Sixth scope: a FIFO node that a `block` input in its own rank holds.
+# Seventh scope: a FIFO node that a `block` input in its own rank holds.
 #
 # Scope: the pure decision functions on the lines the change added or
 # changed. In src/replay_rederive.rs: the edges that can hold a node

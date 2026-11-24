@@ -5340,10 +5340,13 @@ impl LatestStepPops {
 /// writers of every counted frame the log names.
 ///
 /// Under [`EdgeIdentity::EveryEdge`] (trace format 8 on) every edge carries
-/// the annotation and a stage's runs open at its arm, so a site's records
-/// before its first annotation in the pass belong to the run the pass began
-/// inside: a bag that begins mid-run (a resumed pass, a ring capture) does
-/// not hold the annotation that opened it. A pair the stage cannot admit
+/// the annotation and a stage's runs open at its arm, and from trace format
+/// 11 again at the head of every checkpoint window (the step after each step a
+/// checkpoint was due at, whose boundary carries the reopen flag), so a site's
+/// records before its first annotation in the pass belong to the run the pass
+/// began inside: a bag that begins mid-run (a resumed pass, a ring capture)
+/// below format 11 does not hold the annotation that opened it, and one at 11
+/// or later that begins at a window head holds it. A pair the stage cannot admit
 /// leaves the site's run on its old writer and leaves a `Truncated` marker,
 /// which stands the rule down. The frames those records name, a
 /// `DrainedBatch`'s newest and each `BatchFrame` before it, are that one

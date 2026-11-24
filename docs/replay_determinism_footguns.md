@@ -392,10 +392,12 @@ judges no fire of it, and judges a node the checkpoint states as running in
 full. A
 from-start pass re-executes the stop, and a node that fires or reads in its
 body anywhere in a resumed pass is still judged. A `--verify` replay of a
-one-rank bag this build recorded mid-run is refused before its first step when
-a single-writer read in it continues a writer run that began before the bag
-(`read_identity_absent`, exit 2), so on such a bag a neutral `--resim all` is
-the replay that reaches this rule. From `trace_format` 8 on a writer change on any edge stages a producer
+one-rank bag recorded mid-run below trace format 11 is refused before its first
+step when a single-writer read in it continues a writer run that began before
+the bag (`read_identity_absent`, exit 2), so on such a bag a neutral `--resim
+all` is the replay that reaches this rule; from format 11 every read site names
+its writer again after each checkpoint, so `--verify` feeds such a bag and
+reaches this rule too. From `trace_format` 8 on a writer change on any edge stages a producer
 annotation, so the counts a bag that begins mid-run records before the trigger
 drain's first annotation are frames of the one writer whose run it began inside,
 counted as one writer more. That rule stands down by name where a count needs an

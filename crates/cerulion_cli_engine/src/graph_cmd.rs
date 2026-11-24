@@ -17797,40 +17797,24 @@ pub fn render_recorder_json(
         // writers by run, v9 one in which every multi-frame read whose batch
         // fits its read stage's window names each frame it consumed, v10 one
         // in which every complete checkpoint part of a stopped node carries
-        // the stopped flag, and v12 one in which every fire that stopped its
-        // node is followed by a NODE-STOP record, all four also every bag this
-        // binary writes.
+        // the stopped flag, v11 one in which every read site names its
+        // writer again at every checkpoint window head and the boundary there
+        // carries the reopen flag, and v12 one in which every fire that
+        // stopped its node is followed by a NODE-STOP record, all five also
+        // every bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
         // v1 (back-compat).
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
-            crate::replay_engine::recorder_stream_needs_v4(),
-            crate::replay_engine::recorder_stamps_read_site_roles(),
-            // Whether THIS run folds identical runs, read from the one switch.
-            // `stamp_trace_format` tests the stops, identity and consult terms
-            // first, so the stamp is 12 with folding on or off; this term
-            // decides the stamp on the ladder below 7, which is the arm an
-            // older recorder's bag took.
-            cerulion_core::read_outcome::fold_enabled(),
-            // Whether THIS binary records every gated consult a replay also
-            // makes: it does, at every consult that found its queue empty but
-            // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
-            // replay never runs, so no replay re-derives those consults), so
-            // every bag it writes stamps at least 7.
-            crate::replay_engine::recorder_stamps_consult_records(),
-            // Whether every edge carries its frames' writers, one annotation per
-            // writer run, and every multi-frame read whose batch fits its read
-            // stage's window names each frame it consumed: it does.
-            crate::replay_engine::recorder_records_read_identity(),
-            // Whether every complete checkpoint part of a stopped node carries
-            // the stopped flag: it does.
-            crate::replay_engine::recorder_states_anchor_stops(),
-            // Whether every fire that stopped its node is followed by a
-            // NODE-STOP record: it is, so every bag this binary writes stamps
-            // 12.
-            crate::replay_engine::recorder_records_node_stops(),
+            // THIS binary's claims, with whether THIS run folds identical runs
+            // read from the one switch. The node stops, window heads, stops,
+            // identity and consult terms are tested first, so every bag this
+            // binary writes stamps 12 with folding on or off.
+            crate::replay_engine::RecorderClaims::of_this_recorder(
+                cerulion_core::read_outcome::fold_enabled(),
+            ),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -31413,13 +31397,9 @@ nodes:
             v["trace_format"],
             crate::replay_engine::stamp_trace_format(
                 CoordinationMode::Lockstep,
-                crate::replay_engine::recorder_stream_needs_v4(),
-                crate::replay_engine::recorder_stamps_read_site_roles(),
-                cerulion_core::read_outcome::fold_enabled(),
-                crate::replay_engine::recorder_stamps_consult_records(),
-                crate::replay_engine::recorder_records_read_identity(),
-                crate::replay_engine::recorder_states_anchor_stops(),
-                crate::replay_engine::recorder_records_node_stops()
+                crate::replay_engine::RecorderClaims::of_this_recorder(
+                    cerulion_core::read_outcome::fold_enabled()
+                )
             )
         );
         assert_eq!(
@@ -31428,7 +31408,10 @@ nodes:
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
              read stage's window, flags every complete checkpoint part of a stopped \
-             node AND records every stop: a reader below 12 refuses a bag that \
+             node, names every read site's writer at every checkpoint window head \
+             AND records every stop: a reader below 11 never mirrors the reopen, so \
+             an ungated stage near its rim reports a false read_log_diverged, and \
+             never checks the flags word; a reader below 12 refuses a bag that \
              holds a stop record as an unknown record kind, and the stamp makes it \
              refuse one that holds none by its format"
         );
@@ -31441,8 +31424,8 @@ nodes:
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
     /// it to 5, folding to 6, the consult record to 7, read identity to 8,
-    /// per-frame batch identity to 9, checkpoint stops to 10 and node stops
-    /// to the 12 asserted here.
+    /// per-frame batch identity to 9, checkpoint stops to 10, checkpoint
+    /// window heads to 11 and node stops to the 12 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
@@ -31463,9 +31446,10 @@ nodes:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
         // every consumed frame of a batch is named. 10, not 9: every complete
-        // checkpoint part of a stopped node carries the stopped flag. 12, not
-        // 10: every stop is a NODE-STOP record (`stamp_trace_format`'s hand
-        // table pins the whole matrix).
+        // checkpoint part of a stopped node carries the stopped flag. 11, not
+        // 10: every read site names its writer at every checkpoint window head.
+        // 12, not 11: every stop is a NODE-STOP record (`stamp_trace_format`'s
+        // hand table pins the whole matrix).
         assert_eq!(v["trace_format"], 12);
     }
 

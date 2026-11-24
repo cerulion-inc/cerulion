@@ -52,6 +52,7 @@ use cerulion_core::trace_ring::{
     TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
     READ_OUTCOME_NO_FRAME, READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, READ_OUTCOME_SERVED,
     RECORD_TYPE_FIRE, RECORD_TYPE_NODE_STOP, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
+    STEP_BOUNDARY_FLAG_RUNS_REOPENED,
 };
 use cerulion_core::wire::WireHeader;
 use indexmap::IndexMap;
@@ -898,13 +899,30 @@ fn record_uniform_with_read_log(
     externals: &[ExternalDrive],
     steps: usize,
 ) -> Recording {
-    record_reference_impl(
+    record_uniform_with_read_log_at(graph_yaml, make_factories, externals, steps, &[])
+}
+
+/// [`record_uniform_with_read_log`] whose run reopens every read stage's
+/// writer runs after each step in `window_heads` and flags the boundary after
+/// it, as a recorder with a checkpoint due at each of those steps does.
+fn record_uniform_with_read_log_at(
+    graph_yaml: &str,
+    make_factories: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    externals: &[ExternalDrive],
+    steps: usize,
+    window_heads: &[u64],
+) -> Recording {
+    record_reference_impl_fed(
         graph_yaml,
         make_factories,
         externals,
         &vec![DELTA_MS; steps],
         16,
         true,
+        None,
+        &[],
+        window_heads,
+        None,
     )
 }
 
@@ -927,6 +945,8 @@ fn record_uniform_with_read_log_and_feed(
         true,
         Some(feed),
         &[],
+        &[],
+        None,
     )
 }
 
@@ -936,6 +956,48 @@ fn record_uniform_with_read_log_and_feed(
 struct InStepFeed {
     topic: &'static str,
     slot: &'static std::sync::Mutex<Option<cerulion_core::transport::publisher::CerulionPublisher>>,
+}
+
+/// The read-log staging a reference run arms with instead of the derived one,
+/// as a recorder whose binary derived other rims armed it: `rims` names
+/// `(node, input index, stage role, rim)` stages armed through the replay's own
+/// adoption seam, `GraphRuntime::enable_read_outcome_memory_sink_with_recorded_capacities`,
+/// so the run's stage rows, and the bag written from them, state those rims and a
+/// replay adopts them. `reopens` names the nodes a window head reopens: a rank whose
+/// recorder failed to open its arm reopens none of its own.
+struct ReferenceStaging {
+    rims: Vec<(
+        &'static str,
+        u16,
+        cerulion_core::read_outcome::ReadStageRole,
+        u32,
+    )>,
+    reopens: fn(&str) -> bool,
+}
+
+impl ReferenceStaging {
+    /// The rims keyed as the adoption seam reads them.
+    fn rims(
+        &self,
+    ) -> std::collections::HashMap<
+        cerulion_core::read_outcome::StageKey,
+        cerulion_core::read_outcome::AdoptedRim,
+    > {
+        self.rims
+            .iter()
+            .map(|&(node, input_idx, role, rim)| {
+                (
+                    cerulion_core::read_outcome::StageKey {
+                        node: node.to_string(),
+                        input_idx,
+                        role,
+                    },
+                    cerulion_core::read_outcome::AdoptedRim::from_recorded(rim)
+                        .expect("the rim is inside the staging window"),
+                )
+            })
+            .collect()
+    }
 }
 
 /// [`record_reference`] with an explicit reference-transport subscriber
@@ -980,13 +1042,20 @@ fn record_reference_impl(
         read_log,
         None,
         &[],
+        &[],
+        None,
     )
 }
 
 /// [`record_reference_impl`] with `in_step_feed`, which parks one drive's
-/// publisher where a node can reach it ([`InStepFeed`]), and `drivers`, the
+/// publisher where a node can reach it ([`InStepFeed`]), `drivers`, the
 /// `external` nodes the run fires before every step, as their device's wake
-/// does live.
+/// does live, and `window_heads`, the steps a checkpoint is due at: after each
+/// of them the run reopens every read stage's writer runs through the
+/// production `GraphRuntime::reopen_writer_runs_where`, as the live step does,
+/// and the next step's boundary record carries
+/// `STEP_BOUNDARY_FLAG_RUNS_REOPENED`. `staging`, when given, arms the named
+/// stages at its rims and reopens only the nodes it accepts ([`ReferenceStaging`]).
 // Every argument is one independent knob of the reference run.
 #[allow(clippy::too_many_arguments)]
 fn record_reference_impl_fed(
@@ -998,6 +1067,8 @@ fn record_reference_impl_fed(
     read_log: bool,
     in_step_feed: Option<&InStepFeed>,
     drivers: &[&str],
+    window_heads: &[u64],
+    staging: Option<&ReferenceStaging>,
 ) -> Recording {
     let config = cerulion_core::graph::parse_graph(graph_yaml).expect("reference graph parses");
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
@@ -1025,7 +1096,18 @@ fn record_reference_impl_fed(
         // SAME in-memory merge sink the replay engine collects with —
         // record-only, so the frames/fires stay byte-identical to a
         // read-log-less reference run.
-        runtime.enable_read_outcome_memory_sink();
+        match staging {
+            None => runtime.enable_read_outcome_memory_sink(),
+            Some(staging) => {
+                let rims = staging.rims();
+                let keys = runtime.read_outcome_stage_keys();
+                assert!(
+                    rims.keys().all(|k| keys.contains(k)),
+                    "every stage the staging names is wired: {rims:?} against {keys:?}"
+                );
+                runtime.enable_read_outcome_memory_sink_with_recorded_capacities(&rims);
+            }
+        }
     }
     let mgr = runtime
         .test_transport()
@@ -1081,6 +1163,9 @@ fn record_reference_impl_fed(
     // The truthful per-step backlog (see `Recording::pending_after`).
     let mut pending_after: std::collections::BTreeMap<String, Vec<u64>> =
         node_ids.iter().map(|id| (id.clone(), Vec::new())).collect();
+    // Whether the previous step was a window head's due step, so this step's
+    // boundary carries the reopen flag.
+    let mut reopened_before = false;
     for (step, delta_ms) in deltas_ms.iter().enumerate() {
         // Publish this step's external frames BEFORE stepping (stamped at the
         // pre-step gating clock), so the graph drains them at the step start.
@@ -1115,8 +1200,19 @@ fn record_reference_impl_fed(
         }
         runtime.step(Duration::from_millis(*delta_ms));
         // The per-step STEP_BOUNDARY record: the step's ADVANCED clock (what
-        // every same-step publish stamped into its wire timestamp).
-        boundaries.push(boundary_rec(step as u64, clock.now_ns()));
+        // every same-step publish stamped into its wire timestamp), flagged
+        // when the step before it was a due step.
+        let mut boundary = boundary_rec(step as u64, clock.now_ns());
+        if reopened_before {
+            boundary.global_level = STEP_BOUNDARY_FLAG_RUNS_REOPENED;
+        }
+        boundaries.push(boundary);
+        // A due step's end: every stage was drained by its level's merge, so
+        // the reopen lands where the live step's does, before the next step.
+        reopened_before = window_heads.contains(&(step as u64));
+        if reopened_before {
+            runtime.reopen_writer_runs_where(|node| staging.is_none_or(|s| (s.reopens)(node)));
+        }
         // Read the scheduler's own count at the boundary, which is
         // exactly where `capture_framework_state` reads it in production.
         for id in &node_ids {
@@ -1214,6 +1310,22 @@ fn record_reference_impl_fed(
     if let Some(feed) = in_step_feed {
         feed.slot.lock().expect("feed slot").take();
     }
+    // The boundary after each window head's due step, and no other, carries
+    // the reopen flag.
+    let flagged: Vec<u64> = boundaries
+        .iter()
+        .filter(|r| r.global_level == STEP_BOUNDARY_FLAG_RUNS_REOPENED)
+        .map(|r| r.step)
+        .collect();
+    let owed: Vec<u64> = window_heads
+        .iter()
+        .map(|h| h + 1)
+        .filter(|s| *s < deltas_ms.len() as u64)
+        .collect();
+    assert_eq!(
+        flagged, owed,
+        "the boundary after each window head carries the reopen flag"
+    );
     let stage_rows = {
         let mut map = serde_json::Map::new();
         for id in &node_ids {
@@ -21749,7 +21861,7 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
     write_bag_with_recorder_json(&rec, &stamped, pre_stamp_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 10
+    // This bag is recorded BY THIS BINARY, so it stamps 12
     // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
     // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
@@ -24029,14 +24141,17 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 10 on every
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 12 on every
 /// bag this binary writes (every gated consult, and every frame of each batch
-/// that fits its read stage's window, record, and every complete checkpoint
-/// part of a stopped node carries the stopped flag), so every "corpus" bag elsewhere in this file is a format-**10** bag, a PRECONDITION that roles are
+/// that fits its read stage's window, record, every complete checkpoint part
+/// of a stopped node carries the stopped flag, every read site names its
+/// writer at every checkpoint window head, and every stop is a NODE-STOP
+/// record), so every "corpus" bag elsewhere in
+/// this file is a format-**12** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 10, the stops,
-/// identity and consult terms outrank the fold term). Reading an archived bag is a compatibility claim
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 12, the node stops,
+/// window heads, stops, identity and consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
 /// recording stripped of the records those formats never wrote
@@ -26538,13 +26653,42 @@ fn ls_sink_records(
 /// every step, the steps after the stop included. That last fact is what a
 /// stopped node leaves in a bag. Each of the sink's two read sites carries one
 /// producer annotation, at step 0: the counter is the one writer, so its run
-/// never closes.
+/// never closes, and no step is a window head, so no boundary is flagged.
 fn ls_reference(stop_at: u64) -> Recording {
-    let rec = record_uniform_with_read_log(
+    ls_reference_recorded(stop_at, &[], &[0], &[0])
+}
+
+/// [`ls_reference`] recorded as a recorder with a checkpoint due at the
+/// resumed bag's anchor step (`LS_FIRST_STEP - 1`) records it: the boundary of
+/// [`LS_FIRST_STEP`] carries the reopen flag and no other does, and each read
+/// site names the counter again at its first read from that step on. The
+/// drain site reads at every step, so it opens at 0 and at
+/// [`LS_FIRST_STEP`]; the body site reads only at the sink's fires, so it
+/// opens again only when the sink still fires there.
+fn ls_reference_at_window_head(stop_at: u64) -> Recording {
+    let body = if stop_at >= LS_FIRST_STEP {
+        vec![0, LS_FIRST_STEP]
+    } else {
+        vec![0]
+    };
+    ls_reference_recorded(stop_at, &[LS_FIRST_STEP - 1], &body, &[0, LS_FIRST_STEP])
+}
+
+/// The stopping-sink recording under `window_heads`, checked against the
+/// hand oracle above plus the steps each read site's annotations land on
+/// (`body_heads`, `drain_heads`).
+fn ls_reference_recorded(
+    stop_at: u64,
+    window_heads: &[u64],
+    body_heads: &[u64],
+    drain_heads: &[u64],
+) -> Recording {
+    let rec = record_uniform_with_read_log_at(
         ls_yaml(),
         || ls_factories(SinkFailure::Fatal(stop_at as f64)),
         &[],
         LS_STEPS,
+        window_heads,
     );
     let counter: Vec<f64> = rec.messages["/stop/counter/out"]
         .iter()
@@ -26581,16 +26725,18 @@ fn ls_reference(stop_at: u64) -> Recording {
         (0..LS_STEPS as u64).collect::<Vec<_>>(),
         "the boundary drain counts the sink's input at every step, after the stop too"
     );
-    for role in [ReadSiteRole::Body, ReadSiteRole::Drain] {
+    for (role, heads) in [
+        (ReadSiteRole::Body, body_heads),
+        (ReadSiteRole::Drain, drain_heads),
+    ] {
         let (_, annotated) = ls_sink_records(
             &rec,
             cerulion_core::read_outcome::ReadOutcomeKind::Producer,
             role,
         );
         assert_eq!(
-            annotated,
-            vec![0],
-            "the {role:?} site's writer run opens at step 0"
+            annotated, heads,
+            "the {role:?} site's writer run opens at step 0 and at each window head it reads in"
         );
     }
     rec
@@ -26611,7 +26757,7 @@ fn write_ls_resumed_bag(
     write_ls_resumed_bag_stamped(dir, name, rec, sink_anchor, ri_free_run_recorder_json())
 }
 
-/// [`write_ls_resumed_bag`] with `recorder_json` as its `recorder.json`.
+/// [`write_ls_resumed_bag`] stamped by `recorder_json`.
 fn write_ls_resumed_bag_stamped(
     dir: &tempfile::TempDir,
     name: &str,
@@ -26688,12 +26834,12 @@ fn resim_exit(outcome: &ReplayOutcome, verify: bool) -> u8 {
 }
 
 /// A `--verify` replay of a stopping-sink bag that begins at
-/// [`LS_FIRST_STEP`] is refused before its first step: the sink's first read
-/// in the bag continues the counter's writer run, which the recording opened
-/// with a producer annotation at step 0, before the bag's first step, so the
-/// read names no writer and a replay fed by read identity cannot feed it
-/// (`read_identity_absent`, exit 2).
-fn assert_ls_verify_refuses(bag: &std::path::Path, fails: SinkFailure) {
+/// [`LS_FIRST_STEP`], recorded with no window head there, is refused before
+/// its first step: the sink's first read in the bag continues the counter's
+/// writer run, which the recording opened with a producer annotation at step
+/// 0, before the bag's first step, so the read names no writer and a replay
+/// fed by read identity cannot feed it (`read_identity_absent`, exit 2).
+fn assert_ls_verify_refuses(bag: &std::path::Path, fails: SinkFailure) -> ReplayError {
     let (refused, _) = ri_replay(
         bag,
         || ls_factories(fails),
@@ -26716,22 +26862,27 @@ fn assert_ls_verify_refuses(bag: &std::path::Path, fails: SinkFailure) {
         other => panic!("expected ReadLogNotEnforceable, got {other:?}"),
     }
     assert_eq!(err.exit_code(), 2, "not replay-grade for a fed replay");
+    err
 }
 
 /// A sink stopped at its third frame (step 2), the step before a resumed pass's
 /// anchor, fires nothing and reads nothing in the slice while its boundary
 /// drain counts one frame per step. The bag's checkpoint holds no part for the
-/// sink, so it does not state the stop, even at trace format 10.
+/// sink, so it does not state the stop, even at the trace format this build's
+/// recorder stamps, where a part would.
 ///
-/// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
-/// exit 2), so it reaches no verdict on the sink and passes nothing. A neutral
+/// The bag is recorded with a checkpoint due at its anchor, so every read site
+/// names the counter again at its first read of the bag: `--verify` feeds the
+/// slice by read identity (the sink's drain reads one frame at each of the
+/// eight steps 4 to 11, and its body reads nothing) and stands the same rule
+/// down by name. A neutral
 /// `--resim all` replays it, and its resumed pass cannot tell the stop from a
 /// node the scheduler never fired: at depth 1 and one writer the fourth count
 /// in the slice (step 7) passes the reads, two frames in delivery and the one
 /// queue excused before a first fire, and the unread-frame rule stands down by
 /// name. The stand-down is not silent: it is a `stand_down` note with its code
-/// beside the judged `latest_before_first_fire` note, and one WARN line on
-/// stderr names the node and the code. It is not a finding either, so the
+/// beside the judged `latest_before_first_fire` note, and each resumed run
+/// logs one WARN line that names the node and the code. It is not a finding either, so the
 /// outcome passes and moves no exit code. The same recording replayed from its
 /// start under `--verify` is fed by read identity, re-executes the stop, stands
 /// nothing down and exits 0.
@@ -26740,9 +26891,26 @@ fn assert_ls_verify_refuses(bag: &std::path::Path, fails: SinkFailure) {
 #[tracing_test::traced_test]
 fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_silent() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = ls_reference(2);
+    let rec = ls_reference_at_window_head(2);
     let bag = write_ls_resumed_bag(&dir, "ls_stopped_before.mcap", &rec, false);
-    assert_ls_verify_refuses(&bag, SinkFailure::Fatal(2.0));
+    let (verified, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("the resumed --verify replay runs");
+    assert_eq!(ri_assert_fed(&verified), (8, 8), "{verified:?}");
+    assert!(verified.passed, "{verified:?}");
+    assert_eq!(resim_exit(&verified, true), 0, "{verified:?}");
+    assert!(
+        has_stand_down(
+            &verified,
+            LS_SINK,
+            replay_rederive::StandDownReason::LatestUnfiredSinceAnchor
+        ),
+        "{:?}",
+        stand_down_details(&verified)
+    );
 
     let (outcome, _) = ri_replay(
         &bag,
@@ -26852,10 +27020,12 @@ fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_si
                     && l.contains("code=\"latest_unfired_since_anchor\"")
             })
             .collect();
+        // One per resumed run: the `--verify` replay and the neutral resim.
         match loud.as_slice() {
-            [line] if line.contains("node_id=sink") => Ok(()),
+            [a, b] if a.contains("node_id=sink") && b.contains("node_id=sink") => Ok(()),
             _ => Err(format!(
-                "expected exactly one WARN naming the sink and the code, got {}: {loud:?}",
+                "expected one WARN naming the sink and the code per resumed run, got {}: \
+                 {loud:?}",
                 loud.len()
             )),
         }
@@ -26869,25 +27039,46 @@ fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_si
 /// there, and the recording holds no fire after it while the boundary drain
 /// keeps counting.
 ///
-/// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
-/// exit 2). A neutral `--resim all` replays it. The bag holds the stop as a
-/// NODE-STOP record, so the schedule check judges the sink by it and owes it no
-/// fire after step 6, and the finding is the recorded stop the candidate did
-/// not make: a fire-schedule finding (the class `--verify` exits 6 on) with
-/// nothing stood down, which the neutral summary reports as a differing fire
-/// schedule. The same recording stamped below the node-stops format says
-/// nothing about stops, and the slice shows the node running, so the
-/// unread-frame rule judges it: the fourth count after the fire at step 6
-/// (step 10) passes the frame that fire's read took and two in delivery. The
-/// build the recording ran re-executes the stop at step 6 and re-derives clean,
-/// with nothing stood down either.
+/// The bag is recorded with a checkpoint due at its anchor, so `--verify` feeds
+/// the slice by read identity (the sink's body reads one frame at each of its
+/// fires at steps 4 to 6 and its drain one at each of the eight steps 4 to 11).
+/// The bag holds the stop as a NODE-STOP record, so the schedule check judges
+/// the sink by it and owes it no fire after step 6: under `--verify` (exit 6)
+/// and in a neutral `--resim all` the finding is the recorded stop the
+/// candidate did not make, a fire-schedule finding with nothing stood down,
+/// which the neutral summary reports as a differing fire schedule. The same
+/// recording stamped 11, the window-heads format (`--verify` refuses a bag that
+/// begins mid-run below it), says nothing about stops, and the slice shows the
+/// node running, so the unread-frame rule judges it, under `--verify` (fed the
+/// same way, exit 6) and in the neutral resim: the fourth count after the fire
+/// at step 6 (step 10) passes the frame that fire's read took and two in
+/// delivery. The build the recording ran re-executes the stop at step 6 and
+/// re-derives clean, with nothing stood down either.
 #[test]
 #[serial]
 fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_convicted() {
     let dir = tempfile::tempdir().unwrap();
-    let rec = ls_reference(6);
+    let rec = ls_reference_at_window_head(6);
     let bag = write_ls_resumed_bag(&dir, "ls_stops_inside.mcap", &rec, true);
-    assert_ls_verify_refuses(&bag, SinkFailure::Logic(6.0));
+    let (verified, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Logic(6.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("the resumed --verify replay runs");
+    assert_eq!(ri_assert_fed(&verified), (11, 11), "{verified:?}");
+    assert_eq!(
+        verified
+            .trace_divergence
+            .as_ref()
+            .map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 step 6: the recording stops node 'sink' at its \
+             fire 1 of the step (returned_fatal_error), and this re-execution does not stop it \
+             there"
+        )
+    );
+    assert_eq!(resim_exit(&verified, true), 6, "{verified:?}");
 
     let (stamped, _) = ri_replay(
         &bag,
@@ -26927,8 +27118,27 @@ fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_con
         "ls_stops_inside_below.mcap",
         &rec,
         true,
-        ri_recorder_json_at(replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT),
+        ri_recorder_json_at(replay_engine::WINDOW_HEADS_MIN_TRACE_FORMAT),
     );
+    let (verified, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Logic(6.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("the resumed --verify replay runs");
+    assert_eq!(ri_assert_fed(&verified), (11, 11), "{verified:?}");
+    let missed = verified
+        .trace_divergence
+        .as_ref()
+        .expect("the missed fire is a fire-schedule divergence under --verify too");
+    assert!(
+        missed
+            .detail
+            .contains("node 'sink' step 10 consume = latest fire count"),
+        "{}",
+        missed.detail
+    );
+    assert_eq!(resim_exit(&verified, true), 6, "{verified:?}");
 
     let (candidate, _) = ri_replay(
         &bag,
@@ -27001,6 +27211,381 @@ fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_con
         "the re-executed stop explains every count after it: {:?}",
         recorded_build.rederivation_notes
     );
+}
+
+// ===========================================================================
+// Checkpoint window heads
+//
+// A recorder with a checkpoint due at a step reopens every read site's writer
+// run at that step's end, so each site names its writer again at its first
+// read that serves a frame from the next step on, and the next step's
+// boundary carries the reopen flag. A bag that begins at that window head
+// therefore names the writer of every read in it, and `--verify` feeds it by
+// read identity. Each window-head fixture below is recorded by the reference
+// run with that reopen applied through the production
+// `reopen_writer_runs_where`.
+// ===========================================================================
+
+/// The part a format 11 recorder writes for the stopped latest sink at the
+/// anchor: the stopped flag and the recording's pending count there.
+fn ls_stopped_part(rec: &Recording) -> Vec<u8> {
+    let section = NodeFrameworkState {
+        pending_data_count: rec.pending_after[LS_SINK][(LS_FIRST_STEP - 1) as usize],
+        ..stopped_section()
+    };
+    part_with_section(&StoppingLatestSinkNode::default(), &section)
+}
+
+/// The stopped latest sink's resumed bag at its window head, holding the part
+/// a format 11 recorder writes for it ([`ls_stopped_part`]).
+fn ls_window_head_bag(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let rec = ls_reference_at_window_head(2);
+    write_stop_resumed_bag(
+        dir,
+        name,
+        &rec,
+        &ls_stopped_part(&rec),
+        ri_free_run_recorder_json(),
+    )
+}
+
+/// A one-rank free-run bag that begins mid-run, at the window head after its
+/// anchor, is fed by read identity under `--verify`. The sink stopped at step
+/// 2, before the anchor, and the checkpoint states it stopped, so in the slice
+/// it fires nothing and its body reads nothing, while its drain reads one
+/// frame at each of the eight steps 4 to 11, the first of them right after the
+/// annotation naming the counter that the window head restated. Hand count:
+/// eight reads, eight frames; the outcome passes with nothing stood down.
+#[test]
+#[serial]
+fn a_mid_run_one_rank_bag_is_fed_by_read_identity_from_its_window_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_window_head_bag(&dir, "ls_window_head.mcap");
+    let (verified, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("the resumed --verify replay runs");
+    assert_eq!(ri_assert_fed(&verified), (8, 8), "{verified:?}");
+    let resume = verified
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(resume.first_replay_step, LS_FIRST_STEP);
+    assert_eq!(resume.stopped_at_anchor, vec![LS_SINK.to_string()]);
+    assert!(verified.passed, "{verified:?}");
+    assert!(
+        verified.trace_divergence.is_none(),
+        "{:?}",
+        verified.trace_divergence
+    );
+    assert!(
+        verified.rederivation_notes.is_empty(),
+        "{:?}",
+        verified.rederivation_notes
+    );
+    assert_eq!(resim_exit(&verified, true), 0);
+}
+
+/// A bag that begins mid-run below trace format 11 holds no annotation at its
+/// first step, so `--verify` refuses it before its first step and says to
+/// record the run again: the stopping-sink recording with no window head,
+/// stamped at trace format 10, in the exact text an operator reads, exit 2.
+/// No step ran: a resumed pass logs its "resuming from a recorded checkpoint"
+/// INFO line before its first step, and the refused replay logs none; CONTROL:
+/// a neutral `--resim all` of the same bag logs that one line.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_mid_run_bag_below_format_eleven_says_to_record_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = ls_reference(2);
+    let bag = write_ls_resumed_bag_stamped(
+        &dir,
+        "ls_below_eleven.mcap",
+        &rec,
+        false,
+        ri_recorder_json_at(10),
+    );
+    let err = assert_ls_verify_refuses(&bag, SinkFailure::Fatal(2.0));
+    assert_eq!(
+        err.to_string(),
+        "this recording's read log cannot be enforced on edge sink.inp [read_identity_absent]: \
+         node 'sink', input 'inp' (topic '/stop/counter/out'), step 4, writer none, sequence \
+         4: the read popped frames and the recording names no writer for them. This bag \
+         begins mid-run and was recorded at trace format 10, which names a writer only where \
+         its run starts, so this read continues a writer run the bag does not hold. \
+         Recordings at trace format 11 or later name the writer at every checkpoint window. \
+         Record the run again with this build to verify it, or replay this bag with --resim \
+         all and no --verify."
+    );
+    let resumes = |lines: &[&str]| {
+        lines
+            .iter()
+            .filter(|l| {
+                l.split_whitespace().any(|t| t == "INFO")
+                    && l.contains("replay: resuming from a recorded checkpoint")
+            })
+            .count()
+    };
+    logs_assert(|lines: &[&str]| match resumes(lines) {
+        0 => Ok(()),
+        n => Err(format!(
+            "the refused replay reached its resumed pass: {n} resume INFO line(s)"
+        )),
+    });
+    let (resumed, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    resumed.expect("the neutral resim of the same bag runs its resumed pass");
+    logs_assert(|lines: &[&str]| match resumes(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "the resumed pass logs one resume INFO line, got {n}"
+        )),
+    });
+}
+
+/// A STEP_BOUNDARY record that sets a flag bit trace format 11 does not define
+/// refuses the bag before its first step, naming the rank, the step and the
+/// bits, exit 2. CONTROL: the same records stamped at trace format 10, whose
+/// boundaries' flags word is not read, replay. No step ran in the refused
+/// replay: a resumed pass logs one INFO line saying it keeps the stopped sink
+/// stopped, and across both replays exactly one such line names the sink, the
+/// control's.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_unknown_boundary_flag_bit_refuses_before_step_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rec = ls_reference_at_window_head(2);
+    for r in rec.trace.iter_mut() {
+        if r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == 6 {
+            r.global_level = 0b11;
+        }
+    }
+    let part = ls_stopped_part(&rec);
+    let make = || ls_factories(SinkFailure::Fatal(2.0));
+    let bag = write_stop_resumed_bag(
+        &dir,
+        "ls_bad_flag.mcap",
+        &rec,
+        &part,
+        ri_free_run_recorder_json(),
+    );
+    let (refused, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
+    let err = refused.expect_err("an undefined flag bit refuses the bag");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        matches!(err, ReplayError::RecordingInconsistent { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "bag internal consistency check failed: rank 0's STEP_BOUNDARY record of step 6 sets \
+         flag bits 0x2, which trace format 12 does not define (it defines bit 0 alone, the \
+         reopened writer runs) \u{2014} the recording is corrupt or hand-edited; re-record \
+         with `cerulion graph run --record`"
+    );
+
+    let at_ten = write_stop_resumed_bag(
+        &dir,
+        "ls_bad_flag_10.mcap",
+        &rec,
+        &part,
+        ri_recorder_json_at(10),
+    );
+    let (replayed, _) = ri_replay(&at_ten, make, replay_engine::ReplayPurpose::Resim);
+    let replayed = replayed.expect("below 11 the flags word is not read");
+    assert!(replayed.passed, "{replayed:?}");
+    logs_assert(|lines: &[&str]| {
+        let kept = lines
+            .iter()
+            .filter(|l| {
+                l.split_whitespace().any(|t| t == "INFO")
+                    && l.contains("node_id=sink")
+                    && l.contains("keeps it stopped")
+            })
+            .count();
+        match kept {
+            1 => Ok(()),
+            n => Err(format!(
+                "one resumed pass, the control's, keeps the sink stopped: {n} line(s)"
+            )),
+        }
+    });
+}
+
+/// Two `--verify` replays of one window-head bag write byte-identical reports.
+#[test]
+#[serial]
+fn two_verify_reports_of_one_window_head_bag_are_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_window_head_bag(&dir, "ls_window_head_twice.mcap");
+    let reports = ri_two_reports(dir.path(), "ls_window_head", |report| {
+        ri_replay_reporting(
+            &bag,
+            || ls_factories(SinkFailure::Fatal(2.0)),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report),
+        )
+        .0
+    });
+    assert_eq!(
+        reports[0]["resume"]["stopped_at_anchor"],
+        serde_json::json!([LS_SINK])
+    );
+}
+
+/// The FIFO sink stopped on frame 3 at the anchor step, in a bag recorded with
+/// the checkpoint due there and holding the stopped part a format 11 recorder
+/// writes: the window head restates the counter before the drain's one read of
+/// the slice (frame 4, at step 4, frozen unfired), so `--verify` feeds that
+/// read by identity, one read and one frame, and the stopped node owes no
+/// fire: the outcome passes, exit 0.
+#[test]
+#[serial]
+fn a_stopped_fifo_sink_bag_is_fed_under_verify_from_its_window_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = fifo_stopped_at_anchor_reference_at(&[LS_FIRST_STEP - 1]);
+    let (_, annotated) = ls_sink_records(
+        &rec,
+        cerulion_core::read_outcome::ReadOutcomeKind::Producer,
+        ReadSiteRole::Drain,
+    );
+    assert_eq!(
+        annotated,
+        vec![0, LS_FIRST_STEP],
+        "the drain site names the counter at step 0 and again at the window head"
+    );
+    let bag = write_stop_resumed_bag(
+        &dir,
+        "fifo_window_head.mcap",
+        &rec,
+        &fifo_sink_part(&rec, true),
+        ri_free_run_recorder_json(),
+    );
+    let (verified, _) = ri_replay(
+        &bag,
+        || fifo_sink_factories(3.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("the resumed --verify replay runs");
+    assert_eq!(ri_assert_fed(&verified), (1, 1), "{verified:?}");
+    assert_eq!(
+        verified
+            .resume
+            .as_ref()
+            .map(|r| r.stopped_at_anchor.clone()),
+        Some(vec![LS_SINK.to_string()])
+    );
+    assert!(verified.passed, "{verified:?}");
+    assert_eq!(resim_exit(&verified, true), 0);
+}
+
+/// The co-consumer shape of
+/// `a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band`
+/// at its window head, under `--verify`: two FIFO
+/// relays of one external topic, `running`, and `stopped`, which stopped on
+/// frame 2 at the anchor step, recorded with a checkpoint due there and
+/// stamped free-run so a fed replay reads it. The topic has no writer in the
+/// graph, so each relay's read names its writer before every read, and the
+/// window head adds no annotation on this edge: the test pins a stopped
+/// co-consumer fed under `--verify`. In the slice (steps 3 to 5) `running` reads the one frame each step publishes,
+/// frames 3 to 5, and `stopped`'s drain pops frame 3 at step 3 after its stop,
+/// holds it unfired and pops nothing since. The checkpoint states both relays'
+/// served cursor (frame 2) and `stopped`'s stop. Hand count: four reads, four
+/// frames; the stopped relay owes no fire, and the outcome passes, exit 0.
+#[test]
+#[serial]
+fn a_stopped_fifo_co_consumer_bag_is_fed_under_verify() {
+    use cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+    let dir = tempfile::tempdir().unwrap();
+    // Frame k carries `10 * k + 1`, so 21 is frame 2, published at the anchor step.
+    let ids = [("running", None), ("stopped", Some(21.0))];
+    let make = || fifo_relay_factories(&ids);
+    let per_step: Vec<f64> = (0..CP_STEPS).map(|k| (k * 10 + 1) as f64).collect();
+    let anchor_step = CP_FIRST_STEP - 1;
+    let rec = record_uniform_with_read_log_at(
+        &fifo_relays_yaml(&["running", "stopped"]),
+        make,
+        &[ExternalDrive::singles(CP4_EXT_TOPIC, per_step)],
+        CP_STEPS,
+        &[anchor_step],
+    );
+    let anchor_clock = cp_anchor_clock(&rec);
+    let running_cursor = relay_service_cursor(&rec, CP4_EXT_TOPIC, "/xr/running/out", anchor_clock);
+    assert_eq!(
+        running_cursor, 2,
+        "PREMISE: the running relay served frames 0 to 2 by the anchor"
+    );
+    let slice_reads = |node: &str| -> Vec<(u64, u64)> {
+        ri_node_reads(&rec, node)
+            .into_iter()
+            .filter(|r| r.0 >= CP_FIRST_STEP && r.1 != READ_OUTCOME_PRODUCER)
+            .filter(|r| r.2 != READ_OUTCOME_NO_FRAME)
+            .map(|r| (r.0, r.2))
+            .collect()
+    };
+    assert_eq!(slice_reads("running"), vec![(3, 3), (4, 4), (5, 5)]);
+    assert_eq!(slice_reads("stopped"), vec![(3, 3)]);
+    let section = |id: &str, cursor: u32, stopped: bool| NodeFrameworkState {
+        pending_data_count: rec.pending_after[id][anchor_step as usize],
+        input_service: Some([("inp".to_string(), Some(cursor))].into_iter().collect()),
+        stopped,
+        ..Default::default()
+    };
+    let mut records = state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        0,
+        &part_with_section(
+            &StoppingFifoRelayNode::default(),
+            &section("running", running_cursor, false),
+        ),
+    );
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        anchor_step,
+        1,
+        &part_with_section(
+            &StoppingFifoRelayNode::default(),
+            &section("stopped", 2, true),
+        ),
+    ));
+    let mid = make_mid_run(&rec, CP_FIRST_STEP);
+    let bag = dir.path().join("co_consumer_window_head.mcap");
+    let mut manifest_keys = serde_json::Map::new();
+    manifest_keys.insert("read_log_capacity".to_string(), serde_json::json!(0));
+    manifest_keys.insert("read_log_capacities".to_string(), rec.stage_rows.clone());
+    manifest_keys.insert("publishers".to_string(), ri_publishers(&rec));
+    write_checkpoint_bag_with_manifest_keys(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[("running", 0), ("stopped", 1)])),
+        None,
+        None,
+        Some(ri_free_run_recorder_json()),
+        manifest_keys,
+    );
+    let (verified, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let verified = verified.expect("the resumed --verify replay runs");
+    assert_eq!(ri_assert_fed(&verified), (4, 4), "{verified:?}");
+    assert_eq!(
+        verified
+            .resume
+            .as_ref()
+            .map(|r| r.stopped_at_anchor.clone()),
+        Some(vec!["stopped".to_string()])
+    );
+    assert!(verified.passed, "{verified:?}");
+    assert_eq!(resim_exit(&verified, true), 0);
 }
 
 // ===========================================================================
@@ -27345,7 +27930,7 @@ fn a_fatal_unified_latest_sink_stopped_before_the_anchor_stays_stopped_in_a_resu
     );
     let part = part_with_section(&StoppingUnifiedSinkNode::default(), &section);
     for (name, recorder_json) in [
-        ("unified_stopped_10.mcap", ri_free_run_recorder_json()),
+        ("unified_stopped_10.mcap", ri_recorder_json_at(10)),
         ("unified_stopped_9.mcap", ri_recorder_json_at(9)),
     ] {
         let bag = write_stop_resumed_bag(&dir, name, &rec, &part, recorder_json);
@@ -28649,9 +29234,10 @@ fn a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band()
 
 /// A sink stopped before the anchor whose checkpoint holds a `CaptureFailed`
 /// skip for it rather than a part (what a node that saves no state records),
-/// on a format 10 bag: the checkpoint does not state its stop, so the resumed
-/// pass stands its unread-frame rule down by name, as on a bag with no part
-/// at all, and `stopped_at_anchor` is empty.
+/// on a bag this build's recorder stamps, a format that states every stop a
+/// part carries: the checkpoint holds no part, so it does not state the stop,
+/// the resumed pass stands its unread-frame rule down by name, as on a bag
+/// with no part at all, and `stopped_at_anchor` is empty.
 #[test]
 #[serial]
 fn a_stopped_node_with_no_anchor_part_is_unstated() {
@@ -28781,7 +29367,7 @@ fn a_part_without_the_stopped_flag_states_a_running_node_only_from_format_ten() 
         "unflagged_10.mcap",
         &rec,
         &unflagged,
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (running, _) = ri_replay(&at_ten, make, replay_engine::ReplayPurpose::Resim);
     let running = running.expect("the resumed neutral resim runs");
@@ -28837,11 +29423,18 @@ fn fifo_sink_factories(at: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
 /// one frame at every step to step 4. The frame it pops after the stop stays
 /// frozen unfired, so the drain pops nothing after it.
 fn fifo_stopped_at_anchor_reference() -> Recording {
-    let rec = record_uniform_with_read_log(
+    fifo_stopped_at_anchor_reference_at(&[])
+}
+
+/// [`fifo_stopped_at_anchor_reference`] recorded with a checkpoint due after
+/// each step in `window_heads`.
+fn fifo_stopped_at_anchor_reference_at(window_heads: &[u64]) -> Recording {
+    let rec = record_uniform_with_read_log_at(
         &stop_yaml("stopping_fifo_relay_node"),
         || fifo_sink_factories(3.0),
         &[],
         LS_STEPS,
+        window_heads,
     );
     let counter: Vec<f64> = rec.messages["/stop/counter/out"]
         .iter()
@@ -28875,13 +29468,15 @@ fn fifo_stopped_at_anchor_reference() -> Recording {
     rec
 }
 
-/// The FIFO sink's part a recorder below trace format 10 writes at the
-/// anchor: the recording's pending count there and the sink's served cursor
-/// (frame 3, which its stopping fire read), with no stopped flag.
-fn fifo_sink_unflagged_part(rec: &Recording) -> Vec<u8> {
+/// The FIFO sink's part at the anchor: the recording's pending count there,
+/// the sink's served cursor (frame 3, which its stopping fire read) and
+/// `stopped`, the flag a recorder at trace format 10 or later sets and one
+/// below it never writes.
+fn fifo_sink_part(rec: &Recording, stopped: bool) -> Vec<u8> {
     let section = NodeFrameworkState {
         pending_data_count: rec.pending_after[LS_SINK][(LS_FIRST_STEP - 1) as usize],
         input_service: Some([("inp".to_string(), Some(3u32))].into_iter().collect()),
+        stopped,
         ..Default::default()
     };
     part_with_section(&StoppingFifoRelayNode::default(), &section)
@@ -29194,7 +29789,7 @@ fn assert_format_ten_states_the_sink_running(
         &format!("{stem}_10.mcap"),
         rec,
         parts,
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (running, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
     let running = running.expect("the resumed neutral resim runs");
@@ -29242,7 +29837,7 @@ fn sink_part(part: Vec<u8>) -> (&'static str, u32, Vec<Vec<u8>>) {
 #[tracing_test::traced_test]
 fn a_format_nine_resumed_bag_stands_a_stopped_fifo_sink_down_by_name_and_warns() {
     let rec = fifo_stopped_at_anchor_reference();
-    let parts = [sink_part(fifo_sink_unflagged_part(&rec))];
+    let parts = [sink_part(fifo_sink_part(&rec, false))];
     let make = || fifo_sink_factories(3.0);
     assert_format_nine_bag_and_young_capture_stand_the_sink_down(
         "fifo_unflagged",
@@ -29463,7 +30058,7 @@ fn two_neutral_resims_of_an_unstated_stop_bag_give_equal_notes() {
         &dir,
         "fifo_unflagged_twice.mcap",
         &rec,
-        &fifo_sink_unflagged_part(&rec),
+        &fifo_sink_part(&rec, false),
         ri_recorder_json_at(9),
     );
     let resim = || {
@@ -42423,6 +43018,1023 @@ fn a_crafted_cross_rank_block_edge_is_refused_at_the_rank_build_never_verified()
     // pins that surface.
 }
 
+// ---------------------------------------------------------------------------
+// Split `block` edges no credit word can count
+// ---------------------------------------------------------------------------
+//
+// A `block` edge split across ranks is counted live by one cross-process
+// credit word, which `cerulion graph run` mints only for a topic with ONE
+// in-graph producer and accepts only on an input with no `block_timeout_ms`.
+// The arms below split a `block` edge that falls outside that rule (the shared
+// bus, which `left` and `right` both write, and `far.gate` with
+// `block_timeout_ms`), replay the two-writer shape from a lockstep bag, or
+// embed a `depth: 65` the whole graph does not validate. Each bag comes from a
+// consistent reference run of the same graph in ONE process, so frames, fires
+// and reads agree; the rank split is what is crafted, plus, for the `depth: 65`
+// arms, one key of the graph the bag embeds.
+
+/// [`sb_yaml`] with its one `from` replaced by `to`.
+fn sb_yaml_edit(from: &str, to: &str) -> String {
+    let base = sb_yaml();
+    assert_eq!(
+        base.matches(from).count(),
+        1,
+        "the fixture graph carries {from:?} exactly once"
+    );
+    base.replacen(from, to, 1)
+}
+
+/// The shared-bus graph with `backpressure: block` on `far.bus`: a `block`
+/// edge on the topic both `left` and `right` write, set by the graph.
+fn sb_bus_block_yaml() -> String {
+    sb_yaml_edit(
+        "        source: /sb/shared_bus\n      - name: gate\n",
+        "        source: /sb/shared_bus\n        backpressure: block\n      - name: gate\n",
+    )
+}
+
+/// The shared-bus graph with `key` added to `far.gate`, the `block` input
+/// `gate_src` alone writes.
+fn sb_gate_key_yaml(key: &str) -> String {
+    sb_yaml_edit(
+        "        source: gate_src/bus\n",
+        &format!("        source: gate_src/bus\n        {key}\n"),
+    )
+}
+
+/// [`SharedBusFarNode`] whose trigger port DECLARES `block`, so the `block`
+/// edge on the shared bus comes from the node and not from a graph key.
+#[cerulion_node]
+#[derive(Default)]
+struct SharedBusBlockFarNode {
+    #[input(trigger, backpressure = block)]
+    bus: Vector3,
+    #[input(backpressure = block)]
+    gate: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl SharedBusBlockFarNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.bus.x;
+        self.out.y = self.gate.x;
+        Ok(())
+    }
+}
+
+/// [`sb_factories`] with [`SharedBusBlockFarNode`] in `far`'s place.
+fn sb_block_far_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("left", Box::new(SharedBusLeftNodeEntry::new())),
+        ("right", Box::new(SharedBusRightNodeEntry::new())),
+        ("local", Box::new(RelayNodeEntry::new())),
+        ("gate_src", Box::new(SharedBusLeftNodeEntry::new())),
+        ("far", Box::new(SharedBusBlockFarNodeEntry::new())),
+    ])
+}
+
+/// `far` alone on rank 1: its `gate` input reads `gate_src` across ranks.
+fn sb_far_alone_rank_of(id: &str) -> u32 {
+    u32::from(id == "far")
+}
+
+/// The partial `--report` an aborted run writes, as `(failed_at_rank, the
+/// ranks it executed)`. The report leaves `rank_execution` out when no rank
+/// ran, which reads as no ranks here.
+fn sb_partial_report(path: &std::path::Path) -> (serde_json::Value, Vec<u64>) {
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).expect("the aborted run wrote its partial report"),
+    )
+    .expect("the partial report is JSON");
+    let ranks = json["rank_execution"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|r| r["rank"].as_u64().expect("each entry names its rank"))
+                .collect()
+        })
+        .unwrap_or_default();
+    (json["aborted"]["failed_at_rank"].clone(), ranks)
+}
+
+/// `far.bus` set to `block` by the embedded graph, with BOTH shared-bus
+/// writers on rank 0 and `far` on rank 1: refused by name before any pass
+/// (exit 2), so no rank runs and no report is written. Two replays render the
+/// same text.
+#[test]
+#[serial]
+fn a_split_block_edge_from_two_foreign_writers_is_refused_by_name_before_any_pass() {
+    let rec = record_reference_impl(
+        &sb_bus_block_yaml(),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_two_foreign.mcap");
+    let mp = write_sb_bag(rec, &bag, sb_rank_of, 2);
+    assert_eq!(
+        mp.tables[1],
+        ["gate_src".to_string(), "far".to_string()],
+        "rank 1 holds the consumer and no writer of the bus"
+    );
+    let report = dir.path().join("report.json");
+    let mut texts = Vec::new();
+    for run in 1..=2 {
+        let err = replay(&bag, sb_factories, None, Some(report.clone()))
+            .expect_err("the split two-writer `block` edge is refused");
+        assert!(
+            matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+            "run {run}: the split refusal, exit 2: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 2, "run {run}");
+        assert!(
+            !report.exists(),
+            "run {run}: refused before any pass, so no rank ran and no report was written"
+        );
+        texts.push(err.to_string());
+    }
+    assert_eq!(
+        texts[0],
+        "block input 'far.bus' reads topic '/sb/shared_bus', which has 2 in-graph producers, \
+         and this bag's rank manifests put 'far' in rank 1, 'left' in rank 0 and 'right' in rank \
+         0. A `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+         (its credit word counts one producer's outstanding frames), so this bag cannot be \
+         re-executed with `block` on that input. `block` comes from the graph this bag embeds \
+         (`backpressure: block` on 'far.bus'), so the bag was changed after it was recorded. \
+         Re-execute an unchanged copy of the bag, or record the run again."
+    );
+    assert_eq!(texts[0], texts[1], "two replays render the same refusal");
+}
+
+/// The shared bus with ONE writer in `far`'s rank and one in another,
+/// `block` declared by `far`'s node: refused by name before any pass (exit 2),
+/// naming the declaration. The same bag replayed with a build of `far` that
+/// declares `drop_oldest` on `bus` is not refused: the build's declaration
+/// decides.
+#[test]
+#[serial]
+fn a_split_block_edge_with_one_local_writer_is_refused_by_name_before_any_pass() {
+    let rec = record_reference_impl(
+        sb_yaml(),
+        sb_block_far_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_mixed.mcap");
+    let mp = write_sb_bag(rec, &bag, sb_split_rank_of, 2);
+    assert_eq!(
+        mp.tables[1],
+        [
+            "right".to_string(),
+            "gate_src".to_string(),
+            "far".to_string()
+        ],
+        "rank 1 holds the consumer and one writer of the bus"
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_block_far_factories, None, Some(report.clone()))
+        .expect_err("the split two-writer `block` edge is refused");
+    assert!(
+        matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+        "the split refusal, exit 2: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(
+        err.to_string(),
+        "block input 'far.bus' reads topic '/sb/shared_bus', which has 2 in-graph producers, \
+         and this bag's rank manifests put 'far' in rank 1, 'left' in rank 0 and 'right' in rank \
+         1. A `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+         (its credit word counts one producer's outstanding frames), so this bag cannot be \
+         re-executed with `block` on that input. `block` comes from the declaration of input \
+         'bus' on node 'far' in the build you replay. If 'far' did not declare `block` on 'bus' \
+         when the run was recorded, check out the recording-era node sources, build them and \
+         replay with that build; otherwise record the run again with every producer of \
+         '/sb/shared_bus' and 'far' in one process group."
+    );
+    assert!(
+        !report.exists(),
+        "refused before any pass, so no report was written"
+    );
+    let candidate = replay(&bag, sb_factories, None, None);
+    assert!(
+        candidate.is_ok(),
+        "a build of `far` that declares `drop_oldest` on `bus` splits no `block` edge: {:?}",
+        candidate.err()
+    );
+}
+
+/// `far.gate`, which `gate_src` alone writes, set `block_timeout_ms` by the
+/// embedded graph and split from `gate_src`: refused by name before any pass
+/// (exit 2), naming both ends' ranks.
+#[test]
+#[serial]
+fn a_split_block_edge_with_a_block_timeout_is_refused_by_name_before_any_pass() {
+    let rec = record_reference_impl(
+        &sb_gate_key_yaml("block_timeout_ms: 100"),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_timeout_split.mcap");
+    let mp = write_sb_bag(rec, &bag, sb_far_alone_rank_of, 2);
+    assert_eq!(mp.tables[1], ["far".to_string()], "far alone on rank 1");
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the split edge with a timeout is refused");
+    let ReplayError::SplitBlockEdgeTimeout { edge } = &err else {
+        panic!("the split-timeout refusal, exit 2: {err:?}");
+    };
+    assert_eq!(
+        edge,
+        &cerulion_cli_engine::replay_rank::SplitEdgeTimeout {
+            topic: SB_GATE_TOPIC.to_string(),
+            consumer_node: "far".to_string(),
+            consumer_input: "gate".to_string(),
+            consumer_rank: 1,
+            producer: "gate_src".to_string(),
+            producer_rank: 0,
+        }
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(
+        err.to_string(),
+        "this bag's rank manifests split the `block` edge '/sb/gate_src/bus' -> 'far.gate' \
+         across ranks ('far' in rank 1, its producer 'gate_src' in rank 0), and the input sets \
+         `block_timeout_ms`. Across ranks the edge counts on a shared credit word, and a timeout \
+         release keeps that count exact only when the producer and the consumer fire one at a \
+         time on one thread, so `cerulion graph run` refuses `block_timeout_ms` on a split edge \
+         before any worker starts. `block_timeout_ms` comes from the graph this bag embeds, so \
+         the bag was changed after it was recorded. Re-execute an unchanged copy of the bag, or \
+         record the run again."
+    );
+    assert!(
+        !report.exists(),
+        "refused before any pass, so no report was written"
+    );
+}
+
+/// A two-rank bag whose embedded graph declares `depth: 65`, above the
+/// maximum of 64, on `far.gate`, an edge both of whose ends rank 1 holds. The
+/// whole graph does not validate, so the split check leaves it to the rank
+/// builds: rank 0 runs and rank 1's build refuses the depth, exit 5, after a
+/// partial report for rank 0. The reference run used the valid graph; only
+/// the embedded graph's key is changed.
+#[test]
+#[serial]
+fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_the_rank_build() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = sb_gate_key_yaml("depth: 65");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_depth65.mcap");
+    write_sb_bag(rec, &bag, sb_rank_of, 2);
+    let report = dir.path().join("report.json");
+    let err =
+        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; \
+             the maximum queue depth is 64 "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(1), vec![0]),
+        "rank 0 ran before rank 1 refused"
+    );
+}
+
+/// The same `depth: 65` bag under `--verify`: a fed replay refuses it before
+/// any pass, because the bag states no per-stage staging rows (exit 2,
+/// `read_identity_unplanned`, no partial report), as it does when no split
+/// check runs. A whole-graph topology fault never stands in front of a
+/// refusal the replay makes later, before the first pass.
+#[test]
+#[serial]
+fn a_topology_fault_does_not_stand_in_front_of_a_read_identity_refusal() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = sb_gate_key_yaml("depth: 65");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_depth65_fed.mcap");
+    write_sb_bag(rec, &bag, sb_rank_of, 2);
+    let report = dir.path().join("report.json");
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        sb_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let err = outcome.expect_err("a fed replay of a bag with no staging rows is refused");
+    match &err {
+        ReplayError::ReadLogNotEnforceable { cause, detail, .. } => {
+            assert_eq!(cause, "read_identity_unplanned", "{err}");
+            assert!(
+                detail.starts_with("the bag states no per-stage staging rows"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected the read-identity refusal, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+    assert!(!report.exists(), "refused before any pass, so no report");
+}
+
+/// The two-foreign-writer bag under a fed `--verify`: the split refusal comes
+/// first, before the read-identity refusal its missing staging rows would
+/// give.
+#[test]
+#[serial]
+fn a_split_two_writer_block_edge_is_refused_before_the_read_identity_check() {
+    let rec = record_reference_impl(
+        &sb_bus_block_yaml(),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_two_foreign_fed.mcap");
+    write_sb_bag(rec, &bag, sb_rank_of, 2);
+    let (outcome, _) = ri_replay(&bag, sb_factories, replay_engine::ReplayPurpose::Verify);
+    let err = outcome.expect_err("the split two-writer `block` edge is refused");
+    assert!(
+        matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+        "the split refusal comes first: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A several-rank LOCKSTEP bag of the two-foreign-writer shape replays as one
+/// whole-graph pass, which splits nothing, so it is not refused and verifies.
+/// Written with no clock skew: a lockstep run shares one boundary stream.
+#[test]
+#[serial]
+fn a_lockstep_bag_whose_manifests_split_a_two_writer_block_edge_replays() {
+    let rec = record_reference_impl(
+        &sb_bus_block_yaml(),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_two_foreign_lockstep.mcap");
+    let labels = sb_labels(&rec);
+    let mp = write_multi_rank_bag_impl(
+        &rec,
+        sb_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::Lockstep,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(sb_publishers(&rec)),
+            labels: &labels,
+        },
+        None,
+        &[],
+    );
+    assert_eq!(
+        mp.tables[1],
+        ["gate_src".to_string(), "far".to_string()],
+        "the manifests put the consumer in rank 1 and both writers in rank 0"
+    );
+    let outcome = replay(&bag, sb_factories, None, None)
+        .expect("a lockstep bag replays as one pass, which splits nothing");
+    assert_eq!(resim_exit(&outcome, true), 0, "{:?}", outcome.violations);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (4, 4));
+}
+
+/// The same `depth: 65` graph in a ONE-rank free-run bag: one pass builds the
+/// whole graph, and its build refuses the depth, exit 5. A one-rank bag has
+/// no rank split to classify.
+#[test]
+#[serial]
+fn a_one_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_its_build() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = sb_gate_key_yaml("depth: 65");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_depth65_one_rank.mcap");
+    let labels = sb_labels(&rec);
+    write_multi_rank_bag_impl(
+        &rec,
+        |_| 0,
+        1,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(sb_publishers(&rec)),
+            labels: &labels,
+        },
+        None,
+        &[],
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the one pass cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 0: Graph \
+             validation error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; \
+             the maximum queue depth is 64 "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(0), Vec::<u64>::new()),
+        "the one pass refused at its build, so no rank ran"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Whole-graph topology faults in a several-rank bag
+// ---------------------------------------------------------------------------
+//
+// Each arm embeds a graph that the whole-graph topology check or the rank
+// planner refuses, and pins the exit, the text and the partial report
+// `run_engine` gives it. Each bag comes from a consistent reference run of a valid
+// graph in ONE process; only the rank split and keys of the embedded graph are
+// crafted.
+
+/// `yaml` with its one `from` replaced by `to`.
+fn fk_edit(yaml: &str, from: &str, to: &str) -> String {
+    assert_eq!(
+        yaml.matches(from).count(),
+        1,
+        "the fixture graph carries {from:?} exactly once"
+    );
+    yaml.replacen(from, to, 1)
+}
+
+/// The partial `--report` an aborted run writes, as `(failed_at_rank, the
+/// ranks it executed)`; the report leaves `rank_execution` out when no rank
+/// ran.
+fn fk_partial_report(path: &std::path::Path) -> (serde_json::Value, Vec<u64>) {
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).expect("the aborted run wrote its partial report"),
+    )
+    .expect("the partial report is JSON");
+    let ranks = json["rank_execution"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|r| r["rank"].as_u64().expect("each entry names its rank"))
+                .collect()
+        })
+        .unwrap_or_default();
+    (json["aborted"]["failed_at_rank"].clone(), ranks)
+}
+
+/// The whole-graph topology of `yaml`, built with the declarations of the
+/// nodes `make` builds: the premise check of an arm that embeds a fault.
+fn fk_topology(
+    yaml: &str,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+) -> cerulion_core::TransportResult<cerulion_core::graph::GraphTopology> {
+    let config = cerulion_core::graph::parse_graph(yaml).expect("the embedded graph parses");
+    let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = make()
+        .iter()
+        .map(|(id, entry)| {
+            (
+                id.clone(),
+                entry.info().expect("the node declares its ports"),
+            )
+        })
+        .collect();
+    cerulion_core::graph::GraphTopology::build(&config, &infos)
+}
+
+/// The premise of a ring arm: the embedded graph builds, and its validation
+/// refuses a ring of `block` edges.
+fn fk_assert_is_a_block_ring(yaml: &str, make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>) {
+    let refusal = match fk_topology(yaml, make) {
+        Ok(topology) => topology.validate(),
+        Err(e) => panic!("PRECONDITION: the embedded graph builds: {e}"),
+    };
+    let text = refusal
+        .expect_err("PRECONDITION: the embedded graph's validation refuses it")
+        .to_string();
+    assert!(
+        text.contains("a ring of `block` edges"),
+        "PRECONDITION: the embedded graph is a ring of `block` edges: {text}"
+    );
+}
+
+/// Write `rec` as a free-run bag of `rank_count` ranks, with no clock skew.
+fn fk_bag(
+    rec: &Recording,
+    path: &std::path::Path,
+    rank_of: impl Fn(&str) -> u32,
+    rank_count: u32,
+    publishers: Option<serde_json::Value>,
+    labels: &[ProducerLabel<'_>],
+) {
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        rank_count,
+        MpLayout::PerStepBatches,
+        path,
+        |_| {},
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture { publishers, labels },
+        None,
+        &[],
+    );
+}
+
+/// A data-triggered node with a latest-value feedback input `fb`. Its tick
+/// body runs once `fb` holds a message, so in a ring whose topics no node
+/// outside the ring writes (the fk_a ring), it never publishes.
+#[cerulion_node]
+#[derive(Default)]
+struct FkRingMidNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[input]
+    fb: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl FkRingMidNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + self.fb.x;
+        Ok(())
+    }
+}
+
+/// `src` feeds `mid`, `mid` feeds `tail`, and `tail` feeds `mid.fb` back:
+/// every edge has one producer.
+fn fk_ring_yaml() -> &'static str {
+    "name: ring\nprefix: rg\nnodes:\n\
+     \x20 - id: src\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n\
+     \x20 - id: mid\n    type: fk_ring_mid_node\n    inputs:\n      - name: inp\n        \
+     source: src/bus\n      - name: fb\n        source: tail/out\n    outputs:\n      \
+     - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: tail\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: mid/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// [`fk_ring_yaml`] with `backpressure: block` on `mid.fb` and `tail.inp`: a
+/// ring of two `block` edges.
+fn fk_ring_block_yaml() -> String {
+    let fb = fk_edit(
+        fk_ring_yaml(),
+        "        source: tail/out\n",
+        "        source: tail/out\n        backpressure: block\n",
+    );
+    fk_edit(
+        &fb,
+        "        source: mid/out\n",
+        "        source: mid/out\n        backpressure: block\n",
+    )
+}
+
+fn fk_ring_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SharedBusLeftNodeEntry::new())),
+        ("mid", Box::new(FkRingMidNodeEntry::new())),
+        ("tail", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// (a) A ring of two one-writer `block` edges across ranks (`src` in rank 0,
+/// `mid` in rank 1, `tail` in rank 2). Rank 0 runs, and rank 1's build refuses
+/// `mid.fb` as a `block` input with no in-graph producer: exit 5, after a
+/// partial report for rank 0.
+#[test]
+#[serial]
+fn fk_a_cross_rank_block_ring_of_one_writer_edges_stops_at_a_rank_build() {
+    let mut rec = record_reference_impl(
+        fk_ring_yaml(),
+        fk_ring_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    rec.graph_yaml = fk_ring_block_yaml();
+    fk_assert_is_a_block_ring(&rec.graph_yaml, fk_ring_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_ring.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| match id {
+            "src" => 0,
+            "mid" => 1,
+            _ => 2,
+        },
+        3,
+        None,
+        &[],
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_ring_factories, None, Some(report.clone()))
+        .expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'mid.fb' reads topic '/rg/tail/out', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(fk_partial_report(&report), (serde_json::json!(1), vec![0]));
+}
+
+const FK_LT_TOPIC: &str = "/lt/bus";
+
+/// `p1` alone writes `/lt/bus`, which `multi_publisher_topics:` lists, and
+/// `sink.inp` reads it with `backpressure: block`, with `extra` keys.
+fn fk_listed_yaml(extra: &str) -> String {
+    format!(
+        "name: listed\nprefix: lt\nmulti_publisher_topics:\n  - /lt/bus\nnodes:\n\
+         \x20 - id: p1\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+         schema: geometry_msgs/Vector3\n        topic: /lt/bus\n\
+         \x20 - id: sink\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+         source: /lt/bus\n        backpressure: block\n{extra}    outputs:\n      - name: out\n        \
+         schema: geometry_msgs/Vector3\n"
+    )
+}
+
+fn fk_listed_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("p1", Box::new(SharedBusLeftNodeEntry::new())),
+        ("sink", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// (b) A one-writer topic `multi_publisher_topics:` lists, split from its
+/// `block` reader, whose input sets `block_timeout_ms: 100`. The whole graph
+/// does not validate (a timeout on a listed topic), so the split check leaves
+/// it to the rank builds: rank 0 runs, and rank 1's build refuses `sink.inp`
+/// as a `block` input with no in-graph producer, exit 5, after a partial
+/// report for rank 0.
+#[test]
+#[serial]
+fn fk_b_a_timeout_on_a_split_listed_one_writer_topic_stops_at_the_rank_build() {
+    let mut rec = record_reference_impl(
+        &fk_listed_yaml(""),
+        fk_listed_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    rec.graph_yaml = fk_listed_yaml("        block_timeout_ms: 100\n");
+    let labels: Vec<ProducerLabel<'static>> = rec.messages[FK_LT_TOPIC]
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            (
+                FK_LT_TOPIC,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(&rec, "p1", "bus"),
+            )
+        })
+        .collect();
+    let publishers = publishers_table(&rec, &[("p1", "bus")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_listed_timeout.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| u32::from(id == "sink"),
+        2,
+        Some(publishers),
+        &labels,
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_listed_factories, None, Some(report.clone()))
+        .expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'sink.inp' reads topic '/lt/bus', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(fk_partial_report(&report), (serde_json::json!(1), vec![0]));
+}
+
+/// (c) The shared bus with `multi_publisher_topics:` removed from the embedded
+/// graph, its two writers in two ranks: the rank planner refuses a
+/// single-writer topic two ranks write (exit 2), before any pass. This pins
+/// `run_engine`: `cerulion bag play --resim` refuses the graph earlier, at
+/// load, where `validate_graph` refuses a duplicate output topic (also exit 2).
+#[test]
+#[serial]
+fn fk_c_an_unlisted_topic_two_ranks_write_is_the_rank_planner_s_refusal() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = fk_edit(
+        sb_yaml(),
+        "multi_publisher_topics:\n  - /sb/shared_bus\n",
+        "",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_unlisted_two_ranks.mcap");
+    write_sb_bag(rec, &bag, sb_split_rank_of, 2);
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the rank planner refuses the bag");
+    assert!(
+        matches!(err, ReplayError::RecordingInconsistent { .. }),
+        "the rank planner's refusal: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "bag internal consistency check failed: topic `/sb/shared_bus` is produced by node \
+             `left` on rank 0 AND by node `right` on rank 1, but it is not listed in the graph's \
+             `multi_publisher_topics:` "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert!(!report.exists(), "refused before any pass, so no report");
+}
+
+/// `src` feeds `mid`, `mid` and `other` both write the listed `/r2/bus`, which
+/// `tail.inp` reads, and `tail` feeds `mid.fb` back.
+fn fk_ring2_yaml() -> &'static str {
+    "name: ring2\nprefix: r2\nmulti_publisher_topics:\n  - /r2/bus\nnodes:\n\
+     \x20 - id: src\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n\
+     \x20 - id: mid\n    type: fk_ring_mid_node\n    inputs:\n      - name: inp\n        \
+     source: src/bus\n      - name: fb\n        source: tail/out\n    outputs:\n      \
+     - name: out\n        schema: geometry_msgs/Vector3\n        topic: /r2/bus\n\
+     \x20 - id: other\n    type: shared_bus_right_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n        topic: /r2/bus\n\
+     \x20 - id: tail\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: /r2/bus\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn fk_ring2_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SharedBusLeftNodeEntry::new())),
+        ("mid", Box::new(FkRingMidNodeEntry::new())),
+        ("other", Box::new(SharedBusRightNodeEntry::new())),
+        ("tail", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+const FK_R2_TOPIC: &str = "/r2/bus";
+
+/// (d) A ring whose `block` edges include a split one with two writers
+/// (`mid` and `other` write `/r2/bus` in rank 0, `tail` reads it in rank 1,
+/// and `tail` feeds `mid.fb` back): the split check refuses the two-writer
+/// edge by name before validation meets the ring, exit 2, before any pass.
+#[test]
+#[serial]
+fn fk_d_a_ring_with_a_split_two_writer_edge_is_refused_by_name() {
+    let mut rec = record_reference_impl(
+        fk_ring2_yaml(),
+        fk_ring2_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let fb = fk_edit(
+        fk_ring2_yaml(),
+        "        source: tail/out\n",
+        "        source: tail/out\n        backpressure: block\n",
+    );
+    rec.graph_yaml = fk_edit(
+        &fb,
+        "        source: /r2/bus\n",
+        "        source: /r2/bus\n        backpressure: block\n",
+    );
+    fk_assert_is_a_block_ring(&rec.graph_yaml, fk_ring2_factories);
+    // Hand count over `sb_deltas()`: `other` and `src` each fire 14 times, one
+    // frame per fire. `mid` fires on every `src` frame and writes the bus once
+    // `fb` holds a message: `tail` first relays `other`'s step 0 frame after
+    // `mid`'s step 0 fire, so `mid` writes on its 13 later fires. Both writers'
+    // frames lie above `CO_SPLIT`, so no frame says which wrote it, and the bag
+    // states no producer labels or publisher table; the refusal reads neither.
+    let other_idx = rec
+        .node_ids
+        .iter()
+        .position(|n| n == "other")
+        .expect("the graph declares `other`") as u32;
+    let other_fires = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == other_idx)
+        .count();
+    assert_eq!(
+        (rec.messages[FK_R2_TOPIC].len(), other_fires),
+        (27, 14),
+        "the bus carries `other`'s 14 frames and `mid`'s 13"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_ring_two_writer.mcap");
+    fk_bag(&rec, &bag, |id| u32::from(id == "tail"), 2, None, &[]);
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_ring2_factories, None, Some(report.clone()))
+        .expect_err("the split two-writer edge is refused");
+    assert!(
+        matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+        "the split refusal, exit 2: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(
+        err.to_string(),
+        "block input 'tail.inp' reads topic '/r2/bus', which has 2 in-graph producers, and this \
+         bag's rank manifests put 'tail' in rank 1, 'mid' in rank 0 and 'other' in rank 0. A \
+         `block` edge can cross ranks only on a topic with exactly one in-graph producer (its \
+         credit word counts one producer's outstanding frames), so this bag cannot be \
+         re-executed with `block` on that input. `block` comes from the graph this bag embeds \
+         (`backpressure: block` on 'tail.inp'), so the bag was changed after it was recorded. \
+         Re-execute an unchanged copy of the bag, or record the run again."
+    );
+    assert!(!report.exists(), "refused before any pass, so no report");
+}
+
+const FK_IG_EXT: &str = "/ig/ext";
+const FK_IG_BUS: &str = "/ig/bus";
+
+/// `sink` reads the external `/ig/ext`; `w1` and `w2` both write the listed
+/// `/ig/bus`, which `far` reads.
+fn fk_ingress_yaml() -> &'static str {
+    "name: ingress\nprefix: ig\nmulti_publisher_topics:\n  - /ig/bus\nnodes:\n\
+     \x20 - id: w1\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n        topic: /ig/bus\n\
+     \x20 - id: w2\n    type: shared_bus_right_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n        topic: /ig/bus\n\
+     \x20 - id: sink\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: /ig/ext\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: far\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: /ig/bus\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn fk_ingress_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("w1", Box::new(SharedBusLeftNodeEntry::new())),
+        ("w2", Box::new(SharedBusRightNodeEntry::new())),
+        ("sink", Box::new(RelayNodeEntry::new())),
+        ("far", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// (e) A graph that does not build: the embedded graph adds `network:` with
+/// `/ig/ext` as an ingress topic and `backpressure: block` on `sink.inp`,
+/// which reads it, and on `far.inp`, a split `block` edge two writers write.
+/// The graph passes `validate_graph`, the check the CLI makes at load, but
+/// the whole-graph build refuses `block` on an ingress input, so the split
+/// check refuses nothing: rank 0 runs, and rank 1's build, whose subgraph has
+/// no `network:`, refuses `sink.inp` as a `block` input with no in-graph
+/// producer, exit 5, after a partial report for rank 0. The reference run
+/// drove `/ig/ext` from outside the graph and declared no `block`.
+#[test]
+#[serial]
+fn fk_e_a_graph_that_does_not_build_stops_at_the_ingress_consumer_s_rank_build() {
+    let drive = ExternalDrive::singles(FK_IG_EXT, (1..=8).map(f64::from).collect());
+    let mut rec = record_reference_impl(
+        fk_ingress_yaml(),
+        fk_ingress_factories,
+        &[drive],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let networked = fk_edit(
+        fk_ingress_yaml(),
+        "nodes:\n",
+        "network:\n  mode: peer\n  ingress:\n    - /ig/ext\nnodes:\n",
+    );
+    let sink_block = fk_edit(
+        &networked,
+        "        source: /ig/ext\n",
+        "        source: /ig/ext\n        backpressure: block\n",
+    );
+    rec.graph_yaml = fk_edit(
+        &sink_block,
+        "        source: /ig/bus\n",
+        "        source: /ig/bus\n        backpressure: block\n",
+    );
+    let config =
+        cerulion_core::graph::parse_graph(&rec.graph_yaml).expect("the embedded graph parses");
+    if let Err(e) = cerulion_core::graph::validate_graph(&config) {
+        panic!("PRECONDITION: the embedded graph passes the CLI's load check: {e}");
+    }
+    match fk_topology(&rec.graph_yaml, fk_ingress_factories) {
+        Ok(_) => panic!("PRECONDITION: the whole-graph build refuses `block` on an ingress input"),
+        Err(e) => assert!(
+            e.to_string().starts_with(
+                "Graph validation error: `block` input 'sink.inp' reads topic '/ig/ext', which \
+                 `network.ingress` brings in from another host. "
+            ),
+            "{e}"
+        ),
+    }
+    let labels: Vec<ProducerLabel<'static>> = rec.messages[FK_IG_BUS]
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let writer = if frame_x(f) < CO_SPLIT { "w1" } else { "w2" };
+            (
+                FK_IG_BUS,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(&rec, writer, "bus"),
+            )
+        })
+        .collect();
+    let publishers = publishers_table(&rec, &[("w1", "bus"), ("w2", "bus")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_ingress_block.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| u32::from(id == "sink" || id == "far"),
+        2,
+        Some(publishers),
+        &labels,
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_ingress_factories, None, Some(report.clone()))
+        .expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, not the split refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'sink.inp' reads topic '/ig/ext', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(fk_partial_report(&report), (serde_json::json!(1), vec![0]));
+}
+
 /// The fixture's recorded bus interleave, per step, as `(saw a `left` frame,
 /// saw a `right` frame AFTER it)` — the premise the slot path needs.
 ///
@@ -46279,6 +47891,617 @@ fn ri_evict_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
     ])
 }
 
+/// The step a checkpoint is due at in [`ri_evict_live_at_window_head`]: its
+/// window head is the step after.
+const RI_EVICT_DUE: u64 = 8;
+
+/// [`ri_evict_yaml`] recorded by a run with a checkpoint due at
+/// [`RI_EVICT_DUE`]: every read site names the writer again at its first read
+/// that serves a frame from step 9 on, and the boundary of step 9 carries the
+/// reopen flag.
+fn ri_evict_live_at_window_head() -> RiLive {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        ri_evict_yaml(),
+        ri_evict_factories,
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &[],
+        &[RI_EVICT_DUE],
+        None,
+    );
+    RiLive {
+        rec,
+        reads: ri_take(),
+    }
+}
+
+/// `node`'s read-log records in `rec` as `(step, kind, served sequence, role)`,
+/// annotations included.
+fn ri_node_reads(rec: &Recording, node: &str) -> Vec<(u64, u16, u64, ReadSiteRole)> {
+    let idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == node)
+        .expect("the node is in the manifest") as u32;
+    rec.trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == idx)
+        .map(|r| {
+            let (_, kind, role) =
+                cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+            (r.step, kind, r.fire_time_ns, role)
+        })
+        .collect()
+}
+
+/// `--verify` of the from-start window-head evict bag: fed, every consumer's
+/// reads equal the live run's, exit 0.
+fn ri_assert_window_head_bag_verifies(live: &RiLive, name: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join(name);
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    ri_assert_fed(&outcome);
+    let judged =
+        ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(judged >= RI_MIN_READS, "{judged}");
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
+}
+
+/// The slow consumer fires every third step (2, 5, 8, 11, and so on), so after
+/// the window head at step 9 its first read is at step 11, two steps later,
+/// and the annotation naming the writer lands there, before that read, while
+/// steps 9 and 10 hold no record of it and its read at step 8, before the
+/// reopen, stays bare. The fast consumer reads at every step and opens at the
+/// head itself. Hand oracle from the writer's one frame per step (sequence k
+/// at step k), the slow consumer's depth-2 queue (the oldest of three frames
+/// evicted) and its snapshot reading the steps before it. The from-start bag
+/// replays fed and equal under `--verify`.
+#[test]
+#[serial]
+fn a_site_whose_first_read_comes_steps_after_the_window_head_still_names_its_writer() {
+    use cerulion_core::trace_ring::{READ_OUTCOME_BATCH_FRAME, READ_OUTCOME_PRODUCER};
+    let live = ri_evict_live_at_window_head();
+    let slow: Vec<_> = ri_node_reads(&live.rec, "slow")
+        .into_iter()
+        .filter(|r| (RI_EVICT_DUE..=RI_EVICT_DUE + 3).contains(&r.0))
+        .collect();
+    assert_eq!(
+        slow,
+        vec![
+            (8, READ_OUTCOME_BATCH_FRAME, 6, ReadSiteRole::Body),
+            (8, READ_OUTCOME_SERVED, 7, ReadSiteRole::Body),
+            (11, READ_OUTCOME_PRODUCER, 9, ReadSiteRole::Body),
+            (11, READ_OUTCOME_BATCH_FRAME, 9, ReadSiteRole::Body),
+            (11, READ_OUTCOME_SERVED, 10, ReadSiteRole::Body),
+        ],
+        "the slow consumer's first read after the window head names the writer"
+    );
+    let fast_openings: Vec<u64> = ri_node_reads(&live.rec, "fast")
+        .into_iter()
+        .filter(|r| r.1 == READ_OUTCOME_PRODUCER)
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(
+        fast_openings,
+        vec![0, RI_EVICT_DUE + 1],
+        "the fast consumer opens at step 0 and at the window head"
+    );
+    ri_assert_window_head_bag_verifies(&live, "evict_window_head.mcap");
+}
+
+/// A window head's first read that pops a batch names its writer on the first
+/// batch frame: the slow consumer's read at step 11 pops two frames, and its
+/// records there are the annotation, the batch frame of the older frame (9)
+/// and the read naming the newer (10), popped 2. The annotation repeats the
+/// batch frame's sequence. Fed under `--verify`, every frame of that batch is
+/// fed by its identity and the consumers' reads equal the live run's.
+#[test]
+#[serial]
+fn a_window_head_read_that_pops_a_batch_names_its_writer_on_the_first_batch_frame() {
+    use cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+    let live = ri_evict_live_at_window_head();
+    let slow_idx = live
+        .rec
+        .node_ids
+        .iter()
+        .position(|id| id == "slow")
+        .expect("the slow consumer is in the manifest") as u32;
+    let at_head: Vec<(u16, u64, u32)> = live
+        .rec
+        .trace
+        .iter()
+        .filter(|r| {
+            r.record_type == RECORD_TYPE_READ_OUTCOME
+                && r.node_idx == slow_idx
+                && r.step == RI_EVICT_DUE + 3
+        })
+        .map(|r| {
+            let kind = unpack_read_outcome_meta(r.global_level).1;
+            let popped = if kind == READ_OUTCOME_PRODUCER {
+                0
+            } else {
+                unpack_read_outcome_popped(r.duration_ns)
+            };
+            (kind, r.fire_time_ns, popped)
+        })
+        .collect();
+    assert_eq!(
+        at_head,
+        vec![
+            (READ_OUTCOME_PRODUCER, 9, 0),
+            (cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME, 9, 0),
+            (READ_OUTCOME_SERVED, 10, 2),
+        ],
+        "the annotation opens the run on the batch's first frame"
+    );
+    ri_assert_window_head_bag_verifies(&live, "evict_window_head_batch.mcap");
+}
+
+/// A rewritten window-head annotation that adds a second writer to an
+/// unlabeled topic's reads refuses the feed under `--verify`, before the first
+/// step. The fast
+/// consumer's annotation at the step-9 head is rewritten to a token no port of
+/// the graph hashes to; the head is only where that annotation sits, and the
+/// refusal is the topic's writer count, not a check of the head itself. The
+/// topic has one writer, so its frames carry no producer
+/// labels and the feed keys them by sequence alone; the reads of the topic then
+/// name two writers, the real one and the rewritten one, and no frame can be
+/// attributed (`read_identity_frames_unattributed`, exit 2). The feed walks
+/// stage by stage, so the refusal names the first read of the first stage that
+/// pops: the slow consumer's first fire, at step 2, which serves frame 1 under
+/// the real writer. CONTROL: the same recording with its annotation intact
+/// verifies.
+#[test]
+#[serial]
+fn a_window_head_annotation_naming_a_second_writer_on_an_unlabeled_topic_refuses_the_feed() {
+    let mut live = ri_evict_live_at_window_head();
+    ri_assert_window_head_bag_verifies(&live, "evict_right_head.mcap");
+    let node_idx = |node: &str| {
+        live.rec
+            .node_ids
+            .iter()
+            .position(|id| id == node)
+            .expect("the consumer is in the manifest") as u32
+    };
+    let (fast_idx, slow_idx) = (node_idx("fast"), node_idx("slow"));
+    let is_annotation = |r: &TraceRingRecord| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME
+            && unpack_read_outcome_meta(r.global_level).1
+                == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+    };
+    let real_writer = live
+        .rec
+        .trace
+        .iter()
+        .find(|r| is_annotation(r) && r.node_idx == slow_idx)
+        .map(|r| r.duration_ns)
+        .expect("the slow consumer's run opens with an annotation");
+    let mut rewritten = 0;
+    for r in live.rec.trace.iter_mut() {
+        if is_annotation(r) && r.node_idx == fast_idx && r.step == RI_EVICT_DUE + 1 {
+            assert_eq!(r.duration_ns, real_writer, "PREMISE: one writer");
+            r.duration_ns = 0xDEAD_BEEF;
+            rewritten += 1;
+        }
+    }
+    assert_eq!(rewritten, 1, "PREMISE: one annotation at the window head");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("evict_wrong_head.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (refused, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = refused.expect_err("a wrong writer at the window head is refused");
+    assert_eq!(err.exit_code(), 2);
+    match &err {
+        ReplayError::ReadLogNotEnforceable {
+            edge,
+            cause,
+            detail,
+        } => {
+            assert_eq!(edge.as_deref(), Some("slow.inp"), "{err:?}");
+            assert_eq!(cause, "read_identity_frames_unattributed", "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "this recording's read log cannot be enforced on edge slow.inp \
+                     [read_identity_frames_unattributed]: {detail}"
+                )
+            );
+            assert_eq!(
+                detail,
+                &format!(
+                    "node 'slow', input 'inp' (topic '/riev/src/out'), step 2, writer \
+                     {real_writer:016x}, sequence 1: the topic's frames carry no writer labels \
+                     while its reads name 2 writers, so no frame can be attributed"
+                )
+            );
+        }
+        other => panic!("expected ReadLogNotEnforceable, got {other:?}"),
+    }
+}
+
+/// A wrong writer at the head of a mid-run bag, on a topic with one writer and
+/// no producer labels, is fed by sequence and passes under `--verify`. The
+/// stopped latest sink's bag ([`ls_window_head_bag`]) begins at the window
+/// head, so the one annotation of the sink's reads in it is the drain site's
+/// at step 4, which restates the counter's writer; it is rewritten to a token
+/// no port of the bag's `publishers` table hashes to. The replay looks up a
+/// frame of a topic with no producer label by its wire sequence alone, since
+/// such a topic had one writer, and does not check the token a run's
+/// annotation names against the `publishers` table: that table lists only the
+/// recording's own node outputs, while a token names whichever publisher wrote
+/// the frame, so an external input's genuine token is never in it. Hand
+/// count, as for the intact bag: eight reads, eight frames, a clean read log
+/// over the sink's one edge, and exit 0.
+#[test]
+#[serial]
+fn a_wrong_writer_at_a_mid_run_window_head_on_an_unlabeled_topic_is_fed_by_sequence() {
+    let mut rec = ls_reference_at_window_head(2);
+    let sink_idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == LS_SINK)
+        .expect("the sink is in the manifest") as u32;
+    let is_annotation = |r: &TraceRingRecord| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME
+            && unpack_read_outcome_meta(r.global_level).1
+                == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+    };
+    let counter_token =
+        cerulion_core::wire::fnv1a_hash(&real_publisher_id(&rec, CP_NODE, "out").to_le_bytes());
+    const WRONG: u64 = 0xDEAD_BEEF;
+    let port_tokens: Vec<u64> = rec
+        .publisher_ids
+        .values()
+        .flatten()
+        .map(|(_, id)| cerulion_core::wire::fnv1a_hash(&id.to_le_bytes()))
+        .collect();
+    assert!(
+        !port_tokens.contains(&WRONG),
+        "PREMISE: no port of the publishers table hashes to the rewritten token"
+    );
+    let mut rewritten = Vec::new();
+    for r in rec.trace.iter_mut() {
+        if is_annotation(r) && r.node_idx == sink_idx && r.step >= LS_FIRST_STEP {
+            rewritten.push((r.step, read_site_role(r.global_level), r.duration_ns));
+            r.duration_ns = WRONG;
+        }
+    }
+    assert_eq!(
+        rewritten,
+        vec![(LS_FIRST_STEP, ReadSiteRole::Drain, counter_token)],
+        "PREMISE: the bag's one annotation of the sink is the drain site's restated writer \
+         at the window head"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_stop_resumed_bag(
+        &dir,
+        "ls_wrong_head_writer.mcap",
+        &rec,
+        &ls_stopped_part(&rec),
+        ri_free_run_recorder_json(),
+    );
+    let (verified, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("a wrong writer on an unlabeled topic is fed by sequence");
+    assert_eq!(ri_assert_fed(&verified), (8, 8), "{verified:?}");
+    match &verified.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(*edges_compared, 1, "{:?}", verified.read_log)
+        }
+        other => panic!("expected a clean read log, got {other:?}"),
+    }
+    assert!(verified.passed, "{verified:?}");
+    assert_eq!(resim_exit(&verified, true), 0);
+}
+
+// ===========================================================================
+// A stage at its rim across a window head
+// ===========================================================================
+
+/// A writer that fires every millisecond, so each 5 ms step publishes a burst.
+#[cerulion_node(period_ms = 1)]
+#[derive(Default)]
+struct RimBurstWriter {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RimBurstWriter {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// A per-message consumer whose queue holds a whole step's burst.
+#[cerulion_node]
+#[derive(Default)]
+struct RimFifoSink {
+    #[input(trigger, depth = 8)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl RimFifoSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+}
+
+/// The burst writer and two FIFO sinks of it.
+fn rim_yaml() -> &'static str {
+    "name: rim\nprefix: rim\nnodes:\n\
+     \x20 - id: src\n    type: rim_burst_writer\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: near\n    type: rim_fifo_sink\n    inputs:\n      - name: inp\n        source: src/out\n\
+     \x20 - id: far\n    type: rim_fifo_sink\n    inputs:\n      - name: inp\n        source: src/out\n"
+}
+
+fn rim_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "src",
+            Box::new(RimBurstWriterEntry::with_state(RimBurstWriter::default()))
+                as Box<dyn NodeEntry>,
+        ),
+        (
+            "near",
+            Box::new(RimFifoSinkEntry::with_state(RimFifoSink::default())) as Box<dyn NodeEntry>,
+        ),
+        (
+            "far",
+            Box::new(RimFifoSinkEntry::with_state(RimFifoSink::default())) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+/// The rim both FIFO sinks of [`rim_yaml`] arm in [`rim_live`]: one step's
+/// burst of five reads, and no slot for an opening besides. The rim the stage
+/// derives is 75, `max(8 + 64, 2 * 8 + 1) + 1 + 2` (depth 8, a data trigger's
+/// carry clamp of 64, one slot of headroom, two run openings).
+const RIM_STEADY: u32 = 5;
+/// The step a checkpoint is due at in [`rim_live`]: its window head is the
+/// step after.
+const RIM_DUE: u64 = 5;
+const RIM_STEPS: usize = 12;
+
+/// The rim fixture recorded with both sinks armed at [`RIM_STEADY`] and a
+/// checkpoint due at [`RIM_DUE`], its window head reopening the nodes
+/// `reopens` accepts.
+fn rim_live(reopens: fn(&str) -> bool) -> Recording {
+    use cerulion_core::read_outcome::ReadStageRole::Body;
+    let staging = ReferenceStaging {
+        rims: vec![("near", 0, Body, RIM_STEADY), ("far", 0, Body, RIM_STEADY)],
+        reopens,
+    };
+    let rec = record_reference_impl_fed(
+        rim_yaml(),
+        rim_factories,
+        &[],
+        &[DELTA_MS; RIM_STEPS],
+        16,
+        true,
+        None,
+        &[],
+        &[RIM_DUE],
+        Some(&staging),
+    );
+    assert_eq!(
+        rec.stage_rows,
+        serde_json::json!({"far": [[0, 0, RIM_STEADY]], "near": [[0, 0, RIM_STEADY]]}),
+        "the run states the rims it armed"
+    );
+    rec
+}
+
+/// `node`'s read records at `step` as `(kind, served sequence, popped)`, the
+/// `popped` field read off the aux word of every record but an annotation.
+fn rim_reads(rec: &Recording, node: &str, step: u64) -> Vec<(u16, u64, u32)> {
+    use cerulion_core::trace_ring::{unpack_read_outcome_meta_full, unpack_read_outcome_popped};
+    let idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == node)
+        .expect("the sink is in the manifest") as u32;
+    rec.trace
+        .iter()
+        .filter(|r| {
+            r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == idx && r.step == step
+        })
+        .map(|r| {
+            let kind = unpack_read_outcome_meta_full(r.global_level).1;
+            let popped = if kind == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER {
+                0
+            } else {
+                unpack_read_outcome_popped(r.duration_ns)
+            };
+            (kind, r.fire_time_ns, popped)
+        })
+        .collect()
+}
+
+/// A sink's records at `step` when its writer run opens there. The writer
+/// publishes frames `5 * step` to `5 * step + 4` in the step, and each drain
+/// of the FIFO sink pops one. The opening pair takes two slots, the next three
+/// reads fill the rim of five, and the fifth read is dropped there, so the
+/// window ends in a marker of one dropped record.
+fn rim_opened_window(step: u64) -> Vec<(u16, u64, u32)> {
+    use cerulion_core::trace_ring::{READ_OUTCOME_PRODUCER, READ_OUTCOME_TRUNCATED};
+    let first = 5 * step;
+    let mut out = vec![(READ_OUTCOME_PRODUCER, first, 0)];
+    out.extend((first..first + 4).map(|seq| (READ_OUTCOME_DRAINED_BATCH, seq, 1)));
+    out.push((READ_OUTCOME_TRUNCATED, READ_OUTCOME_NO_FRAME, 1));
+    out
+}
+
+/// A sink's records at `step` when its writer run continues: the five reads
+/// fill the rim exactly.
+fn rim_continued_window(step: u64) -> Vec<(u16, u64, u32)> {
+    (5 * step..5 * step + 5)
+        .map(|seq| (READ_OUTCOME_DRAINED_BATCH, seq, 1))
+        .collect()
+}
+
+/// `node`'s recorded windows against the hand oracle: opened at step 0 and,
+/// when `reopened`, at the window head, and continued everywhere else.
+fn rim_assert_windows(rec: &Recording, node: &str, reopened: bool) {
+    for step in 0..RIM_STEPS as u64 {
+        let opens = step == 0 || (reopened && step == RIM_DUE + 1);
+        let want = if opens {
+            rim_opened_window(step)
+        } else {
+            rim_continued_window(step)
+        };
+        assert_eq!(rim_reads(rec, node, step), want, "{node} at step {step}");
+    }
+}
+
+/// A one-rank lockstep bag whose FIFO sinks sit at their rim, with a
+/// checkpoint due mid-pass. A lockstep replay arms no read gate, so both
+/// stages are ungated and their read logs are compared position by position.
+/// The window head opens each sink's writer run again, so the recording's head
+/// window holds the opening and drops the step's fifth read, as its first
+/// window did. A neutral `--resim all` from step 0 replays both sinks at the
+/// rims the bag states and reopens their runs at the flagged boundary, so its
+/// stages drop the same read and the read log matches the recording's: no
+/// divergence, both edges compared, and the run passes.
+#[test]
+#[serial]
+fn an_ungated_stage_at_its_rim_reads_the_same_log_across_a_mid_pass_window_head() {
+    let rec = rim_live(|_| true);
+    rim_assert_windows(&rec, "near", true);
+    rim_assert_windows(&rec, "far", true);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("rim_window_head.mcap");
+    // One writer, so the topic's frames carry no producer labels.
+    ri_bag_labelled(
+        &rec,
+        &bag,
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep),
+        false,
+    );
+    let (outcome, _) = ri_replay(&bag, rim_factories, replay_engine::ReplayPurpose::Resim);
+    let outcome = outcome.expect("the neutral resim runs");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "{:?}",
+        outcome.read_log_divergence
+    );
+    match &outcome.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(*edges_compared, 2, "{:?}", outcome.read_log)
+        }
+        other => panic!("expected a clean read log, got {other:?}"),
+    }
+    assert!(outcome.passed, "{outcome:?}");
+}
+
+/// The rim fixture's process split: `far` alone on rank 1.
+fn rim_rank_of(id: &str) -> u32 {
+    u32::from(id == "far")
+}
+
+/// Write the rank-0-reopened rim recording as a two-rank lockstep bag: rank
+/// 1's boundaries carry no flag, as a rank whose recorder failed to open its
+/// arm writes them, and each rank states its own sink's rim.
+fn rim_two_rank_bag(rec: &Recording, path: &std::path::Path) {
+    write_multi_rank_bag_impl(
+        rec,
+        rim_rank_of,
+        2,
+        MpLayout::RankBlocks,
+        path,
+        |per_rank| {
+            let flagged = |rank: &[TraceRingRecord]| -> Vec<u64> {
+                rank.iter()
+                    .filter(|r| {
+                        r.record_type == RECORD_TYPE_STEP_BOUNDARY
+                            && r.global_level == STEP_BOUNDARY_FLAG_RUNS_REOPENED
+                    })
+                    .map(|r| r.step)
+                    .collect()
+            };
+            assert_eq!(flagged(&per_rank[0]), vec![RIM_DUE + 1], "rank 0's flag");
+            for r in per_rank[1].iter_mut() {
+                if r.record_type == RECORD_TYPE_STEP_BOUNDARY {
+                    r.global_level = 0;
+                }
+            }
+            assert!(flagged(&per_rank[1]).is_empty(), "rank 1 carries no flag");
+        },
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::Lockstep,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(ri_publishers(rec)),
+            labels: &[],
+        },
+        Some(&|rank| {
+            let rows = match rank {
+                0 => serde_json::json!({"near": [[0, 0, RIM_STEADY]]}),
+                _ => serde_json::json!({"far": [[0, 0, RIM_STEADY]]}),
+            };
+            Some(serde_json::json!({"capacities": rows, "scalar": 0}))
+        }),
+        &[],
+    );
+}
+
+/// A two-rank lockstep bag whose rank 1 carries no reopen flag, because its
+/// recorder failed to open its arm: the recording reopened rank 0's stages at
+/// the window head and left rank 1's alone. Both FIFO sinks sit at their rim,
+/// so rank 0's `near` drops the head window's fifth read and rank 1's `far`
+/// reads all five. A neutral `--resim all` reopens each rank's stages on that
+/// rank's own flag, so `near` drops the same read and `far` drops none, and the
+/// read log matches the recording's: no divergence, both edges compared.
+#[test]
+#[serial]
+fn a_lockstep_bag_reopens_each_ranks_stages_on_its_own_flag() {
+    let rec = rim_live(|node| rim_rank_of(node) == 0);
+    rim_assert_windows(&rec, "near", true);
+    rim_assert_windows(&rec, "far", false);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("rim_lockstep.mcap");
+    rim_two_rank_bag(&rec, &bag);
+    let (outcome, _) = ri_replay(&bag, rim_factories, replay_engine::ReplayPurpose::Resim);
+    let outcome = outcome.expect("the neutral resim runs");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "{:?}",
+        outcome.read_log_divergence
+    );
+    match &outcome.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(*edges_compared, 2, "{:?}", outcome.read_log)
+        }
+        other => panic!("expected a clean read log, got {other:?}"),
+    }
+    assert!(outcome.passed, "{outcome:?}");
+}
+
 /// Three writers on ONE `multi_publisher_topics` topic, read per message.
 fn ri_multi_writer_yaml() -> &'static str {
     "name: rimw\nprefix: rimw\nmulti_publisher_topics:\n  - /rimw/bus\nnodes:\n\
@@ -46307,6 +48530,72 @@ fn ri_multi_writer_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
             })),
         ),
     ])
+}
+
+/// A multi-writer edge at a window head is unchanged: such an edge names the
+/// writer before every read whatever its runs, so the reopen adds no record.
+/// Hand rule over the sink's read log: every read that serves a frame directly
+/// follows the annotation naming its writer, which repeats its sequence, and no
+/// annotation stands anywhere else, at the window head after [`RI_EVICT_DUE`]
+/// as at every other step. The `--verify` of the bag is fed and every replayed
+/// read equals the live one.
+#[test]
+#[serial]
+fn a_multi_writer_edge_at_a_window_head_is_unchanged() {
+    use cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+    ri_take();
+    let rec = record_reference_impl_fed(
+        ri_multi_writer_yaml(),
+        ri_multi_writer_factories,
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &[],
+        &[RI_EVICT_DUE],
+        None,
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let reads = ri_node_reads(&live.rec, "sink");
+    let mut at_head = 0;
+    for (i, &(step, kind, seq, _)) in reads.iter().enumerate() {
+        if kind == READ_OUTCOME_PRODUCER {
+            let next = reads.get(i + 1).copied();
+            assert!(
+                next.is_some_and(|(s, k, q, _)| s == step
+                    && k != READ_OUTCOME_PRODUCER
+                    && q == seq),
+                "the annotation at step {step} names the read right after it: {next:?}"
+            );
+        } else if seq != READ_OUTCOME_NO_FRAME {
+            assert!(
+                i > 0 && reads[i - 1].1 == READ_OUTCOME_PRODUCER,
+                "the read of frame {seq} at step {step} follows its annotation"
+            );
+            if step == RI_EVICT_DUE + 1 {
+                at_head += 1;
+            }
+        }
+    }
+    assert!(at_head > 0, "PREMISE: the sink reads at the window head");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_three_writers_window_head.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_multi_writer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    let judged = ri_judge(&live.reads, &replayed, &[RI_SINK]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(judged >= RI_MIN_READS, "{judged}");
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
 }
 
 /// A live run, recorded with its read log, and what each consumer observed.
@@ -47531,7 +49820,11 @@ fn identity_fed_replay_reproduces_reads_of_three_writers_on_one_topic() {
 /// MUTANT: the recorded identity dropped from the bag. On a single-writer
 /// edge one annotation opens the writer's run, so dropping it leaves every
 /// read of the run unattributed. The replay refuses by name (node, input,
-/// writer, sequence) at the first of them, before its first step.
+/// writer, sequence) at the first of them, before its first step. The same
+/// records stamped at trace format 10, below the format that names a writer at
+/// every window head, are refused with the same text: the bag begins at step
+/// 0, so the read continues no run the bag lacks, and the refusal neither says
+/// the bag begins mid-run nor asks for the run to be recorded again.
 #[test]
 #[serial]
 fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
@@ -47581,6 +49874,28 @@ fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
     ] {
         assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
     }
+    assert!(
+        msg.ends_with(&format!(
+            "writer none, sequence {named}: the read popped frames and the recording names no \
+             writer for them"
+        )),
+        "a bag that begins at step 0 gets the plain sentence: {msg}"
+    );
+
+    let at_ten = dir.path().join("ri_dropped_identity_10.mcap");
+    ri_bag(&live.rec, &at_ten, ri_recorder_json_at(10));
+    let (outcome, _) = ri_replay(
+        &at_ten,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a format-10 read with no recorded identity is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert_eq!(
+        err.to_string(),
+        msg,
+        "a format-10 bag recorded from step 0 is refused with the same sentence"
+    );
 }
 
 /// MUTANT: one recorded identity dropped on the three-writer topic, where the
@@ -48971,6 +51286,11 @@ fn drv_xyz(frame: &[u8]) -> (f64, f64, f64) {
 /// anchored to the hand oracle: the camera published reading k = 1..=N with
 /// `z = 3k + 2`, the meter read each in order and published `z = 30k + 21`.
 fn drv_record() -> RiLive {
+    drv_record_at(&[])
+}
+
+/// [`drv_record`] with a checkpoint due at each step in `window_heads`.
+fn drv_record_at(window_heads: &[u64]) -> RiLive {
     ri_take();
     let rec = record_reference_impl_fed(
         drv_yaml(),
@@ -48981,6 +51301,8 @@ fn drv_record() -> RiLive {
         true,
         None,
         &["cam"],
+        window_heads,
+        None,
     );
     let live = RiLive {
         rec,
@@ -49132,6 +51454,59 @@ fn drv_stamp() -> Vec<u8> {
         replay_engine::CoordinationMode::FreeRun,
         &[("cam", true), ("meter", false)],
     )
+}
+
+/// The step a checkpoint is due at in the driver window-head arm.
+const DRV_DUE: u64 = 8;
+
+/// A driver edge at a window head is fed. The camera is the meter's one
+/// writer, so the meter's read site names it once per writer run: at step 0
+/// and, with a checkpoint due at [`DRV_DUE`], again at the window head after
+/// it. A `--verify` of the bag stamped with the driver flags feeds every meter
+/// read the one camera frame it read live, credits the meter's topic 1/1 and
+/// exits 0.
+#[test]
+#[serial]
+fn a_driver_edge_at_a_window_head_is_fed() {
+    use cerulion_core::trace_ring::READ_OUTCOME_PRODUCER;
+    let live = drv_record_at(&[DRV_DUE]);
+    let openings: Vec<u64> = ri_node_reads(&live.rec, "meter")
+        .into_iter()
+        .filter(|r| r.1 == READ_OUTCOME_PRODUCER)
+        .map(|r| r.0)
+        .collect();
+    assert_eq!(
+        openings,
+        vec![0, DRV_DUE + 1],
+        "the meter names the camera at step 0 and at the window head"
+    );
+    let meter_reads = ri_by_consumer(&live.reads)[&DRV_METER.to_bits()].len();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_window_head.mcap");
+    ri_bag(&live.rec, &bag, drv_stamp());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    assert_eq!(
+        outcome.read_identity,
+        replay_engine::ReadIdentityReport::Fed {
+            reads: meter_reads,
+            frames: meter_reads
+        },
+        "each meter read was fed the one camera frame it read live"
+    );
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 1),
+        "the meter's topic is the one checked and credited"
+    );
+    let compared = ri_judge(&live.reads, &replayed, &[DRV_METER]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(compared, meter_reads);
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
 }
 
 /// A recording whose stamp names its drivers, replayed by the build that
@@ -50004,6 +52379,8 @@ fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
         true,
         None,
         &["cam"],
+        &[],
+        None,
     );
     ri_take();
     let image = &rec.messages[DRV_CAM_ONLY_IMAGE];
@@ -50287,6 +52664,8 @@ fn drv_bus_record() -> RiLive {
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     let live = RiLive {
         rec,
@@ -50648,6 +53027,8 @@ fn drv_silent_record_bag(dir: &std::path::Path) -> (std::path::PathBuf, Vec<RiRe
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     let live_reads = ri_take();
     let bus = &rec.messages[DRV_SILENT_BUS];
@@ -50823,6 +53204,8 @@ fn drv_teleop_record() -> RiLive {
         true,
         None,
         &["teleop"],
+        &[],
+        None,
     );
     let live = RiLive {
         rec,
@@ -51204,6 +53587,8 @@ fn drv_teleop_bus_record() -> (RiLive, usize, usize) {
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     let live = RiLive {
         rec,
@@ -51489,6 +53874,8 @@ fn an_unattributed_topic_a_driver_shares_is_compared_over_every_recorded_frame()
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     ri_take();
     let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_UNREAD_BUS]
@@ -51810,6 +54197,8 @@ fn drv_trio_record(w3_publishes: bool) -> RiLive {
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     let live = RiLive {
         rec,
@@ -52029,6 +54418,8 @@ fn a_foreign_drivers_injected_frames_on_a_shared_topic_are_left_out_of_the_compa
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     ri_take();
     let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_SLOW_BUS]
@@ -52284,6 +54675,8 @@ fn an_unattributed_shared_topic_fails_though_its_driver_publishes_its_recorded_f
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     ri_take();
     let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_UNREAD_BUS]
@@ -52422,6 +54815,8 @@ fn drv_unread_trio_bag(dir: &std::path::Path) -> (Recording, std::path::PathBuf)
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     ri_take();
     let bag = dir.join("drv_unread_trio_unlabelled_two_rank.mcap");
@@ -53949,6 +56344,8 @@ fn ri_drv3_bag_stamped(dir: &std::path::Path, name: &str, recorder: Vec<u8>) -> 
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     ri_take();
     let n = RI_STEPS;
@@ -54155,6 +56552,8 @@ fn ri_drv4_bag(dir: &std::path::Path, name: &str, recorder: Vec<u8>) -> std::pat
         true,
         None,
         &["w1"],
+        &[],
+        None,
     );
     ri_take();
     let n = RI_STEPS;
@@ -55457,6 +57856,8 @@ fn stop_drv_bag(
         true,
         None,
         &["cam"],
+        &[],
+        None,
     );
     ri_take();
     let cam = rec
@@ -58089,6 +60490,8 @@ fn a_driver_consumers_recorded_stop_releases_its_slot() {
         true,
         None,
         &["drv"],
+        &[],
+        None,
     );
     ri_take();
     let stops = rs_stops(&rec);

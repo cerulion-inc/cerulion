@@ -103,7 +103,7 @@ use cerulion_core::state_ring::{
 };
 use cerulion_core::trace_ring::{
     TraceRingProducer, TraceRingRecord, RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE,
-    RECORD_TYPE_STEP_BOUNDARY, TRACE_RECORD_SIZE,
+    RECORD_TYPE_STEP_BOUNDARY, STEP_BOUNDARY_FLAG_RUNS_REOPENED, TRACE_RECORD_SIZE,
 };
 
 use common::{
@@ -2130,6 +2130,67 @@ fn two_captures_of_one_stimulus_carry_byte_identical_traces() {
 
     a.cleanup();
     b.cleanup();
+}
+
+/// The first kept boundary of a capture is the one the recorder flags when the
+/// checkpoint at the anchor reopened every writer run: its `global_level` sets
+/// `STEP_BOUNDARY_FLAG_RUNS_REOPENED`. The capture keeps that record as the
+/// ring was handed it, flag bit included, byte for byte.
+#[test]
+fn a_capture_keeps_its_first_boundarys_reopen_flag() {
+    let flagged = TraceRingRecord {
+        global_level: STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+        ..boundary(ANCHOR_STEP + 1)
+    };
+    let trace: Vec<TraceRingRecord> = trace_across_the_anchor()
+        .into_iter()
+        .map(|r| {
+            if r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == ANCHOR_STEP + 1 {
+                flagged
+            } else {
+                r
+            }
+        })
+        .collect();
+    assert_eq!(
+        trace.iter().filter(|r| **r == flagged).count(),
+        1,
+        "premise: the trace holds the flagged boundary exactly once"
+    );
+    let h = capture(
+        "reopen_flag",
+        &trace,
+        &full_anchor(),
+        64 * 1024 * 1024,
+        true,
+    );
+
+    let payloads = trace_payloads(&h.bag);
+    let oracle: Vec<Vec<u8>> = expected_kept()
+        .iter()
+        .map(|r| {
+            if r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == ANCHOR_STEP + 1 {
+                flagged.as_bytes().to_vec()
+            } else {
+                r.as_bytes().to_vec()
+            }
+        })
+        .collect();
+    assert_eq!(
+        payloads.first().map(Vec::as_slice),
+        Some(flagged.as_bytes().as_slice()),
+        "the capture's first record is the flagged boundary as pushed"
+    );
+    assert_eq!(payloads, oracle, "every kept record is the pushed bytes");
+    let first = TraceRingRecord::from_bytes(payloads[0].as_slice().try_into().expect("40 bytes"));
+    assert_eq!(
+        cerulion_core::trace_ring::step_boundary_flags(first.global_level)
+            .map(|f| f.runs_reopened()),
+        Ok(true),
+        "the kept boundary decodes as reopened"
+    );
+
+    h.cleanup();
 }
 
 /// **A ONE-WORKER-GROUP capture resolves its node map, departure ring and all,

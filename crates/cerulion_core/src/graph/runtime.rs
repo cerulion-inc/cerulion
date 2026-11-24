@@ -17125,10 +17125,22 @@ impl GraphRuntime {
         // The block is `#[cfg(unix)]` as a WHOLE because on other targets
         // `AttachedStateArm` is uninhabited, so naming `due()` on it would not
         // compile — the class the cfg audit exists to catch.
+        //
+        // A due step also OPENS A CHECKPOINT WINDOW at the next step: every
+        // read-outcome stage's writer runs reopen here, so each read site's
+        // first read that serves a frame from the next step on is annotated
+        // with its writer, and the next step's boundary record carries the
+        // flag that says so. Every stage was drained by its level's merge
+        // (and a chain member's by its own level's), so nothing staged before
+        // this instant lands after the reopen. Keyed on `due()`, not on the
+        // anchor landing: a skipped anchor still reopens, which costs at most
+        // one annotation per site.
         #[cfg(unix)]
         {
             let due = self.state_arm.as_ref().is_some_and(|arm| arm.due(step));
             if due {
+                self.reopen_writer_runs_where(|_| true);
+                self.scheduler.mark_next_boundary_runs_reopened();
                 self.take_anchor(step);
             }
         }
@@ -18161,6 +18173,32 @@ impl GraphRuntime {
     pub fn set_read_log_records_batch_frames(&self, every: bool) {
         for (_node, stage) in &self.read_outcome_stages {
             stage.adopt_batch_frame_records(every);
+        }
+    }
+
+    /// Reopen the writer runs of every read-outcome stage whose owning node id
+    /// `keep` accepts, in wiring order: the next annotated read of each read
+    /// site of such a stage stages its writer's annotation again, whatever the
+    /// site annotated before. A disarmed stage is left as it is, and a reopen
+    /// never arms one.
+    ///
+    /// The live step calls it with every node at the end of each step a
+    /// checkpoint is due at, right before the anchor, and marks the next
+    /// step's boundary record with `trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED`,
+    /// so the read log of every checkpoint window names the writer of each
+    /// site's first read that serves a frame. A replay calls it before a step
+    /// whose recorded boundary carries that flag, with the nodes of the rank
+    /// that flagged it, so the replayed stages stage what the recorded ones
+    /// did.
+    ///
+    /// One uncontended lock per armed stage, at checkpoint cadence: no
+    /// allocation, no clock read, and the stages are walked in their build
+    /// order.
+    pub fn reopen_writer_runs_where(&self, keep: impl Fn(&str) -> bool) {
+        for (node, stage) in &self.read_outcome_stages {
+            if keep(node.as_str()) {
+                stage.reopen_writer_runs();
+            }
         }
     }
 
