@@ -1123,15 +1123,16 @@ never as clean coverage.
 ## The replay contract a bag declares
 
 A replay-grade bag (`cerulion graph run --record`) declares, in
-`__cerulion/recorder.json`, the three things re-execution must not guess: the
-trace stream's FORMAT, the run's COORDINATION contract and which nodes ran as
-DRIVERS.
+`__cerulion/recorder.json`, the four things re-execution must not guess: the
+trace stream's FORMAT, the run's COORDINATION contract, which nodes ran as
+DRIVERS and how each input queued its frames.
 
 | Key | Answers |
 |---|---|
 | `trace_format` | "Can this binary decode my trace records at all?" A reader refuses a bag stamped ABOVE its own supported version, rather than decoding a stream it does not understand |
 | `coordination` | "Which execution contract was I recorded under?": `lockstep` or `free_run` |
 | `node_external` | "Which of my nodes ran as `external` (driver) nodes?": a map of node id to `true` or `false`, one entry for every node of the recorded graph but its `ros2:` entries, `true` where the loaded node declared the `external` policy. A resim judges drivers by it and refuses a build that declares any node differently (exit 2, naming each node). ABSENT on a bag recorded before the key existed: the build you replay declares the drivers, and a warning says so. A value that is not such a map (`null` included), or one that names a node the embedded graph does not run or leaves one out, is refused with exit 2. A Cerulion older than the key reads the bag and ignores it |
+| `node_inputs` | "How did each of my inputs queue its frames?": a map of node id to a map of input name to `{"backpressure": ..., "depth": ...}`, one entry for every node of the recorded graph but its `ros2:` entries, holding every input the graph wires it. `backpressure` is `block`, `drop_oldest` or `sample(N)` and `depth` the queue depth, as the run read the input: the graph's `backpressure:` and `depth:` keys where it sets them, the node's `#[input]` declaration otherwise. A `--verify` resim allows for a `block` input holding its producer only where this map names the input `block` at the depth the build you replay gives it; any other input's slot is judged as if nothing held its producer. ABSENT on a bag recorded before the key: a `block` input counts only where the embedded graph sets both `backpressure: block` and `depth:` for it. A value that is not such a map counts as absent. A Cerulion older than the key reads the bag and ignores it |
 
 `recorder.json` also carries `env_names_left_out`: how many environment
 variables the bag's `env.json` left out because their name is not valid UTF-8,

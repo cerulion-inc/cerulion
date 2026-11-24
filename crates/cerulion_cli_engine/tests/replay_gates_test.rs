@@ -1611,6 +1611,7 @@ fn production_recorder_att(coordination: CoordinationMode) -> Att {
             std::time::Duration::from_nanos(1_783_092_278_948_123_456),
             coordination,
             &std::collections::BTreeMap::from([("pub1".to_string(), false)]),
+            &std::collections::BTreeMap::new(),
             0,
         ),
     )

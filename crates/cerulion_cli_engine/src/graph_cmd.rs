@@ -6972,6 +6972,7 @@ pub fn graph_run(
             // COPIES these bytes verbatim).
             resolve_run_coordination(execution_mode),
             &crate::replay_engine::node_external_flags(&infos),
+            &crate::replay_engine::node_input_queues(&config, &infos),
             run_env_names_left_out,
         );
     }
@@ -11561,12 +11562,17 @@ fn graph_run_supervisor(
     // unless the write failed, and then embeds no graph.
     #[cfg(unix)]
     let node_external = crate::replay_engine::node_external_flags(&loaded_entry_infos);
+    // Each native node's inputs with the backpressure and depth the run reads
+    // them with: the `node_inputs` key, from the same loaded metadata.
+    #[cfg(unix)]
+    let node_inputs = crate::replay_engine::node_input_queues(&config, &loaded_entry_infos);
     #[cfg(unix)]
     write_run_recorder_best_effort(
         run_dir,
         run_recorded_at,
         resolve_run_coordination(execution_mode),
         &node_external,
+        &node_inputs,
         run_env_names_left_out,
     );
     #[cfg(not(unix))]
@@ -12920,6 +12926,7 @@ fn graph_run_supervisor(
                 // the bag's `coordination` stamp is its pure map.
                 execution_mode,
                 node_external: &node_external,
+                node_inputs: &node_inputs,
                 // The always-on plane's departure ring is what the
                 // recorder's `--ring` set is completed from. `None` (declined or
                 // refused) is unreachable under `--record`: `--no-rings`
@@ -17720,8 +17727,8 @@ fn run_dir_partition_provenance(
 /// Minimal by design (a sacred user-facing format): `arch`, `os`,
 /// `cerulion_version`, `recorded_at_ns` (the recording's start timestamp —
 /// the same `now` that stamps the bag filename; no second clock read), and
-/// three CONTRACT keys a replay applies: `trace_format`, `coordination` and
-/// `node_external`, plus one count a replay does not read,
+/// four CONTRACT keys a replay applies: `trace_format`, `coordination`,
+/// `node_external` and `node_inputs`, plus one count a replay does not read,
 /// `env_names_left_out`.
 ///
 /// `env_names_left_out` is how many variables the same artifact's `env.json`
@@ -17739,6 +17746,13 @@ fn run_dir_partition_provenance(
 /// therefore renders AFTER the node libraries load, since the flags come from
 /// the loaded metadata (a source parse would describe the tree, not the build
 /// that runs). The map is a `BTreeMap`, so the key order is the id order.
+///
+/// `node_inputs` is each native node's inputs with the backpressure and depth
+/// the run's topology reads each with, from
+/// [`crate::replay_engine::node_input_queues`]. A replay counts a `block` slot
+/// only where it names the input `block` at the depth the replayed build gives
+/// it. REQUIRED like `node_external`, so an ABSENT key means a recording made
+/// before it.
 ///
 /// `coordination` is stamped EXPLICITLY on every bag this binary
 /// describes — monolith and lockstep routes included — so an ABSENT key means
@@ -17767,6 +17781,7 @@ pub fn render_recorder_json(
     now: Duration,
     coordination: crate::replay_engine::CoordinationMode,
     node_external: &std::collections::BTreeMap<String, bool>,
+    node_inputs: &crate::replay_engine::NodeInputQueues,
     env_names_left_out: usize,
 ) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -17809,6 +17824,9 @@ pub fn render_recorder_json(
         "coordination": coordination,
         // Each native node's driver flag, from the loaded metadata.
         "node_external": node_external,
+        // Each native node's inputs, with the backpressure and depth the
+        // run's topology reads each with.
+        "node_inputs": node_inputs,
         // How many names `env.json` left out for not being valid UTF-8.
         "env_names_left_out": env_names_left_out,
     }))
@@ -18263,6 +18281,10 @@ struct RecordingInputSpec<'a> {
     /// ([`crate::replay_engine::node_external_flags`]). Stamped into the bag's
     /// `recorder.json` as `node_external`, the record a replay judges drivers by.
     node_external: &'a std::collections::BTreeMap<String, bool>,
+    /// Each native node's inputs with the backpressure and depth the run reads
+    /// them with ([`crate::replay_engine::node_input_queues`]). Stamped into the
+    /// bag's `recorder.json` as `node_inputs`.
+    node_inputs: &'a crate::replay_engine::NodeInputQueues,
     /// The effective config cloned BEFORE the ros2 split — rendered VERBATIM
     /// as the `graph.yaml` attachment (the bag carries the WHOLE run in
     /// authored node order).
@@ -18280,6 +18302,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         record_env,
         coordination,
         node_external,
+        node_inputs,
         embed_config,
     } = spec;
     // Wall-clock filename is fine at the CLI layer (NOT the deterministic
@@ -18351,6 +18374,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
             now,
             coordination,
             node_external,
+            node_inputs,
             env_json.left_out_names.len(),
         ),
     )
@@ -20594,12 +20618,19 @@ fn write_run_recorder_best_effort(
     recorded_at: Duration,
     coordination: crate::replay_engine::CoordinationMode,
     node_external: &std::collections::BTreeMap<String, bool>,
+    node_inputs: &crate::replay_engine::NodeInputQueues,
     env_names_left_out: usize,
 ) {
     let Some(dir) = run_dir else {
         return;
     };
-    let bytes = render_recorder_json(recorded_at, coordination, node_external, env_names_left_out);
+    let bytes = render_recorder_json(
+        recorded_at,
+        coordination,
+        node_external,
+        node_inputs,
+        env_names_left_out,
+    );
     if let Err(e) = crate::run_dir::write_run_recorder(dir, &bytes) {
         tracing::warn!(
             dir = %dir.display(),
@@ -22508,6 +22539,9 @@ struct SupervisorRecordingStart<'a> {
     /// metadata (`loaded_entry_infos`), the same metadata the bag's schema
     /// hashes come from.
     node_external: &'a std::collections::BTreeMap<String, bool>,
+    /// Each native node's inputs with the backpressure and depth the run reads
+    /// them with, from the same metadata.
+    node_inputs: &'a crate::replay_engine::NodeInputQueues,
 }
 
 /// Bring the multi-process recording session up, BETWEEN
@@ -22555,6 +22589,7 @@ fn start_supervisor_recording(
         trace_plane,
         execution_mode,
         node_external,
+        node_inputs,
     } = start;
 
     // (1) the shared input prep (bag path, ready sentinel, topics-json,
@@ -22585,6 +22620,7 @@ fn start_supervisor_recording(
         // the run opted out with `CERULION_EXECUTION_MODE=lockstep`.
         coordination: resolve_run_coordination(execution_mode),
         node_external,
+        node_inputs,
     })?;
 
     // (2) bagd's iceoryx2 Config file (the DEFAULT `iox2_` data-plane
@@ -22735,6 +22771,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // Each node's driver flag for the bag's `recorder.json`, from the same
     // loaded metadata the runtime is built with.
     let node_external = crate::replay_engine::node_external_flags(&entry_infos);
+    // Each native node's inputs with the backpressure and depth the run reads
+    // them with, for the same `recorder.json`.
+    let node_inputs = crate::replay_engine::node_input_queues(&config, &entry_infos);
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
     let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
@@ -22940,6 +22979,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         // From the metadata this run's runtime was built with (`entry_infos`,
         // harvested before the build consumed the factories).
         node_external: &node_external,
+        node_inputs: &node_inputs,
     })?;
     let RecordingPaths {
         out: out_path,
@@ -30500,6 +30540,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -30593,6 +30634,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -30670,6 +30712,7 @@ process_groups:
                 record_env: RecordEnvMode::None,
                 coordination: crate::replay_engine::CoordinationMode::Lockstep,
                 node_external: &std::collections::BTreeMap::new(),
+                node_inputs: &std::collections::BTreeMap::new(),
             })
             .unwrap();
             assert_eq!(inputs.display_out_path.parent(), Some(directory.as_path()));
@@ -30727,6 +30770,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         });
         assert!(
             matches!(result, Err(CliError::Validation(message)) if message == "recording: output escaped its directory")
@@ -30759,6 +30803,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -30857,6 +30902,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.schema_catalog.clone().expect("built-in bindings");
@@ -30913,6 +30959,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let text = std::fs::read_to_string(&inputs.graph_yaml)
@@ -31200,6 +31247,7 @@ nodes:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.graph_yaml.clone();
@@ -31268,7 +31316,7 @@ nodes:
     }
 
     /// `render_recorder_json` carries EXACTLY
-    /// eight fields (a sacred user-facing format: a speculative NINTH
+    /// nine fields (a sacred user-facing format: a speculative TENTH
     /// field fails the count pin), with `arch`/`os` from the compile-time consts,
     /// `recorded_at_ns` equal to the filename-stamp `now` (no second clock), and
     /// `trace_format` = the INTENTIONAL scheduler-trace format version this binary
@@ -31276,31 +31324,53 @@ nodes:
     /// aware v2) so replay refuses a bag from a newer binary instead of mis-
     /// decoding the discard bit; `node_external` is the seventh, each node's
     /// driver flag exactly as the caller handed it; `env_names_left_out` is the
-    /// eighth, the count of names `env.json` left out. The exact-count assert
-    /// stays (no speculative extras; each count move is one intentional add).
+    /// eighth, the count of names `env.json` left out; `node_inputs` is the
+    /// ninth, each node's input queues exactly as the caller handed them. The
+    /// exact-count assert stays (no speculative extras; each count move is one
+    /// intentional add).
     #[cfg(unix)]
     #[test]
-    fn recorder_json_carries_exactly_the_eight_fields() {
-        use crate::replay_engine::CoordinationMode;
+    fn recorder_json_carries_exactly_the_nine_fields() {
+        use crate::replay_engine::{CoordinationMode, InputQueue};
         let now = Duration::from_nanos(1_783_092_278_948_123_456);
         let flags = std::collections::BTreeMap::from([
             ("meter".to_string(), false),
             ("cam".to_string(), true),
         ]);
+        let inputs = std::collections::BTreeMap::from([
+            ("cam".to_string(), std::collections::BTreeMap::new()),
+            (
+                "meter".to_string(),
+                std::collections::BTreeMap::from([(
+                    "x".to_string(),
+                    InputQueue {
+                        backpressure: "block".to_string(),
+                        depth: 4,
+                    },
+                )]),
+            ),
+        ]);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
             now,
             CoordinationMode::Lockstep,
             &flags,
+            &inputs,
             2,
         ))
         .expect("valid JSON");
         let obj = v.as_object().expect("an object");
         assert_eq!(
             obj.len(),
-            8,
-            "exactly eight fields (arch/os/cerulion_version/recorded_at_ns + the \
+            9,
+            "exactly nine fields (arch/os/cerulion_version/recorded_at_ns + the \
              trace_format + the coordination stamp + the driver flags + the count of \
-             env.json names left out), no speculative extras"
+             env.json names left out + the input queues), no speculative extras"
+        );
+        // The ninth field: each node's input queues, a map of node id to a map
+        // of input name to its backpressure and depth.
+        assert_eq!(
+            v["node_inputs"],
+            serde_json::json!({"cam": {}, "meter": {"x": {"backpressure": "block", "depth": 4}}})
         );
         // The eighth field: the count exactly as the caller handed it.
         assert_eq!(v["env_names_left_out"], 2);
@@ -31371,6 +31441,7 @@ nodes:
             now,
             CoordinationMode::FreeRun,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             0,
         ))
         .expect("valid JSON");
@@ -31410,6 +31481,7 @@ nodes:
                 now,
                 CoordinationMode::FreeRun,
                 &node_external_flags(infos),
+                &std::collections::BTreeMap::new(),
                 0,
             )
         };
@@ -31417,7 +31489,7 @@ nodes:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"node_inputs":{{}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
