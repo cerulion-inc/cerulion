@@ -330,7 +330,11 @@ The slot allows for no hold where:
   observed), or reports any frame in the bag drained and never written;
 - the bag has no `recorder.json`, or one stamped below `trace_format` 12;
 - the producer's metadata says it needs a publisher for every output, and the
-  recording shows it sending more frames at a stamp than it fired there;
+  recording shows it sending more frames at a stamp than it fired there, at a
+  step its rank's trace proves ran. A capture keeps the frames of the steps its
+  end cut removed, after its covered range, and a rank whose last recorded step
+  banked no fires is proven only through the step before it (see the ragged
+  tail below): the frames of those steps are not compared;
 - the graph lists the topic in `multi_publisher_topics`;
 - the recording does not pin the input's `block` policy and depth: the
   `node_inputs` entry of its `recorder.json` gives another policy or depth

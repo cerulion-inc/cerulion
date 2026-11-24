@@ -13721,23 +13721,68 @@ fn recorded_fire_instants(
     Ok(instants)
 }
 
+/// The gating clock of the last step `rank`'s trace proves it ran: the target
+/// of the last `STEP_BOUNDARY` the rank kept at a step at or below
+/// `through_step` ([`RaggedTailContext::proven_through_step`]), or `None` where
+/// it kept none there or `through_step` is `None`.
+///
+/// A frame stamped above it comes from a step whose fires the trace does not
+/// hold. A Flashback capture's end cut removes each rank's final steps and
+/// keeps their frames, stamped above every boundary the rank kept: frames
+/// past the covered range, which no pass of the rank re-produces
+/// ([`resolve_covered_range`]). And on a recording with several ranks, a
+/// rank whose final step kept its boundary and no fire does not show whether
+/// that step fired ([`TestifiedEnd::FirelessFinalStep`]).
+///
+/// # Errors
+///
+/// A trace the walk cannot read.
+fn proven_through_target(
+    trace: &RecordedTrace,
+    rank: u32,
+    through_step: Option<u64>,
+) -> Result<Option<u64>, ReplayError> {
+    let Some(through_step) = through_step else {
+        return Ok(None);
+    };
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
+    let mut last = None;
+    while let Some(b) = cursor.next()? {
+        if b.step > through_step {
+            break;
+        }
+        last = Some(b.target_ns);
+    }
+    Ok(last)
+}
+
 /// PURE: does the bag record more frames of a topic at one wire stamp
 /// (`frame_stamps`, ascending) than its producer fired at that instant
 /// (`fire_instants`, ascending), at any stamp from `from_ns` (the rank's first
-/// recorded fire) on? A fire stamps every frame it sends with its step's
-/// gating clock, which is also its FIRE record's instant, so more frames than
-/// fires at a stamp shows a fire that sent several frames, or a frame no
-/// recorded fire sent. Equal totals do not say which fire sent which frame:
-/// two fires at one stamp, the first sending nothing and the second two
-/// frames, match two frames. [`local_block_holds`] reads the answer only for a
-/// producer that sends at most one frame per fire ([`producer_sends_per_fire`]),
-/// for which more frames than fires at a stamp is a frame no fire sent, or a
-/// fire of a node that sets `publisher_for_every_output` by hand and sent
-/// several frames. Frames stamped before `from_ns` precede the trace and are
-/// not compared.
-fn writes_past_fires(frame_stamps: &[u64], fire_instants: &[u64], from_ns: u64) -> bool {
+/// recorded fire) through `through_ns` (the gating clock of the last step the
+/// rank's trace proves it ran, [`proven_through_target`])? A fire stamps every
+/// frame it sends with its step's gating clock, which is also its FIRE
+/// record's instant, so more frames than fires at a stamp shows a fire that
+/// sent several frames, or a frame no recorded fire sent. Equal totals do not
+/// say which fire sent which frame: two fires at one stamp, the first sending
+/// nothing and the second two frames, match two frames. [`local_block_holds`]
+/// reads the answer only for a producer that sends at most one frame per fire
+/// ([`producer_sends_per_fire`]), for which more frames than fires at a stamp
+/// is a frame no fire sent, or a fire of a node that sets
+/// `publisher_for_every_output` by hand and sent several frames. Frames
+/// stamped before `from_ns` precede the trace, and frames stamped above
+/// `through_ns` ([`is_beyond_covered`]) come from steps whose fires the trace
+/// does not hold, so neither is compared. A frame stamped at `through_ns` is
+/// compared: that step's fires are in the trace.
+fn writes_past_fires(
+    frame_stamps: &[u64],
+    fire_instants: &[u64],
+    from_ns: u64,
+    through_ns: u64,
+) -> bool {
     let start = frame_stamps.partition_point(|&at| at < from_ns);
     let frames = &frame_stamps[start..];
+    let frames = &frames[..frames.partition_point(|&at| !is_beyond_covered(at, through_ns))];
     let mut at = 0;
     while at < frames.len() {
         let stamp = frames[at];
@@ -13862,8 +13907,9 @@ fn producer_sends_per_fire(
 /// [`NODE_STOPS_MIN_TRACE_FORMAT`], or none): a consumer's stop releases its
 /// slot live, and such a trace keeps no record of it. And so does an edge
 /// whose producer sends at most one frame per fire and that the bag shows
-/// writing more frames to the topic than it fires (`writes_past_fires(producer,
-/// topic)`, [`writes_past_fires`]): for such a producer that shows a frame no
+/// writing more frames to the topic than it fires, at the steps the rank's
+/// trace proves it ran (`writes_past_fires(producer, topic)`,
+/// [`writes_past_fires`]): for such a producer that shows a frame no
 /// fire sent, or a fire of a node that sets `publisher_for_every_output` by
 /// hand and sent several frames, and its slot can pass the depth while it
 /// holds, which the replay reads as its release. A producer that can send
@@ -15152,7 +15198,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// THIRTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// SEVENTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -15196,6 +15242,8 @@ fn prepare_pass_verification(
     recorded_queues: Option<&RecordedInputQueues>,
     // Does the bag's trace hold every node stop (`trace_format` 12 or later)?
     stops_recorded: bool,
+    // How far each rank's recording proves its schedule ran.
+    ragged: &RaggedTailContext,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -16060,12 +16108,13 @@ fn prepare_pass_verification(
     let hold_flows = block_hold_flows(plan.subgraph(), node_infos, recorded_queues, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
-    let (fire_levels, fire_instants) = if hold_flows.is_empty() {
-        (BTreeMap::new(), BTreeMap::new())
+    let (fire_levels, fire_instants, proven_through_ns) = if hold_flows.is_empty() {
+        (BTreeMap::new(), BTreeMap::new(), None)
     } else {
         (
             recorded_fire_levels(trace, rank_tables, plan.rank())?,
             recorded_fire_instants(trace, rank_tables, plan.rank())?,
+            proven_through_target(trace, plan.rank(), ragged.proven_through_step(plan.rank()))?,
         )
     };
     let first_fire_ns = fire_instants
@@ -16079,17 +16128,19 @@ fn prepare_pass_verification(
         &hold_flows,
         &fire_levels,
         stops_recorded,
+        // Only the frames of the steps the rank's trace proves it ran are
+        // compared: a frame stamped later has no fire record to match.
         &|producer, topic| {
-            hold_stamps
-                .get(topic)
-                .and_then(Option::as_ref)
-                .is_some_and(|stamps| {
-                    writes_past_fires(
-                        stamps,
-                        fire_instants.get(producer).unwrap_or(&no_fires),
-                        first_fire_ns,
-                    )
-                })
+            let stamps = hold_stamps.get(topic).and_then(Option::as_ref);
+            match (stamps, proven_through_ns) {
+                (Some(stamps), Some(through_ns)) => writes_past_fires(
+                    stamps,
+                    fire_instants.get(producer).unwrap_or(&no_fires),
+                    first_fire_ns,
+                    through_ns,
+                ),
+                _ => false,
+            }
         },
         &|producer| producer_sends_per_fire(node_infos.get(producer)),
         &|topic, consumer, input| {
@@ -16648,6 +16699,7 @@ fn plan_pass_verification(
         pass.record_health,
         pass.recorded_queues,
         pass.stops_recorded,
+        pass.ragged,
     )?;
     Ok(verification)
 }
@@ -19789,6 +19841,20 @@ impl RaggedTailContext {
         self.testified
             .get(rank as usize)
             .is_some_and(|t| t.fireless_final_step())
+    }
+
+    /// PURE: the last step `rank`'s recording PROVES ran, the step its
+    /// tolerated window opens after ([`TestifiedEnd::window_opens_after`]):
+    /// the rank's final boundary step where that step banked fires, one step
+    /// before it where it banked none, `None` where that leaves no step, and
+    /// every step the rank's trace keeps (`u64::MAX`) on a single-rank bag,
+    /// whose one stream has no ragged tail, or for a rank that kept no
+    /// boundary.
+    fn proven_through_step(&self, rank: u32) -> Option<u64> {
+        self.testified
+            .get(rank as usize)
+            .and_then(|t| t.window_opens_after())
+            .unwrap_or(Some(u64::MAX))
     }
 }
 
@@ -41360,11 +41426,129 @@ mod trigger_input_capacity_tests {
             (&[10, 20], &[][..], u64::MAX, false),
         ] {
             assert_eq!(
-                writes_past_fires(frames, fires, from),
+                writes_past_fires(frames, fires, from, u64::MAX),
                 past,
                 "frames {frames:?}, fires {fires:?}, from {from}"
             );
         }
+    }
+
+    /// Only the frames of the steps the rank's trace proves it ran are
+    /// compared: a frame stamped above `through_ns` comes from a step whose
+    /// fires the trace does not hold, and one stamped at it is compared. Hand
+    /// table: the trace proves the steps at 10, 20 and 30.
+    #[test]
+    fn a_producer_writes_past_its_fires_only_through_the_last_step_its_trace_proves() {
+        for (frames, fires, from, through, past) in [
+            // A capture's end cut kept the 40 frame and removed its fire.
+            (&[10, 20, 30, 40][..], &[10, 20, 30][..], 10, 30, false),
+            // Two such frames, at two cut steps.
+            (&[10, 20, 30, 40, 50], &[10, 20, 30], 10, 30, false),
+            // The same frame inside the steps the trace proves is one no fire
+            // sent.
+            (&[10, 20, 30, 40], &[10, 20, 30], 10, 40, true),
+            // A frame no fire sent at a proven step, with a cut tail after it.
+            (&[10, 20, 20, 30, 40], &[10, 20, 30], 10, 30, true),
+            // A frame stamped at the last proven step is compared.
+            (&[10, 20, 30], &[10, 20], 10, 30, true),
+            (&[10, 20, 30], &[10, 20], 10, 29, false),
+            (&[10, 20, 30, 30], &[10, 20, 30], 10, 30, true),
+            // A proven end below the first fire compares nothing.
+            (&[10, 20], &[][..], 20, 10, false),
+            (&[10, 20], &[][..], 0, 5, false),
+        ] {
+            assert_eq!(
+                writes_past_fires(frames, fires, from, through),
+                past,
+                "frames {frames:?}, fires {fires:?}, from {from}, through {through}"
+            );
+        }
+    }
+
+    /// A rank's proven end is the target of the last boundary it kept at or
+    /// below its proven step, read off its own boundaries alone. Hand table:
+    /// rank 0 keeps steps 0 to 3 at 10 to 40 ms, rank 1 steps 5 and 6 at 60
+    /// and 70 ms, and rank 2 keeps none.
+    #[test]
+    fn a_ranks_proven_end_is_the_target_of_its_last_boundary_through_its_proven_step() {
+        use cerulion_bag::{BagWriter, BagWriterConfig};
+        use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY};
+        const MS: u64 = 1_000_000;
+        let boundary = |step: u64, rank: u32| TraceRingRecord {
+            step,
+            fire_time_ns: (step + 1) * 10 * MS,
+            duration_ns: 0,
+            node_idx: 0,
+            global_level: 0,
+            record_type: RECORD_TYPE_STEP_BOUNDARY,
+            reserved: rank,
+        };
+        let records = [
+            boundary(0, 0),
+            boundary(1, 0),
+            boundary(2, 0),
+            boundary(3, 0),
+            boundary(5, 1),
+            boundary(6, 1),
+        ];
+        let dir = tempfile::tempdir().expect("a bag directory");
+        let path = dir.path().join("proven_ends.mcap");
+        let mut w = BagWriter::create(&path, BagWriterConfig::default(), &[]).expect("a bag");
+        for (seq, r) in records.iter().enumerate() {
+            w.write_scheduler_trace(u32::try_from(seq).unwrap(), r.step, r.step, r)
+                .expect("a trace record");
+        }
+        w.finalize().expect("the bag finalizes");
+        let trace = RecordedTrace::new(Arc::new(
+            cerulion_bag::BagReader::open(&path).expect("the bag opens"),
+        ));
+        for (rank, through_step, end) in [
+            (0, Some(u64::MAX), Some(40 * MS)),
+            (0, Some(3), Some(40 * MS)),
+            (0, Some(2), Some(30 * MS)),
+            (0, Some(0), Some(10 * MS)),
+            (0, None, None),
+            (1, Some(u64::MAX), Some(70 * MS)),
+            (1, Some(5), Some(60 * MS)),
+            (1, Some(4), None),
+            (2, Some(u64::MAX), None),
+        ] {
+            assert_eq!(
+                proven_through_target(&trace, rank, through_step).expect("the trace walks"),
+                end,
+                "rank {rank}, proven through step {through_step:?}"
+            );
+        }
+    }
+
+    /// The last step a rank's recording proves ran, the step its tolerated
+    /// window opens after: its final boundary step where that step banked
+    /// fires, the step before it where it banked none, no step where that
+    /// leaves none, and every step its trace keeps for a rank the context
+    /// holds no stream of. Hand table over a four-rank context.
+    #[test]
+    fn a_ranks_recording_proves_its_schedule_through_the_step_its_window_opens_after() {
+        let ragged = RaggedTailContext {
+            testified: vec![
+                TestifiedEnd::Complete { through: 7 },
+                TestifiedEnd::FirelessFinalStep {
+                    last_boundary: 7,
+                    through: Some(6),
+                },
+                TestifiedEnd::FirelessFinalStep {
+                    last_boundary: 0,
+                    through: None,
+                },
+                TestifiedEnd::NoStream,
+            ],
+            authoritative_last: vec![7, 7, 0, 7],
+        };
+        assert_eq!(
+            (0..5)
+                .map(|rank| ragged.proven_through_step(rank))
+                .collect::<Vec<_>>(),
+            vec![Some(7), Some(6), None, Some(u64::MAX), Some(u64::MAX)]
+        );
     }
 
     /// A consumer whose info says it needs a publisher for every output it
