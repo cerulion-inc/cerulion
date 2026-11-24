@@ -1200,14 +1200,61 @@ fn c_scan_loaned_take_forges_both_sequences_and_unforges_on_return() {
     }
 }
 
-/// Budget: the shadow pool is the loan budget (4). With four forged loans
-/// outstanding the fifth take is REFUSED — RMW_RET_ERROR, `taken` false,
-/// no pointer, the queued frame NOT consumed, the refusal COUNTED — and
-/// returning one loan serves that surviving frame through the recycled
-/// shadow (FIFO intact).
+/// A take served by COPY: every field is the oracle's, but `data()` is a
+/// private buffer outside every held sample, and the object is not one of the
+/// held loans.
+unsafe fn assert_image_copy(
+    subscription: *const ffi::rmw_subscription_t,
+    loaned: *mut c_void,
+    o: &ImageOracle,
+) {
+    let img = &*(loaned as *const CppImage);
+    assert_eq!(img.header.stamp, o.stamp);
+    assert_eq!(
+        cpp_string_of(img.header.frame_id.0.as_ptr() as *const c_void),
+        o.frame_id
+    );
+    assert_eq!((img.height, img.width), (o.height, o.width));
+    assert_eq!(
+        cpp_string_of(img.encoding.0.as_ptr() as *const c_void),
+        o.encoding
+    );
+    assert_eq!((img.is_bigendian, img.step), (o.is_bigendian, o.step));
+    let vec = img.data.0.as_ptr() as *const c_void;
+    let data_ptr = rmw_cerulion_vector_u8_data(vec) as usize;
+    let inner = sub_data(subscription)
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for take in &inner.pending_takes {
+        assert_ne!(take.key, loaned as usize, "a copy is not a held loan");
+        let payload = take.sample.payload();
+        let start = payload.as_ptr() as usize;
+        assert!(
+            !(start..start + payload.len()).contains(&data_ptr),
+            "a copy's data() must be private memory, never a held sample"
+        );
+    }
+    drop(inner);
+    assert_eq!(rmw_cerulion_vector_u8_size(vec), o.data.len());
+    assert_eq!(
+        std::slice::from_raw_parts(data_ptr as *const u8, o.data.len()),
+        &o.data[..],
+        "payload bytes copied exactly"
+    );
+}
+
+/// Budget: a consumer that holds forged loans past the reserve keeps
+/// receiving. The ceiling is 4 and one borrow stays in reserve, so three takes
+/// are zero-copy loans through pooled shadows and the 4th and the 5th are
+/// served by COPY through a fresh, unpooled shadow filled by the copying decode:
+/// every field the oracle's, `data()` private, no fourth shadow built in the
+/// pool, nothing refused, both copies counted. Returning a copy destroys it
+/// through the C++ destructor (one `fini`) and leaves the pool as it was; a
+/// destroy with loans and a copy outstanding destroys each exactly once.
 #[test]
 #[serial]
-fn cpp_shadow_pool_exhaustion_is_refused_before_consuming_a_frame_and_recovers() {
+fn cpp_forged_takes_past_the_reserve_are_served_by_copy_and_freed_on_return_and_destroy() {
     unsafe {
         let suffix = unique_suffix();
         let ts = image_ts(&format!("ImgB{suffix}"));
@@ -1217,65 +1264,58 @@ fn cpp_shadow_pool_exhaustion_is_refused_before_consuming_a_frame_and_recovers()
             publish_image(publisher, o);
         }
         let mut held = Vec::new();
-        for (i, o) in oracles.iter().take(4).enumerate() {
+        for (i, o) in oracles.iter().take(3).enumerate() {
             let (ret, taken, p, _) = take_loaned(subscription);
             assert_eq!(ret, RMW_RET_OK, "take {i} inside the budget");
             assert!(taken);
             assert_image_loan(subscription, p, o);
             held.push(p);
         }
-        assert_eq!(shadows_built_and_free(subscription), (4, 0));
-        assert_eq!(sub_data(subscription).loan_refusal_count(), 0);
+        assert_eq!(shadows_built_and_free(subscription), (3, 0));
 
-        let (ret, taken, p5, _) = take_loaned(subscription);
+        let mut copies = Vec::new();
+        for (i, o) in oracles.iter().enumerate().skip(3) {
+            let (ret, taken, p, _) = take_loaned(subscription);
+            assert_eq!(ret, RMW_RET_OK, "take {i} past the reserve is served");
+            assert!(taken, "take {i} is taken");
+            assert_image_copy(subscription, p, o);
+            copies.push(p);
+        }
         assert_eq!(
-            ret,
-            ffi::RMW_RET_ERROR,
-            "the fifth concurrent forged loan is refused"
+            outstanding(subscription),
+            3,
+            "the fourth borrow stays in reserve"
         );
-        assert!(!taken);
-        assert!(p5.is_null());
-        assert_eq!(outstanding(subscription), 4);
         assert_eq!(
             shadows_built_and_free(subscription),
-            (4, 0),
-            "no fifth shadow is built"
+            (3, 0),
+            "a copy never builds a pooled shadow"
         );
-        assert_eq!(
-            sub_data(subscription).loan_refusal_count(),
-            1,
-            "the refusal is counted unconditionally"
-        );
+        assert_eq!(sub_data(subscription).loan_copy_count(), 2);
+        assert_eq!(sub_data(subscription).loan_refusal_count(), 0);
 
-        // Return ONE: the surviving fifth frame is served through the
-        // recycled shadow, oracle-exact.
-        let first = held.remove(0);
+        CPP_FINI_CALLS.store(0, Ordering::SeqCst);
         assert_eq!(
-            rmw_return_loaned_message_from_subscription(subscription, first),
+            rmw_return_loaned_message_from_subscription(subscription, copies.pop().expect("copy")),
             RMW_RET_OK
         );
-        let (ret, taken, p, _) = take_loaned(subscription);
-        assert_eq!(ret, RMW_RET_OK, "returning a loan recovers the take");
-        assert!(taken);
-        assert_eq!(p, first, "the freed shadow is the one reused");
-        assert_image_loan(subscription, p, &oracles[4]);
         assert_eq!(
-            sub_data(subscription).loan_refusal_count(),
+            CPP_FINI_CALLS.load(Ordering::SeqCst),
             1,
-            "a served take never counts"
+            "a returned copy is destroyed through its destructor once"
         );
+        assert_eq!(shadows_built_and_free(subscription), (3, 0));
+
+        // Three loans and one copy outstanding: destroy destroys all four.
+        CPP_FINI_CALLS.store(0, Ordering::SeqCst);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(
-            rmw_return_loaned_message_from_subscription(subscription, p),
-            RMW_RET_OK
+            CPP_FINI_CALLS.load(Ordering::SeqCst),
+            4,
+            "every shadow and every copy is destroyed exactly once"
         );
-        for p in held {
-            assert_eq!(
-                rmw_return_loaned_message_from_subscription(subscription, p),
-                RMW_RET_OK
-            );
-        }
-        assert_eq!(shadows_built_and_free(subscription), (4, 4));
-        teardown(node, publisher, subscription);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
 }
 

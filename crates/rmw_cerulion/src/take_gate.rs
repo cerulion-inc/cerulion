@@ -133,6 +133,24 @@ pub fn var_entry_decodable(entry: Option<&[u8]>, elem_size: Option<usize>) -> En
     }
 }
 
+/// Whether a loaned take is served by COPY rather than as a zero-copy loan.
+///
+/// `held_loans` is the number of zero-copy loans the subscription holds, each
+/// pinning one SHM borrow; `ceiling` is how many borrows the subscription may
+/// hold at once (`min(RMW_TAKE_LOAN_BORROW_BUDGET, the service's
+/// max_borrowed_samples)`). One borrow is kept in reserve: the take that would
+/// hold the last one receives into it, copies the message into private memory
+/// and releases it at once, so a consumer that retains loans keeps receiving
+/// and never reaches the transport's borrow refusal. Zero-copy loans held are
+/// therefore at most `ceiling - 1`, and a ceiling of 1 or 0 serves every take
+/// by copy.
+///
+/// Total over `usize x usize` (`held_loans + 1` saturates), allocation-free,
+/// and dependent on nothing but its two arguments.
+pub fn loaned_take_serves_copy(held_loans: usize, ceiling: usize) -> bool {
+    held_loans.saturating_add(1) >= ceiling
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +353,55 @@ mod tests {
             var_entry_decodable(Some(&[0u8; 5]), Some(4)),
             EntryVerdict::PartialElement
         );
+    }
+
+    /// The reserve rule against a hand-written table: the boundary sits one
+    /// below the ceiling, a ceiling of 1 or 0 copies every take, and a held
+    /// count at or past the ceiling (unreachable through the take, which never
+    /// passes the reserve) still copies.
+    #[test]
+    fn the_loaned_take_copies_from_one_below_the_ceiling() {
+        let oracle: &[(usize, usize, bool, &str)] = &[
+            (0, 4, false, "nothing held: zero-copy"),
+            (1, 4, false, "one held: zero-copy"),
+            (2, 4, false, "two held: the third loan is zero-copy"),
+            (3, 4, true, "three held: the fourth borrow stays in reserve"),
+            (4, 4, true, "at the ceiling: copy"),
+            (9, 4, true, "past the ceiling: copy"),
+            (
+                0,
+                2,
+                false,
+                "an iceoryx2-default service: one zero-copy loan",
+            ),
+            (1, 2, true, "...and the second take copies"),
+            (
+                0,
+                1,
+                true,
+                "a ceiling of 1 has no borrow to lend: every take copies",
+            ),
+            (0, 0, true, "a ceiling of 0: every take copies"),
+            (usize::MAX, 4, true, "the increment saturates"),
+            (
+                usize::MAX - 1,
+                usize::MAX,
+                true,
+                "one below a saturated ceiling",
+            ),
+            (
+                usize::MAX - 2,
+                usize::MAX,
+                false,
+                "two below a saturated ceiling",
+            ),
+        ];
+        for &(held, ceiling, want, why) in oracle {
+            assert_eq!(
+                loaned_take_serves_copy(held, ceiling),
+                want,
+                "held={held} ceiling={ceiling}: {why}"
+            );
+        }
     }
 }

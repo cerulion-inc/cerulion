@@ -2,27 +2,33 @@
 //! The flood-suppression reporters of the forged loaned
 //! take — the take-side siblings of [`crate::decode_failure_latch`] and
 //! [`crate::publish_reject_latch`], built on `cerulion_core`'s one shared
-//! `FailureRegimeLatch` (never a hand-rolled fifth copy). Two CONDITIONS,
-//! two latches, because their remedies differ:
+//! `FailureRegimeLatch` (never a hand-rolled fifth copy). Three CONDITIONS,
+//! three latches, because their remedies differ:
 //!
 //! # A REFUSED loaned take (`report_loan_refused`)
 //!
 //! `rmw_take_loaned_message` holds an iceoryx2 sample across the C ABI for
-//! every loan the consumer has not yet returned, and (for a forged type) one
-//! rmw-owned shadow message per outstanding loan. Both are BUDGETED — the
+//! every zero-copy loan the consumer has not yet returned, and (for a forged
+//! type) one rmw-owned shadow message per such loan. Both are BUDGETED: the
 //! service's `subscriber_max_borrowed_samples` (provisioned at
 //! `RMW_TAKE_LOAN_BORROW_BUDGET`) and the shadow pool sized to the same
-//! number — and a consumer that RETAINS loans past that budget is refused on
-//! every following take until it returns one. A BARE `error!` per
-//! attempt would flood: rclcpp's executor retries the take at the arrival
-//! rate, so on a 30 Hz camera topic a stuck consumer is 30 lines/s forever —
-//! the disk-fill class `FailureRegimeLatch` exists for. Every refusal kind
-//! ([`LoanRefusal`]) shares the ONE regime (they are all "the take was
-//! refused, no frame consumed") but carries its OWN headline and remedy: a
-//! pool exhausted by retained loans is cured by returning one, a failed heap
-//! allocation is memory pressure with NOTHING to return, and a transport
-//! receive failure carries the transport's own reason (`ExceedsMaxBorrows`
-//! is the budget; anything else is not).
+//! number. The take keeps zero-copy loans one below the borrow ceiling and
+//! serves every take past them by copy (below), so loans a consumer retains
+//! are never refused. A take is refused only when it cannot get a borrow or a
+//! shadow at all: the transport refuses the receive (`ExceedsMaxBorrows` when
+//! ADOPTED messages of the same subscription hold the reserved borrow, or a
+//! condition of the transport's own) or a shadow allocation fails. A BARE
+//! `error!` per attempt would flood: rclcpp's executor retries the take at
+//! the arrival rate, so on a 30 Hz camera topic a stuck consumer is 30
+//! lines/s forever, the disk-fill class `FailureRegimeLatch` exists for.
+//! Every refusal kind ([`LoanRefusal`]) shares the ONE regime (they are all
+//! "the take was refused, no frame consumed") but carries its OWN headline
+//! and remedy: a pool exhausted by retained loans is cured by returning one
+//! (the reserve keeps the pool from running dry, so this kind is the bound,
+//! not a path retention reaches), a failed heap allocation is memory pressure
+//! with NOTHING to return, and a transport receive failure carries the
+//! transport's own reason (`ExceedsMaxBorrows` is the budget; anything else
+//! is not).
 //!
 //! The ADOPT path's budget refusal has its own reporter
 //! (`report_adopt_borrow_refused`) on the SAME latch and regime, because an
@@ -43,6 +49,18 @@
 //! rule forbids. Loud once per regime (`warn!` — a degrade, not a loss), a
 //! recovery line when a clean frame follows, an unconditional total.
 //!
+//! # A take SERVED BY COPY past the borrow ceiling (`report_loan_copied`)
+//!
+//! The loaned take keeps one borrow of the subscription's ceiling in reserve:
+//! once a consumer holds every other one as a zero-copy loan, each further
+//! take receives into the reserved borrow, copies the message into private
+//! memory and releases the borrow before it returns, so the consumer keeps
+//! receiving instead of being refused. The take succeeded, so this is a
+//! degrade line (`warn!` once per regime, `debug!` repeats, decade
+//! re-announcement) on its OWN latch, with an unconditional total; the
+//! regime closes, with one recovery line (`report_loan_served_zero_copy`), on
+//! the next take served zero-copy, once the consumer has returned loans.
+//!
 //! # The policy, as every latch consumer applies it
 //!
 //! Loud head (full context + the remedy), `debug!` repeats carrying the
@@ -56,7 +74,8 @@
 //! head, repeat, re-announcement and recovery alike, exactly as the sibling
 //! reporters do — so a regime that never reaches a decade still exposes its
 //! running count. Keys are the repo's: `topic=`, `total_failures=`,
-//! `suppressed_count=`, and `kind=` names which budget bound.
+//! `suppressed_count=`, and `kind=` names which budget bound; the copy lines
+//! carry `held_loans=` and `ceiling=` in its place.
 
 use std::sync::Mutex;
 
@@ -696,6 +715,67 @@ pub(crate) fn report_forge_clean(latch: &Mutex<FailureRegimeLatch>, topic: &str)
             total_failures = total,
             "forged loaned take recovered — frames place their sequences at or above the data \
              floor again"
+        );
+    }
+}
+
+/// Record a loaned take served by COPY: the subscription already held
+/// `held_loans` zero-copy loans, one below its borrow `ceiling`, so the take
+/// received into the reserved borrow, copied the message into private memory
+/// and released the borrow. The take succeeded with the published contents;
+/// what the operator learns is that this consumer retains loans and is paying
+/// a copy for every take past them.
+pub(crate) fn report_loan_copied(
+    latch: &Mutex<FailureRegimeLatch>,
+    topic: &str,
+    held_loans: usize,
+    ceiling: usize,
+) {
+    let (decision, total) = observe_failure(latch);
+    match decision {
+        RegimeDecision::Loud => tracing::warn!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            "loaned take served by COPY: the consumer holds held_loans= zero-copy loans and the \
+             last of the subscription's ceiling= borrows stays in reserve, so this message was \
+             copied into private memory and its borrow released at once; the subscription \
+             keeps receiving, each take past the reserve pays a copy, and to return to \
+             zero-copy takes return loans via rmw_return_loaned_message_from_subscription \
+             (repeats are logged at debug until a take is served zero-copy)"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            suppressed_count = suppressed,
+            "loaned takes STILL served by COPY: the consumer keeps holding its zero-copy loans, \
+             so every take past the reserve is copied"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            suppressed_count = suppressed,
+            "loaned take served by COPY (suppressed repeat)"
+        ),
+    }
+}
+
+/// Record a loaned take served ZERO-COPY: closes an open served-by-copy
+/// regime (one recovery line if anything was suppressed) and re-arms.
+pub(crate) fn report_loan_served_zero_copy(latch: &Mutex<FailureRegimeLatch>, topic: &str) {
+    let (recovered, total) = observe_success(latch);
+    if let Some(suppressed) = recovered {
+        tracing::info!(
+            topic = %topic,
+            suppressed_count = suppressed,
+            total_failures = total,
+            "loaned take served zero-copy again: the consumer returned loans below the reserve; \
+             the takes served by copy while the regime was open are counted in suppressed_count"
         );
     }
 }

@@ -15,6 +15,7 @@ ROS 2/MoveIt 2 on zero-copy SHM (cdylib + rlib); C ABI tests run in-process, onl
 - Failure paths: unconditional counters + flood-latched logs + decade re-announcements.
 - ROS names are verbatim (`/chatter` ⇔ `/chatter/data`), relative refused, no alias. Eligible publishers register best-effort, never unregister. Claim excluded topic/service-family guards before ports; retain for process lifetime. Ingress admits subscriptions only; only egress admits publishers.
 - Windowed borrows: NEVER link `cerulion_heaphook` (2nd malloc interposer); dlsym per-symbol (`src/heaphook.rs`). Only a thread's FIRST borrow owns its window; a loan finished on the WRONG thread copies + HOLDS its slot till that thread borrows again (destroy/poisoned LEAKS slot + `PublisherData`: freeing it wedges the dead-node sweep); quarantine retires at slot REUSE, never publish. Every degrade = the copy path, never a failed publish.
+- Loaned takes keep ONE borrow of `min(RMW_TAKE_LOAN_BORROW_BUDGET, service ceiling)` in reserve: past `ceiling - 1` held loans a take is served by a heap copy (`copied_takes`, own latch), never refused; the return looks in `pending_takes` first.
 - NEVER export an entry point whose types a distro's headers lack: cfg the `extern "C"` fn out WHOLE, never stub it (`rmw_absent_export_table_test`, lane `nm` audit).
 - NEVER strip `ROS_DISTRO` around a fixture: a Kilted-and-later `.so` refuses it (`every_ros_distro_strip_is_declared`).
 

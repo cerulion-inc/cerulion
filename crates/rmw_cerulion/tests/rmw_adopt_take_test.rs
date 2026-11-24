@@ -4437,8 +4437,8 @@ fn a_pre_existing_smaller_service_refusal_names_the_effective_budget_not_the_req
         // budget, and the adopt line was advising a free for borrows that
         // might all be loans. This child holds two ADOPTED messages and no
         // loan, so the pair is the discriminating assertion — and it is the
-        // `AdoptedOnly` side of the classification, whose `LoanedOnly` twin
-        // is pinned by `a_refusal_held_by_loans_names_the_loans_and_not_the_adopted_messages`.
+        // `AdoptedOnly` side of the classification; its `Both` twin is pinned
+        // by `loans_and_an_adopted_message_share_the_budget_and_each_refusal_names_its_holders`.
         assert!(
             has_field(refusal, "adopted_outstanding", "2"),
             "every refusal names how many ADOPTED messages are held: {refusal}"
@@ -5947,14 +5947,19 @@ fn the_borrow_ceiling_refusal_says_why_and_an_ordinary_service_does_not() {
     );
 }
 
-/// CHILD (runs only under the parent's re-exec): the whole borrow budget is
-/// held by outstanding LOANED takes when the adopted take's receive is
-/// refused. The parent reads the refusal line off stderr.
+/// CHILD (runs only under the parent's re-exec): loaned takes and adopted
+/// messages share the service's four borrows (the adopt budget is 1, so the
+/// service is minted at `max(1, RMW_TAKE_LOAN_BORROW_BUDGET)` = 4). Four loaned
+/// takes leave a borrow free, because the 4th is served by copy and holds
+/// nothing, so the adopted take that follows is served. With three loans and
+/// one adopted message holding all four, a loaned take past the reserve is
+/// refused by the transport and so is the next adopted take. The parent reads
+/// both refusal lines off stderr.
 #[test]
 #[ignore]
-fn child_loaned_borrows_hold_the_budget_at_the_adopt_refusal() {
+fn child_loans_and_an_adopted_message_share_the_borrow_budget() {
     if std::env::var("CER_RMW_ADOPT_TAKE_CHILD").is_err() {
-        eprintln!("child body invoked without the parent harness — skipping");
+        eprintln!("child body invoked without the parent harness: skipping");
         return;
     }
     reset_fake();
@@ -5965,58 +5970,60 @@ fn child_loaned_borrows_hold_the_budget_at_the_adopt_refusal() {
         let (node, publisher, subscription) = setup_pair(ts, "item10", suffix);
         let stats = adopt_stats(subscription);
         let o = scan_oracle(3, 2, 2.0);
-        for _ in 0..6 {
+        // Six frames are served below and two stay queued, so neither
+        // refusal is an empty queue.
+        for _ in 0..8 {
             publish_scan(publisher, &o);
         }
-        // Hold the WHOLE borrow budget as loans. With the adopt budget set
-        // to 1 the service is minted at `max(1, RMW_TAKE_LOAN_BORROW_BUDGET)`
-        // = 4, which is also the shadow pool's capacity — so four loaned
-        // takes take every unit and none of them is an adopted sample.
-        let mut loans: Vec<*mut c_void> = Vec::new();
-        for _ in 0..4 {
+        let take_loan = |subscription: *const ffi::rmw_subscription_t| {
             let mut p: *mut c_void = std::ptr::null_mut();
             let mut taken = false;
-            assert_eq!(
-                rmw_take_loaned_message(subscription, &mut p, &mut taken, std::ptr::null_mut()),
-                RMW_RET_OK
-            );
-            assert!(
-                taken,
-                "each loaned take must be served — the budget is not spent yet"
-            );
+            let ret =
+                rmw_take_loaned_message(subscription, &mut p, &mut taken, std::ptr::null_mut());
+            (ret, taken, p)
+        };
+        let mut loans: Vec<*mut c_void> = Vec::new();
+        for i in 0..4 {
+            let (ret, taken, p) = take_loan(subscription);
+            assert_eq!(ret, RMW_RET_OK, "loaned take {i}");
+            assert!(taken, "loaned take {i} is served");
             loans.push(p);
         }
-        // The adopted take's receive now fails `ExceedsMaxBorrows`.
-        let (taken, mut msg, _) = take_scan(subscription);
-        assert!(!taken, "the receive is refused, so nothing is delivered");
         assert_eq!(
-            stats.budget_refusals.load(Ordering::Relaxed),
+            sub_data(subscription).loan_copy_count(),
             1,
-            "exactly one refusal"
+            "the 4th loaned take is served by copy: one borrow stays in reserve"
         );
+        // The copy holds no borrow; give it back now. Three loans hold three.
         assert_eq!(
-            stats.outstanding.load(Ordering::Relaxed),
-            0,
-            "and NO adopted message is held — every borrow is a loan, which is the whole \
-             point of this arm"
-        );
-        scan_fini(&mut *msg as *mut _ as *mut c_void);
-        // Now the MIXED shape: give ONE borrow back and let an adopted take
-        // have it, so both counters are nonzero — the only state in which
-        // either single-sided remedy would be half wrong.
-        //
-        // Exactly one adopted message, not two: the env budget is 1, so
-        // `retention_limit = min(budget, effective) = 1` and a SECOND adopted
-        // take would be served by the over-retention COPY arm and retain
-        // nothing. (Asking for two here measures one — the
-        // budget that makes the loaned-only shape reachable is the same
-        // budget that caps retention at one.)
-        assert_eq!(
-            rmw_return_loaned_message_from_subscription(subscription, loans.remove(0)),
+            rmw_return_loaned_message_from_subscription(subscription, loans.pop().expect("copy")),
             RMW_RET_OK
         );
-        let (taken_adopt, msg_adopt, _) = take_scan(subscription);
-        assert!(taken_adopt, "the freed borrow lets an adopted take through");
+        let (taken_a, msg_a, _) = take_scan(subscription);
+        assert!(
+            taken_a,
+            "four loaned takes left the fourth borrow free for the adopted take"
+        );
+        assert_eq!(stats.outstanding.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.budget_refusals.load(Ordering::Relaxed), 0);
+
+        // Three loans and one adopted message hold all four borrows: a loaned
+        // take past the reserve cannot receive.
+        let (ret, taken, p) = take_loan(subscription);
+        assert_eq!(
+            ret,
+            rmw_cerulion::ffi::RMW_RET_ERROR,
+            "the transport refuses the receive"
+        );
+        assert!(!taken);
+        assert!(p.is_null());
+        assert_eq!(sub_data(subscription).loan_refusal_count(), 1);
+
+        // Free the adopted message and adopt another: that served take closes
+        // the refusal regime, so the next refusal is loud again.
+        free_adopted_scan(*msg_a);
+        let (taken_b, msg_b, _) = take_scan(subscription);
+        assert!(taken_b, "the freed borrow lets an adopted take through");
         assert_eq!(
             stats.outstanding.load(Ordering::Relaxed),
             1,
@@ -6029,11 +6036,11 @@ fn child_loaned_borrows_hold_the_budget_at_the_adopt_refusal() {
         );
         assert_eq!(
             stats.budget_refusals.load(Ordering::Relaxed),
-            2,
-            "the second refusal"
+            1,
+            "the adopted refusal"
         );
         scan_fini(&mut *msg_mixed as *mut _ as *mut c_void);
-        free_adopted_scan(*msg_adopt);
+        free_adopted_scan(*msg_b);
         for p in loans {
             assert_eq!(
                 rmw_return_loaned_message_from_subscription(subscription, p),
@@ -6041,66 +6048,58 @@ fn child_loaned_borrows_hold_the_budget_at_the_adopt_refusal() {
             );
         }
         teardown(node, publisher, subscription);
-        eprintln!("CHILD_LOANED_REFUSAL_OK");
+        eprintln!("CHILD_SHARED_BUDGET_OK");
     }
 }
 
-/// When LOANS hold the borrow budget, the adopted take's
-/// refusal says so — and does not advise a release the consumer cannot make.
+/// Loans and adopted messages share one borrow budget, and each refusal names
+/// who holds it.
 ///
 /// An adopt-armed type is always `can_loan_take` too, so outstanding loaned
 /// takes consume the SAME `subscriber_max_borrowed_samples` budget adopted
-/// samples do. A refusal that reports `kind=adopted_budget_exhausted`
-/// and tells the operator to free adopted messages whichever side holds the
-/// borrows — advice that does nothing when every outstanding borrow is a
-/// loan, on a line operators grep BY KIND.
+/// samples do. Loaned takes keep one borrow in reserve (a take past it is
+/// served by copy), so loans alone never hold the whole budget: no
+/// `kind=loaned_borrows_exhausted` line appears where four loans are held.
+/// With three loans and an adopted message holding it, the loaned take is
+/// refused by the transport (`kind=receive_failed`, the transport's own
+/// `ExceedsMaxBorrows`), and the adopted take's line names BOTH holders.
 ///
-/// Fields are asserted as whole `key=value` tokens (`loaned_outstanding=4`
-/// is a substring of `loaned_outstanding=40`), and the remedy is pinned in
-/// BOTH directions: it must name the return call, and it must NOT tell this
-/// consumer to free adopted messages it does not have.
+/// Fields are asserted as whole `key=value` tokens (`loaned_outstanding=3` is a
+/// substring of `loaned_outstanding=30`), and each remedy is pinned.
 #[test]
 #[serial]
-fn a_refusal_held_by_loans_names_the_loans_and_not_the_adopted_messages() {
+fn loans_and_an_adopted_message_share_the_budget_and_each_refusal_names_its_holders() {
     let (status, err) = run_child(
-        "child_loaned_borrows_hold_the_budget_at_the_adopt_refusal",
+        "child_loans_and_an_adopted_message_share_the_borrow_budget",
         &[(ADOPT_TAKE_ENV, "1"), (ADOPT_TAKE_BUDGET_ENV, "1")],
     );
     assert!(status.success(), "child failed:\n{err}");
     assert!(
-        err.contains("CHILD_LOANED_REFUSAL_OK"),
+        err.contains("CHILD_SHARED_BUDGET_OK"),
         "the child must have reached its end:\n{err}"
     );
-    let line = err
+    assert!(
+        !err.contains("kind=loaned_borrows_exhausted"),
+        "four loaned takes keep a borrow in reserve, so loans alone never exhaust it:\n{err}"
+    );
+    let loaned = err
         .lines()
-        .find(|l| l.contains("WARN") && l.contains("adopted take refused"))
-        .unwrap_or_else(|| panic!("no adopt refusal warn; stderr:\n{err}"));
+        .find(|l| l.contains("ERROR") && l.contains("loaned take refused"))
+        .unwrap_or_else(|| panic!("no loaned-take refusal; stderr:\n{err}"));
     assert!(
-        has_field(line, "kind", "loaned_borrows_exhausted"),
-        "the kind must name who actually holds the budget — `adopted_budget_exhausted` here \
-         sends an operator to the wrong API: {line}"
+        has_field(loaned, "kind", "receive_failed")
+            && has_field(loaned, "outstanding_loans", "3")
+            && has_field(loaned, "budget", "4"),
+        "the loaned refusal must carry kind=receive_failed, the three loans and the \
+         ceiling: {loaned}"
     );
     assert!(
-        has_field(line, "adopted_outstanding", "0"),
-        "no adopted message is held: {line}"
-    );
-    assert!(
-        has_field(line, "loaned_outstanding", "4"),
-        "four loans are: {line}"
-    );
-    assert!(
-        line.contains("rmw_return_loaned_message_from_subscription"),
-        "the remedy must name the call that actually releases a unit here: {line}"
-    );
-    assert!(
-        !line.contains("free adopted messages (their fini"),
-        "and must NOT prescribe freeing adopted messages this consumer does not hold — that \
-         was the defect: {line}"
+        loaned.contains("ExceedsMaxBorrows"),
+        "...and the transport's own reason: {loaned}"
     );
 
-    // The MIXED holder, from the same child's second refusal: both counters
-    // nonzero, so neither single-sided remedy is the whole truth and the line
-    // must name both. Without this arm `Both` is a variant nothing drives.
+    // The MIXED holder: both counters nonzero, so neither single-sided remedy
+    // is the whole truth and the line must name both.
     let mixed = err
         .lines()
         .filter(|l| l.contains("adopted take") && l.contains("refused"))
