@@ -142,8 +142,8 @@ pub fn var_entry_decodable(entry: Option<&[u8]>, elem_size: Option<usize>) -> En
 /// hold the last one receives into it, copies the message into private memory
 /// and releases it at once, so a consumer that retains loans keeps receiving
 /// and never reaches the transport's borrow refusal. Zero-copy loans held are
-/// therefore at most `ceiling - 1`, and a ceiling of 1 or 0 serves every take
-/// by copy.
+/// therefore at most `ceiling - 1`, and a ceiling of 1 serves every take by
+/// copy.
 ///
 /// Total over `usize x usize` (`held_loans + 1` saturates), allocation-free,
 /// and dependent on nothing but its two arguments.
@@ -356,7 +356,7 @@ mod tests {
     }
 
     /// The reserve rule against a hand-written table: the boundary sits one
-    /// below the ceiling, a ceiling of 1 or 0 copies every take, and a held
+    /// below the ceiling, a ceiling of 1 copies every take, and a held
     /// count at or past the ceiling (unreachable through the take, which never
     /// passes the reserve) still copies.
     #[test]
@@ -381,7 +381,6 @@ mod tests {
                 true,
                 "a ceiling of 1 has no borrow to lend: every take copies",
             ),
-            (0, 0, true, "a ceiling of 0: every take copies"),
             (usize::MAX, 4, true, "the increment saturates"),
             (
                 usize::MAX - 1,

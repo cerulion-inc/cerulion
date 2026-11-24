@@ -1195,7 +1195,8 @@ pub struct SubscriptionData {
     /// every zero-copy loan its borrow ceiling allows
     /// (`loan_refusal_latch::report_loan_copied`). Its own latch: the take
     /// SUCCEEDED (a degrade, not a refusal), so it must not share the
-    /// refusal regime, and it recovers on the next take served zero-copy.
+    /// refusal regime, and it recovers on the first take served zero-copy
+    /// with no copy outstanding.
     pub loan_copies: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
     /// Adopt-take (`--adopt-take`): `Some` iff the env gate
     /// was armed at CREATE, the heap-hook grant was constructible, AND the

@@ -2443,8 +2443,9 @@ fn c_abi_loaned_take_hold_across_publish_pins_the_slot() {
 /// subscription's borrow ceiling is RMW_TAKE_LOAN_BORROW_BUDGET (4) and the take
 /// keeps one borrow in reserve, so with six messages taken and all held the
 /// first three are zero-copy loans and the 4th, the 5th and the 6th are served
-/// by COPY: RMW_RET_OK, taken, FIFO values, `message_info` stamped exactly as for
-/// a zero-copy loan, the copy counter at 3 and nothing refused. The 3/4
+/// by COPY: RMW_RET_OK, taken, FIFO values, a `message_info` with a nonzero
+/// source timestamp and the publication sequence number, the copy counter at
+/// 3 and nothing refused. The 3/4
 /// boundary also pins that the rmw create provisioned the service at the
 /// documented budget: a service minted at the iceoryx2 default of 2 would copy
 /// from the 2nd take on. Returning every loan, copies included, succeeds and

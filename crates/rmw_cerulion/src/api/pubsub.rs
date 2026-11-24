@@ -52,8 +52,9 @@ const BRIDGED_VARIABLE_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(128 * 102
 /// Each outstanding take loan is one live borrow on the subscription's
 /// connection. The budget is sized for the real rclcpp shapes:
 ///
-/// - `SingleThreadedExecutor`: at most 1 loan held at a time (the loaned
-///   callback returns before the next take);
+/// - `SingleThreadedExecutor` on rclcpp 28.1.22 and earlier: at most 1 loan
+///   held at a time (the loan is returned when the callback returns, before
+///   the next take); on 28.1.23 and later see the last bullet;
 /// - `MultiThreadedExecutor` with a reentrant callback group: one loan per
 ///   concurrently-executing callback — bounded in practice by the executor's
 ///   thread count, but not by the rmw;
@@ -4152,7 +4153,8 @@ fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_v
 /// the sample before returning and hands out the copy, tracked in
 /// `copied_takes` and returned through the same call as a loan. Loud once
 /// per regime on its own latch (`loan_refusal_latch::report_loan_copied`),
-/// recovered by the next take served zero-copy. A take that cannot get a
+/// recovered by the first take served zero-copy with no copy outstanding. A
+/// take that cannot get a
 /// borrow or a shadow at all (a transport refusal, a failed shadow
 /// allocation) is refused, loud once per regime, consumes no frame, and
 /// recovers on the first served take.
