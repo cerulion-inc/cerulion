@@ -41550,7 +41550,7 @@ mod trigger_input_capacity_tests {
     }
 
     /// A producer writes past its fires where the bag records more frames at
-    /// one stamp than it fired at that instant, from the rank's first fire on:
+    /// one stamp than it fired at that clock, from the rank's first fire on:
     /// hand table.
     #[test]
     fn a_producer_writes_past_its_fires_where_a_stamp_holds_more_frames_than_fires() {

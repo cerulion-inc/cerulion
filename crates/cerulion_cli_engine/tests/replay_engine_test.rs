@@ -61470,11 +61470,12 @@ fn a_held_sync_node_is_judged_with_the_hold_allowed_for_under_a_neutral_resim() 
     assert_eq!(
         outcome.rederivation_notes[0].detail,
         "node 'fusion' sync alignment: judged with a hold allowed for, since a block input in its \
-        own rank reads a topic the node produces and its pre-fire check can hold an aligned \
-        set's fire with no record in the bag; at a step where the bag shows the slot full an \
-        aligned set left unfired is not convicted, and every other step and every set the node \
-        fired is still judged (report-only; the allowance can only drop a finding, never invent \
-        one)"
+         own rank reads a topic the node produces and its pre-fire check can hold an aligned \
+         set's fire with no record in the bag; at a step where the bag shows the slot full an \
+         aligned set left unfired is not convicted, unless every slot that held it there shows a \
+         release with no record before its consumer next reads it, and every other step and every \
+         set the node fired is still judged (report-only; the allowance can only drop a finding, \
+         never invent one)"
     );
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
@@ -61506,10 +61507,12 @@ fn bh_assert_period_held_replays(outcome: &ReplayOutcome, label: &str) {
     assert_eq!(
         outcome.rederivation_notes[0].detail,
         "node 'src' period_ms schedule: judged with a hold allowed for, since a block input in \
-        its own rank reads a topic the node produces and its pre-fire check can hold the period \
-        fires a step owed with no record in the bag; at a step where the bag shows the slot full \
-        the node is judged on the first fires it owed, and the rest of its schedule is still \
-        judged (report-only; the allowance can only drop a finding, never invent one)",
+         its own rank reads a topic the node produces and its pre-fire check can hold the period \
+         fires a step owed with no record in the bag; at a step where the bag shows the slot full \
+         the node is judged on the first fires it owed, unless every slot that held it there \
+         shows a release with no record before its consumer next reads it, and the rest of its \
+         schedule is still judged (report-only; the allowance can only drop a finding, never \
+         invent one)",
         "{label}"
     );
 }

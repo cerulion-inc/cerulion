@@ -2212,21 +2212,23 @@ impl fmt::Display for HoldAllowedForNote {
             HeldRule::Period => write!(
                 f,
                 "node '{}' {}: judged with a hold allowed for, since a block input in its own \
-                 rank reads a topic the node produces and its pre-fire check can hold the \
-                 period fires a step owed with no record in the bag; at a step where the bag \
-                 shows the slot full the node is judged on the first fires it owed, and the \
-                 rest of its schedule is still judged (report-only; the allowance can only \
-                 drop a finding, never invent one)",
+                 rank reads a topic the node produces and its pre-fire check can hold the period \
+                 fires a step owed with no record in the bag; at a step where the bag shows the \
+                 slot full the node is judged on the first fires it owed, unless every slot that \
+                 held it there shows a release with no record before its consumer next reads it, \
+                 and the rest of its schedule is still judged (report-only; the allowance can \
+                 only drop a finding, never invent one)",
                 self.node_id,
                 Decider::Period
             ),
             HeldRule::Sync => write!(
                 f,
                 "node '{}' {}: judged with a hold allowed for, since a block input in its own \
-                 rank reads a topic the node produces and its pre-fire check can hold an \
-                 aligned set's fire with no record in the bag; at a step where the bag shows \
-                 the slot full an aligned set left unfired is not convicted, and every other \
-                 step and every set the node fired is still judged (report-only; the \
+                 rank reads a topic the node produces and its pre-fire check can hold an aligned \
+                 set's fire with no record in the bag; at a step where the bag shows the slot \
+                 full an aligned set left unfired is not convicted, unless every slot that held \
+                 it there shows a release with no record before its consumer next reads it, and \
+                 every other step and every set the node fired is still judged (report-only; the \
                  allowance can only drop a finding, never invent one)",
                 self.node_id,
                 Decider::Sync
@@ -2954,11 +2956,12 @@ fn verify_period(
         };
         let recorded = recorded_fires(step, &node.node_id, render_instants);
         let stop_burst = stop.and_then(|s| s.burst_at(step.step));
-        // A step at which the bag shows the slot full that fired the first of its
-        // owed fires is the hold, and the node's next deadline is the first
-        // owed instant it did not fire: the decide gate defers before the
-        // advance, so the deadline stays, and a catch-up burst the check stops
-        // leaves it at the first interval it did not fire.
+        // A step at which the bag shows the slot full that fired fewer fires
+        // than it owed, none or the first of them at their instants, is the
+        // hold, and the node's next deadline is the first owed instant it did
+        // not fire: the decide gate defers before the advance, so the deadline
+        // stays, and a catch-up burst the check stops leaves it at the first
+        // owed instant it did not fire.
         let held_fires = (stop_burst.is_none() && hold_possible)
             .then(|| recorded_fires(step, &node.node_id, true))
             .filter(|at| is_block_held_period_burst(&derived, interval_ns, at.instants()));
@@ -4587,8 +4590,10 @@ impl SlotBound {
             .map(|q| q.saturating_add(sent).saturating_sub(owed_now));
         // While it holds, a slot stops its producer at the depth. The producer
         // is checked at the decide gate (`Scheduler::decide_node`) and before
-        // every fire of its burst, the first included
-        // (`Scheduler::tick_data_burst`), and the check holds it while the slot
+        // every fire of its burst, the first included (`Scheduler::tick_data_burst`
+        // for a Data node, the catch-up loop of `Scheduler::tick_node` for a
+        // `period_ms` node, `Scheduler::tick_sync_burst` for a Sync node), and
+        // the check holds it while the slot
         // counts its depth (`scheduler::block::judge_slot`: `outstanding >=
         // depth`); each frame counts on the slot when it is sent
         // (`CerulionPublisher::send_counted`). A counted edge's consumer fires
@@ -4787,8 +4792,9 @@ pub(crate) struct StepDeferral {
 /// PURE state: whether a node's pre-fire check can have deferred its fire at
 /// each step of a pass, read off the recording alone. The FIFO rule reads both
 /// halves; the Period and Sync rules read the hold (the Period rule reads no
-/// throttle, which `#[cerulion_node]` refuses on a `period_ms` node, and the
-/// Sync rule judges a throttled node on its own). A Period node's check runs
+/// throttle, which `#[cerulion_node]` refuses on a `period_ms` node, and a
+/// throttle stands the Sync rule's owed-fire arm down
+/// ([`StandDownReason::SuppressibleFire`])). A Period node's check runs
 /// at the decide gate and again before each catch-up fire, a Sync node's at
 /// the decide gate and before each aligned set it fires; a Period fire's
 /// instant is its deadline, not the step's clock, but the hold half reads only
@@ -12547,7 +12553,7 @@ mod tests {
 
     /// The recording reads clean with the held source judged on every step:
     /// the hold is noted once, at step 4, as a judged note and not a
-    /// stand-down, and its deadline follows the first owed instant it did not
+    /// stand-down, and its next deadline is the first owed instant it did not
     /// fire. Judged with
     /// nothing holding it, step 4 is a `period_ms` schedule finding: four
     /// owed fires re-derived at their instants, none recorded.
@@ -12564,11 +12570,13 @@ mod tests {
         assert_eq!(held.holds_allowed_for[0].rule.code(), "period_block_held");
         assert_eq!(
             held.holds_allowed_for[0].to_string(),
-            "node 'src' period_ms schedule: judged with a hold allowed for, since a block input in \
-            its own rank reads a topic the node produces and its pre-fire check can hold the period \
-            fires a step owed with no record in the bag; at a step where the bag shows the slot full \
-            the node is judged on the first fires it owed, and the rest of its schedule is still \
-            judged (report-only; the allowance can only drop a finding, never invent one)"
+            "node 'src' period_ms schedule: judged with a hold allowed for, since a block input \
+             in its own rank reads a topic the node produces and its pre-fire check can hold the \
+             period fires a step owed with no record in the bag; at a step where the bag shows \
+             the slot full the node is judged on the first fires it owed, unless every slot that \
+             held it there shows a release with no record before its consumer next reads it, and \
+             the rest of its schedule is still judged (report-only; the allowance can only drop a \
+             finding, never invent one)"
         );
         assert_eq!(
             held,
@@ -13027,12 +13035,13 @@ mod tests {
         assert_eq!(held.holds_allowed_for[0].rule.code(), "sync_block_held");
         assert_eq!(
             held.holds_allowed_for[0].to_string(),
-            "node 'fusion' sync alignment: judged with a hold allowed for, since a block input in its \
-            own rank reads a topic the node produces and its pre-fire check can hold an aligned \
-            set's fire with no record in the bag; at a step where the bag shows the slot full an \
-            aligned set left unfired is not convicted, and every other step and every set the node \
-            fired is still judged (report-only; the allowance can only drop a finding, never invent \
-            one)"
+            "node 'fusion' sync alignment: judged with a hold allowed for, since a block input in \
+             its own rank reads a topic the node produces and its pre-fire check can hold an \
+             aligned set's fire with no record in the bag; at a step where the bag shows the slot \
+             full an aligned set left unfired is not convicted, unless every slot that held it \
+             there shows a release with no record before its consumer next reads it, and every \
+             other step and every set the node fired is still judged (report-only; the allowance \
+             can only drop a finding, never invent one)"
         );
 
         // After the first held step, step 3 fires on two heads 400 ms apart,

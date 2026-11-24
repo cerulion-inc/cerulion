@@ -494,9 +494,9 @@ in prepare_pass_verification
 # (`is_block_held_period_burst`), the two rules that read it and the
 # per-step hold bound (`verify_period`, `verify_sync`), the walk that bounds
 # it and the fires and clocks it folds (`PreFireDeferral`,
-# `step_fire_instants`, `next_clock_ns`), the text of a stand down
-# (`StandDownReason`), the note a held node gets (`HeldRule`,
-# `HoldAllowedForNote`, `withdraw_hold_allowed_for`), and the excuse a held
+# `step_fire_instants`, `next_clock_ns`), the note a held node gets
+# (`HeldRule`, `HoldAllowedForNote`, `withdraw_hold_allowed_for`), and the
+# excuse a held
 # step keeps until its consumer's
 # read confirms it or a release with no record voids it, which the FIFO rule
 # shares (`PendingExcuse`, `FifoCarry::step`). In src/replay_engine.rs: the
@@ -527,8 +527,10 @@ in prepare_pass_verification
 #          caught. Re-run over the change once the count it reads stays at
 #          or below the slot's, in 2 shards, with the full `--re`: 32
 #          mutants, 32 caught. Re-run over the change once the rules take
-#          whether the pass resumed again and the held Period stand-down names
-#          the rank, with `--re 'verify_period|verify_sync|StandDownReason::label'`:
+#          whether the pass resumed again and the held Period rule's note
+#          names the rank (a stand-down reason then, which the
+#          `hold_allowed_for` note later replaced), with
+#          `--re 'verify_period|verify_sync|StandDownReason::label'`:
 #          11 mutants, 11 caught.
 #          Re-run over the merge with the FIFO rules of the Seventh scope, which
 #          voids a held Period or Sync step as it voids a FIFO one, through
