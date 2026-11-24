@@ -1436,17 +1436,19 @@ impl TraceRingHook {
     /// Push the per-step
     /// [`crate::trace_ring::RECORD_TYPE_STEP_BOUNDARY`] record — `step` is
     /// the 0-based step index, `advanced_ns` the step's post-advance clock
-    /// (what `begin_step` returns). `node_idx`/`global_level`/`duration_ns`
-    /// are 0 by contract. WAIT-FREE + zero-alloc (a 40-byte stack encode +
-    /// the wait-free ring push) — one extra push per step on the recording
-    /// path, nothing on the recording-OFF path (the hook is `None`).
-    fn push_step_boundary(&mut self, step: u64, advanced_ns: u64) {
+    /// (what `begin_step` returns), `flags` the boundary's flags word
+    /// ([`crate::trace_ring::step_boundary_flags`] decodes it), written to
+    /// `global_level`. `node_idx`/`duration_ns` are 0 by contract. WAIT-FREE +
+    /// zero-alloc (a 40-byte stack encode + the wait-free ring push): one
+    /// extra push per step on the recording path, nothing on the recording-OFF
+    /// path (the hook is `None`).
+    fn push_step_boundary(&mut self, step: u64, advanced_ns: u64, flags: u32) {
         self.producer.push(&crate::trace_ring::TraceRingRecord {
             step,
             fire_time_ns: advanced_ns,
             duration_ns: 0,
             node_idx: 0,
-            global_level: 0,
+            global_level: flags,
             record_type: crate::trace_ring::RECORD_TYPE_STEP_BOUNDARY,
             reserved: 0,
         });
@@ -1563,7 +1565,7 @@ struct TraceRingHook;
 #[cfg(not(unix))]
 impl TraceRingHook {
     fn push_fire(&mut self, _entry: &TraceEntry) {}
-    fn push_step_boundary(&mut self, _step: u64, _advanced_ns: u64) {}
+    fn push_step_boundary(&mut self, _step: u64, _advanced_ns: u64, _flags: u32) {}
     fn push_read_outcome(
         &mut self,
         _step: u64,
@@ -1950,6 +1952,14 @@ pub struct Scheduler {
     /// never-taken branch — zero hot-path change. Installed once by
     /// `set_trace_ring_producer` before step 0 of a recording run.
     trace_ring: Option<TraceRingHook>,
+    /// The flags word the NEXT step's boundary record carries in its
+    /// `global_level` slot (bit 0 is `trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED`,
+    /// named rather than linked: this module is portable and that one is
+    /// `#[cfg(unix)]`). Set between two steps by
+    /// `mark_next_boundary_runs_reopened`, and read and cleared by EVERY
+    /// [`Self::begin_step`], hook or no hook, so a flag describes the one
+    /// boundary after it was set and never a later one. 0 by default.
+    boundary_flags: u32,
     /// The attached checkpoint arm, read ONCE per step by
     /// [`Self::begin_step`] to derive [`Self::catchup_cap_override`]. `None`
     /// (the default) = no recorder is attached to this run, and the whole clamp
@@ -2147,6 +2157,7 @@ impl Scheduler {
             #[cfg(feature = "oracle-mutants")]
             chain_call_inline_trace_mutant: false,
             trace_ring: None,
+            boundary_flags: 0,
             catchup_arm: None,
             catchup_cap_override: None,
             read_outcome_sink: None,
@@ -2177,6 +2188,7 @@ impl Scheduler {
             #[cfg(feature = "oracle-mutants")]
             chain_call_inline_trace_mutant: false,
             trace_ring: None,
+            boundary_flags: 0,
             catchup_arm: None,
             catchup_cap_override: None,
             read_outcome_sink: None,
@@ -2218,6 +2230,7 @@ impl Scheduler {
             #[cfg(feature = "oracle-mutants")]
             chain_call_inline_trace_mutant: false,
             trace_ring: None,
+            boundary_flags: 0,
             catchup_arm: None,
             catchup_cap_override: None,
             read_outcome_sink: None,
@@ -2253,6 +2266,7 @@ impl Scheduler {
             #[cfg(feature = "oracle-mutants")]
             chain_call_inline_trace_mutant: false,
             trace_ring: None,
+            boundary_flags: 0,
             catchup_arm: None,
             catchup_cap_override: None,
             read_outcome_sink: None,
@@ -5156,8 +5170,14 @@ impl Scheduler {
         // and the `max_trace_entries` cap semantics are untouched by
         // construction. SPSC holds: `begin_step` runs on the step-calling
         // thread only.
+        //
+        // The boundary's FLAGS word is taken on EVERY step, hook or no hook:
+        // a flag marked after step S describes the boundary of step S+1 only,
+        // so it must never survive into a later one. A field read and a store
+        // of 0, no allocation.
+        let flags = std::mem::take(&mut self.boundary_flags);
         if let Some(hook) = self.trace_ring.as_mut() {
-            hook.push_step_boundary(self.steps_begun.saturating_sub(1), new_time);
+            hook.push_step_boundary(self.steps_begun.saturating_sub(1), new_time, flags);
         }
         new_time
     }
@@ -7372,6 +7392,20 @@ impl Scheduler {
     #[cfg(unix)]
     pub(crate) fn trace_ring_installed(&self) -> bool {
         self.trace_ring.is_some()
+    }
+
+    /// Mark the NEXT step's boundary record with
+    /// [`crate::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED`]. The runtime calls
+    /// it at the end of a step a checkpoint is due at, right after it reopened
+    /// every read-outcome stage's writer runs, and the next
+    /// [`Self::begin_step`] writes the flag into that step's boundary and clears
+    /// it. Idempotent within one step; one OR on a field, no allocation.
+    ///
+    /// `#[cfg(unix)]` like its only caller, the runtime's due branch: the flag
+    /// reaches a record only through the trace ring, which is POSIX SHM.
+    #[cfg(unix)]
+    pub(crate) fn mark_next_boundary_runs_reopened(&mut self) {
+        self.boundary_flags |= crate::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED;
     }
 
     /// The LEVEL-END read-outcome merge — drain the level's

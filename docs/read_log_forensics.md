@@ -97,6 +97,13 @@ the slots. All little-endian.
 | 32..36 | `record_type` | `6` for every record in this doc (`1` = fire, `2` = departure, `3` = step boundary, `7` = node stop) |
 | 36..40 | `reserved` | The owning worker RANK, stamped by `bagd` at bag-write time |
 
+A step boundary record (`record_type` 3) uses the same `global_level` slot for
+flags from `trace_format` 11 on: bit 0 (`STEP_BOUNDARY_FLAG_RUNS_REOPENED`)
+says the recorder reopened every read site's writer run right before this
+step, at a checkpoint, so each site's first read that serves a frame from this
+step on carries a `producer` annotation. A format 11 bag whose boundary sets
+any other bit is refused.
+
 ### The outcome kinds
 
 | Kind | Label | `served_seq` | `popped` (frames this drain took OFF THE QUEUE) |
@@ -121,8 +128,10 @@ all; a reader that predates them decodes every field to the value the writer
 meant and renders the kind as `unknown(6)` / `unknown(7)`. (They are defined
 from format 3 on. A bag stamps 5 for the read-site role, 6 for folded runs and 7
 for the every-consult record, each a WIRE change rather than a diagnostic, and
-8 for read identity and 9 for batch frames, so a bag recorded with the
-defaults carries these annotations under a 9, folding on or off:
+8 for read identity, 9 for batch frames and 11 for window heads (10 states
+checkpoint stops in the state records, and 12 adds a NODE-STOP record, record
+kind 7, after every fire that stopped its node), so a bag recorded with the
+defaults carries these annotations under a 12, folding on or off:
 `CERULION_READ_LOG_FOLD=off` moves no stamp, because the every-consult record,
 the annotations and the batch frames are written either way.)
 
@@ -145,7 +154,9 @@ a WRITER RUN: it names the writer (the token) of the read right after it and of
 every later read of the same read stage and read site up to the next
 annotation. A read site is the node body (`body`), or the scheduler (`drain`
 and `peek` together). A single-writer edge therefore shows one annotation per
-read site in the whole log. With the wire sequence
+read site per checkpoint window: the recording's first, and from
+`trace_format` 11 each window after a checkpoint, whose first step boundary
+sets bit 0. With the wire sequence
 on every read record, the log names the writer and the sequence of every frame
 a read served. That is what lets `bag play --resim all --verify` feed each read
 its recorded frames (see "Read identity" in [`docs/bag.md`](bag.md)). Below

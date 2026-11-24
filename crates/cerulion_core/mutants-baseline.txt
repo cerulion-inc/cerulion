@@ -1,13 +1,14 @@
 # Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
 # the live loop's wait sizing, its period-park decisions, the framework-section
-# codec, the capture judge's frame check and its start of each rank, and the
-# replay-fed `block` edge checks.
+# codec, the capture judge's frame check and its start of each rank, the
+# replay-fed `block` edge checks and the step boundary flags decode.
 #
 # Scope: the two pure parser files, the pure wait-sizing and period-park
 # functions named below, the framework-section codec in state_restore.rs (its
 # changed lines), the three frame-check functions in flashback/resim.rs named
 # below, the rank-start functions and judge lines in the same file named below,
 # the replay-fed `block` edge checks named below (their changed lines),
+# the step boundary flags decode named below (its changed lines),
 # and the oracle mutants listed below, each on one pure decision
 # function. The rest of the crate holds transport and scheduler paths that the
 # mutation rule does not cover.
@@ -243,6 +244,22 @@
 #          `scheduler::tests::a_marked_node_below_the_cap_drives_its_trailing_refill`,
 #          and the `run_live` refusal fails
 #          `credit_block_iox2_test::run_live_refuses_a_runtime_built_to_feed_a_block_edge`.
+#
+# Checkpoint window heads: the decode of a STEP_BOUNDARY record's flags word
+# in trace_ring.rs (`step_boundary_flags`, and the
+# `StepBoundaryFlags::runs_reopened` accessor its answer is read through), run
+# on the changed lines only, in two slices, each its own run, with the
+# unmutated baseline on the first:
+#
+# Run:     cargo mutants -p cerulion_core \
+#            -f crates/cerulion_core/src/trace_ring.rs \
+#            --in-diff <the change's diff of that file> \
+#            --re '\bstep_boundary_flags\b|StepBoundaryFlags::runs_reopened' \
+#            --cap-lints true --in-place --timeout 600 --shard 0/2 \
+#            -- --lib -- trace_ring::
+#          and the same with `--shard 1/2 --baseline=skip`
+# Result:  shard 0/2: 5 mutants, 5 caught; shard 1/2: 5 mutants, 5 caught.
+#          Total: 10 mutants, 10 caught, 0 unviable, 0 missed.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail

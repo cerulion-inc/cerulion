@@ -42,7 +42,12 @@ pub const RECORD_TYPE_DEPARTURE: u32 = 2;
 /// - `fire_time_ns` — the step's ADVANCED gating-clock value (the
 ///   `current_time_ns` every same-step publish stamps into its wire
 ///   `timestamp_ns`),
-/// - `duration_ns` = 0, `node_idx` = 0, `global_level` = 0, `reserved` = 0
+/// - `global_level`: the boundary's FLAGS word, decoded by
+///   [`step_boundary_flags`]: bit 0 ([`STEP_BOUNDARY_FLAG_RUNS_REOPENED`]) is
+///   set on the boundary of the step after each step a checkpoint was due at,
+///   and every other bit is 0. A recorder that predates the flag writes 0 on
+///   every boundary.
+/// - `duration_ns` = 0, `node_idx` = 0, `reserved` = 0
 ///   on the RING (rank lives in the ring header); when writing the record to
 ///   the BAG, `bagd` stamps the ring's rank into `reserved` (the
 ///   multi-process contract — rank 0 == the single-process 0, back-compatible).
@@ -60,6 +65,55 @@ pub const RECORD_TYPE_STEP_BOUNDARY: u32 = 3;
 // NOT be minted; kinds 6 and 7 are minted below
 // ([`RECORD_TYPE_READ_OUTCOME`], [`RECORD_TYPE_NODE_STOP`]); values 8+ are
 // RESERVED.
+
+/// Bit 0 of a [`RECORD_TYPE_STEP_BOUNDARY`] record's `global_level` word: at the
+/// end of the step before this one, a step a checkpoint was due at, the live
+/// loop reopened the writer runs of every read-outcome stage. So this step opens
+/// a checkpoint window, and the first read of each read site from here on that
+/// serves a frame of a writer-run edge is preceded by its writer's
+/// [`READ_OUTCOME_PRODUCER`] annotation, whatever the site annotated before.
+///
+/// The flag is keyed on the due step, not on the anchor landing in the state
+/// ring, so a boundary can carry it after a step whose anchor was skipped. The
+/// boundary of step 0 never carries it: the recording's first window opens when
+/// its stages are armed.
+pub const STEP_BOUNDARY_FLAG_RUNS_REOPENED: u32 = 1;
+
+/// Every bit a [`RECORD_TYPE_STEP_BOUNDARY`] record's flags word defines.
+const STEP_BOUNDARY_KNOWN_FLAGS: u32 = STEP_BOUNDARY_FLAG_RUNS_REOPENED;
+
+/// The decoded flags word of one [`RECORD_TYPE_STEP_BOUNDARY`] record: every bit
+/// [`step_boundary_flags`] accepted. `Default` is the word 0, no flag set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StepBoundaryFlags {
+    runs_reopened: bool,
+}
+
+impl StepBoundaryFlags {
+    /// Whether the record carries [`STEP_BOUNDARY_FLAG_RUNS_REOPENED`]: the
+    /// recorder reopened every read-outcome stage's writer runs right before
+    /// this step.
+    #[must_use]
+    pub const fn runs_reopened(self) -> bool {
+        self.runs_reopened
+    }
+}
+
+/// PURE: decode a [`RECORD_TYPE_STEP_BOUNDARY`] record's `global_level` word.
+///
+/// `Ok` with the flags when every set bit is one this build defines; `Err` with
+/// the word masked to the bits it does not define otherwise, so a refusal can
+/// name exactly those bits. Total over `u32`: it reads nothing but the word and
+/// allocates nothing.
+pub fn step_boundary_flags(global_level: u32) -> Result<StepBoundaryFlags, u32> {
+    let unknown = global_level & !STEP_BOUNDARY_KNOWN_FLAGS;
+    if unknown != 0 {
+        return Err(unknown);
+    }
+    Ok(StepBoundaryFlags {
+        runs_reopened: (global_level & STEP_BOUNDARY_FLAG_RUNS_REOPENED) != 0,
+    })
+}
 
 /// Record kind: a per-edge READ OUTCOME (`trace_format` 3) —
 /// which frame(s) a consumer's input read actually served. Reuses the one
@@ -80,7 +134,10 @@ pub const RECORD_TYPE_STEP_BOUNDARY: u32 = 3;
 ///   every read of a multi-writer edge, and on every other edge before each
 ///   read whose writer differs from the writer the previous annotation of the
 ///   same stage and read site named, so every serving read is attributed to
-///   the last annotation of its site before it,
+///   the last annotation of its site before it. On a recording whose step
+///   boundaries carry [`STEP_BOUNDARY_FLAG_RUNS_REOPENED`], every other edge
+///   also restates its writer before each site's first serving read after
+///   each flagged boundary,
 /// - `node_idx` — the CONSUMER node (manifest-indexed, unchanged meaning),
 /// - `global_level` — packed via [`pack_read_outcome_meta`]: high 16 bits =
 ///   the input's index into the node's manifest input table
@@ -920,7 +977,9 @@ pub struct TraceRingRecord {
     pub node_idx: u32,
     /// The node's global DAG level. For a [`RECORD_TYPE_READ_OUTCOME`] record
     /// this slot is REINTERPRETED as the packed `(input_idx:16 | role:2 |
-    /// outcome_kind:14)` word ([`pack_read_outcome_meta`]).
+    /// outcome_kind:14)` word ([`pack_read_outcome_meta`]), and for a
+    /// [`RECORD_TYPE_STEP_BOUNDARY`] record as the boundary's flags word
+    /// ([`step_boundary_flags`]).
     pub global_level: u32,
     /// One of [`RECORD_TYPE_FIRE`] / [`RECORD_TYPE_DEPARTURE`] /
     /// [`RECORD_TYPE_STEP_BOUNDARY`] / [`RECORD_TYPE_READ_OUTCOME`] /
@@ -2917,6 +2976,45 @@ mod tests {
                 Some(TraceRecordFault::UnsupportedRecordType { record_type: kind }),
                 "kind {kind}"
             );
+        }
+    }
+
+    /// The STEP_BOUNDARY flags decoder over hand words: the word 0 and the word
+    /// with bit 0 alone decode, every word with any other bit set is refused
+    /// naming exactly the bits this build does not define, and two decodes of
+    /// one word agree.
+    #[test]
+    fn step_boundary_flags_accept_bit_zero_and_refuse_every_other_bit() {
+        assert_eq!(STEP_BOUNDARY_FLAG_RUNS_REOPENED, 0b1, "the flag is bit 0");
+
+        let none = step_boundary_flags(0).expect("the word 0 sets no flag");
+        assert!(!none.runs_reopened());
+        assert_eq!(none, StepBoundaryFlags::default(), "0 is the default");
+        let reopened = step_boundary_flags(1).expect("bit 0 is defined");
+        assert!(reopened.runs_reopened());
+        assert_ne!(reopened, none);
+
+        assert_eq!(step_boundary_flags(0b10), Err(0b10), "bit 1 alone");
+        assert_eq!(
+            step_boundary_flags(0b11),
+            Err(0b10),
+            "bit 0 is defined, so only bit 1 is named"
+        );
+        assert_eq!(
+            step_boundary_flags(0x8000_0000),
+            Err(0x8000_0000),
+            "the top bit"
+        );
+        assert_eq!(
+            step_boundary_flags(u32::MAX),
+            Err(0xFFFF_FFFE),
+            "every bit: all but bit 0 are named"
+        );
+
+        for word in [0u32, 1, 0b10, 0b11, 0x8000_0000, u32::MAX] {
+            let first = step_boundary_flags(word);
+            let second = step_boundary_flags(word);
+            assert_eq!(first, second, "word {word:#x} decodes the same twice");
         }
     }
 

@@ -80,7 +80,7 @@
 
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,16 +90,18 @@ use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::{
     BackpressurePolicy, ClosureNodeEntry, InputMeta, MacroPolicy, NodeEntry, NodeInfo, OutputMeta,
 };
-use cerulion_core::graph::GraphRuntime;
+use cerulion_core::graph::{GraphRuntime, FUSE_CHAINS_ENV};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::read_outcome::ReadSiteRole;
+use cerulion_core::state_arm::MappedStateArm;
 use cerulion_core::trace_ring::{
-    default_capacity_records, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
-    TraceRingConsumer, TraceRingOwner, TraceRingRecord, READ_OUTCOME_BATCH_FRAME,
-    READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
-    READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED,
-    RECORD_TYPE_READ_OUTCOME,
+    default_capacity_records, read_site_role, step_boundary_flags, unpack_read_outcome_meta,
+    unpack_read_outcome_popped, TraceRingConsumer, TraceRingOwner, TraceRingRecord,
+    READ_OUTCOME_BATCH_FRAME, READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH,
+    READ_OUTCOME_HELD, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER,
+    READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED, RECORD_TYPE_READ_OUTCOME,
+    RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
@@ -7339,4 +7341,608 @@ fn a_restored_held_frame_gives_one_stream_in_two_runs() {
         "the producer's six fires, and nothing of the stopped consumer"
     );
     assert_eq!(first_pending, vec![1; STEPS as usize]);
+}
+
+// ===========================================================================
+// Checkpoint window heads: the writer of every site's first read
+// ===========================================================================
+
+/// What one window-head run recorded.
+struct WindowHeadRun {
+    /// Every kind-6 record in ring order, with the step its merge stamped.
+    stream: Vec<(u64, AnnotRec)>,
+    /// The build's publisher table, which the writer tokens are derived from.
+    publishers: WiringPublisherTable,
+    /// The chain calls the stepped runtime made.
+    chain_calls: u64,
+    /// The steps whose STEP_BOUNDARY record carries the reopen flag, in order.
+    flagged_steps: Vec<u64>,
+}
+
+/// The recorded-run harness for the window-head arms: a REAL trace ring AND a
+/// checkpoint arm word, armed from step 0 every `cadence` steps as a recorder
+/// arms it, on one runtime stepped `steps` times by 10 ms. The live step
+/// reopens every stage's writer runs at the end of each due step, so a
+/// checkpoint window opens at step 0 and at the step after each due step.
+///
+/// No state ring is installed, so each due step's anchor walk returns at its
+/// ring check and the reopen is the due step's whole effect on the read log.
+/// The manifest tables are read off `config` in its node and input order, the
+/// order the build assigns `node_idx` and `input_idx` in.
+fn run_at_window_heads(
+    tag: &str,
+    config: GraphConfig,
+    factories: IndexMap<String, Box<dyn NodeEntry>>,
+    cadence: u64,
+    steps: u64,
+) -> WindowHeadRun {
+    let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
+    let node_inputs: Vec<Vec<String>> = config
+        .nodes
+        .iter()
+        .map(|n| n.inputs.iter().map(|i| i.name.clone()).collect())
+        .collect();
+    let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+    let input_refs: Vec<Vec<&str>> = node_inputs
+        .iter()
+        .map(|inputs| inputs.iter().map(String::as_str).collect())
+        .collect();
+    let input_slices: Vec<&[&str]> = input_refs.iter().map(Vec::as_slice).collect();
+    let ring_tag = format!("{tag}_{}", std::process::id());
+    let mut owner = TraceRingOwner::create_with_inputs(
+        &ring_tag,
+        default_capacity_records(),
+        0,
+        &id_refs,
+        &input_slices,
+    )
+    .expect("create ring");
+    let ring_name = owner.name().to_string();
+    let producer_handle = owner.producer().expect("mint producer");
+
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime =
+        GraphRuntime::build_for_test(config, factories, clock, 8).expect("build graph");
+    runtime.set_trace_ring_producer(producer_handle, &node_ids);
+    assert!(
+        runtime.read_outcome_stages_armed_for_test() > 0,
+        "installing the ring must ARM the wired read-outcome stages"
+    );
+    // Held until the run ends: dropping the owning handle unlinks the word.
+    let arm = Arc::new(MappedStateArm::create_owned(&format!("{ring_tag}_arm")).expect("arm word"));
+    arm.arm(cadence, 0);
+    runtime.attach_state_arm(Arc::clone(&arm));
+
+    for _ in 0..steps {
+        runtime.step(Duration::from_millis(10));
+    }
+    let publishers = runtime.read_log_publisher_ids().clone();
+    let chain_calls = runtime.chain_calls_made();
+
+    let mut ring_consumer = TraceRingConsumer::open(&ring_name).expect("open consumer");
+    let mut records = Vec::new();
+    ring_consumer.drain(&mut records).expect("drain ring");
+    drop(ring_consumer);
+    runtime.shutdown();
+    drop(arm);
+    drop(owner);
+    let flagged_steps = records
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .filter(|r| {
+            step_boundary_flags(r.global_level)
+                .expect("a recorder writes only defined boundary bits")
+                .runs_reopened()
+        })
+        .map(|r| r.step)
+        .collect();
+    WindowHeadRun {
+        stream: stepped_annot_stream(&records),
+        publishers,
+        chain_calls,
+        flagged_steps,
+    }
+}
+
+/// Every kind-6 record in ring order, aux word intact, with the step its merge
+/// stamped: the window-head arms need the checkpoint window each record fell
+/// in.
+fn stepped_annot_stream(records: &[TraceRingRecord]) -> Vec<(u64, AnnotRec)> {
+    records
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .map(|r| r.step)
+        .zip(annot_stream(records))
+        .collect()
+}
+
+/// The reopen flag sits on the boundary of every window head but the first:
+/// the recording's first window opens when its stages are armed, and each
+/// later one at the step after a due step, the step whose boundary the live
+/// step flags. `window_starts` ascends from 0.
+fn assert_flagged_at_window_heads(run: &WindowHeadRun, window_starts: &[u64], shape: &str) {
+    assert_eq!(
+        run.flagged_steps,
+        window_starts[1..].to_vec(),
+        "{shape}: the reopen flag is on exactly the boundaries where a reopened window starts"
+    );
+}
+
+/// One kind-6 record as the window-head arms write it by hand:
+/// `(step, node_idx, input_idx, kind, served sequence, call-site role)`.
+type HeadRow = (u64, u32, u16, u16, u64, ReadSiteRole);
+
+/// A hand [`HeadRow`] on input 0, the only input every hand-checked edge
+/// below reads through.
+fn head_row(step: u64, node_idx: u32, kind: u16, seq: u64, role: ReadSiteRole) -> HeadRow {
+    (step, node_idx, 0, kind, seq, role)
+}
+
+/// The [`HeadRow`] projection of a window-head run's stream.
+fn head_rows(stream: &[(u64, AnnotRec)]) -> Vec<HeadRow> {
+    stream
+        .iter()
+        .map(|(step, r)| (*step, r.node_idx, r.input_idx, r.kind, r.seq, r.role))
+        .collect()
+}
+
+/// Whether a read record served a frame, and so names a writer, over the
+/// shapes the window-head arms run: a `NoFrame` read served nothing, and a
+/// `Truncated` marker is no read. `Decimated` is left out because the kind
+/// alone cannot say: a decimated boundary snapshot on a held frame is
+/// annotated, while a decimated live or trigger read is not. No window-head
+/// shape gates a sample, and the rule check refuses a `Decimated` record
+/// rather than guess.
+fn serves_a_frame(kind: u16) -> bool {
+    matches!(
+        kind,
+        READ_OUTCOME_SERVED
+            | READ_OUTCOME_HELD
+            | READ_OUTCOME_DRAINED_BATCH
+            | READ_OUTCOME_BATCH_FRAME
+    )
+}
+
+/// THE WINDOW-HEAD RULE over one recorded stream, for single-writer edges:
+/// in every checkpoint window (`window_starts`, ascending from 0), each read
+/// site of each `(node, input)` stages exactly one `Producer` annotation when
+/// it serves any frame in the window and none otherwise; the annotation comes
+/// before the site's first frame-serving read of the window, binds to the read
+/// right after it (same node, input, step and served sequence) and names the
+/// edge's writer (`writer_of`). Reads that served nothing may come first.
+///
+/// A stream holding a `Decimated` record is refused, not classified.
+///
+/// Returns how many `(node, input, site, window)` heads carried an annotation,
+/// so a caller can floor it and a check over nothing fails.
+fn assert_every_window_head_names_its_writer(
+    stream: &[(u64, AnnotRec)],
+    window_starts: &[u64],
+    writer_of: impl Fn(u32, u16) -> u64,
+) -> usize {
+    let window_of = |step: u64| {
+        window_starts
+            .iter()
+            .rposition(|&start| start <= step)
+            .expect("the first window starts at step 0")
+    };
+    // (node, input, site, window) -> (annotations, frame-serving reads).
+    let mut heads = BTreeMap::new();
+    for (i, (step, r)) in stream.iter().enumerate() {
+        let site = cerulion_core::read_outcome::writer_run_site(r.role);
+        let key = (r.node_idx, r.input_idx, site, window_of(*step));
+        assert_ne!(
+            r.kind, READ_OUTCOME_DECIMATED,
+            "record {i} is a Decimated read, which this rule check does not classify"
+        );
+        let entry: &mut (usize, usize) = heads.entry(key).or_insert((0, 0));
+        if r.kind == READ_OUTCOME_PRODUCER {
+            let (read_step, read) = stream
+                .get(i + 1)
+                .unwrap_or_else(|| panic!("an annotation ends the stream at record {i}"));
+            assert!(
+                *read_step == *step
+                    && read.kind != READ_OUTCOME_PRODUCER
+                    && (read.node_idx, read.input_idx, read.seq)
+                        == (r.node_idx, r.input_idx, r.seq),
+                "the annotation at record {i} binds to the read right after it: {:?}",
+                head_rows(stream)
+            );
+            assert_eq!(
+                entry.1,
+                0,
+                "an annotation at record {i} after its site's first frame-serving read of \
+                 the window: that read named no writer: {:?}",
+                head_rows(stream)
+            );
+            assert_eq!(
+                r.aux,
+                writer_of(r.node_idx, r.input_idx),
+                "the annotation at record {i} names the edge's writer"
+            );
+            entry.0 += 1;
+        } else if serves_a_frame(r.kind) {
+            assert_eq!(
+                entry.0,
+                1,
+                "record {i}, a frame-serving read at step {step}, follows exactly one \
+                 annotation of its site in its window {key:?}: {:?}",
+                head_rows(stream)
+            );
+            entry.1 += 1;
+        }
+    }
+    for (key, (annotations, serving)) in &heads {
+        assert_eq!(
+            *annotations,
+            usize::from(*serving > 0),
+            "(node, input, site, window) {key:?}: one annotation where the site served a \
+             frame, none where it served nothing"
+        );
+    }
+    heads
+        .values()
+        .filter(|(annotations, _)| *annotations == 1)
+        .count()
+}
+
+/// THE WINDOW-HEAD RULE on real runs: a checkpoint arm attached beside the
+/// trace ring makes the live step reopen every stage's writer runs at the end
+/// of each due step, so every read site's first frame-serving read of each
+/// checkpoint window is preceded by its writer's annotation, and no other read
+/// of a single-writer edge is.
+///
+/// Armed from step 0 every 2 steps, a run is due at 0, 2, 4 and so on, so its
+/// windows open at steps 0, 1, 3, 5 and so on, and every shape also pins that
+/// the reopen flag sits on exactly the boundaries of the windows after the
+/// first. Five shapes:
+///
+/// 1. UNIFIED with REFILL: a data trigger's boundary drain and its
+///    between-fires refill, both drain-site reads on the body stage (full hand
+///    oracle).
+/// 2. SEPARATE: the body's own pops on the body stage and the runtime's batch
+///    drain on the drain stage, each site opening its own run, the drain's
+///    opening carried by its batch frame (full hand oracle).
+/// 3. PER-SET SYNC with a PEEK: in-graph sources at 10 ms and 30 ms, so the
+///    fast input queues frames at later stamps while the slow one has none,
+///    and the matcher peeks behind the fast head when the slow frame lands
+///    (the rule, and the premise that a peek opened a run).
+/// 4. CHAIN CALL: `src -> mid -> far` with chain calls on, so both members
+///    drain their input in a chain call after the head's level (full hand
+///    oracle, and the premise that both members were called every step).
+/// 5. PLAIN-INPUT SNAPSHOT: a slow source into a polling sink, whose boundary
+///    snapshot serves a new frame or holds the last one at the body site, so
+///    a window can open on a HELD frame popped in an earlier window and still
+///    names that frame's writer (full hand oracle).
+///
+/// Every stage is drained by its level's merge before the due boundary, so no
+/// read staged before a reopen lands after it: such a read would be merged
+/// into the next window ahead of its site's annotation, and the rule check
+/// names it.
+#[test]
+#[serial]
+fn every_sites_first_read_after_a_due_step_carries_its_writer() {
+    use cerulion_core::trace_ring::{
+        READ_OUTCOME_BATCH_FRAME as FRAME, READ_OUTCOME_DRAINED_BATCH as DRAINED,
+        READ_OUTCOME_HELD as HELD, READ_OUTCOME_NONE as NO_FRAME_KIND,
+        READ_OUTCOME_NO_FRAME as NO_SEQ, READ_OUTCOME_PRODUCER as PRODUCER,
+        READ_OUTCOME_SERVED as SERVED,
+    };
+    use ReadSiteRole::{Body, Drain};
+    const STEPS: u64 = 6;
+    const HEADS: [u64; 4] = [0, 1, 3, 5];
+
+    // (1) UNIFIED with REFILL. `FastSrc` commits 2k and 2k+1 on step k; the
+    // boundary drain pops 2k and the refill 2k+1, both at the drain site.
+    {
+        let (config, factories) = two_node_graph(
+            "whuni",
+            Box::new(FastSrcEntry::new()),
+            Box::new(TrigSinkEntry::new()),
+        );
+        let run = run_at_window_heads("whuni", config, factories, 2, STEPS);
+        assert_flagged_at_window_heads(&run, &HEADS, "UNIFIED");
+        let writer = expected_token(publisher_id_of(&run.publishers, "producer", "out"));
+        let mut expected: Vec<HeadRow> = Vec::new();
+        for k in 0..STEPS {
+            if HEADS.contains(&k) {
+                expected.push(head_row(k, 1, PRODUCER, 2 * k, Drain));
+            }
+            expected.push(head_row(k, 1, DRAINED, 2 * k, Drain));
+            expected.push(head_row(k, 1, DRAINED, 2 * k + 1, Drain));
+        }
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "UNIFIED: the boundary pop of each window's first step names the writer, and \
+             every other read of the window is bare"
+        );
+        let heads = assert_every_window_head_names_its_writer(&run.stream, &HEADS, |_, _| writer);
+        assert_eq!(
+            heads,
+            HEADS.len(),
+            "UNIFIED: one drain-site opening per window"
+        );
+    }
+
+    // (2) SEPARATE. The body stage's records merge before the drain stage's.
+    {
+        let _separate = WaveEnvGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+        let (config, factories) = two_node_graph(
+            "whsep",
+            Box::new(FastSrcEntry::new()),
+            Box::new(TrigSinkEntry::new()),
+        );
+        let run = run_at_window_heads("whsep", config, factories, 2, STEPS);
+        assert_flagged_at_window_heads(&run, &HEADS, "SEPARATE");
+        let writer = expected_token(publisher_id_of(&run.publishers, "producer", "out"));
+        let mut expected: Vec<HeadRow> = Vec::new();
+        for k in 0..STEPS {
+            let head = HEADS.contains(&k);
+            if head {
+                expected.push(head_row(k, 1, PRODUCER, 2 * k, Body));
+            }
+            expected.push(head_row(k, 1, SERVED, 2 * k, Body));
+            expected.push(head_row(k, 1, SERVED, 2 * k + 1, Body));
+            if head {
+                expected.push(head_row(k, 1, PRODUCER, 2 * k, Drain));
+            }
+            expected.push(head_row(k, 1, FRAME, 2 * k, Drain));
+            expected.push(head_row(k, 1, DRAINED, 2 * k + 1, Drain));
+        }
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "SEPARATE: each site names the writer at its first read of each window; the \
+             drain site's opening is carried by the batch frame it stages first"
+        );
+        let heads = assert_every_window_head_names_its_writer(&run.stream, &HEADS, |_, _| writer);
+        assert_eq!(
+            heads,
+            2 * HEADS.len(),
+            "SEPARATE: one opening per site per window"
+        );
+    }
+
+    // (3) PER-SET SYNC with a PEEK.
+    {
+        const SYNC_STEPS: u64 = 9;
+        const SYNC_HEADS: [u64; 5] = [0, 1, 3, 5, 7];
+        let config = graph_of(
+            "whsync",
+            vec![
+                src_def("pa"),
+                src_def("pb"),
+                sink_def("consumer", &[("a", "pa/out"), ("b", "pb/out")]),
+            ],
+        );
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("pa".to_string(), Box::new(StepSrcEntry::new()));
+        factories.insert("pb".to_string(), Box::new(SlowSrcEntry::new()));
+        factories.insert("consumer".to_string(), Box::new(SyncSinkEntry::new()));
+        let run = run_at_window_heads("whsync", config, factories, 2, SYNC_STEPS);
+        assert_flagged_at_window_heads(&run, &SYNC_HEADS, "SYNC");
+        let writer_a = expected_token(publisher_id_of(&run.publishers, "pa", "out"));
+        let writer_b = expected_token(publisher_id_of(&run.publishers, "pb", "out"));
+        assert!(
+            run.stream
+                .iter()
+                .any(|(_, r)| r.kind == READ_OUTCOME_PRODUCER && r.role == ReadSiteRole::Peek),
+            "PREMISE: a peek opened a writer run, so the peek site is covered: {:?}",
+            head_rows(&run.stream)
+        );
+        let heads = assert_every_window_head_names_its_writer(
+            &run.stream,
+            &SYNC_HEADS,
+            |node, input| match (node, input) {
+                (2, 0) => writer_a,
+                (2, 1) => writer_b,
+                other => panic!("no read-logged edge at (node, input) {other:?}"),
+            },
+        );
+        assert!(
+            heads >= SYNC_HEADS.len(),
+            "SYNC: at least as many openings as windows, a floor so a check over nothing fails ({heads} over {} windows)",
+            SYNC_HEADS.len()
+        );
+    }
+
+    // (4) CHAIN CALL. `src` publishes k on step k, `mid` relays it as k, and
+    // both members drain at the drain site from the chain call.
+    {
+        let _fuse = WaveEnvGuard::set(FUSE_CHAINS_ENV, "1");
+        let config = graph_of(
+            "whchain",
+            vec![
+                src_def("src"),
+                relay_def("mid", "inp", "src/out", None),
+                sink_def("far", &[("inp", "mid/out")]),
+            ],
+        );
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("src".to_string(), Box::new(StepSrcEntry::new()));
+        factories.insert("mid".to_string(), Box::new(TrigRelayEntry::new()));
+        factories.insert("far".to_string(), Box::new(TrigSinkEntry::new()));
+        let run = run_at_window_heads("whchain", config, factories, 2, STEPS);
+        assert_flagged_at_window_heads(&run, &HEADS, "CHAIN CALL");
+        assert_eq!(
+            run.chain_calls,
+            2 * STEPS,
+            "PREMISE: both members were called on every step"
+        );
+        let writer_src = expected_token(publisher_id_of(&run.publishers, "src", "out"));
+        let writer_mid = expected_token(publisher_id_of(&run.publishers, "mid", "out"));
+        let mut expected: Vec<HeadRow> = Vec::new();
+        for k in 0..STEPS {
+            for node in [1u32, 2] {
+                if HEADS.contains(&k) {
+                    expected.push(head_row(k, node, PRODUCER, k, Drain));
+                }
+                expected.push(head_row(k, node, DRAINED, k, Drain));
+            }
+        }
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "CHAIN CALL: each member's chain-called drain names its writer at the first \
+             step of each window"
+        );
+        let heads =
+            assert_every_window_head_names_its_writer(&run.stream, &HEADS, |node, input| {
+                match (node, input) {
+                    (1, 0) => writer_src,
+                    (2, 0) => writer_mid,
+                    other => panic!("no read-logged edge at (node, input) {other:?}"),
+                }
+            });
+        assert_eq!(
+            heads,
+            2 * HEADS.len(),
+            "CHAIN CALL: one opening per member per window"
+        );
+    }
+
+    // (5) PLAIN-INPUT SNAPSHOT. `SlowSrc` publishes 0, 1 and 2 on steps 2, 5
+    // and 8 on a plain edge, so the poller shares its level and each step's
+    // boundary snapshot reads what the steps before it published: nothing on
+    // steps 0 to 2, then a new frame (`Served`) on 3, 6 and 9, and the held
+    // one (`Held`) between. Windows open at 3, 5, 7 and 9 with a frame to
+    // name; at 5 and 7 that frame is HELD, popped in the window before, and
+    // the annotation still names its writer.
+    {
+        const HOLD_STEPS: u64 = 10;
+        const HOLD_HEADS: [u64; 6] = [0, 1, 3, 5, 7, 9];
+        let (config, factories) = two_node_graph(
+            "whhold",
+            Box::new(SlowSrcEntry::new()),
+            Box::new(PollSinkEntry::new()),
+        );
+        let run = run_at_window_heads("whhold", config, factories, 2, HOLD_STEPS);
+        assert_flagged_at_window_heads(&run, &HOLD_HEADS, "SNAPSHOT");
+        let writer = expected_token(publisher_id_of(&run.publishers, "producer", "out"));
+        let expected: Vec<HeadRow> = vec![
+            head_row(0, 1, NO_FRAME_KIND, NO_SEQ, Body),
+            head_row(1, 1, NO_FRAME_KIND, NO_SEQ, Body),
+            head_row(2, 1, NO_FRAME_KIND, NO_SEQ, Body),
+            head_row(3, 1, PRODUCER, 0, Body),
+            head_row(3, 1, SERVED, 0, Body),
+            head_row(4, 1, HELD, 0, Body),
+            head_row(5, 1, PRODUCER, 0, Body),
+            head_row(5, 1, HELD, 0, Body),
+            head_row(6, 1, SERVED, 1, Body),
+            head_row(7, 1, PRODUCER, 1, Body),
+            head_row(7, 1, HELD, 1, Body),
+            head_row(8, 1, HELD, 1, Body),
+            head_row(9, 1, PRODUCER, 2, Body),
+            head_row(9, 1, SERVED, 2, Body),
+        ];
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "SNAPSHOT: no annotation before the first frame; each later window names \
+             the writer at its first served or held read, the held frame's included"
+        );
+        let heads =
+            assert_every_window_head_names_its_writer(&run.stream, &HOLD_HEADS, |_, _| writer);
+        assert_eq!(
+            heads, 4,
+            "SNAPSHOT: the windows at 3, 5, 7 and 9 open on a frame; 0 and 1 to 2 serve none"
+        );
+    }
+}
+
+/// `GraphRuntime::reopen_writer_runs_where` reopens ONLY the stages of the
+/// nodes `keep` accepts. One source feeds two data-trigger sinks, `a` and `b`;
+/// after two steps the test reopens the runs of `a` alone, so at step 2 `a`'s
+/// read names its writer again while `b`'s stays bare, its run still open
+/// from step 0. No checkpoint arm is attached, so the only reopen is the
+/// test's own and no boundary carries the flag.
+///
+/// Hand oracle per sink: `src` publishes k on step k, and each sink's boundary
+/// drain pops it at the drain site (the refill that follows finds nothing and
+/// stages nothing).
+#[test]
+#[serial]
+fn a_reopen_kept_to_one_node_leaves_every_other_nodes_run_open() {
+    use cerulion_core::trace_ring::{
+        READ_OUTCOME_DRAINED_BATCH as DRAINED, READ_OUTCOME_PRODUCER as PRODUCER,
+    };
+    use ReadSiteRole::Drain;
+
+    let config = graph_of(
+        "whkeep",
+        vec![
+            src_def("src"),
+            sink_def("a", &[("inp", "src/out")]),
+            sink_def("b", &[("inp", "src/out")]),
+        ],
+    );
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("src".to_string(), Box::new(StepSrcEntry::new()));
+    factories.insert("a".to_string(), Box::new(TrigSinkEntry::new()));
+    factories.insert("b".to_string(), Box::new(TrigSinkEntry::new()));
+    let mut publishers = None;
+    let (_kind6, all, _inputs) = run_recorded_driven(
+        "whkeep",
+        config,
+        factories,
+        &["src", "a", "b"],
+        &[&[], &["inp"], &["inp"]],
+        |runtime, _clock| {
+            for _ in 0..2 {
+                runtime.step(Duration::from_millis(10));
+            }
+            runtime.reopen_writer_runs_where(|node| node == "a");
+            for _ in 0..2 {
+                runtime.step(Duration::from_millis(10));
+            }
+            publishers = Some(runtime.read_log_publisher_ids().clone());
+        },
+    );
+    let publishers = publishers.expect("the drive ran");
+    let writer = expected_token(publisher_id_of(&publishers, "src", "out"));
+    let stream = stepped_annot_stream(&all);
+    assert!(
+        stream
+            .iter()
+            .filter(|(_, r)| r.kind == READ_OUTCOME_PRODUCER)
+            .all(|(_, r)| r.aux == writer),
+        "every annotation names `src`'s writer: {:?}",
+        head_rows(&stream)
+    );
+    assert!(
+        all.iter()
+            .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+            .all(|r| r.global_level == 0),
+        "CONTROL: with no arm attached no boundary carries a flag"
+    );
+    let rows_of = |node: u32| -> Vec<HeadRow> {
+        head_rows(&stream)
+            .into_iter()
+            .filter(|row| row.1 == node)
+            .collect()
+    };
+    assert_eq!(
+        rows_of(1),
+        vec![
+            head_row(0, 1, PRODUCER, 0, Drain),
+            head_row(0, 1, DRAINED, 0, Drain),
+            head_row(1, 1, DRAINED, 1, Drain),
+            head_row(2, 1, PRODUCER, 2, Drain),
+            head_row(2, 1, DRAINED, 2, Drain),
+            head_row(3, 1, DRAINED, 3, Drain),
+        ],
+        "`a`, the node kept: its first read after the reopen names its writer again"
+    );
+    assert_eq!(
+        rows_of(2),
+        vec![
+            head_row(0, 2, PRODUCER, 0, Drain),
+            head_row(0, 2, DRAINED, 0, Drain),
+            head_row(1, 2, DRAINED, 1, Drain),
+            head_row(2, 2, DRAINED, 2, Drain),
+            head_row(3, 2, DRAINED, 3, Drain),
+        ],
+        "`b`, the node left out: its run continues bare from step 0"
+    );
 }
