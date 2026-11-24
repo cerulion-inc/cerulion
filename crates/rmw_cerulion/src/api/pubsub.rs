@@ -4128,8 +4128,115 @@ fn report_copy_regime(
     }))
 }
 
+/// A loaned take whose RECEIVE the transport refused: who else holds borrows
+/// (adopted messages of this subscription, none unless adopt-take is armed)
+/// goes into the line's remedy. Out of line and cold, as the copy helpers.
+#[cold]
+#[inline(never)]
+fn report_receive_refused(
+    data: &SubscriptionData,
+    held_loans: usize,
+    ceiling: usize,
+    error: &dyn std::fmt::Display,
+) {
+    let adopted_outstanding = data.adopt.as_ref().map_or(0, |adopt| {
+        adopt.stats.outstanding.load(Ordering::Relaxed) as usize
+    });
+    crate::loan_refusal_latch::report_loan_refused(
+        &data.loan_refusals,
+        &data.topic,
+        crate::loan_refusal_latch::LoanRefusal::ReceiveFailed,
+        held_loans,
+        adopted_outstanding,
+        ceiling,
+        &error.to_string(),
+    );
+}
+
+/// Untrack a take whose serve reporting panicked: dropping the entry releases
+/// the borrow (and its shadow), or frees the copy.
+#[cold]
+#[inline(never)]
+fn untrack_take(inner: &mut SubscriptionInner, key: usize, by_copy: bool) {
+    if by_copy {
+        inner.copied_takes.retain(|c| c.key() != key);
+    } else {
+        inner.pending_takes.retain(|p| p.key != key);
+    }
+}
+
+/// The unpooled shadow a FORGED take past the reserve is served into. Out of
+/// line and marked cold, with the other copy-regime helpers below, so the
+/// zero-copy take keeps its own code compact.
+#[cold]
+#[inline(never)]
+fn build_copy_shadow(
+    bridge: &Arc<crate::bridge::AnyBridge>,
+) -> Result<runtime::TakeShadow, crate::loan_refusal_latch::LoanRefusal> {
+    // Allocates (the shadow and, in the decode, its members) only on the
+    // degraded path of a consumer that retains loans; a zero-copy take
+    // recycles pooled shadows and never reaches this.
+    runtime::TakeShadow::build(bridge)
+        .ok_or(crate::loan_refusal_latch::LoanRefusal::ShadowAllocationFailed)
+}
+
+/// A FORGED take served by COPY (past the reserve). The unpooled shadow is
+/// filled by the copying decode, the one `rmw_take` runs into a caller's
+/// message, so every member owns its storage and nothing aliases the sample,
+/// which is released before the take returns. `None` when the decode refuses
+/// the frame: it is consumed and dropped through the same latch as the forged
+/// arm, `taken` false, and the shadow's `fini` frees whatever the decode copied
+/// before it stopped.
+#[cold]
+#[inline(never)]
+unsafe fn serve_forged_copy(
+    data: &SubscriptionData,
+    inner: &mut SubscriptionInner,
+    owned: cerulion_core::transport::subscriber::OwnedInboundSample,
+    copy_shadow: runtime::TakeShadow,
+) -> Option<*mut c_void> {
+    let body = &owned.payload()[WireHeader::SIZE..];
+    if !data.bridge.unflatten(body, copy_shadow.as_ptr()) {
+        crate::decode_failure_latch::report_decode_failure(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body.len(),
+        );
+        return None;
+    }
+    drop(owned);
+    Some(hold_copy(inner, runtime::TakeCopy::Shadow(copy_shadow)))
+}
+
+/// A FIXED take served by COPY (past the reserve): the fixed section, which IS
+/// the C struct, into heap words (8-aligned, and `fixed_align` is at most 8),
+/// then the sample is released before the take returns. At least one word, so
+/// every copy has its own address.
+#[cold]
+#[inline(never)]
+unsafe fn serve_fixed_copy(
+    inner: &mut SubscriptionInner,
+    owned: cerulion_core::transport::subscriber::OwnedInboundSample,
+    fixed_size: usize,
+) -> *mut c_void {
+    // hot-path-alloc-ok: a take past the reserve is the degraded path of a
+    // consumer that retains loans; a zero-copy take never reaches this.
+    let mut words = vec![0u64; fixed_size.div_ceil(8).max(1)];
+    std::ptr::copy_nonoverlapping(
+        owned.payload().as_ptr().add(WireHeader::SIZE),
+        words.as_mut_ptr() as *mut u8,
+        fixed_size,
+    );
+    drop(owned);
+    hold_copy(inner, runtime::TakeCopy::Fixed(words))
+}
+
 /// Track a take served by copy and return the pointer handed to the caller
 /// (the copy's own address, so it is the return's key).
+#[cold]
+#[inline(never)]
 fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_void {
     let mut take = runtime::CopiedTake::new(copy);
     let ptr = take.loaned_ptr();
@@ -4256,11 +4363,7 @@ unsafe fn take_loaned_impl(
     let mut copy_shadow = None;
     if forged {
         let acquired = if by_copy {
-            // Allocates (the shadow and, in the decode, its members) only
-            // on the degraded path of a consumer that retains loans; a
-            // zero-copy take recycles pooled shadows and never reaches this.
-            runtime::TakeShadow::build(&data.bridge)
-                .ok_or(crate::loan_refusal_latch::LoanRefusal::ShadowAllocationFailed)
+            build_copy_shadow(&data.bridge)
         } else {
             inner.shadows.acquire(&data.bridge)
         };
@@ -4302,20 +4405,7 @@ unsafe fn take_loaned_impl(
             if let Some(s) = shadow.take() {
                 inner.shadows.release(s);
             }
-            // Who else holds borrows: adopted messages of this subscription
-            // (none unless adopt-take is armed). The line's remedy names them.
-            let adopted_outstanding = data.adopt.as_ref().map_or(0, |adopt| {
-                adopt.stats.outstanding.load(Ordering::Relaxed) as usize
-            });
-            crate::loan_refusal_latch::report_loan_refused(
-                &data.loan_refusals,
-                &data.topic,
-                crate::loan_refusal_latch::LoanRefusal::ReceiveFailed,
-                held_loans,
-                adopted_outstanding,
-                ceiling,
-                &e.to_string(),
-            );
+            report_receive_refused(data, held_loans, ceiling, &e);
             return RMW_RET_ERROR;
         }
     };
@@ -4402,27 +4492,10 @@ unsafe fn take_loaned_impl(
     // Delivery log: the body this take hands out (kept only if it is taken).
     crate::replay::capture_take_body(&owned.payload()[WireHeader::SIZE..], seq as i64, ts as i64);
     let loaned_ptr: *mut c_void = if let Some(copy_shadow) = copy_shadow {
-        // FORGED shape served by COPY (past the reserve). The unpooled
-        // shadow is filled by the copying decode, the one `rmw_take` runs
-        // into a caller's message, so every member owns its storage and
-        // nothing aliases the sample, which is released before the take
-        // returns. A frame the decode refuses is consumed and dropped through
-        // the same latch as the forged arm below, `taken` false; the shadow
-        // drops here and its `fini` frees whatever the decode copied before
-        // it stopped.
-        let body = &owned.payload()[WireHeader::SIZE..];
-        if !data.bridge.unflatten(body, copy_shadow.as_ptr()) {
-            crate::decode_failure_latch::report_decode_failure(
-                &data.decode_failures,
-                crate::decode_failure_latch::DecodeSite::Subscription,
-                &data.topic,
-                &data.type_name,
-                body.len(),
-            );
-            return RMW_RET_OK;
+        match serve_forged_copy(data, &mut inner, owned, copy_shadow) {
+            Some(ptr) => ptr,
+            None => return RMW_RET_OK,
         }
-        drop(owned);
-        hold_copy(&mut inner, runtime::TakeCopy::Shadow(copy_shadow))
     } else if let Some(mut shadow) = shadow {
         // FORGED shape. The bridge validates the frame (entries in bounds,
         // element-multiple lengths, element-aligned forge targets) and
@@ -4519,21 +4592,7 @@ unsafe fn take_loaned_impl(
             return RMW_RET_OK;
         }
         if by_copy {
-            // Served by COPY (past the reserve): the fixed section, which IS
-            // the C struct, into heap words (8-aligned, and `fixed_align` is
-            // at most 8), then the sample is released before the take
-            // returns. At least one word, so every copy has its own address.
-            // hot-path-alloc-ok: a take past the reserve is the degraded path
-            // of a consumer that retains loans; a zero-copy take never
-            // reaches this.
-            let mut words = vec![0u64; fixed_size.div_ceil(8).max(1)];
-            std::ptr::copy_nonoverlapping(
-                frame.as_ptr().add(WireHeader::SIZE),
-                words.as_mut_ptr() as *mut u8,
-                fixed_size,
-            );
-            drop(owned);
-            hold_copy(&mut inner, runtime::TakeCopy::Fixed(words))
+            serve_fixed_copy(&mut inner, owned, fixed_size)
         } else {
             // Alignment gate (fail closed: never hand out a misaligned struct
             // pointer). Expected to ALWAYS hold: the sample header is align 8 and
@@ -4593,9 +4652,6 @@ unsafe fn take_loaned_impl(
     // The rollback keeps the same invariant as that path: on failure
     // the caller holds nothing of ours and we hold nothing of the caller's.
     // Dropping the `PendingTake` releases the borrow (and its shadow).
-    // Read before the guarded window: a zero-copy take closes the
-    // served-by-copy regime only once no copy is outstanding (see
-    // `report_loan_served_zero_copy`).
     // The served-by-copy regime: a copy opens (or repeats) it, and the first
     // take served zero-copy with no copy outstanding closes it. Only those two
     // takes report to the copy latch; every other zero-copy take skips it.
@@ -4626,12 +4682,7 @@ unsafe fn take_loaned_impl(
     if let Err(payload) = served {
         // Dropping the entry releases the borrow (and its shadow), or frees
         // the copy.
-        let key = loaned_ptr as usize;
-        if by_copy {
-            inner.copied_takes.retain(|c| c.key() != key);
-        } else {
-            inner.pending_takes.retain(|p| p.key != key);
-        }
+        untrack_take(&mut inner, loaned_ptr as usize, by_copy);
         std::panic::resume_unwind(payload);
     }
     *loaned_message = loaned_ptr;
