@@ -327,10 +327,19 @@ The slot allows for no hold where:
 - the bag records no frame of the topic, or a frame header it cannot parse;
 - its record-health stamp is absent or malformed, has no entry for the topic,
   reports the topic lossy or written by several publishers (declared or
-  observed), or reports any frame in the bag drained and never written;
+  observed), or reports any frame in the bag drained and never written. A
+  Flashback capture carries no record-health stamp, so its slots allow for no
+  hold;
 - the bag has no `recorder.json`, or one stamped below `trace_format` 12;
 - the producer's metadata says it needs a publisher for every output, and the
-  recording shows it sending more frames at a stamp than it fired there;
+  recording shows it sending more frames at a stamp than it fired there. A
+  worker can stop after its last recorded step published a frame and before
+  that step's records reach the trace, so the frames of each worker process's
+  last recorded step are compared only where the trace keeps a fire of that
+  process at that step from a level after the producer's. Otherwise they are
+  not compared, and neither are the frames of an earlier step that shares that
+  step's clock. Frames stamped after a process's last recorded step are never
+  compared. This holds for a recording of one worker process or several;
 - the graph lists the topic in `multi_publisher_topics`;
 - the recording does not pin the input's `block` policy and depth: the
   `node_inputs` entry of its `recorder.json` gives another policy or depth

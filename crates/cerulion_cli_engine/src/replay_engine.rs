@@ -13742,23 +13742,132 @@ fn recorded_fire_clocks(
     Ok(clocks)
 }
 
+/// The frames of a `block` producer that its rank's trace can judge against
+/// its fires ([`judged_frames`], [`writes_past_fires`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgedFrames {
+    /// None: the rank kept no step boundary, so no frame of it can be judged.
+    Nothing,
+    /// Those stamped at or below this gating clock.
+    Through(u64),
+    /// Those stamped strictly below this gating clock.
+    Below(u64),
+}
+
+/// The last `STEP_BOUNDARY` a rank kept: its gating clock, and the highest
+/// level a FIRE record the rank kept at that step carries (`None` where it
+/// kept no fire there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastKeptStep {
+    target_ns: u64,
+    top_fire_level: Option<u32>,
+}
+
+/// The last `STEP_BOUNDARY` `rank` kept and the highest level of its FIRE
+/// records at that step ([`LastKeptStep`]), or `None` where it kept no
+/// boundary: one walk of the rank's boundaries, one of the trace's fires.
+///
+/// # Errors
+///
+/// A trace the walk cannot read.
+fn last_kept_step(trace: &RecordedTrace, rank: u32) -> Result<Option<LastKeptStep>, ReplayError> {
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
+    let mut last = None;
+    while let Some(b) = cursor.next()? {
+        last = Some(b);
+    }
+    let Some(last) = last else {
+        return Ok(None);
+    };
+    let mut top_fire_level: Option<u32> = None;
+    trace.for_each(|rec| {
+        if rec.record_type == RECORD_TYPE_FIRE && rec.rank() == rank && rec.step == last.step {
+            top_fire_level =
+                Some(top_fire_level.map_or(rec.global_level, |top| top.max(rec.global_level)));
+        }
+        Ok(())
+    })?;
+    Ok(Some(LastKeptStep {
+        target_ns: last.target_ns,
+        top_fire_level,
+    }))
+}
+
+/// PURE: the frames of a producer on a rank that the rank's trace can judge
+/// against its fires, from the gating clock of the last `STEP_BOUNDARY` the
+/// rank kept (`last_kept_ns`, `None` where it kept none), the level the
+/// producer's fires carry (`producer_level`, `None` where they carry none or
+/// several, [`recorded_fire_levels`]) and the highest level of a fire the rank
+/// kept at its last step (`last_step_top_level`, [`last_kept_step`]).
+///
+/// A step's records reach the rank's trace in order: its boundary, then its
+/// fires' records level by level, each after its fire's tick. So a step is
+/// proven by the boundary after it, and a level of it by the record of a fire
+/// at a later level, which reaches the trace only after every record of the
+/// producer's level. A worker can stop after a fire of its last step published
+/// its frame and before that fire's record reached the trace, so where nothing
+/// proves the producer's level at the rank's last step, that step's frames can
+/// have fires the trace lost, and only the frames stamped below its gating
+/// clock are judged. That also leaves out every earlier step whose clock ties
+/// it, since their frames carry the same stamp. A fire the rank kept at that
+/// step at a level above the producer's proves every fire of the producer
+/// there. A frame stamped after the rank's last kept step is never judged: a
+/// Flashback capture keeps the frames of the steps its end cut removed there.
+/// The rule is the same on one rank and on several.
+fn judged_frames(
+    last_kept_ns: Option<u64>,
+    producer_level: Option<u32>,
+    last_step_top_level: Option<u32>,
+) -> JudgedFrames {
+    let Some(at) = last_kept_ns else {
+        return JudgedFrames::Nothing;
+    };
+    let level_proven = match (producer_level, last_step_top_level) {
+        (Some(level), Some(top)) => top > level,
+        _ => false,
+    };
+    if level_proven {
+        JudgedFrames::Through(at)
+    } else {
+        JudgedFrames::Below(at)
+    }
+}
+
 /// PURE: does the bag record more frames of a topic at one wire stamp
 /// (`frame_stamps`, ascending) than its producer fired at that clock
 /// (`fire_clocks`, ascending, [`recorded_fire_clocks`]), at any stamp from
-/// `from_ns` (the clock of the rank's first recorded fire) on? A fire stamps
-/// every frame it sends with its step's gating clock, so more frames than fires
-/// at a stamp shows a fire that sent several frames, or a frame no recorded
-/// fire sent. Equal totals do not say which fire sent which frame: two fires at
-/// one stamp, the first sending nothing and the second two frames, match two
-/// frames. [`local_block_holds`] reads the answer only for a
+/// `from_ns` (the clock of the rank's first recorded fire) on that the rank's
+/// trace can judge (`judged`, [`judged_frames`]), or, where it judges no frame
+/// ([`JudgedFrames::Nothing`]), does the bag record any frame of the topic? A
+/// fire stamps every frame it sends with its step's gating clock, so more
+/// frames than fires at a stamp shows a fire that sent several frames, or a
+/// frame no recorded fire sent. Equal totals do not say which fire sent which
+/// frame: two fires at one stamp, the first sending nothing and the second two
+/// frames, match two frames. [`local_block_holds`] reads the answer only for a
 /// producer that sends at most one frame per fire ([`producer_sends_per_fire`]),
 /// for which more frames than fires at a stamp is a frame no fire sent, or a
 /// fire of a node that sets `publisher_for_every_output` by hand and sent
-/// several frames. Frames stamped before `from_ns` precede the trace and are
-/// not compared.
-fn writes_past_fires(frame_stamps: &[u64], fire_clocks: &[u64], from_ns: u64) -> bool {
+/// several frames. Frames stamped before `from_ns` precede the trace, and
+/// frames the trace cannot judge may have fires it lost, so neither is
+/// compared. A trace that keeps no boundary of the rank judges no frame, and
+/// any frame recorded on the topic then answers yes, so the slot is not
+/// counted.
+fn writes_past_fires(
+    frame_stamps: &[u64],
+    fire_clocks: &[u64],
+    from_ns: u64,
+    judged: JudgedFrames,
+) -> bool {
     let start = frame_stamps.partition_point(|&at| at < from_ns);
     let frames = &frame_stamps[start..];
+    let end = match judged {
+        JudgedFrames::Nothing => return !frame_stamps.is_empty(),
+        JudgedFrames::Through(through_ns) => {
+            frames.partition_point(|&at| !is_beyond_covered(at, through_ns))
+        }
+        JudgedFrames::Below(below_ns) => frames.partition_point(|&at| at < below_ns),
+    };
+    let frames = &frames[..end];
     let mut at = 0;
     while at < frames.len() {
         let stamp = frames[at];
@@ -13883,8 +13992,10 @@ fn producer_sends_per_fire(
 /// [`NODE_STOPS_MIN_TRACE_FORMAT`], or none): a consumer's stop releases its
 /// slot live, and such a trace keeps no record of it. And so does an edge
 /// whose producer sends at most one frame per fire and that the bag shows
-/// writing more frames to the topic than it fires (`writes_past_fires(producer,
-/// topic)`, [`writes_past_fires`]): for such a producer that shows a frame no
+/// writing more frames to the topic than it fires, at the steps the rank's
+/// trace proves other than one that shares the clock of a last step it does
+/// not (`writes_past_fires(producer, topic)`, [`writes_past_fires`],
+/// [`judged_frames`]): for such a producer that shows a frame no
 /// fire sent, or a fire of a node that sets `publisher_for_every_output` by
 /// hand and sent several frames, and its slot can pass the depth while it
 /// holds, which the replay reads as its release. A producer that can send
@@ -15173,7 +15284,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// THIRTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// SIXTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -16081,12 +16192,13 @@ fn prepare_pass_verification(
     let hold_flows = block_hold_flows(plan.subgraph(), node_infos, recorded_queues, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
-    let (fire_levels, fire_clocks) = if hold_flows.is_empty() {
-        (BTreeMap::new(), BTreeMap::new())
+    let (fire_levels, fire_clocks, last_kept) = if hold_flows.is_empty() {
+        (BTreeMap::new(), BTreeMap::new(), None)
     } else {
         (
             recorded_fire_levels(trace, rank_tables, plan.rank())?,
             recorded_fire_clocks(trace, rank_tables, plan.rank())?,
+            last_kept_step(trace, plan.rank())?,
         )
     };
     let first_fire_ns = fire_clocks
@@ -16100,15 +16212,26 @@ fn prepare_pass_verification(
         &hold_flows,
         &fire_levels,
         stops_recorded,
+        // A topic whose frame headers do not all parse has no stamps here, and
+        // `slot_record` leaves its slot uncounted.
         &|producer, topic| {
             hold_stamps
                 .get(topic)
                 .and_then(Option::as_ref)
                 .is_some_and(|stamps| {
+                    let producer_level = match fire_levels.get(producer) {
+                        Some(RecordedLevel::One(level)) => Some(*level),
+                        Some(RecordedLevel::Several) | None => None,
+                    };
                     writes_past_fires(
                         stamps,
                         fire_clocks.get(producer).unwrap_or(&no_fires),
                         first_fire_ns,
+                        judged_frames(
+                            last_kept.map(|step| step.target_ns),
+                            producer_level,
+                            last_kept.and_then(|step| step.top_fire_level),
+                        ),
                     )
                 })
         },
@@ -41381,11 +41504,164 @@ mod trigger_input_capacity_tests {
             (&[10, 20], &[][..], u64::MAX, false),
         ] {
             assert_eq!(
-                writes_past_fires(frames, fires, from),
+                writes_past_fires(frames, fires, from, JudgedFrames::Through(u64::MAX)),
                 past,
                 "frames {frames:?}, fires {fires:?}, from {from}"
             );
         }
+    }
+
+    /// Only the frames the rank's trace can judge are compared: through the
+    /// last kept step where a later level's fire proves it, strictly below it
+    /// elsewhere, none where the trace keeps no boundary of the rank. Hand
+    /// table: in most rows the rank's steps run at 10, 20 and 30.
+    #[test]
+    fn a_producer_writes_past_its_fires_only_at_the_stamps_its_trace_can_judge() {
+        use JudgedFrames::{Below, Nothing, Through};
+        for (frames, fires, from, judged, past) in [
+            // A capture's end cut kept the 40 frame and removed its fire.
+            (
+                &[10, 20, 30, 40][..],
+                &[10, 20, 30][..],
+                10,
+                Through(30),
+                false,
+            ),
+            // Two such frames, at two cut steps.
+            (&[10, 20, 30, 40, 50], &[10, 20, 30], 10, Through(30), false),
+            // The same frame at a step the trace judges is one no fire sent.
+            (&[10, 20, 30, 40], &[10, 20, 30], 10, Through(40), true),
+            (&[10, 20, 20, 30, 40], &[10, 20, 30], 10, Through(30), true),
+            // A frame stamped at a proven last step is compared.
+            (&[10, 20, 30], &[10, 20], 10, Through(30), true),
+            (&[10, 20, 30], &[10, 20], 10, Through(29), false),
+            (&[10, 20, 30, 30], &[10, 20, 30], 10, Through(30), true),
+            // An unproven last step at 30: its frame, whose fire the trace may
+            // have lost, is not compared.
+            (&[10, 20, 30], &[10, 20], 10, Below(30), false),
+            // Two fires of that step, the first kept: neither frame is.
+            (&[10, 20, 30, 30], &[10, 20, 30], 10, Below(30), false),
+            // An earlier step tied to its clock goes with it.
+            (&[10, 20, 30, 30], &[10, 20], 10, Below(30), false),
+            // A frame no fire sent below it is still one.
+            (&[10, 20, 20, 30], &[10, 20, 30], 10, Below(30), true),
+            (&[10, 20, 30], &[10, 30], 10, Below(30), true),
+            (&[10, 20, 30], &[10, 30], 10, Below(20), false),
+            // A bound below the first fire compares nothing.
+            (&[10, 20], &[][..], 20, Through(10), false),
+            (&[10, 20], &[][..], 20, Below(20), false),
+            // A trace that keeps no boundary of the rank counts no slot for
+            // any frame.
+            (&[10, 20], &[10, 20], 10, Nothing, true),
+            (&[10], &[][..], u64::MAX, Nothing, true),
+            (&[][..], &[][..], 0, Nothing, false),
+        ] {
+            assert_eq!(
+                writes_past_fires(frames, fires, from, judged),
+                past,
+                "frames {frames:?}, fires {fires:?}, from {from}, judged {judged:?}"
+            );
+        }
+    }
+
+    /// The frames a rank's trace can judge, from the gating clock of the last
+    /// boundary it kept, the producer's level and the highest level of a fire
+    /// the rank kept at its last step. Hand table: in most rows the last kept
+    /// step runs at 30 and the producer at level 1. A tie needs no row of its
+    /// own: `Below(30)` leaves out every frame stamped 30, an earlier step's
+    /// tied to it included (the `writes_past_fires` table holds those rows).
+    #[test]
+    fn a_ranks_last_kept_step_is_judged_where_a_later_level_proves_it() {
+        use JudgedFrames::{Below, Nothing, Through};
+        for (last_kept_ns, producer_level, top_level, judged) in [
+            // A fire at a later level proves the producer's level.
+            (Some(30), Some(1), Some(2), Through(30)),
+            (Some(30), Some(0), Some(7), Through(30)),
+            (Some(0), Some(1), Some(2), Through(0)),
+            // A fire at the producer's own level proves nothing: a later fire
+            // of the same burst can be the one the trace lost.
+            (Some(30), Some(1), Some(1), Below(30)),
+            (Some(0), Some(1), Some(1), Below(0)),
+            // An earlier level's fire proves nothing of the producer's.
+            (Some(30), Some(1), Some(0), Below(30)),
+            // No fire kept at the last step.
+            (Some(30), Some(1), None, Below(30)),
+            // A producer with no recorded level, or several, is no proof.
+            (Some(30), None, Some(5), Below(30)),
+            (Some(30), None, None, Below(30)),
+            // No kept boundary, no bound.
+            (None, Some(1), Some(2), Nothing),
+            (None, None, None, Nothing),
+        ] {
+            assert_eq!(
+                judged_frames(last_kept_ns, producer_level, top_level),
+                judged,
+                "last kept {last_kept_ns:?}, producer level {producer_level:?}, top level \
+                 {top_level:?}"
+            );
+        }
+    }
+
+    /// A rank's last kept step is its last boundary, with the highest level of
+    /// the FIRE records it kept at that step, read off that rank's own records
+    /// alone. Hand table: rank 0 keeps steps 0 to 3 at 10 to 40 ms with fires
+    /// at levels 0 and 2 at step 3 and at level 5 at step 2, rank 1 keeps steps
+    /// 0 and 1 at 10 and 20 ms with no fire at step 1 and a level 9 fire at
+    /// step 0, and rank 2 keeps none but a fire record.
+    #[test]
+    fn a_ranks_last_kept_step_carries_the_top_level_of_its_own_fires_there() {
+        use cerulion_bag::{BagWriter, BagWriterConfig};
+        use cerulion_core::trace_ring::{
+            TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY,
+        };
+        const MS: u64 = 1_000_000;
+        let record = |record_type: u32, step: u64, rank: u32, level: u32| TraceRingRecord {
+            step,
+            fire_time_ns: (step + 1) * 10 * MS,
+            duration_ns: 0,
+            node_idx: 0,
+            global_level: level,
+            record_type,
+            reserved: rank,
+        };
+        let boundary = |step, rank| record(RECORD_TYPE_STEP_BOUNDARY, step, rank, 0);
+        let fire = |step, rank, level| record(RECORD_TYPE_FIRE, step, rank, level);
+        let records = [
+            boundary(0, 0),
+            boundary(0, 1),
+            fire(0, 1, 9),
+            boundary(1, 0),
+            boundary(1, 1),
+            boundary(2, 0),
+            fire(2, 0, 5),
+            boundary(3, 0),
+            fire(3, 0, 2),
+            fire(3, 0, 0),
+            fire(3, 2, 4),
+        ];
+        let dir = tempfile::tempdir().expect("a bag directory");
+        let path = dir.path().join("last_kept_steps.mcap");
+        let mut w = BagWriter::create(&path, BagWriterConfig::default(), &[]).expect("a bag");
+        for (seq, r) in records.iter().enumerate() {
+            w.write_scheduler_trace(u32::try_from(seq).unwrap(), r.step, r.step, r)
+                .expect("a trace record");
+        }
+        w.finalize().expect("the bag finalizes");
+        let trace = RecordedTrace::new(Arc::new(
+            cerulion_bag::BagReader::open(&path).expect("the bag opens"),
+        ));
+        let at = |target_ns, top_fire_level| {
+            Some(LastKeptStep {
+                target_ns,
+                top_fire_level,
+            })
+        };
+        assert_eq!(
+            (0..3)
+                .map(|rank| last_kept_step(&trace, rank).expect("the trace walks"))
+                .collect::<Vec<_>>(),
+            vec![at(40 * MS, Some(2)), at(20 * MS, None), None]
+        );
     }
 
     /// A consumer whose info says it needs a publisher for every output it

@@ -48769,6 +48769,34 @@ fn ri_ranked_bag_with_labels(
     label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
     recorder_json: Vec<u8>,
 ) {
+    ri_ranked_bag_cut(
+        rec,
+        path,
+        rank_of,
+        rank_count,
+        label_rows,
+        recorder_json,
+        |_| {},
+        None,
+    );
+}
+
+/// [`ri_ranked_bag_with_labels`], each rank's trace stream passed through
+/// `tweak` first, with `flashback` as the `__cerulion/flashback.json` manifest
+/// where it is given.
+// Every argument is one independent knob of the bag.
+#[allow(clippy::too_many_arguments)]
+fn ri_ranked_bag_cut(
+    rec: &Recording,
+    path: &std::path::Path,
+    rank_of: impl Fn(&str) -> u32 + Copy,
+    rank_count: u32,
+    label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
+    recorder_json: Vec<u8>,
+    tweak: impl FnOnce(&mut Vec<Vec<TraceRingRecord>>),
+    flashback: Option<serde_json::Value>,
+) {
+    let flashback = flashback.map(|manifest| serde_json::to_vec(&manifest).unwrap());
     let stage_rows = rec.stage_rows.clone();
     let staging = move |rank: u32| -> Option<serde_json::Value> {
         let rows: serde_json::Map<String, serde_json::Value> = stage_rows
@@ -48791,7 +48819,7 @@ fn ri_ranked_bag_with_labels(
         rank_count,
         MpLayout::PerStepBatches,
         path,
-        |_| {},
+        tweak,
         None,
         Some(recorder_json),
         None,
@@ -48801,7 +48829,11 @@ fn ri_ranked_bag_with_labels(
             labels: &labels,
         },
         Some(&staging),
-        &[],
+        &flashback
+            .as_deref()
+            .map(|bytes| ("__cerulion/flashback.json", bytes))
+            .into_iter()
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -60135,11 +60167,12 @@ const FP3_YAML: &str = "name: fpgraph\nprefix: fp\nnodes:\n\
 /// (`x` 6) stops it, which releases its slot, so nothing ever holds the relay,
 /// which fires each step's frame. Then take out the relay's fire record at
 /// `drop_at`, its frame still in the bag, the shape of a relay that popped a
-/// frame there and fired nothing. The frame with no fire also makes the bag
-/// show the relay sending more frames at that step than it fired, which
-/// counts no slot of its topic on its own: these vectors pin the verdict on
-/// such a bag, and the pure vectors and the stopping-sink vectors pin the
-/// release itself.
+/// frame there and fired nothing. At a step before the recording's last, the
+/// frame with no fire also makes the bag show the relay sending more frames at
+/// that step than it fired, which counts no slot of its topic on its own; at
+/// the last step, where the trace keeps no fire of a level after the relay's,
+/// that frame is not compared. These vectors pin the verdict on such a bag,
+/// and the pure vectors and the stopping-sink vectors pin the release itself.
 fn fp3_recording(steps: usize, drop_at: u64) -> Recording {
     let mut rec = record_uniform_with_read_log(FP3_YAML, || fp3_factories(Some(6.0)), &[], steps);
     let last = steps as u64 - 1;
@@ -60176,14 +60209,16 @@ fn fp3_finding(drop_at: u64) -> String {
 
 /// `rec`, with the relay's fire at `drop_at` taken out after a live sink stop,
 /// replayed with a build in which the sink does not stop and with the build
-/// that recorded the bag. The frame the taken-out fire sent stays in the bag,
-/// so the bag shows the relay sending more frames at `drop_at` than it fired
-/// there, and no slot of its topic is counted on any stamp: nothing holds the
-/// relay and the step is the finding whichever build replays. At the
-/// node-stops trace format the bag also holds the sink's stop, which releases
-/// its slot from the next step; below it the trace holds no stop, so no slot
-/// is counted there either. The relay's frames differ either way, since the
-/// replay fires it as the bag records.
+/// that recorded the bag. The frame the taken-out fire sent stays in the bag.
+/// At a step before the last, the bag then shows the relay sending more frames
+/// at `drop_at` than it fired there, and no slot of its topic is counted on any
+/// stamp; at the last step, where the trace keeps no fire of a level after the
+/// relay's, that frame is not compared. Either way nothing holds the relay and
+/// the step is the finding whichever build replays. At the node-stops trace
+/// format the bag also holds the sink's stop, which releases its slot from the
+/// next step; below it the trace holds no stop, so no slot is counted there
+/// either. The relay's frames differ either way, since the replay fires it as
+/// the bag records.
 fn fp3_assert(rec: &Recording, drop_at: u64, name: &str) {
     for format in [
         replay_engine::NODE_STOPS_MIN_TRACE_FORMAT,
@@ -60695,6 +60730,413 @@ fn a_one_frame_producer_with_a_frame_no_fire_sent_is_judged_by_its_own_info() {
     );
     assert!(!outcome.passed);
     bh_assert_judged(&outcome, "a one-frame producer with a frame no fire sent");
+}
+
+/// The steps the cut-tail recordings run: through step 41, at which the relay
+/// fires the frame its hold froze at step 31 (`x` 22), its last fire.
+const BH_CUT_STEPS: usize = 42;
+
+/// The block-held recording through step 41: [`bh_reference`]'s hand oracle up
+/// to that step. Step `k`'s gating clock is `(k + 1) * 5` ms, so the relay's
+/// last frame is stamped 210 ms.
+fn bh_through_last_relay_fire() -> Recording {
+    let rec = record_uniform_with_read_log(
+        &bh_yaml("slow_block_sink_node", ""),
+        bh_held_factories,
+        &[],
+        BH_CUT_STEPS,
+    );
+    assert_eq!(
+        bh_xs(&rec, BH_RELAY_TOPIC),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 22.0]
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), vec![0, 1, 2, 11, 21, 31, 41]);
+    assert_eq!(
+        WireHeader::read_from_buf(rec.messages[BH_RELAY_TOPIC].last().unwrap())
+            .map(|h| h.timestamp_ns),
+        Some(210_000_000)
+    );
+    rec
+}
+
+/// `rec` as a single-rank Flashback capture: the trace through the recorder's
+/// end cut (`cerulion_bagd::end_at_last_complete_step`), which removes step
+/// 41's records and keeps every frame, and a manifest that states the cut
+/// (`handoff.trace_end_cut`, opening with the count the recorder writes) and
+/// the covered range the cut trace backs, the step 40 target (205 ms). Like a
+/// capture the recorder writes, the bag carries no record-health stamp, so on
+/// its own its slots allow for no hold. The capture vectors give the replay
+/// the recording's clean stamp (`bh_clean_stamp`, what a recording carries as
+/// `__cerulion/record_health.json`) so they reach the frame comparison on a
+/// cut trace.
+fn bh_capture_bag(rec: &Recording, path: &std::path::Path) {
+    let complete = cerulion_bagd::end_at_last_complete_step(rec.trace.iter().copied());
+    assert_eq!(complete.steps_cut, 1, "one rank, one final step");
+    assert!(complete.records.iter().all(|r| r.step <= 40));
+    assert_eq!(capture_last_boundary_target(&complete.records), 205_000_000);
+    let manifest = serde_json::json!({
+        "anchor": { "resim_covered_through_ns": 205_000_000 },
+        "handoff": {
+            "trace_end_cut": format!(
+                "{} step(s) removed from the end of the trace ({} scheduler-trace record(s))",
+                complete.steps_cut, complete.cut
+            )
+        }
+    });
+    ri_ranked_bag_cut(
+        rec,
+        path,
+        |_| 0,
+        1,
+        &[],
+        ri_free_run_recorder_json(),
+        |per_rank| {
+            per_rank[0] =
+                cerulion_bagd::end_at_last_complete_step(per_rank[0].iter().copied()).records
+        },
+        Some(manifest),
+    );
+}
+
+/// The exit code `cerulion bag play --resim all --verify` gives `outcome`.
+fn bh_verify_exit(outcome: &ReplayOutcome) -> u8 {
+    cerulion_cli_engine::resim_cmd::resim_exit_code(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+        true,
+    )
+}
+
+/// A CAPTURE WHOSE END CUT KEEPS A HELD PRODUCER'S FRAME after its covered
+/// range. The capture of the block-held run through step 41 ([`bh_capture_bag`])
+/// ends its trace at step 40 and keeps the relay's step 41 frame (`x` 22,
+/// 210 ms), which no fire in the trace sent. The relay sends at most one frame
+/// per fire, and a frame stamped after the rank's last kept step is not
+/// compared with its fires, so the slot stays counted. The replay is given
+/// the recording's clean record-health stamp ([`bh_capture_bag`]) so it
+/// reaches that comparison; a capture the recorder writes carries no such
+/// stamp, so its slots allow for no hold. The hold's onset at step 3, at
+/// which the bag shows the slot full (three frames sent, the sink's step 0 read
+/// took one), is excused, and the replay plans the refill of every held fire:
+/// frame 4 serves the frame the hold froze (`x` 5), where a replay without
+/// that refill serves `x` 12. The replay passes, exit 0, with the relay's and
+/// the source's step 41 frames trailing the range, the same twice.
+#[test]
+#[serial]
+fn a_capture_whose_end_cut_keeps_a_held_producers_frame_replays_its_holds() {
+    let rec = bh_through_last_relay_fire();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_capture_cut_tail.mcap");
+    bh_capture_bag(&rec, &bag);
+    let outcome = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        (
+            outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+            bh_verify_exit(&outcome)
+        ),
+        (None, 0),
+        "no hold is a finding, and the verify passes"
+    );
+    bh_assert_replays(
+        &outcome,
+        "a capture whose end cut keeps a held relay's frame",
+    );
+    let covered = outcome
+        .covered_range
+        .as_ref()
+        .expect("a capture reports its covered range");
+    assert_eq!(covered.through_ns, 205_000_000);
+    assert_eq!(
+        covered.trailing_frames,
+        BTreeMap::from([
+            ("/bh/relay/out".to_string(), 1),
+            ("/bh/src/out".to_string(), 1),
+        ]),
+        "the step 41 frames trail the range: {covered:?}"
+    );
+    let again = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// The same capture with a copy of the relay's step 31 frame stamped at step
+/// 40's clock (205 ms), under a sequence no relay frame carries: a frame no
+/// fire sent, at the last step the capture's trace keeps, which is inside its
+/// covered range. The relay fires nothing at step 40, and the sink's fire at
+/// the level after the relay's proves that step. For a producer that sends at
+/// most one frame per fire, that leaves the slot uncounted however the capture
+/// ends, so nothing holds the relay and the hold's onset, step 3, is the
+/// finding (exit 6). The replay is given the recording's clean record-health
+/// stamp ([`bh_capture_bag`]) so it reaches the comparison; a capture the
+/// recorder writes carries no such stamp, so its slots allow for no hold
+/// either way. Left out of the comparison, the copy would push the slot past
+/// its depth at step 40, a release with no record, and the first finding would
+/// be the step 31 hold that release voids.
+#[test]
+#[serial]
+fn a_capture_with_a_frame_no_fire_sent_at_its_last_covered_step_counts_no_slot() {
+    let mut rec = bh_through_last_relay_fire();
+    let frames = rec.messages.get_mut(BH_RELAY_TOPIC).unwrap();
+    let mut copy = frames[5].clone();
+    let mut header = WireHeader::read_from_buf(&copy).expect("the step 31 frame's header");
+    assert_eq!(header.timestamp_ns, 160_000_000, "step 31's clock");
+    header.sequence = 1000;
+    header.timestamp_ns = 205_000_000;
+    header.write_to_buf(&mut copy);
+    frames.insert(6, copy);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_capture_frame_no_fire_sent.mcap");
+    bh_capture_bag(&rec, &bag);
+    let outcome = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        (
+            outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+            bh_verify_exit(&outcome)
+        ),
+        (
+            Some(
+                "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node \
+                 'relay' step 3 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+            ),
+            6
+        )
+    );
+    assert!(!outcome.passed);
+    bh_assert_judged(&outcome, "a capture with a frame no fire sent");
+}
+
+/// A RECORDING OF TWO WORKER PROCESSES WHOSE HELD RANK ENDS ON A STEP WITH NO
+/// RECORDED FIRE. The block-held run through step 41, `src` on rank 0 and the
+/// held pair on rank 1, whose rank 1 trace keeps step 41's boundary and none of
+/// that step's fires or reads: a worker that stopped after its relay published
+/// and before the step's records reached the trace. The bag keeps the relay's
+/// step 41 frame (`x` 22, 210 ms). Rank 1's recording proves its schedule only
+/// through step 40, so only the relay's frames through step 40 are compared
+/// with its fires: the slot stays counted, every hold through step 40 is
+/// excused, nothing in the schedule is a finding, and the replay plans each
+/// held fire's refill and reproduces every relay frame through step 40. The
+/// replay fires nothing at a step whose trace holds no fire, so the one data
+/// violation is the relay's step 41 frame: recorded 7, replayed 6. Read with
+/// step 41's frame compared, the slot would be uncounted, the hold's onset at
+/// step 3 would be the finding, and frame 4 would serve `x` 12 for the
+/// recorded 5.
+#[test]
+#[serial]
+fn a_held_rank_ending_on_a_step_with_no_recorded_fire_is_judged_through_its_proven_steps() {
+    let rec = bh_through_last_relay_fire();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_fireless_final_step.mcap");
+    ri_ranked_bag_cut(
+        &rec,
+        &bag,
+        |id| u32::from(id != "src"),
+        2,
+        &[],
+        ri_free_run_recorder_json(),
+        |per_rank| {
+            per_rank[1].retain(|r| r.step != 41 || r.record_type == RECORD_TYPE_STEP_BOUNDARY);
+            assert_eq!(
+                per_rank[1]
+                    .iter()
+                    .filter(|r| r.step == 41)
+                    .map(|r| r.record_type)
+                    .collect::<Vec<_>>(),
+                vec![RECORD_TYPE_STEP_BOUNDARY],
+                "rank 1 keeps step 41's boundary alone"
+            );
+        },
+        None,
+    );
+    let outcome = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        (
+            outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+            bh_violations(&outcome)
+        ),
+        (
+            None,
+            vec![
+                "/bh/relay/out: recorded 7 frame(s), replay produced 6 on '/bh/relay/out'"
+                    .to_string()
+            ]
+        ),
+        "no hold through step 40 is a finding, and only the step 41 frame is missing"
+    );
+    assert!(!outcome.passed);
+    bh_assert_judged(
+        &outcome,
+        "a held rank ending on a step with no recorded fire",
+    );
+    let again = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// A ONE-PROCESS RECORDING WHOSE LAST STEP THE TRACE KEPT ONLY IN PART. The
+/// block-held run through step 41 on one rank, whose trace keeps step 41's
+/// boundary and the source's fire at level 0, and none of the relay's fire at
+/// level 1 or the step's reads: a worker that stopped after the relay
+/// published and before its fire's record reached the trace. The bag keeps
+/// the relay's step 41 frame (`x` 22, 210 ms). No boundary after step 41
+/// proves that step, and the one fire kept there is of a level before the
+/// relay's, so only the relay's frames stamped below 210 ms are compared with
+/// its fires: the slot stays counted, every hold through step 40
+/// is excused, nothing in the schedule is a finding, and the replay plans each
+/// held fire's refill and reproduces every relay frame through step 40. The
+/// replay fires the relay nowhere at step 41, so the one data violation is that
+/// frame: recorded 7, replayed 6. Read with step 41's frame compared, the slot
+/// would be uncounted, the hold's onset at step 3 would be the finding, and
+/// frame 4 would serve `x` 12 for the recorded 5.
+#[test]
+#[serial]
+fn a_last_step_whose_trace_kept_an_earlier_fire_alone_is_judged_below_its_clock() {
+    let mut rec = bh_through_last_relay_fire();
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let src = rec.node_ids.iter().position(|n| n == "src").unwrap() as u32;
+    rec.trace.retain(|r| {
+        r.step != 41
+            || r.record_type == RECORD_TYPE_STEP_BOUNDARY
+            || (r.record_type == RECORD_TYPE_FIRE && r.node_idx != relay)
+    });
+    assert_eq!(
+        rec.trace
+            .iter()
+            .filter(|r| r.step == 41)
+            .map(|r| (r.record_type, r.node_idx))
+            .collect::<Vec<_>>(),
+        vec![(RECORD_TYPE_STEP_BOUNDARY, 0), (RECORD_TYPE_FIRE, src)],
+        "step 41 keeps its boundary and the source's fire alone"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_partly_kept_last_step.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        (
+            outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+            bh_violations(&outcome)
+        ),
+        (
+            None,
+            vec![
+                "/bh/relay/out: recorded 7 frame(s), replay produced 6 on '/bh/relay/out'"
+                    .to_string()
+            ]
+        ),
+        "no hold through step 40 is a finding, and only the step 41 frame is missing"
+    );
+    assert!(!outcome.passed);
+    bh_assert_judged(
+        &outcome,
+        "a last step whose trace kept an earlier fire alone",
+    );
+    let again = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// A ONE-PROCESS RECORDING THAT LOST THE LATER FIRES OF ITS LAST STEP'S BURST.
+/// The block-held run with the sink stopping on its third frame, through step
+/// 21, at which the relay fires the frame its hold froze (`x` 5) and then the
+/// eleven frames its queue kept (`x` 12 to 22) in one burst. The trace keeps
+/// step 21's boundary, the source's fire and the relay's first fire, and
+/// none of the relay's later fires or the step's reads: the trace ends inside
+/// the burst while every frame of it was recorded. The bag keeps all twelve
+/// frames, stamped 110 ms. A fire
+/// at the relay's own level proves nothing of the burst's later fires, so only
+/// the relay's frames stamped below 110 ms are compared with its fires: the
+/// slot stays counted, the holds before the sink's recorded stop at step 20
+/// are excused, the stop releases it, nothing in the schedule is a finding,
+/// and the replay reproduces every relay frame through step 11 and the first
+/// of the burst. The replay fires the relay once at step 21, as the trace
+/// records, so the one data violation is the burst's rest: recorded 16,
+/// replayed 5. Read with step 21's frames compared, twelve frames against one
+/// fire would leave the slot uncounted, and the hold's onset at step 3 would be
+/// the finding.
+#[test]
+#[serial]
+fn a_last_step_whose_trace_lost_the_rest_of_a_burst_is_judged_below_its_clock() {
+    let mut rec = record_uniform_with_read_log(
+        &bh_yaml("slow_block_sink_node", ""),
+        || bh_factories(Some(3.0)),
+        &[],
+        22,
+    );
+    let mut relay_oracle = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+    relay_oracle.extend((12..=22).map(f64::from));
+    assert_eq!(bh_xs(&rec, BH_RELAY_TOPIC), relay_oracle);
+    let mut fire_steps = vec![0, 1, 2, 11];
+    fire_steps.extend([21; 12]);
+    assert_eq!(bh_fire_steps(&rec, "relay"), fire_steps);
+    assert_eq!(
+        WireHeader::read_from_buf(rec.messages[BH_RELAY_TOPIC].last().unwrap())
+            .map(|h| h.timestamp_ns),
+        Some(110_000_000)
+    );
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let src = rec.node_ids.iter().position(|n| n == "src").unwrap() as u32;
+    let mut relay_fires_kept = 0;
+    rec.trace.retain(|r| {
+        if r.step != 21 || r.record_type == RECORD_TYPE_STEP_BOUNDARY {
+            return true;
+        }
+        if r.record_type != RECORD_TYPE_FIRE {
+            return false;
+        }
+        if r.node_idx != relay {
+            return true;
+        }
+        relay_fires_kept += 1;
+        relay_fires_kept == 1
+    });
+    assert_eq!(
+        rec.trace
+            .iter()
+            .filter(|r| r.step == 21)
+            .map(|r| (r.record_type, r.node_idx))
+            .collect::<Vec<_>>(),
+        vec![
+            (RECORD_TYPE_STEP_BOUNDARY, 0),
+            (RECORD_TYPE_FIRE, src),
+            (RECORD_TYPE_FIRE, relay)
+        ],
+        "step 21 keeps its boundary, the source's fire and the relay's first fire"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_lost_burst_last_step.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let make = || bh_factories(Some(3.0));
+    let outcome = bh_replay_stamped(&bag, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        (
+            outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+            bh_violations(&outcome)
+        ),
+        (
+            None,
+            vec![
+                "/bh/relay/out: recorded 16 frame(s), replay produced 5 on '/bh/relay/out'"
+                    .to_string()
+            ]
+        ),
+        "no hold is a finding, and only the burst's rest is missing"
+    );
+    assert!(!outcome.passed);
+    bh_assert_judged(&outcome, "a last step whose trace lost the rest of a burst");
+    let again = bh_replay_stamped(&bag, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 /// A `period_ms` source whose topic a NON-trigger `block` input reads:
