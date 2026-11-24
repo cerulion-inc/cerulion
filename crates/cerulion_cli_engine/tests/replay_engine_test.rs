@@ -60212,12 +60212,13 @@ fn fp3_finding(drop_at: u64) -> String {
 /// that recorded the bag. The frame the taken-out fire sent stays in the bag.
 /// At a step before the last, the bag then shows the relay sending more frames
 /// at `drop_at` than it fired there, and no slot of its topic is counted on any
-/// stamp; at the last step, which no later record proves, that frame is not
-/// compared. Either way nothing holds the relay and the step is the finding
-/// whichever build replays. At the node-stops trace format the bag also holds
-/// the sink's stop, which releases its slot from the next step; below it the
-/// trace holds no stop, so no slot is counted there either. The relay's frames differ either way, since the
-/// replay fires it as the bag records.
+/// stamp; at the last step, where the trace keeps no fire of a level after the
+/// relay's, that frame is not compared. Either way nothing holds the relay and
+/// the step is the finding whichever build replays. At the node-stops trace
+/// format the bag also holds the sink's stop, which releases its slot from the
+/// next step; below it the trace holds no stop, so no slot is counted there
+/// either. The relay's frames differ either way, since the replay fires it as
+/// the bag records.
 fn fp3_assert(rec: &Recording, drop_at: u64, name: &str) {
     for format in [
         replay_engine::NODE_STOPS_MIN_TRACE_FORMAT,
@@ -60762,7 +60763,12 @@ fn bh_through_last_relay_fire() -> Recording {
 /// end cut (`cerulion_bagd::end_at_last_complete_step`), which removes step
 /// 41's records and keeps every frame, and a manifest that states the cut
 /// (`handoff.trace_end_cut`, opening with the count the recorder writes) and
-/// the covered range the cut trace backs, the step 40 target (205 ms).
+/// the covered range the cut trace backs, the step 40 target (205 ms). Like a
+/// capture the recorder writes, the bag carries no record-health stamp, so on
+/// its own its slots allow for no hold. The capture vectors give the replay
+/// the recording's clean stamp (`bh_clean_stamp`, what a recording carries as
+/// `__cerulion/record_health.json`) so they reach the frame comparison on a
+/// cut trace.
 fn bh_capture_bag(rec: &Recording, path: &std::path::Path) {
     let complete = cerulion_bagd::end_at_last_complete_step(rec.trace.iter().copied());
     assert_eq!(complete.steps_cut, 1, "one rank, one final step");
@@ -60804,8 +60810,11 @@ fn bh_verify_exit(outcome: &ReplayOutcome) -> u8 {
 /// range. The capture of the block-held run through step 41 ([`bh_capture_bag`])
 /// ends its trace at step 40 and keeps the relay's step 41 frame (`x` 22,
 /// 210 ms), which no fire in the trace sent. The relay sends at most one frame
-/// per fire, and only the frames of the steps the trace proves are compared
-/// with its fires, so the slot stays counted. The hold's onset at step 3, at
+/// per fire, and a frame stamped after the rank's last kept step is not
+/// compared with its fires, so the slot stays counted. The replay is given
+/// the recording's clean record-health stamp ([`bh_capture_bag`]) so it
+/// reaches that comparison; a capture the recorder writes carries no such
+/// stamp, so its slots allow for no hold. The hold's onset at step 3, at
 /// which the bag shows the slot full (three frames sent, the sink's step 0 read
 /// took one), is excused, and the replay plans the refill of every held fire:
 /// frame 4 serves the frame the hold froze (`x` 5), where a replay without
@@ -60855,12 +60864,16 @@ fn a_capture_whose_end_cut_keeps_a_held_producers_frame_replays_its_holds() {
 /// The same capture with a copy of the relay's step 31 frame stamped at step
 /// 40's clock (205 ms), under a sequence no relay frame carries: a frame no
 /// fire sent, at the last step the capture's trace keeps, which is inside its
-/// covered range. The relay fires nothing at step 40. For a producer that
-/// sends at most one frame per fire, that leaves the slot uncounted however
-/// the capture ends, so nothing holds the relay and the hold's onset, step 3,
-/// is the finding (exit 6). Left out of the comparison, the copy would push
-/// the slot past its depth at step 40, a release with no record, and the first
-/// finding would be the step 31 hold that release voids.
+/// covered range. The relay fires nothing at step 40, and the sink's fire at
+/// the level after the relay's proves that step. For a producer that sends at
+/// most one frame per fire, that leaves the slot uncounted however the capture
+/// ends, so nothing holds the relay and the hold's onset, step 3, is the
+/// finding (exit 6). The replay is given the recording's clean record-health
+/// stamp ([`bh_capture_bag`]) so it reaches the comparison; a capture the
+/// recorder writes carries no such stamp, so its slots allow for no hold
+/// either way. Left out of the comparison, the copy would push the slot past
+/// its depth at step 40, a release with no record, and the first finding would
+/// be the step 31 hold that release voids.
 #[test]
 #[serial]
 fn a_capture_with_a_frame_no_fire_sent_at_its_last_covered_step_counts_no_slot() {
@@ -61035,8 +61048,9 @@ fn a_last_step_whose_trace_kept_an_earlier_fire_alone_is_judged_below_its_clock(
 /// 21, at which the relay fires the frame its hold froze (`x` 5) and then the
 /// eleven frames its queue kept (`x` 12 to 22) in one burst. The trace keeps
 /// step 21's boundary, the source's fire and the relay's first fire, and
-/// none of the relay's later fires or the step's reads: a worker that stopped
-/// inside the burst. The bag keeps all twelve frames, stamped 110 ms. A fire
+/// none of the relay's later fires or the step's reads: the trace ends inside
+/// the burst while every frame of it was recorded. The bag keeps all twelve
+/// frames, stamped 110 ms. A fire
 /// at the relay's own level proves nothing of the burst's later fires, so only
 /// the relay's frames stamped below 110 ms are compared with its fires: the
 /// slot stays counted, the holds before the sink's recorded stop at step 20

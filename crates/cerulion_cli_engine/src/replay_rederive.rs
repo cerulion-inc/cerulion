@@ -4553,11 +4553,12 @@ pub(crate) struct StepDeferral {
 ///   `block_timeout_ms` always gives, since its release forgives the slot's
 ///   frames with no record, one whose `block` policy and depth the bag does
 ///   not pin, one whose producer the bag shows sending more frames at a stamp
-///   than it fired there, at a step the trace proves, and every edge of a bag
-///   whose trace does not hold its node stops); on the consumer's input, from
-///   the step after a truncated read stream's marker, a drain whose site the
-///   read log does not say, or, before any body read of the input is recorded,
-///   a consumer fire the bag does not show ended before the input; and on a
+///   than it fired there, at a step the trace proves other than one that shares
+///   the clock of a last step it does not, and every edge of a bag whose trace
+///   does not hold its node stops); on the consumer's input, from the step
+///   after a truncated read stream's marker, a drain whose site the read log
+///   does not say, or, before any body read of the input is recorded, a
+///   consumer fire the bag does not show ended before the input; and on a
 ///   latest-value input, from the step after a consumer
 ///   fire that can hide a drain of it through the step at which the consumer
 ///   next reads it. Such an input is read only by its consumer's tick, which

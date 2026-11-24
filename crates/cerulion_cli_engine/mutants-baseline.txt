@@ -457,38 +457,27 @@ in prepare_pass_verification
 #          caught, 2 unviable, which replace `local_block_holds` with a map of
 #          an edge its type cannot default, none missed.
 #          Re-run over the change that compares a one-frame producer's frames
-#          with its fires only through the last step its rank's trace proves
-#          ran (`writes_past_fires` and its bound, the step a rank's ragged
-#          tail window opens after, `RaggedTailContext::proven_through_step`,
-#          and the boundary walk that turns that step into a gating clock,
-#          `proven_through_target`, which its lib test reads off a trace it
-#          writes), with
-#          `--re 'writes_past_fires|proven_through_step|proven_through_target'`
-#          and `--exclude-re 'delete field'`: 12 mutants, 12 caught, none
-#          missed. The pass planning that calls them
-#          (`prepare_pass_verification`) builds a graph and reads the bag, and
-#          is pinned by the engine vectors
-#          `a_capture_whose_end_cut_keeps_a_held_producers_frame_replays_its_holds`,
-#          `a_capture_with_a_frame_no_fire_sent_at_its_last_covered_step_counts_no_slot`
-#          and
-#          `a_held_rank_ending_on_a_step_with_no_recorded_fire_is_judged_through_its_proven_steps`.
-#          Re-run over the change that compares the frames of a rank's last
-#          kept step only where the bag states a capture's end cut or the rank
-#          kept a fire at that step from a level after the producer's, and
-#          otherwise only the frames below that step's clock (the frames a
-#          trace can judge, `judged_frames`, and `writes_past_fires` over
-#          them), which deletes `proven_through_step` and
-#          `proven_through_target`, with the bag's end cut statement
-#          (`capture_states_end_cut`) and the walk that finds a rank's last
-#          kept step and the top level of its fires there (`last_kept_step`),
-#          both read off bags their lib tests write, with
-#          `--re 'writes_past_fires|judged_frames|last_kept_step|capture_states_end_cut'`
-#          and `--exclude-re 'delete field'`: 22 mutants, 20 caught, 2
-#          unviable, none missed. The unviable replace `last_kept_step` and
-#          `judged_frames` with a default their types do not have. The engine
-#          vectors `a_last_step_whose_trace_kept_an_earlier_fire_alone_is_judged_below_its_clock`
+#          with its fires only where its rank's trace can judge them: through
+#          the rank's last kept step where the rank kept a fire there from a
+#          level after the producer's, strictly below that step's clock
+#          otherwise, and never past it (`judged_frames`, `writes_past_fires`
+#          over the frames it judges, and the walk that finds a rank's last
+#          kept step and the top level of its fires there, `last_kept_step`,
+#          which its lib test reads off a trace it writes), with `--in-diff`
+#          the whole change's diff of the two files,
+#          `--re 'judged_frames|writes_past_fires|last_kept_step'` and
+#          `--exclude-re 'delete field'`: 19 mutants, 17 caught, 2 unviable,
+#          none missed. The unviable replace `last_kept_step` and
+#          `judged_frames` with a default their types do not have. The pass
+#          planning that calls them (`prepare_pass_verification`) builds a
+#          graph and reads the bag, and is pinned by the engine vectors
+#          `a_first_fire_that_ends_at_a_context_input_before_its_first_delivery_keeps_the_slot`
+#          (a later level's fire proves the last step),
+#          `a_last_step_whose_trace_kept_an_earlier_fire_alone_is_judged_below_its_clock`
 #          and `a_last_step_whose_trace_lost_the_rest_of_a_burst_is_judged_below_its_clock`
-#          pin the pass planning that calls them.
+#          (nothing proves it), and
+#          `a_capture_whose_end_cut_keeps_a_held_producers_frame_replays_its_holds`
+#          (a frame past the last kept step).
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
