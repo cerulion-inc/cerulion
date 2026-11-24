@@ -55,6 +55,44 @@ pub fn schema_hash_verdict(frame_hash: u64, expected_hash: u64) -> HashVerdict {
     }
 }
 
+/// The size rule for a FIXED (recursively plain) message's loaned take: at
+/// most this many bytes is the private-copy shape, more is the shared-memory
+/// shape ([`fixed_loan_shape`]).
+///
+/// A private copy is the struct in rmw-owned memory with its sample released
+/// at once, so a `std::shared_ptr<MsgT>` callback may write it; the
+/// shared-memory shape is the struct inside the held sample, read-only, so the
+/// take stays zero-copy. The rule for the value: a private copy may add at most
+/// 10% to one hop at the smallest measured size, which gives 4 KiB. Every test
+/// derives its boundary types from it, so a new value changes nothing else.
+pub const RMW_FIXED_LOAN_COPY_MAX_BYTES: usize = 4 * 1024;
+
+/// The shape the size rule ([`fixed_loan_shape`]) gives a FIXED type's loaned
+/// take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedLoanShape {
+    /// A private copy of the struct in rmw-owned memory, writable; the sample
+    /// is released before the take returns.
+    PrivateCopy,
+    /// The struct inside the held shared-memory sample, read-only (the
+    /// subscriber's mapping is read-only), until the loan is returned.
+    SharedMemory,
+}
+
+/// The fixed loaned take's shape for a message of `fixed_size` bytes: a
+/// private copy up to and including [`RMW_FIXED_LOAN_COPY_MAX_BYTES`], the
+/// shared-memory struct above it.
+///
+/// Total over `usize`, allocation-free, and dependent on nothing but its
+/// argument: a legal mutation target.
+pub fn fixed_loan_shape(fixed_size: usize) -> FixedLoanShape {
+    if fixed_size <= RMW_FIXED_LOAN_COPY_MAX_BYTES {
+        FixedLoanShape::PrivateCopy
+    } else {
+        FixedLoanShape::SharedMemory
+    }
+}
+
 /// What one of a frame's VARIABLE entries says about
 /// whether the frame can be decoded at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +372,47 @@ mod tests {
                 want == EntryVerdict::Decodable,
                 "is_decodable must agree with the verdict: {why}"
             );
+        }
+    }
+
+    /// The fixed loan's shape against a table of sizes, each row placed
+    /// relative to the limit so the table holds for any value of it: real
+    /// messages far below it, the limit and its two neighbours (an off-by-one
+    /// in the comparison moves one of them), and sizes far above it.
+    #[test]
+    fn the_fixed_loan_shape_matches_its_oracle_table() {
+        let limit = RMW_FIXED_LOAN_COPY_MAX_BYTES;
+        let oracle: &[(usize, FixedLoanShape, &str)] = &[
+            (1, FixedLoanShape::PrivateCopy, "std_msgs/Empty's one byte"),
+            (48, FixedLoanShape::PrivateCopy, "a geometry_msgs/Twist"),
+            (
+                limit - 1,
+                FixedLoanShape::PrivateCopy,
+                "one byte under the limit",
+            ),
+            (
+                limit,
+                FixedLoanShape::PrivateCopy,
+                "exactly the limit: inclusive",
+            ),
+            (
+                limit + 1,
+                FixedLoanShape::SharedMemory,
+                "one byte past the limit",
+            ),
+            (
+                16 * 1024 * 1024,
+                FixedLoanShape::SharedMemory,
+                "a 16 MiB fixed message keeps its zero-copy take",
+            ),
+            (
+                usize::MAX,
+                FixedLoanShape::SharedMemory,
+                "saturated: never wraps to a copy",
+            ),
+        ];
+        for &(size, want, why) in oracle {
+            assert_eq!(fixed_loan_shape(size), want, "fixed_size={size}: {why}");
         }
     }
 
