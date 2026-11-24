@@ -575,11 +575,61 @@ impl FrameIndex {
     }
 }
 
+/// Why a read that popped frames names no writer: the cause an
+/// [`FeedRefusalReason::IdentityAbsent`] refusal states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsentWriter {
+    /// The recording holds no annotation that names the read's writer.
+    NotRecorded,
+    /// The bag begins mid-run and was recorded at `trace_format`, below
+    /// [`crate::replay_engine::WINDOW_HEADS_MIN_TRACE_FORMAT`]: its recorder
+    /// named a writer only where the writer's run started, so a single-writer
+    /// read continues a run whose opening the bag does not hold.
+    BeforeWindowHeads {
+        /// The bag's stamped `trace_format`, always below
+        /// [`crate::replay_engine::WINDOW_HEADS_MIN_TRACE_FORMAT`].
+        trace_format: u32,
+    },
+}
+
+/// What [`plan_feeds`] knows about the bag as a whole, which a refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedBagFacts {
+    /// The replay resumes from a checkpoint: the bag begins mid-run.
+    pub begins_mid_run: bool,
+    /// The bag's stamped `trace_format`, `None` with no recorder attachment.
+    pub trace_format: Option<u32>,
+}
+
+/// PURE: why a single-writer read that popped frames names no writer.
+///
+/// [`AbsentWriter::BeforeWindowHeads`] on a bag that begins mid-run and was
+/// recorded below [`crate::replay_engine::WINDOW_HEADS_MIN_TRACE_FORMAT`],
+/// where the recorder named a writer only where its run started;
+/// [`AbsentWriter::NotRecorded`] on every other bag, a bag with no stamped
+/// format included.
+#[must_use]
+pub fn absent_writer_cause(facts: FeedBagFacts) -> AbsentWriter {
+    match facts.trace_format {
+        Some(trace_format)
+            if facts.begins_mid_run
+                && trace_format < crate::replay_engine::WINDOW_HEADS_MIN_TRACE_FORMAT =>
+        {
+            AbsentWriter::BeforeWindowHeads { trace_format }
+        }
+        _ => AbsentWriter::NotRecorded,
+    }
+}
+
 /// Why a recorded read's frames cannot be fed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedRefusalReason {
-    /// The read popped frames and no producer annotation named their writer.
-    IdentityAbsent,
+    /// The read popped frames and no producer annotation named their writer,
+    /// for the stated cause.
+    IdentityAbsent {
+        /// Why no annotation names the writer.
+        cause: AbsentWriter,
+    },
     /// The bag holds no frame of this writer at this sequence on the topic.
     FrameMissing,
     /// Several recorded frames carry this writer and this sequence, so which
@@ -643,7 +693,7 @@ impl FeedRefusalReason {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::IdentityAbsent => "read_identity_absent",
+            Self::IdentityAbsent { .. } => "read_identity_absent",
             Self::FrameMissing => "read_identity_frame_missing",
             Self::WritersIndistinguishable { .. } => "read_identity_writers_indistinguishable",
             Self::BatchUnattributed { .. } => "read_identity_batch_unattributed",
@@ -693,10 +743,25 @@ impl fmt::Display for FeedRefusal {
             self.node, self.input, self.topic, self.step
         )?;
         match &self.reason {
-            FeedRefusalReason::IdentityAbsent => write!(
-                f,
-                "the read popped frames and the recording names no writer for them"
-            ),
+            FeedRefusalReason::IdentityAbsent { cause } => {
+                write!(
+                    f,
+                    "the read popped frames and the recording names no writer for them"
+                )?;
+                match cause {
+                    AbsentWriter::NotRecorded => Ok(()),
+                    AbsentWriter::BeforeWindowHeads { trace_format } => write!(
+                        f,
+                        ". This bag begins mid-run and was recorded at trace format \
+                         {trace_format}, which names a writer only where its run starts, so \
+                         this read continues a writer run the bag does not hold. Recordings \
+                         at trace format {} or later name the writer at every checkpoint \
+                         window. Record the run again with this build to verify it, or \
+                         replay this bag with --resim all and no --verify.",
+                        crate::replay_engine::WINDOW_HEADS_MIN_TRACE_FORMAT
+                    ),
+                }
+            }
             FeedRefusalReason::FrameMissing => write!(
                 f,
                 "the bag holds no frame of that writer at that sequence (the recorder lost it)"
@@ -925,7 +990,8 @@ pub mod mutants {
 /// For each admission that pops, the frames its recorded identity names, looked
 /// up in `index`. Steps at or past `step_end` (`None` = no bound) are not
 /// planned. `step_targets` maps a step to its recorded boundary target and is
-/// read only by the timestamp mutant.
+/// read only by the timestamp mutant. `facts` names the cause a
+/// single-writer read with no writer is refused for ([`absent_writer_cause`]).
 ///
 /// # Errors
 ///
@@ -935,6 +1001,7 @@ pub fn plan_feeds(
     index: &FrameIndex,
     step_targets: &BTreeMap<u64, u64>,
     step_end: Option<u64>,
+    facts: FeedBagFacts,
 ) -> Result<FeedPlan, Box<FeedRefusal>> {
     let _ = step_targets;
     // Pass 1: an unlabeled topic must be read under ONE writer, counting the
@@ -1016,7 +1083,9 @@ pub fn plan_feeds(
                         step.step,
                         None,
                         id.served_seq,
-                        FeedRefusalReason::IdentityAbsent,
+                        FeedRefusalReason::IdentityAbsent {
+                            cause: AbsentWriter::NotRecorded,
+                        },
                     ));
                 }
                 // The same rule per batch frame: on a multi-writer edge each
@@ -1026,15 +1095,23 @@ pub fn plan_feeds(
                         step.step,
                         None,
                         Some(lost.sequence),
-                        FeedRefusalReason::IdentityAbsent,
+                        FeedRefusalReason::IdentityAbsent {
+                            cause: AbsentWriter::NotRecorded,
+                        },
                     ));
                 }
+                // The single-writer arm: a read of an edge that carries its
+                // writer by run, with no annotation before it in the bag. Only
+                // here can the cause be a bag that begins inside a run its
+                // recorder never restated.
                 let Some(writer) = id.writer else {
                     return Err(refuse(
                         step.step,
                         None,
                         id.served_seq,
-                        FeedRefusalReason::IdentityAbsent,
+                        FeedRefusalReason::IdentityAbsent {
+                            cause: absent_writer_cause(facts),
+                        },
                     ));
                 };
                 let Some(served) = id.served_seq else {
@@ -1042,7 +1119,9 @@ pub fn plan_feeds(
                         step.step,
                         Some(writer),
                         None,
-                        FeedRefusalReason::IdentityAbsent,
+                        FeedRefusalReason::IdentityAbsent {
+                            cause: AbsentWriter::NotRecorded,
+                        },
                     ));
                 };
                 if !topic.labeled {
@@ -1376,6 +1455,19 @@ mod tests {
         FrameIndex::build(&f, &l)
     }
 
+    /// A bag recorded from its start by this binary: no refusal names a
+    /// window-head cause on it.
+    const FROM_START: FeedBagFacts = FeedBagFacts {
+        begins_mid_run: false,
+        trace_format: Some(11),
+    };
+
+    /// A bag that begins mid-run, recorded at trace format 10.
+    const MID_RUN_AT_TEN: FeedBagFacts = FeedBagFacts {
+        begins_mid_run: true,
+        trace_format: Some(10),
+    };
+
     fn plan(adm: &StageAdmission, idx: &FrameIndex) -> Result<FeedPlan, Box<FeedRefusal>> {
         plan_with(adm, idx, false)
     }
@@ -1384,6 +1476,15 @@ mod tests {
         adm: &StageAdmission,
         idx: &FrameIndex,
         every_read: bool,
+    ) -> Result<FeedPlan, Box<FeedRefusal>> {
+        plan_on(adm, idx, every_read, FROM_START)
+    }
+
+    fn plan_on(
+        adm: &StageAdmission,
+        idx: &FrameIndex,
+        every_read: bool,
+        facts: FeedBagFacts,
     ) -> Result<FeedPlan, Box<FeedRefusal>> {
         plan_feeds(
             &[FedStage {
@@ -1395,6 +1496,7 @@ mod tests {
             idx,
             &BTreeMap::new(),
             None,
+            facts,
         )
     }
 
@@ -1464,6 +1566,7 @@ mod tests {
             &idx,
             &BTreeMap::new(),
             Some(2),
+            FROM_START,
         )
         .expect("plans the bounded steps");
         assert_eq!(p.reads_planned(), 1);
@@ -1684,11 +1787,131 @@ mod tests {
         let idx = index(vec![frame(1, 5)], vec![]);
         let adm = admission(&[(3, 5, None, 1, ReadKind::Served)]);
         let r = plan(&adm, &idx).unwrap_err();
-        assert_eq!(r.reason, FeedRefusalReason::IdentityAbsent);
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::NotRecorded
+            }
+        );
         let text = r.to_string();
         for part in ["'sink'", "'inp'", "step 3", "writer none", "sequence 5"] {
             assert!(text.contains(part), "{text}");
         }
+    }
+
+    /// The window-head cause, as a hand table: only a bag that begins mid-run
+    /// AND was recorded below trace format 11 names it, at the bag's own
+    /// format; a from-start bag, a bag at 11 or later and a bag with no stamped
+    /// format keep the plain cause.
+    #[test]
+    fn absent_writer_cause_answers_its_hand_table() {
+        let cases = [
+            // (begins_mid_run, trace_format, expected)
+            (
+                true,
+                Some(8),
+                AbsentWriter::BeforeWindowHeads { trace_format: 8 },
+            ),
+            (
+                true,
+                Some(9),
+                AbsentWriter::BeforeWindowHeads { trace_format: 9 },
+            ),
+            (
+                true,
+                Some(10),
+                AbsentWriter::BeforeWindowHeads { trace_format: 10 },
+            ),
+            (true, Some(11), AbsentWriter::NotRecorded),
+            (true, Some(12), AbsentWriter::NotRecorded),
+            (true, None, AbsentWriter::NotRecorded),
+            (false, Some(8), AbsentWriter::NotRecorded),
+            (false, Some(10), AbsentWriter::NotRecorded),
+            (false, Some(11), AbsentWriter::NotRecorded),
+            (false, None, AbsentWriter::NotRecorded),
+        ];
+        for (begins_mid_run, trace_format, expected) in cases {
+            let facts = FeedBagFacts {
+                begins_mid_run,
+                trace_format,
+            };
+            assert_eq!(absent_writer_cause(facts), expected, "{facts:?}");
+        }
+    }
+
+    /// On a mid-run bag recorded at trace format 10, the single-writer read
+    /// with no writer says to record the run again, in the exact text an
+    /// operator reads; every other arm that names no writer keeps the plain
+    /// sentence on the same bag. CONTROL: the same read on a bag recorded from
+    /// its start keeps the plain sentence too.
+    #[test]
+    fn a_mid_run_read_with_no_writer_below_format_eleven_says_to_record_again() {
+        let idx = index(vec![frame(1, 5)], vec![]);
+        let adm = admission(&[(3, 5, None, 1, ReadKind::Served)]);
+        let r = plan_on(&adm, &idx, false, MID_RUN_AT_TEN).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::BeforeWindowHeads { trace_format: 10 }
+            }
+        );
+        assert_eq!(r.reason.code(), "read_identity_absent");
+        assert_eq!(
+            r.to_string(),
+            "node 'sink', input 'inp' (topic '/t'), step 3, writer none, sequence 5: the read \
+             popped frames and the recording names no writer for them. This bag begins \
+             mid-run and was recorded at trace format 10, which names a writer only where \
+             its run starts, so this read continues a writer run the bag does not hold. \
+             Recordings at trace format 11 or later name the writer at every checkpoint \
+             window. Record the run again with this build to verify it, or replay this \
+             bag with --resim all and no --verify."
+        );
+
+        let plain = "node 'sink', input 'inp' (topic '/t'), step 3, writer none, sequence 5: \
+                     the read popped frames and the recording names no writer for them";
+        let from_start = plan_on(&adm, &idx, false, FROM_START).unwrap_err();
+        assert_eq!(from_start.to_string(), plain, "CONTROL: a from-start bag");
+
+        // The multi-writer arm, on the mid-run format 10 bag: a read without
+        // its own annotation keeps the plain cause.
+        let labels = vec![(ProducerAttribution::FrameLabel { frame_index: 0 }, 1u128)];
+        let labeled = index(vec![frame(1, 5)], labels);
+        let mut unannotated = admission(&[(3, 5, Some(writer_token(1)), 1, ReadKind::Served)]);
+        unannotated.per_step[0].identity[0].annotated = false;
+        let r = plan_on(&unannotated, &labeled, true, MID_RUN_AT_TEN).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::NotRecorded
+            },
+            "the every-read arm"
+        );
+        // A multi-writer batch frame without its own annotation.
+        let mut lost_batch = admission(&[(3, 6, Some(writer_token(1)), 2, ReadKind::Served)]);
+        lost_batch.per_step[0].identity[0].batch = vec![ConsumedFrame {
+            writer: Some(writer_token(1)),
+            sequence: 5,
+            annotated: false,
+        }];
+        let r = plan_on(&lost_batch, &labeled, true, MID_RUN_AT_TEN).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::NotRecorded
+            },
+            "the every-read batch frame arm"
+        );
+        // A read that names its writer and no served sequence.
+        let mut unserved = admission(&[(3, 5, Some(writer_token(1)), 1, ReadKind::Served)]);
+        unserved.per_step[0].identity[0].served_seq = None;
+        let r = plan_on(&unserved, &idx, false, MID_RUN_AT_TEN).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::NotRecorded
+            },
+            "the served-sequence arm"
+        );
     }
 
     #[test]
@@ -1780,7 +2003,12 @@ mod tests {
         ]);
         adm.per_step[1].identity[0].annotated = false;
         let r = plan_with(&adm, &idx, true).unwrap_err();
-        assert_eq!(r.reason, FeedRefusalReason::IdentityAbsent);
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::NotRecorded
+            }
+        );
         assert_eq!((r.step, r.writer, r.sequence), (2, None, Some(6)));
         // A single-writer edge's run carries the writer forward.
         let idx = index(vec![frame(1, 5), frame(2, 6)], vec![]);
