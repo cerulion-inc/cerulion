@@ -1218,6 +1218,81 @@ fn a_panic_in_the_serve_report_of_a_copy_frees_the_copy() {
     }
 }
 
+/// A panic in the serve report of the take that CLOSES a copy regime: three
+/// zero-copy loans and one copy taken, the copy and one loan returned, then the
+/// next take is zero-copy and closes the regime. The seam fires after that
+/// take's last report, the regime close, so the latch is already closed, the
+/// regime flag is clear, and the rollback untracks the new loan.
+#[test]
+#[serial]
+fn a_panic_in_the_serve_report_of_the_regime_closing_take_closes_the_regime_first() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = scan_ts(&format!("ServeRepClose{suffix}"));
+        let (node, publisher, subscription) = setup_pair(ts, "serverepclose", suffix);
+        for _ in 0..5 {
+            publish_scan(publisher, &scan_oracle(64));
+        }
+        let mut held = Vec::new();
+        for i in 0..4 {
+            let (ret, taken, loaned, _) = take_loaned(subscription);
+            assert_eq!(ret, RMW_RET_OK, "take {i}");
+            assert!(taken && !loaned.is_null());
+            held.push(loaned);
+        }
+        assert_eq!(outstanding(subscription), 3, "three loans and one copy");
+        assert_eq!(sub_data(subscription).loan_copy_count(), 1);
+        let copy = held.pop().expect("the copy");
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, copy),
+            RMW_RET_OK
+        );
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
+            RMW_RET_OK
+        );
+        assert_eq!(outstanding(subscription), 2);
+
+        let fired_before = rmw_cerulion::test_seams::loaned_serve_report_panics_fired();
+        let (ret, taken, loaned, _) = {
+            let _seam = rmw_cerulion::test_seams::LoanedServeReportPanicGuard::arm();
+            take_loaned(subscription)
+        };
+        assert_eq!(
+            rmw_cerulion::test_seams::loaned_serve_report_panics_fired(),
+            fired_before + 1,
+            "the seam fired once on the closing take"
+        );
+        assert_eq!(ret, ffi::RMW_RET_ERROR, "the panic surfaces as an error");
+        assert!(!taken && loaned.is_null(), "nothing is handed out");
+        assert_eq!(
+            outstanding(subscription),
+            2,
+            "the closing take's loan is untracked"
+        );
+        assert_eq!(
+            sub_data(subscription).loan_copy_count(),
+            1,
+            "no copy was added"
+        );
+        let data = sub_data(subscription);
+        assert!(
+            !cerulion_core::transport::failure_regime_latch::lock_regime_latch(&data.loan_copies)
+                .is_failing(),
+            "the regime close ran before the seam fired"
+        );
+        assert!(
+            !data
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .copy_regime_open,
+            "the regime flag is clear"
+        );
+        teardown(node, publisher, subscription);
+    }
+}
+
 /// TWO `float32[]` members aim into the held sample, 4-aligned, and the
 /// return re-points both at `{NULL, 0, 0}`.
 #[test]

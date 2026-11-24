@@ -4169,7 +4169,7 @@ fn untrack_take(inner: &mut SubscriptionInner, key: usize, by_copy: bool) {
 }
 
 /// The unpooled shadow a FORGED take past the reserve is served into. Out of
-/// line and marked cold, with the other copy-regime helpers below, so the
+/// line and marked cold, with the other copy-regime helpers around it, so the
 /// zero-copy take keeps its own code compact.
 #[cold]
 #[inline(never)]
@@ -4657,8 +4657,9 @@ unsafe fn take_loaned_impl(
     // the caller holds nothing of ours and we hold nothing of the caller's.
     // Dropping the `PendingTake` releases the borrow (and its shadow).
     // The served-by-copy regime: a copy opens (or repeats) it, and the first
-    // take served zero-copy with no copy outstanding closes it. Only those two
-    // takes report to the copy latch; every other zero-copy take skips it.
+    // take served zero-copy with no copy outstanding closes it. Only a copy and
+    // the closing take report to the copy latch; every other zero-copy take
+    // skips it.
     let close_copy_regime = !by_copy && inner.copy_regime_open && inner.copied_takes.is_empty();
     if by_copy {
         inner.copy_regime_open = true;
@@ -4679,7 +4680,7 @@ unsafe fn take_loaned_impl(
         }
     }));
     // The copy-regime report runs under its own guard, out of line, so the
-    // common take's guarded window is the single reporter call it always was.
+    // common take's guarded window holds only `report_loan_served`.
     let served = match served {
         Ok(()) if by_copy || close_copy_regime => {
             report_copy_regime(data, by_copy, held_loans, ceiling)

@@ -915,8 +915,8 @@ pub struct SubscriptionInner {
     /// Whether the served-by-copy regime is open: set by a take served by
     /// copy, cleared by the first take served zero-copy with no copy
     /// outstanding, which is the only take that reports to the copy latch's
-    /// success side. A zero-copy take while it is clear touches no copy
-    /// bookkeeping at all.
+    /// success side. A zero-copy take while it is clear reads only this flag
+    /// of the copy bookkeeping.
     pub copy_regime_open: bool,
     /// The recyclable shadow messages the forged take hands
     /// out, sized to the loan budget. Empty (nothing built) until the first
