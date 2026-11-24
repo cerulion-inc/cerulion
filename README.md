@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/sc
 cerulion --version
 ```
 
-`cerulion --version` prints `cerulion 2.1.0` or later. The script checks the release's SHA-256, installs into `~/.cerulion/bin`, links the programs into `~/.local/bin`, adds one line to your shell startup files, adds Rust through rustup when yours is missing (or older than 1.95, with rustup installed) and, on Linux, adds `rmw_cerulion` for ROS 2 Jazzy ([every step, uninstall and moving a 2.0 workspace](docs/install.md)). If it stops, fix what its `error:` line names and rerun it. Later, `cerulion doctor` names each problem, with a `fix:` line where it knows one.
+`cerulion --version` prints `cerulion 2.1.0` or later. The script checks the release's SHA-256, installs into `~/.cerulion/bin`, links the programs into `~/.local/bin` and adds one line to your shell startup files. It adds Rust through rustup when yours is missing (or older than 1.95, with rustup installed) and, on Linux, adds `rmw_cerulion` for ROS 2 Jazzy ([every step, uninstall and moving a 2.0 workspace](docs/install.md)). If it stops, fix what its `error:` line names and rerun it. Later, `cerulion doctor` names each problem, with a `fix:` line where it knows one.
 
 Release builds send coarse usage events, with your account id after sign-in. `cerulion telemetry off` turns them off ([what they carry](docs/telemetry.md)).
 
@@ -128,7 +128,7 @@ Open the URL it prints on any device and enter its code, and the terminal prints
 <details>
 <summary>What sign-in stores and sends, and the commands that skip it</summary>
 
-- `~/.cerulion/auth.json` holds your account id and session, and `~/.cerulion/identity/device.key` is this machine's key. After sign-in the account check reads that file and needs no network. Telemetry, when it is on, commands that reach other machines, and the first node build and simulator start still use the network.
+- `~/.cerulion/auth.json` holds your account id and session, and `~/.cerulion/identity/device.key` is this machine's key. After sign-in the account check reads `auth.json` and needs no network. Telemetry, when it is on, commands that reach other machines, and the first node build and simulator start still use the network.
 - With telemetry on, a machine's first sign-in links its earlier usage events, sent under a random id, to your account ([Usage telemetry](docs/telemetry.md)).
 - `doctor`, `telemetry`, `completions`, `ros2 run` and `ros2 launch`, among others, skip the sign-in ([full list](docs/user-api.md#cerulion-connect--rcp--login--logout--account)). A CI runner uses the state of a machine that signed in ([Automation and CI](docs/user-api.md#automation-and-ci)).
 
@@ -136,7 +136,7 @@ Open the URL it prints on any device and enter its code, and the terminal prints
 
 ## Try the harness
 
-**Before you start.** [Install Cerulion](#install) 2.1.0 or later and [sign in](#sign-in). You need macOS on Apple silicon or Linux on x86_64 or ARM64, with `git` and `curl` (on Ubuntu, also `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0`), no GPU, 5 GiB free for the first run's 4 GB install, and an MCP client whose model calls tools and reads images, such as Claude Code. Your provider bills the model calls.
+**Before you start.** [Install Cerulion](#install) 2.1.0 or later and [sign in](#sign-in). You need macOS on Apple silicon or Linux on x86_64 or ARM64, with `git` and `curl` (on Ubuntu, also `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0`), no GPU, 5 GiB free for the first run's install of about 4 GB, and an MCP client whose model calls tools and reads images, such as Claude Code. Your provider bills the model calls.
 
 **1. Start the simulator in a first terminal and leave it running.** The first run takes minutes. Apart from usage telemetry, it reaches no Cerulion service.
 
@@ -186,7 +186,7 @@ In another MCP client, add `http://127.0.0.1:8765/mcp` as a streamable HTTP serv
 <details>
 <summary>The hosted Cerulion MCP (early access, closed source)</summary>
 
-The hosted Cerulion MCP needs no install. Its simulated arm runs in Cerulion's cloud at one sim credit for each second it is held open, and your model stops it with `sim_end`. The local simulator above spends no sim credits. Request access on the page of [Hindsight](https://docs.cerulion.com/cerulion/hindsight), Cerulion's recording analysis.
+The hosted Cerulion MCP needs no install. Its simulated arm runs in Cerulion's cloud at one sim credit for each second it is held open, and your model stops it with `sim_end`. The local simulator above spends no sim credits. Request access on the [Hindsight page](https://docs.cerulion.com/cerulion/hindsight). Hindsight is Cerulion's recording analysis.
 
 ```bash
 claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
@@ -437,7 +437,7 @@ Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultr
   <img src="docs/media/native-rtt.svg" alt="Native round-trip latency, with median lines and p50-to-p99 bands, from 64 B to 16 MiB.">
 </picture>
 
-Jazzy nodes on `rmw_cerulion` that publish and take loaned messages read **11.12 µs / 37.21 µs** at 1 MiB, against **11.0 ms / 43.4 ms** on `rmw_fastrtps_cpp` defaults. Loaned publishing is a code change in your nodes, and the package has no figure for nodes that do not loan. It counts four echoes in 105,050, one at 1 MiB, that borrowed inside their timed window ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)).
+Jazzy nodes on `rmw_cerulion` that publish and take loaned messages read **11.12 µs / 37.21 µs** at 1 MiB, against **11.0 ms / 43.4 ms** on `rmw_fastrtps_cpp` defaults. Loaned publishing is a code change in your nodes, and the package has no figure for nodes that do not loan. In 4 of the package's 105,050 echoes, one of them at 1 MiB, the echo node borrowed its reply loan inside the timed window; the published p50 is unaffected ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)).
 
 These figures time the transport only. They come from one desktop and are not a guarantee, and the largest gap is against ROS 2 defaults, not a tuned setup. From 1 MiB up (11.0 ms at 1 MiB), a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap. Raw iceoryx2 is faster than native Cerulion, at 2.42 µs / 3.02 µs at 64 B ([native package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md), [methodology](benches/latency/METHODOLOGY.md), [benchmark suite](benches/latency/README.md)).
 
@@ -449,7 +449,7 @@ These figures time the transport only. They come from one desktop and are not a 
 
 The recording shows a six-axis industrial arm running ROS 2 and MoveIt: its discovered topics, its live 3D model driven by its joint states and a controller plot, with a phone video of the real arm inset. No AI model drives the arm, and the pauses between moves are cut ([how it was made](docs/media/README.md#assets-the-readme-and-docs-use)).
 
-Cerulion has run this arm with MoveIt 2 on `rmw_cerulion`, and has run on an [NVIDIA Jetson Orin NX](docs/benchmarks/results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/) and an [Apple M4](docs/benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/), each with a latency package, and the [examples](#examples) cover a Unitree Go2, an Intel RealSense camera and a V4L2 camera.
+Cerulion has run this arm with MoveIt 2 on `rmw_cerulion`. It has also run on an [NVIDIA Jetson Orin NX](docs/benchmarks/results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/) and an [Apple M4](docs/benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/), each with a latency package. The [examples](#examples) cover a Unitree Go2, an Intel RealSense camera and a V4L2 camera.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/platform-rtt-dark.svg">
