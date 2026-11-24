@@ -1121,8 +1121,9 @@ def grid(name, check, changed):
           f"note names, and part of the gap in it caching; wall seconds carrying each endpoint's stalls and failed "
           f"requests, so a statement about speed is read with them in mind (RULES.md section 6). Each factor is the "
           f"larger mean of its pair over the smaller, to two decimals under 1.1, one under 10 and a whole number from "
-          f"10. RULES.md section 3 declares the statement that episodes with {name} cost less, per model where one "
-          f"costs more, as this table prints it; no rule declared these factors or a statement about speed.", ""]
+          f"10. RULES.md section 3 declares 'Episodes with {name} use fewer requests and cost less', which becomes per "
+          f"model when a model's column with {name} costs more; this table prints the cost half per model. No rule "
+          f"declared these factors or a statement about speed.", ""]
     L += ["## How the replies ended (finish reason), scored episodes", ""] + finish_table(cols, name)
     L += ["## Episodes that ended without a score", ""]
     if uns:

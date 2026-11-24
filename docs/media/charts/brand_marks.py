@@ -1,20 +1,24 @@
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-only AND MIT AND CC0-1.0
+# SPDX-FileCopyrightText: 2023 LobeHub
 """The model makers' marks the README's harness results chart draws beside each model's name.
 
-Each mark names the maker of a model in the chart; the marks are their owners' trademarks and are drawn
-unaltered, in the colours each owner publishes. The drawing data is kept here, in the chart's generator
+Each mark names the maker of a model in the chart; the marks are their owners' trademarks, their paths drawn
+unaltered, in the colours listed for each below. The drawing data is kept here, in the chart's generator
 directory, so the chart is the same bytes on every machine.
 
-  OPENAI   OpenAI's mark: Simple Icons 16.38.1 (npm simple-icons, CC0-1.0), icons/openai.svg; drawn in the
-           chart's ink colour
+  OPENAI   OpenAI's mark: Simple Icons 15.22.0 (npm simple-icons, CC0-1.0), icons/openai.svg (Simple Icons removed
+           it in 16.0.0); drawn in black on light and white on dark; its use is governed by openai.com/brand
   CLAUDE   Anthropic's Claude mark: Simple Icons 16.38.1 (CC0-1.0), icons/claude.svg; drawn in #D97757, the colour
            Simple Icons lists for it
   GOOGLE   Google's "G": LobeHub Icons (npm @lobehub/icons-static-svg 1.106.0, MIT), icons/google-color.svg, as is
-  XAI      the mark on x.ai/legal/brand-guidelines (its black SVG, viewBox 40 0 2176 831), unaltered, drawn in the
-           chart's ink colour; that page allows the mark only to refer to its owner accurately, unaltered
+  XAI      the mark on x.ai/legal/brand-guidelines (its black SVG, viewBox 40 0 2176 831), unaltered, drawn in black
+           on light and white on dark as that page offers it; that page allows the mark only to refer to its owner
+           accurately, unaltered
 
-The drawing data below is not this repository's work: the two Simple Icons paths are CC0-1.0, and the LobeHub
-Icons path is under the MIT licence, whose notice follows.
+The drawing data below is not this repository's work: the two Simple Icons paths are CC0-1.0, the LobeHub
+Icons path is under the MIT licence, whose notice follows, and the XAI path is its owner's artwork under no open
+licence, used under the terms of x.ai/legal/brand-guidelines. Each mark stays its owner's trademark, whatever
+licence covers its drawing.
 
   MIT License
 
