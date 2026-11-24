@@ -360,12 +360,20 @@ pub enum ProducerAnnotation {
     Annotated,
     /// A single-publisher, graph-owned edge whose reads carry their writer by
     /// RUN: the annotation is staged only when the writer differs from the one
-    /// the stage last annotated, so one writer costs one annotation per
-    /// recording. The bound takes two records over [`Self::Plain`]: the
-    /// annotation that opens the writer's run at each of the two read sites
-    /// ([`writer_run_site`]). A read costs at most one slot in the plain bound
-    /// (a read equal to the pair's read folds into it, as an equal read folds
-    /// into a bare one), so the annotation is the only record a run adds.
+    /// the stage last annotated at the read's site, and again at the first
+    /// read of each site after a checkpoint window opens (the stage's
+    /// `reopen_writer_runs`), so one writer costs one annotation per read site
+    /// per checkpoint window, the recording's first window included. The bound
+    /// takes two records over [`Self::Plain`]: the annotation that opens the
+    /// writer's run at each of the two read sites ([`writer_run_site`]), which
+    /// is the most one writer opens in one merge window, in the recording's
+    /// first checkpoint window and in every reopened one alike. A writer switch
+    /// in a merge window that already holds both openings has no reserve left:
+    /// its pair fits only in the plain bound's slack, and a pair that does not
+    /// fit is refused as one pair, counted and marked like any drop at the rim.
+    /// A read costs at most one slot in the plain bound (a read equal to the
+    /// pair's read folds into it, as an equal read folds into a bare one), so
+    /// the annotation is the only record a run adds.
     WriterRuns,
     /// An edge whose reads carry no annotation: one record per read.
     Plain,
@@ -1369,8 +1377,10 @@ struct StageInner {
     /// the read log attributes it to that annotation. Set only when an
     /// annotation is admitted, so a pair dropped at the rim leaves the old
     /// writer in place and the next read of the new writer is annotated again.
-    /// Cleared by `arm`, and by a drain whose consumer refused an annotation,
-    /// so a run never continues past an annotation the read log does not hold.
+    /// Cleared by `arm`, by `reopen_writer_runs` at the head of every checkpoint
+    /// window after the first, and by a drain whose consumer refused an
+    /// annotation, so a run never continues past an annotation the read log
+    /// does not hold.
     run_writer: [Option<u64>; 2],
     /// The last sequence this input SERVED (`Served` / `DrainedBatch`) — the
     /// "last accepted" a `Decimated` record reports (on a sample-gated input
@@ -1638,6 +1648,30 @@ impl ReadOutcomeStage {
         self.armed.store(true, Ordering::Release);
     }
 
+    /// Open both writer runs again, as [`Self::arm`] leaves them: the next
+    /// annotated read of each read site ([`writer_run_site`]) stages its
+    /// writer's annotation whatever the site last annotated.
+    ///
+    /// The live loop calls it, through `GraphRuntime::reopen_writer_runs_where`,
+    /// at the end of every step a checkpoint is due at, so the read log of
+    /// every checkpoint window names the writer of the first read at each site
+    /// that served a frame in it; a replay calls it at the same boundaries to
+    /// stage what the recording staged. It opens at most both sites again,
+    /// two annotations in any one merge window, which is the run-opening
+    /// reserve [`derive_stage_capacity`] already holds for the recording's
+    /// first window, so no rim moves.
+    ///
+    /// A disarmed stage holds no run and records nothing, so it is left as it
+    /// is, and a reopen never arms one. Right after `arm` it changes nothing.
+    /// It rewrites the two run slots under the uncontended stage lock: no
+    /// allocation, no clock read.
+    pub(crate) fn reopen_writer_runs(&self) {
+        if !self.is_armed() {
+            return;
+        }
+        self.lock_inner().run_writer = [None, None];
+    }
+
     /// TEST SEAM: drive the last staged record's fold count
     /// directly, so the `u32::MAX` saturation boundary is reachable without
     /// four billion real `record` calls.
@@ -1839,8 +1873,10 @@ impl ReadOutcomeStage {
     /// pair that opened the run when it equals it), and the read log
     /// attributes it to the last annotation of its site before it. A
     /// single-writer edge therefore stages one annotation per read site per
-    /// recording. A stage built [`Self::annotating_every_read`] (a multi-writer
-    /// edge) annotates every read instead.
+    /// checkpoint window: [`Self::arm`] opens the recording's first window and
+    /// [`Self::reopen_writer_runs`] each later one. A stage built
+    /// [`Self::annotating_every_read`] (a multi-writer edge) annotates every
+    /// read instead.
     ///
     /// # Atomic-pair admission at the rim
     ///
@@ -3888,6 +3924,265 @@ mod tests {
         assert_eq!(
             kst(&drain_all(&stage)),
             vec![(Producer, 2, Some(0xA)), (Served, 2, None)]
+        );
+    }
+
+    /// The (kind, served sequence, token, role) projection the window-head arms
+    /// read: a reopen is kept per read site, so the role is part of the oracle.
+    fn kstr(
+        drained: &[StagedReadOutcome],
+    ) -> Vec<(ReadOutcomeKind, u64, Option<u64>, ReadSiteRole)> {
+        drained
+            .iter()
+            .map(|r| (r.kind, r.served_seq, r.token, r.role))
+            .collect()
+    }
+
+    /// One read of writer 0xA at each read site, body first: the reads every
+    /// window-head arm below opens a window with.
+    fn read_both_sites(stage: &ReadOutcomeStage, body_seq: u32, drain_seq: u32) {
+        stage.record_with_producer(
+            ReadOutcomeKind::Served,
+            Some(body_seq),
+            1,
+            0xA,
+            ReadSiteRole::Body,
+        );
+        stage.record_with_producer(
+            ReadOutcomeKind::DrainedBatch,
+            Some(drain_seq),
+            1,
+            0xA,
+            ReadSiteRole::Drain,
+        );
+    }
+
+    /// A reopen opens BOTH sites' runs again: in the window after it, each
+    /// site's first read of the writer whose run was open stages its
+    /// annotation, exactly as in the recording's first window, while the window
+    /// between the two continues both runs bare.
+    #[test]
+    fn a_reopen_opens_both_sites_again() {
+        use ReadOutcomeKind::{DrainedBatch, Producer, Served};
+        use ReadSiteRole::{Body, Drain};
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.arm();
+        read_both_sites(&stage, 1, 2);
+        assert_eq!(
+            kstr(&drain_all(&stage)),
+            vec![
+                (Producer, 1, Some(0xA), Body),
+                (Served, 1, None, Body),
+                (Producer, 2, Some(0xA), Drain),
+                (DrainedBatch, 2, None, Drain),
+            ],
+            "the arm opens the first window: one annotation per site"
+        );
+        read_both_sites(&stage, 3, 4);
+        assert_eq!(
+            kstr(&drain_all(&stage)),
+            vec![(Served, 3, None, Body), (DrainedBatch, 4, None, Drain)],
+            "inside the window both runs continue bare"
+        );
+        stage.reopen_writer_runs();
+        read_both_sites(&stage, 5, 6);
+        assert_eq!(
+            kstr(&drain_all(&stage)),
+            vec![
+                (Producer, 5, Some(0xA), Body),
+                (Served, 5, None, Body),
+                (Producer, 6, Some(0xA), Drain),
+                (DrainedBatch, 6, None, Drain),
+            ],
+            "the reopened window names the same writer again at both sites"
+        );
+        read_both_sites(&stage, 7, 8);
+        assert_eq!(
+            kstr(&drain_all(&stage)),
+            vec![(Served, 7, None, Body), (DrainedBatch, 8, None, Drain)],
+            "and continues bare after its openings, as the first window did"
+        );
+    }
+
+    /// A reopen on a DISARMED stage stages nothing and arms nothing: the stage
+    /// still records nothing and has no room.
+    #[test]
+    fn a_disarmed_reopen_stages_nothing() {
+        let stage = rim_stage(0, ReadStageRole::Body);
+        stage.reopen_writer_runs();
+        assert!(!stage.is_armed(), "a reopen never arms a stage");
+        read_both_sites(&stage, 1, 2);
+        assert!(
+            drain_all(&stage).is_empty(),
+            "a disarmed stage records nothing, reopened or not"
+        );
+        assert_eq!(stage.room(), 0, "a disarmed stage has no room");
+        assert_eq!(stage.dropped(), 0, "and drops nothing");
+    }
+
+    /// A reopen right after `arm` changes nothing: `arm` already opened both
+    /// runs, so the reopened stage stages the hand sequence the merely armed
+    /// one does.
+    #[test]
+    fn a_reopen_right_after_arm_changes_nothing() {
+        use ReadOutcomeKind::{DrainedBatch, Producer, Served};
+        use ReadSiteRole::{Body, Drain};
+        let expected = vec![
+            (Producer, 1, Some(0xA), Body),
+            (Served, 1, None, Body),
+            (Producer, 2, Some(0xA), Drain),
+            (DrainedBatch, 2, None, Drain),
+            (Served, 3, None, Body),
+            (DrainedBatch, 4, None, Drain),
+        ];
+        let armed = rim_stage(0, ReadStageRole::Body);
+        armed.arm();
+        let reopened = rim_stage(0, ReadStageRole::Body);
+        reopened.arm();
+        reopened.reopen_writer_runs();
+        for stage in [&armed, &reopened] {
+            read_both_sites(stage, 1, 2);
+            read_both_sites(stage, 3, 4);
+        }
+        assert_eq!(kstr(&drain_all(&armed)), expected, "the armed stage");
+        assert_eq!(
+            kstr(&drain_all(&reopened)),
+            expected,
+            "the stage reopened right after its arm"
+        );
+    }
+
+    /// The writer-run stage the capacity arms below drive: depth 16, burst 64,
+    /// which derives 83 (`max(16 + 64, 2 * 16 + 1) + 1 = 81`, plus the two
+    /// run-opening records), pinned by
+    /// `writer_runs_add_one_annotation_per_read_site_to_the_plain_bound`.
+    fn writer_runs_stage_83() -> ReadOutcomeStage {
+        let stage = ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            shape(
+                16,
+                ProducerAnnotation::WriterRuns,
+                SyncTriggerShape::Ordinary,
+                FireBurstBound::Fires(64),
+            ),
+        );
+        assert_eq!(stage.capacity(), 83, "PREMISE: the derived rim");
+        stage
+    }
+
+    /// A reopened window holds both of its openings inside the run-opening
+    /// reserve: 81 distinct reads of one writer, 41 at the body site and 40 at
+    /// the drain site, stage 83 records, the rim exactly, and drop none. One
+    /// read more is the first record the window drops.
+    #[test]
+    fn a_reopen_window_holds_both_openings_inside_the_writer_run_reserve() {
+        use ReadOutcomeKind::{DrainedBatch, Producer, Served, Truncated};
+        let stage = writer_runs_stage_83();
+        stage.arm();
+        read_both_sites(&stage, 0, 100);
+        drain_all(&stage);
+        stage.reopen_writer_runs();
+        for seq in 1..=41 {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        for seq in 101..=140 {
+            stage.record_with_producer(DrainedBatch, Some(seq), 1, 0xA, ReadSiteRole::Drain);
+        }
+        assert_eq!(stage.room(), 0, "81 reads and 2 openings fill the 83 slots");
+        assert_eq!(stage.dropped(), 0, "and drop nothing");
+        let window = drain_all(&stage);
+        assert_eq!(window.len(), 83, "{window:?}");
+        let annotations: Vec<(usize, u64, ReadSiteRole)> = window
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == Producer)
+            .map(|(i, r)| (i, r.served_seq, r.role))
+            .collect();
+        assert_eq!(
+            annotations,
+            vec![(0, 1, ReadSiteRole::Body), (42, 101, ReadSiteRole::Drain)],
+            "one opening per site, each before that site's first read"
+        );
+        assert!(
+            window.iter().all(|r| r.kind != Truncated),
+            "a full window that dropped nothing carries no marker"
+        );
+        stage.reopen_writer_runs();
+        for seq in 1..=41 {
+            stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+        }
+        for seq in 101..=141 {
+            stage.record_with_producer(DrainedBatch, Some(seq), 1, 0xA, ReadSiteRole::Drain);
+        }
+        assert_eq!(stage.dropped(), 1, "the 82nd read is the first drop");
+        assert_eq!(
+            drain_all(&stage).last().map(|r| (r.kind, r.popped)),
+            Some((Truncated, 1))
+        );
+    }
+
+    /// A writer switch in a reopened window is a THIRD opening, and the
+    /// reserve holds two. On the 83 rim, 80 reads with both openings leave
+    /// one slot, so the new writer's pair is refused as one pair, counted 2,
+    /// and the old writer's run stays open. CONTROL: the same reads in a window
+    /// that continues both runs leave three slots, and the switch is admitted.
+    #[test]
+    fn a_writer_switch_in_a_reopen_window_is_refused_as_one_pair() {
+        use ReadOutcomeKind::{DrainedBatch, Producer, Served, Truncated};
+        let fill = |stage: &ReadOutcomeStage| {
+            for seq in 1..=40 {
+                stage.record_with_producer(Served, Some(seq), 1, 0xA, ReadSiteRole::Body);
+            }
+            for seq in 101..=140 {
+                stage.record_with_producer(DrainedBatch, Some(seq), 1, 0xA, ReadSiteRole::Drain);
+            }
+        };
+
+        let reopened = writer_runs_stage_83();
+        reopened.arm();
+        read_both_sites(&reopened, 0, 100);
+        drain_all(&reopened);
+        reopened.reopen_writer_runs();
+        fill(&reopened);
+        assert_eq!(reopened.room(), 1, "PREMISE: 80 reads and 2 openings");
+        reopened.record_with_producer(Served, Some(200), 1, 0xB, ReadSiteRole::Body);
+        assert_eq!(reopened.dropped(), 2, "the refused pair counts as two");
+        let window = drain_all(&reopened);
+        assert_eq!(window.len(), 83, "82 admitted records and the marker");
+        assert_eq!(
+            window.last().map(|r| (r.kind, r.popped)),
+            Some((Truncated, 2))
+        );
+        assert!(
+            window.iter().all(|r| r.token != Some(0xB)),
+            "no record names the refused writer"
+        );
+        reopened.record_with_producer(Served, Some(41), 1, 0xA, ReadSiteRole::Body);
+        reopened.record_with_producer(Served, Some(201), 1, 0xB, ReadSiteRole::Body);
+        assert_eq!(
+            kst(&drain_all(&reopened)),
+            vec![
+                (Served, 41, None),
+                (Producer, 201, Some(0xB)),
+                (Served, 201, None),
+            ],
+            "the old writer's run stayed open, and the new writer opens its own \
+             at its first admitted read"
+        );
+
+        let continued = writer_runs_stage_83();
+        continued.arm();
+        read_both_sites(&continued, 0, 100);
+        drain_all(&continued);
+        fill(&continued);
+        assert_eq!(continued.room(), 3, "CONTROL: 80 bare reads");
+        continued.record_with_producer(Served, Some(200), 1, 0xB, ReadSiteRole::Body);
+        assert_eq!(continued.dropped(), 0, "CONTROL: the switch fits");
+        assert_eq!(
+            kst(&drain_all(&continued)[80..]),
+            vec![(Producer, 200, Some(0xB)), (Served, 200, None)],
+            "CONTROL: the new writer's pair follows the 80 bare reads"
         );
     }
 

@@ -65,7 +65,7 @@
 //!   disagree (corrupt / hand-edited) → [`ReplayError::BagGraphMismatch`]
 //!   (exit 2).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,11 +92,11 @@ use cerulion_core::state_restore::{
     StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters,
 };
 use cerulion_core::trace_ring::{
-    unpack_read_outcome_meta, unpack_read_outcome_meta_full, unpack_read_outcome_popped,
-    unpack_read_outcome_run, TraceRingRecord, AUTHORITATIVE_TRACE_RANK, READ_OUTCOME_DECIMATED,
-    READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME,
-    READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED, RECORD_TYPE_DEPARTURE,
-    RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
+    step_boundary_flags, unpack_read_outcome_meta, unpack_read_outcome_meta_full,
+    unpack_read_outcome_popped, unpack_read_outcome_run, TraceRingRecord, AUTHORITATIVE_TRACE_RANK,
+    READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
+    READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED,
+    RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{NodeEntry, TransportManager, VirtualClock};
@@ -2400,6 +2400,70 @@ pub fn recorder_stream_needs_v4() -> bool {
     false
 }
 
+/// What one recorder's stream claims, the terms [`stamp_trace_format`] stamps
+/// a bag's `trace_format` from, each by name.
+///
+/// No `Default`, deliberately: a stamping site that left a term to a default
+/// would stamp a claim nobody decided, and the only direction the
+/// never-under-claim law permits is a loud over-claim. This binary's own
+/// claims come from [`RecorderClaims::of_this_recorder`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecorderClaims {
+    /// The stream carries content a format-3 reader cannot decode
+    /// ([`recorder_stream_needs_v4`]).
+    pub stream_needs_v4: bool,
+    /// Kind-6 records carry read-site roles ([`recorder_stamps_read_site_roles`]).
+    pub stamps_roles: bool,
+    /// The run folds identical runs into one counted record.
+    pub folds_runs: bool,
+    /// Every gated consult a replay also makes wrote a record
+    /// ([`recorder_stamps_consult_records`]).
+    pub records_consults: bool,
+    /// Every edge names its frames' writers by run, and every multi-frame read
+    /// whose batch fits its read stage names each frame it consumed
+    /// ([`recorder_records_read_identity`]).
+    pub records_identity: bool,
+    /// Every complete checkpoint part of a stopped node carries the stopped
+    /// flag ([`recorder_states_anchor_stops`]).
+    pub states_anchor_stops: bool,
+    /// Every read site names its writer again at the head of every checkpoint
+    /// window, and the boundary there carries the reopen flag
+    /// ([`recorder_names_window_heads`]).
+    pub names_window_heads: bool,
+}
+
+impl RecorderClaims {
+    /// What THIS binary's recorder claims for a run, with `folds_runs` read
+    /// from the run's one fold switch (`cerulion_core::read_outcome::fold_enabled`).
+    ///
+    /// The window heads, stops, identity and consult terms are tested first,
+    /// so a bag this binary writes stamps the same with folding on or off; the
+    /// fold term decides the stamp only on the ladder below 7, the arm an
+    /// older recorder's bag took.
+    #[must_use]
+    pub fn of_this_recorder(folds_runs: bool) -> Self {
+        Self {
+            stream_needs_v4: recorder_stream_needs_v4(),
+            stamps_roles: recorder_stamps_read_site_roles(),
+            folds_runs,
+            // It records every gated consult a replay also makes: every consult
+            // that found its queue empty but the ones a POST-FIRE REFILL align
+            // pass made (a pass a plan-driven replay never runs).
+            records_consults: recorder_stamps_consult_records(),
+            // Every edge carries its frames' writers, one annotation per writer
+            // run, and every multi-frame read whose batch fits its read stage's
+            // window names each frame it consumed.
+            records_identity: recorder_records_read_identity(),
+            // Every complete checkpoint part of a stopped node carries the
+            // stopped flag.
+            states_anchor_stops: recorder_states_anchor_stops(),
+            // Every read site's writer run reopens at each checkpoint window
+            // head, and the boundary there says so.
+            names_window_heads: recorder_names_window_heads(),
+        }
+    }
+}
+
 /// The `trace_format` version to STAMP into one bag's
 /// `recorder.json` — decoupled from [`SUPPORTED_TRACE_FORMAT`], which is the
 /// READ gate.
@@ -2412,14 +2476,17 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the ANCHOR STOPS term and stamps 10, because
-///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`]
-///   and [`recorder_states_anchor_stops`] are unconditionally true and this
-///   function returns before the ladder is consulted. The ladder below (the
-///   fold term at 6, the role term at 5, then the mode and stream arms) is the
-///   `records_consults == false` fallback, i.e. the rules that produced the
-///   bags recorded before each term existed, and NO bag written today reaches
-///   it.
+///   this binary writes takes the WINDOW HEADS term and stamps 11, because
+///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`],
+///   [`recorder_states_anchor_stops`] and [`recorder_names_window_heads`] are
+///   unconditionally true and this function returns before the ladder is
+///   consulted. The ladder below (the fold term at 6, the role term at 5, then
+///   the mode and stream arms) is the `records_consults == false` fallback,
+///   i.e. the rules that produced the bags recorded before each term existed,
+///   and NO bag written today reaches it.
+///
+/// The claims arrive as one [`RecorderClaims`] value with a name on every
+/// term, so two of them cannot trade places at a call site.
 ///
 /// Under that fallback the stamp is 4 in exactly two cases — (a) a FREE-RUN
 /// bag would stamp 4, because a format-3 reader would silently apply the
@@ -2433,15 +2500,32 @@ pub fn recorder_stream_needs_v4() -> bool {
 /// is the (b) arm, and it holds independently of the mode — a LOCKSTEP bag with
 /// such a stream would stamp 4 too. Every term above those arms stamps 5 or
 /// more, so the claim survives each of them.
-pub fn stamp_trace_format(
-    coordination: CoordinationMode,
-    stream_needs_v4: bool,
-    stamps_roles: bool,
-    folds_runs: bool,
-    records_consults: bool,
-    records_identity: bool,
-    states_anchor_stops: bool,
-) -> u32 {
+pub fn stamp_trace_format(coordination: CoordinationMode, claims: RecorderClaims) -> u32 {
+    let RecorderClaims {
+        stream_needs_v4,
+        stamps_roles,
+        folds_runs,
+        records_consults,
+        records_identity,
+        states_anchor_stops,
+        names_window_heads,
+    } = claims;
+    if records_consults && records_identity && states_anchor_stops && names_window_heads {
+        // Every read site's first read that serves a frame after a step a
+        // checkpoint was due at carries its writer's annotation again, and
+        // the boundary of the NEXT step, the checkpoint window's head, carries
+        // the reopen flag in its `global_level` word, so a bag that begins at
+        // a checkpoint window names the writer of every read in it and a
+        // replay reopens its own stages where the recording did. A format 10
+        // reader attributes those annotations correctly, but it never mirrors
+        // the reopen, so an ungated stage near its rim places its `Truncated`
+        // and `BatchFrame` records differently from the recording and the
+        // reader reports a false `read_log_diverged`; nor does it check the
+        // flags word. So the stamp moves and that reader refuses the bag. The
+        // term claims nothing without the stops, identity and consult terms
+        // under it.
+        return 11;
+    }
     if records_consults && records_identity && states_anchor_stops {
         // Every complete checkpoint part of a node the scheduler had stopped
         // carries the stopped flag in its framework section, so a part
@@ -2579,6 +2663,18 @@ pub fn recorder_states_anchor_stops() -> bool {
     true
 }
 
+/// Does THIS binary's recorder name each read site's writer again at the head
+/// of every checkpoint window, and flag the boundary there?
+///
+/// `true`, unconditionally: the live step reopens every read-outcome stage's
+/// writer runs at the end of each step a checkpoint is due at and marks the
+/// next step's boundary record with
+/// `cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED`, on every
+/// runtime this binary builds.
+pub fn recorder_names_window_heads() -> bool {
+    true
+}
+
 /// The lowest `trace_format` whose read log names the identity of every read:
 /// the bags a `--verify` replay feeds read by read through private per-input
 /// feeds, refusing by name what it cannot feed, instead of re-creating each
@@ -2611,6 +2707,27 @@ const _: () = assert!(ANCHOR_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 /// An ABSENT `recorder.json` answers `false`.
 pub fn recorder_states_anchor_stops_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= ANCHOR_STOPS_MIN_TRACE_FORMAT)
+}
+
+/// The lowest `trace_format` whose recorder names each read site's writer
+/// again at the head of every checkpoint window and sets
+/// `cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED` on the
+/// boundary there. From it on a replay reopens its own stages where a
+/// boundary carries the flag, and refuses a boundary that sets any other bit.
+/// Below it no recorder wrote anything but 0 in a boundary's flags word, and
+/// the word is not read.
+pub const WINDOW_HEADS_MIN_TRACE_FORMAT: u32 = 11;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(WINDOW_HEADS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's format say that every read site names its writer again at
+/// the head of every checkpoint window, and that the boundary there carries the
+/// reopen flag?
+///
+/// An ABSENT `recorder.json` answers `false`.
+pub fn recorder_names_window_heads_at(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= WINDOW_HEADS_MIN_TRACE_FORMAT)
 }
 
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
@@ -2789,18 +2906,35 @@ pub fn replay_stages_batch_frames(
 /// what a resumed replay concludes needs its own `trace_format` bump, which
 /// this binary refuses.
 ///
+/// Bumped to 11 by checkpoint window heads: every read site's first read that
+/// serves a frame after a step a checkpoint was due at carries its writer's
+/// annotation again, and the boundary record of the NEXT step, the checkpoint
+/// window's head, carries
+/// `cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED` in its
+/// `global_level` word ([`WINDOW_HEADS_MIN_TRACE_FORMAT`]). A replay reopens
+/// its own stages before a flagged step, so its read log stages what the
+/// recording's did, and a bag that begins at a window head names the writer
+/// of every read a `--verify` replay feeds. A format 10 reader attributes the
+/// window-head annotations correctly, but it never mirrors the reopen, so an
+/// ungated stage near its rim places its `Truncated` and `BatchFrame` records
+/// differently from the recording and the reader reports a false
+/// `read_log_diverged`; nor does it check the flags word. So it must refuse
+/// the bag. Formats 1 to 10 stay readable: their boundaries carry no flag and
+/// their stages are never reopened mid-pass.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 10,
+/// them to zero for the bags this binary writes (every one of them stamps 11,
 /// because every one records every consult, every frame each read
-/// consumed when its batch fits the read stage's window, and the stopped flag
-/// in every complete checkpoint part of a stopped node), but the two remain
+/// consumed when its batch fits the read stage's window, the stopped flag
+/// in every complete checkpoint part of a stopped node, and the writer of
+/// every read site at every checkpoint window head), but the two remain
 /// separate functions serving separate
-/// questions, and the READ gate still admits 1 to 9
+/// questions, and the READ gate still admits 1 to 10
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 10;
+pub const SUPPORTED_TRACE_FORMAT: u32 = 11;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -5082,6 +5216,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // CHECKPOINT STOPS: does every complete checkpoint part of a stopped node
     // carry the stopped flag, so that a part without it states a running node?
     let every_stop_flagged = recorder_states_anchor_stops_at(recorder.as_ref());
+    // CHECKPOINT WINDOW HEADS: does every read site name its writer again at
+    // the head of every checkpoint window, and does the boundary there carry
+    // the reopen flag? Then the boundary validator refuses any other flag bit
+    // and every pass mirrors the reopens.
+    let window_heads_named = recorder_names_window_heads_at(recorder.as_ref());
     let fed = purpose == ReplayPurpose::Verify
         && coordination == CoordinationMode::FreeRun
         && identity_recorded;
@@ -5362,7 +5501,15 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     let BoundaryWalk {
         summaries: boundary_summaries,
         last_fire_step,
-    } = validate_step_boundaries(&trace, rank_count, coordination)?;
+    } = validate_step_boundaries(
+        &trace,
+        rank_count,
+        coordination,
+        recorder
+            .as_ref()
+            .map(|r| r.trace_format)
+            .filter(|_| window_heads_named),
+    )?;
     // 3a. WHICH runtimes this replay stands up, and over which
     //     slice of the recorded step axis each is driven.
     //
@@ -5582,6 +5729,10 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         fed.then_some(&recorded_messages),
         duration_bound_ns.map(|d| (run_epoch_ns, d)),
         feed_index_budget.unwrap_or(crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET),
+        crate::replay_feed::FeedBagFacts {
+            begins_mid_run: resume.is_some(),
+            trace_format: recorder.as_ref().map(|r| r.trace_format),
+        },
     )?;
     let mut fed_totals = (0usize, 0usize);
     // The publisher slots of every topic the whole graph writes, which a pass
@@ -5629,6 +5780,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 identity: edge_identity,
                 kind_width,
                 trace_format: recorder.as_ref().map(|r| r.trace_format),
+                window_heads_named,
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
@@ -10158,6 +10310,12 @@ struct PassInputs<'a> {
     /// Named on the warnings a resumed pass's stand-downs print, since the
     /// format decides whether the checkpoint can state a node's stop.
     trace_format: Option<u32>,
+    /// Do this bag's step boundaries carry the reopen flag
+    /// (`trace_format >= WINDOW_HEADS_MIN_TRACE_FORMAT`)? Then the pass
+    /// reopens its read stages' writer runs before every flagged step, as the
+    /// recorder did. Resolved ONCE beside `identity_recorded`. `false` on
+    /// every bag below that format, whose stages are never reopened mid-pass.
+    window_heads_named: bool,
     /// The armed capture plane the recording ran under, if any: the
     /// SAME onset `attach_replay_catchup_arm` hands this pass's scheduler, so
     /// the re-derivation verifier runs the one clamp the replay runs.
@@ -13923,12 +14081,15 @@ fn rank_step_targets(
 /// decline, its own warn and its own report field, and reproducing them here
 /// would be a second spelling of each; the pass plans for itself only in the
 /// no-rows case, where there was nothing to plan from before pass 0.
-// NINE arguments, every one a BAG or GRAPH fact this planning needs and none of
-// them derivable from another: the plans, the trace and its rank tables, the
+// THIRTEEN arguments, every one a BAG or GRAPH fact this planning needs and none
+// of them derivable from another: the plans, the trace and its rank tables, the
 // graph config, the factories the declared node metadata is read from, the topic
-// classes, and the three per-bag contract terms (the coordination mode, whether
-// the role bits may be believed, and the kind field's width). Bundling them into
-// a struct only to satisfy the ceiling would name the same nine values twice.
+// classes, the three per-bag contract terms (the coordination mode, whether the
+// role bits may be believed, and the kind field's width), the recorded messages a
+// fed replay reads, the `--duration` bound, the feed index budget, and the bag
+// facts a feed refusal names (whether the bag begins mid-run, and its format).
+// Bundling them into a struct only to satisfy the ceiling would name the same
+// thirteen values twice.
 #[allow(clippy::too_many_arguments)]
 fn plan_bag_side_admissions(
     plans: &[RankPlan],
@@ -13948,6 +14109,8 @@ fn plan_bag_side_admissions(
     duration_bound: Option<(u64, u64)>,
     // Bytes the feed index may take.
     feed_index_budget: u64,
+    // What a feed refusal names about the bag as a whole.
+    bag_facts: crate::replay_feed::FeedBagFacts,
 ) -> Result<BTreeMap<u32, RankBagSide>, ReplayError> {
     // A lockstep bag arms no gate at all: one gating clock already orders every
     // publish against every step.
@@ -14203,6 +14366,7 @@ fn plan_bag_side_admissions(
             &index,
             &targets,
             step_end,
+            bag_facts,
         ) {
             Ok(feed) => Arc::new(feed),
             Err(refusal) => {
@@ -16446,6 +16610,11 @@ fn run_rank_pass(
     } else {
         PassBoundaries::Rank(BoundaryCursor::for_rank(pass.trace, plan.rank())?)
     };
+    // The REOPEN MIRROR's two facts, read once: whether this bag's boundaries
+    // carry the reopen flag at all, and which recorded rank owns each node of a
+    // lockstep pass (one runtime holds every rank's nodes there).
+    let window_heads_named = pass.window_heads_named;
+    let node_rank = pass.node_rank;
     // `while let` over the boundary source: it ends when this pass's stream
     // does, i.e. when every recorded boundary in it has been replayed.
     while let Some(boundary) = boundaries.next()? {
@@ -16636,6 +16805,28 @@ fn run_rank_pass(
                         ),
                     })?;
             }
+        }
+        // The REOPEN MIRROR. A recorder at `WINDOW_HEADS_MIN_TRACE_FORMAT` or
+        // later reopened every read stage's writer runs at the end of the step
+        // before a flagged boundary, so the replay reopens its own stages at
+        // the same instant: after the previous step and before this one reads
+        // anything. Without it the recording's stages hold up to two
+        // annotations more than the replay's at every window head, and since a
+        // `Truncated` marker and a `BatchFrame` record are positions that
+        // depend on a stage's room, an ungated stage near its rim would read a
+        // different log. A free-run pass is one rank's stream and reopens on
+        // its own flag; a lockstep pass reopens each flagged rank's nodes, on
+        // that rank's own flag, since ranks legitimately differ.
+        //
+        // ONE walk of the stages, decided per node by `reopens_node` over the
+        // flags and rank map `reopen_flags` hands it, so a pass cannot pair one
+        // rank's buffer with another's map. The walk runs only on a bag that
+        // names window heads, on a step some rank flagged.
+        let (reopened, ranked) = reopen_flags(&boundaries, &boundary, node_rank);
+        if window_heads_named && reopened.contains(&true) {
+            runtime.reopen_writer_runs_where(|node| {
+                reopens_node(window_heads_named, reopened, recorded_rank_of(ranked, node))
+            });
         }
         runtime.step(Duration::from_nanos(delta));
         if !lockstep {
@@ -25530,10 +25721,101 @@ struct StepBoundary {
     /// The step's ADVANCED gating-clock value — what every same-step publish
     /// stamps into its wire `timestamp_ns`, and what replay re-advances to.
     target_ns: u64,
+    /// Does the record's flags word carry
+    /// `cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED`: did the
+    /// recorder reopen every read-outcome stage's writer runs right before
+    /// this step? Decoded from every boundary, and read only on a bag at
+    /// [`WINDOW_HEADS_MIN_TRACE_FORMAT`] or later, where
+    /// [`validate_step_boundaries`] has refused any bit the format does not
+    /// define. A word with such a bit decodes as `false` here.
+    runs_reopened: bool,
+}
+
+impl StepBoundary {
+    /// Decode one STEP_BOUNDARY record: its step, its clock target and its
+    /// reopen flag. The one decode every boundary reader shares.
+    fn from_record(r: &TraceRingRecord) -> Self {
+        Self {
+            step: r.step,
+            target_ns: r.fire_time_ns,
+            runs_reopened: step_boundary_flags(r.global_level).is_ok_and(|f| f.runs_reopened()),
+        }
+    }
+}
+
+/// PURE: does the replay reopen the read stages of a node owned by recorded
+/// rank `node_rank` before this step, the step whose boundaries `reopened`
+/// flags per rank?
+///
+/// Only on a bag whose boundaries carry the flag (`window_heads_named`, trace
+/// format [`WINDOW_HEADS_MIN_TRACE_FORMAT`] or later), and only when the
+/// node's OWN rank flagged the step: ranks are never compared, since a rank
+/// whose checkpoint arm did not open never reopens. A node no rank names
+/// (`None`) is never reopened, and a rank past the buffer flagged nothing.
+fn reopens_node(window_heads_named: bool, reopened: &[bool], node_rank: Option<u32>) -> bool {
+    window_heads_named
+        && node_rank.is_some_and(|rank| reopened.get(rank as usize).copied().unwrap_or(false))
+}
+
+/// PURE: the recorded rank that owns `node` for the reopen mirror: its entry
+/// in the bag's node-to-rank map, or rank 0 for every node of a single-rank
+/// bag, which has no map. A lookup, never a walk of the map, so the map's
+/// order cannot reach the replay.
+fn recorded_rank_of(
+    node_rank: Option<&std::collections::HashMap<Arc<str>, u32>>,
+    node: &str,
+) -> Option<u32> {
+    node_rank.map_or(Some(0), |ranks| ranks.get(node).copied())
+}
+
+/// PURE: the reopen mirror's inputs at one step of a pass: the per-rank reopen
+/// flags and the node-to-rank map [`reopens_node`] reads them through.
+///
+/// A free-run pass is one rank's stream, so it hands the flag of `boundary`,
+/// the boundary it is at, as rank 0's, and no map whatever the bag's map
+/// holds, which puts every node at rank 0. A lockstep pass hands each rank's
+/// own flag from its cursors and the bag's `node_rank` map. Borrows only, so
+/// the step path allocates nothing.
+fn reopen_flags<'a>(
+    boundaries: &'a PassBoundaries<'_>,
+    boundary: &'a StepBoundary,
+    node_rank: Option<&'a HashMap<Arc<str>, u32>>,
+) -> (&'a [bool], Option<&'a HashMap<Arc<str>, u32>>) {
+    match boundaries {
+        PassBoundaries::Rank(_) => (std::slice::from_ref(&boundary.runs_reopened), None),
+        PassBoundaries::Lockstep(cursors) => (cursors.reopened_ranks(), node_rank),
+    }
+}
+
+/// PURE: the refusal of one STEP_BOUNDARY record whose flags word sets a bit
+/// this bag's format does not define, or `None`.
+///
+/// From [`WINDOW_HEADS_MIN_TRACE_FORMAT`] on the word carries
+/// `cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED` and nothing
+/// else, so any other bit, on any rank, names a recording this binary cannot
+/// read as it was written ([`ReplayError::RecordingInconsistent`], exit 2), and
+/// the refusal names the bag's own stamped format, `window_heads_format`.
+/// Below that format no recorder wrote anything but 0 there and the word is
+/// not read (`window_heads_format` is `None`: `None` whatever the word holds).
+fn boundary_flags_refusal(
+    window_heads_format: Option<u32>,
+    rank: u32,
+    step: u64,
+    global_level: u32,
+) -> Option<ReplayError> {
+    let trace_format = window_heads_format?;
+    let undefined = step_boundary_flags(global_level).err()?;
+    Some(ReplayError::RecordingInconsistent {
+        detail: format!(
+            "rank {rank}'s STEP_BOUNDARY record of step {step} sets flag bits {undefined:#x}, \
+             which trace format {trace_format} does not define (it defines bit 0 alone, the \
+             reopened writer runs)"
+        ),
+    })
 }
 
 /// Validate the STEP_BOUNDARY (kind 3) stream's shape — STREAMING (a
-/// materialized `Vec<StepBoundary>` would be ~16 B × step
+/// materialized `Vec<StepBoundary>` would be ~24 B × step
 /// count ≈ gigabytes at 300 GB-bag scale; the replay loop pulls boundaries
 /// from its own [`BoundaryCursor`] instead). The boundaries are the
 /// AUTHORITATIVE clock source (see the module docs: FIRE records undershoot
@@ -25555,7 +25837,10 @@ struct StepBoundary {
 ///   guarantees `b - a >= 0`, and a 0-delta advance is a legal
 ///   no-op. The clock contract permits this: wall-path
 ///   recordings are non-decreasing, not strictly increasing — a monotonic clock
-///   can read the same nanosecond on back-to-back steps).
+///   can read the same nanosecond on back-to-back steps);
+/// - on a bag at [`WINDOW_HEADS_MIN_TRACE_FORMAT`] or later, no flags word
+///   sets a bit that format does not define, on any rank
+///   ([`boundary_flags_refusal`]).
 ///
 /// Multi-rank bags additionally run PHASE 2: the cross-rank
 /// boundary AGREEMENT check — shared-step target equality + aligned first
@@ -25586,6 +25871,11 @@ fn validate_step_boundaries(
     trace: &RecordedTrace,
     rank_count: usize,
     coordination: CoordinationMode,
+    // The bag's stamped `trace_format` when it defines the boundary flags word
+    // (`trace_format >= WINDOW_HEADS_MIN_TRACE_FORMAT`), else `None`. With a
+    // format, a word with any other bit is refused on every rank, before the
+    // first replayed step, and the refusal names that format.
+    window_heads_format: Option<u32>,
 ) -> Result<BoundaryWalk, ReplayError> {
     // Multi-rank: the trace interleaves k independent
     // per-rank boundary streams in file order (bagd drains ring-by-ring), so
@@ -25645,10 +25935,12 @@ fn validate_step_boundaries(
         if rank == 0 {
             seen_rank0 = true;
         }
-        let b = StepBoundary {
-            step: r.step,
-            target_ns: r.fire_time_ns,
-        };
+        if let Some(refusal) =
+            boundary_flags_refusal(window_heads_format, r.rank(), r.step, r.global_level)
+        {
+            return Err(refusal);
+        }
+        let b = StepBoundary::from_record(r);
         if let Some(a) = prev[rank] {
             if b.step == a.step {
                 return Err(ReplayError::RecordingInconsistent {
@@ -25854,13 +26146,10 @@ impl BoundaryCursor<'_> {
             };
             // `.rank()` masks the discard bit (no-op on a boundary).
             let is_mine = r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.rank() == self.rank;
-            let b = StepBoundary {
-                step: r.step,
-                target_ns: r.fire_time_ns,
-            };
+            let b = is_mine.then(|| StepBoundary::from_record(r));
             self.cur.consume();
-            if is_mine {
-                return Ok(Some(b));
+            if b.is_some() {
+                return Ok(b);
             }
         }
     }
@@ -25892,6 +26181,13 @@ impl BoundaryCursor<'_> {
 /// MEMORY: k cursors, one peeked record each — O(k), never O(records).
 struct RankBoundaryCursors<'a> {
     cursors: Vec<BoundaryCursor<'a>>,
+    /// Per rank, whether its boundary of the step [`Self::next_authoritative`]
+    /// last returned carries the reopen flag (`false` for a rank whose stream
+    /// has ended). Allocated once in [`Self::new`], one entry per rank, and
+    /// rewritten in place every step. Never compared across ranks: a rank
+    /// whose checkpoint arm did not open never reopens, so the ranks of one
+    /// recording legitimately differ here.
+    reopened: Vec<bool>,
     /// Whether the defense-in-depth peer re-check below applies.
     /// It re-asserts `validate_step_boundaries` phase 2, which is itself
     /// mode-gated — so on a FREE-RUN bag the re-check would fire on essentially
@@ -25916,8 +26212,15 @@ impl<'a> RankBoundaryCursors<'a> {
         }
         Ok(Self {
             cursors,
+            reopened: vec![false; rank_count],
             check_peer_agreement: coordination == CoordinationMode::Lockstep,
         })
+    }
+
+    /// Per rank, whether its boundary of the step [`Self::next_authoritative`]
+    /// last returned carries the reopen flag, indexed by rank.
+    fn reopened_ranks(&self) -> &[bool] {
+        &self.reopened
     }
 
     /// The MIN absolute bag offset across every rank's boundary cursor — the
@@ -25937,6 +26240,7 @@ impl<'a> RankBoundaryCursors<'a> {
     /// docs).
     fn next_authoritative(&mut self) -> Result<Option<StepBoundary>, ReplayError> {
         let authoritative = self.cursors[0].next()?;
+        self.reopened[0] = authoritative.is_some_and(|b| b.runs_reopened);
         // Hoisted: the loop below borrows `self.cursors` mutably.
         let check_peer_agreement = self.check_peer_agreement;
         for (rank, peer) in self.cursors.iter_mut().enumerate().skip(1) {
@@ -25944,6 +26248,7 @@ impl<'a> RankBoundaryCursors<'a> {
             // the loop's per-rank sources and must stay index-locked with the
             // authoritative one); only the AGREEMENT assertion is mode-gated.
             let peer_boundary = peer.next()?;
+            self.reopened[rank] = peer_boundary.is_some_and(|b| b.runs_reopened);
             if !check_peer_agreement {
                 continue; // free-run: peers keep their own streams by design.
             }
@@ -33371,12 +33676,13 @@ mod recorder_info_version_tests {
         // included, which a v6 reader convicts as an impossible shape and
         // plans no position for), and v8 marks a stream in which every edge
         // names its frames' writers by run (read identity), v9 names every
-        // frame of a batch that fits its read stage, and v10 states every
-        // stopped node in its checkpoints. A recorder.json stamped v9 is NOT
-        // newer than this binary, and the absent-field back-compat default
-        // stays v1 (`trace_format_v1`). A bump must move this pin
-        // DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 10);
+        // frame of a batch that fits its read stage, v10 states every
+        // stopped node in its checkpoints, and v11 names every read site's
+        // writer again at every checkpoint window head and flags the boundary
+        // there. A recorder.json stamped v10 is NOT newer than this binary,
+        // and the absent-field back-compat default stays v1
+        // (`trace_format_v1`). A bump must move this pin DELIBERATELY.
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 11);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -33388,15 +33694,29 @@ mod recorder_info_version_tests {
         assert_eq!(READ_IDENTITY_MIN_TRACE_FORMAT, 8);
         assert_eq!(BATCH_FRAME_MIN_TRACE_FORMAT, 9);
         assert_eq!(ANCHOR_STOPS_MIN_TRACE_FORMAT, 10);
+        assert_eq!(WINDOW_HEADS_MIN_TRACE_FORMAT, 11);
     }
+
+    /// No claim at all: the base every hand row below states its claims over,
+    /// by name.
+    const NO_CLAIMS: RecorderClaims = RecorderClaims {
+        stream_needs_v4: false,
+        stamps_roles: false,
+        folds_runs: false,
+        records_consults: false,
+        records_identity: false,
+        states_anchor_stops: false,
+        names_window_heads: false,
+    };
 
     /// The decoupling pin.
     ///
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
     /// its consults and the frames of every batch that fits its read stage's
-    /// window, and flags every complete checkpoint part of a stopped node, and
-    /// therefore stamps 10, so the write
+    /// window, flags every complete checkpoint part of a stopped node and
+    /// names every read site's writer at every checkpoint window head, and
+    /// therefore stamps 11, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -33405,36 +33725,34 @@ mod recorder_info_version_tests {
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 1 to 9, which the write stamp never
+    /// the gate still admits formats 1 to 10, which the write stamp never
     /// emits. The decoupling is therefore alive in both directions, the READ
-    /// side reading nine formats the WRITE side never produces.
+    /// side reading ten formats the WRITE side never produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
             CoordinationMode::Lockstep,
-            recorder_stream_needs_v4(),
-            recorder_stamps_read_site_roles(),
-            true,
-            recorder_stamps_consult_records(),
-            recorder_records_read_identity(),
-            recorder_states_anchor_stops(),
+            RecorderClaims::of_this_recorder(true),
         );
         assert_eq!(
-            stamp, 10,
+            stamp, 11,
             "a recorder that records every consult, the frames of every batch \
-             that fits its read stage AND flags every complete checkpoint part of a \
-             stopped node stamps 10: a format-7 reader would replay its reads by queue \
-             re-creation and call the result clean, a format-8 reader does not \
-             know the batch frame record, and a format-9 reader reads past the \
-             stopped flag"
+             that fits its read stage, flags every complete checkpoint part of a \
+             stopped node AND names every read site's writer at every checkpoint \
+             window head stamps 11: a format-7 reader would replay its reads by \
+             queue re-creation and call the result clean, a format-8 reader does \
+             not know the batch frame record, a format-9 reader reads past the \
+             stopped flag, and a format-10 reader never mirrors the reopen, so an \
+             ungated stage near its rim reports a false read_log_diverged, and \
+             never checks the flags word"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: nine formats this binary
+        // The gate is strictly WIDER than the stamp: ten formats this binary
         // reads and never writes.
-        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9] {
+        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -33452,8 +33770,9 @@ mod recorder_info_version_tests {
     /// pre-existing arms and the pre-roles table survives intact underneath it.
     /// Every row then carries more expected values: `folds_runs` alone is 6,
     /// `records_consults` is 7 with folding on or off, consults with identity
-    /// is 9, and consults with identity and checkpoint stops is 10, the
-    /// strongest claim.
+    /// is 9, consults with identity and checkpoint stops is 10, and those three
+    /// with window heads is 11, the strongest claim. Each claim is set by name
+    /// over the row's base.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [
@@ -33472,62 +33791,150 @@ mod recorder_info_version_tests {
             (CoordinationMode::FreeRun, true, true, 5),
         ];
         for (mode, needs_v4, roles, expected) in cases {
-            assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, false, false, false, false),
-                expected,
-                "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false, consults=false)"
-            );
+            let row = format!("{mode:?}, v4 {needs_v4}, roles {roles}");
+            let base = RecorderClaims {
+                stream_needs_v4: needs_v4,
+                stamps_roles: roles,
+                ..NO_CLAIMS
+            };
+            assert_eq!(stamp_trace_format(mode, base), expected, "{row}: no term");
             // Folding dominates every axis below it: a folded aux word is
             // unreadable to anything below 6 whatever the coordination mode or
             // the role bits say.
-            assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, true, false, false, false),
-                6,
-                "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true, consults=false)"
-            );
-            // The consult record is the STRONGEST claim: a stream holding a
-            // record at every consult is misread by anything below 7 whatever
-            // else is true of it, folding included.
+            let folded = RecorderClaims {
+                folds_runs: true,
+                ..base
+            };
+            assert_eq!(stamp_trace_format(mode, folded), 6, "{row}: folds");
             for folds in [false, true] {
-                assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, false),
-                    7,
-                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
-                );
+                let row = format!("{row}, folds {folds}");
+                // The consult record: a stream holding a record at every
+                // consult is misread by anything below 7 whatever else is true
+                // of it, folding included.
+                let consults = RecorderClaims {
+                    folds_runs: folds,
+                    records_consults: true,
+                    ..base
+                };
+                assert_eq!(stamp_trace_format(mode, consults), 7, "{row}: consults");
                 // Read identity rides the consult term: 9 over every axis (8
                 // plus per-frame batch identity), and it claims nothing without
                 // the consult records under it.
-                assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, false),
-                    9,
-                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, identity)"
-                );
+                let identity = RecorderClaims {
+                    records_identity: true,
+                    ..consults
+                };
+                assert_eq!(stamp_trace_format(mode, identity), 9, "{row}: identity");
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, false) < 8,
-                    "identity without the consult records is not format 8 or 9"
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_consults: false,
+                            ..identity
+                        }
+                    ) < 8,
+                    "{row}: identity without the consult records is not format 8 or 9"
                 );
                 // Checkpoint stops ride both: 10 over every axis, and the term
                 // claims nothing without the consult and identity terms under it.
+                let stops = RecorderClaims {
+                    states_anchor_stops: true,
+                    ..identity
+                };
+                assert_eq!(stamp_trace_format(mode, stops), 10, "{row}: stops");
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, true),
-                    10,
-                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, stops)"
-                );
-                assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, true),
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_identity: false,
+                            ..stops
+                        }
+                    ),
                     7,
-                    "stops without identity stay at the consult term's 7"
+                    "{row}: stops without identity stay at the consult term's 7"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, true) < 8,
-                    "stops without the consult records are not format 8, 9 or 10"
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_consults: false,
+                            ..stops
+                        }
+                    ) < 8,
+                    "{row}: stops without the consult records are not format 8, 9 or 10"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, false, true) < 7,
-                    "stops alone claim nothing above the ladder"
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            states_anchor_stops: true,
+                            folds_runs: folds,
+                            ..base
+                        }
+                    ) < 7,
+                    "{row}: stops alone claim nothing above the ladder"
+                );
+                // Window heads ride all three: 11 over every axis, and the term
+                // claims nothing without the stops, identity and consult terms
+                // under it.
+                let heads = RecorderClaims {
+                    names_window_heads: true,
+                    ..stops
+                };
+                assert_eq!(stamp_trace_format(mode, heads), 11, "{row}: window heads");
+                assert_eq!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            states_anchor_stops: false,
+                            ..heads
+                        }
+                    ),
+                    9,
+                    "{row}: window heads without stops stay at the identity term's 9"
+                );
+                assert_eq!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_identity: false,
+                            ..heads
+                        }
+                    ),
+                    7,
+                    "{row}: window heads without identity stay at the consult term's 7"
+                );
+                assert!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_consults: false,
+                            ..heads
+                        }
+                    ) < 8,
+                    "{row}: window heads without the consult records are not format 8 to 11"
+                );
+                assert!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            names_window_heads: true,
+                            folds_runs: folds,
+                            ..base
+                        }
+                    ) < 7,
+                    "{row}: window heads alone claim nothing above the ladder"
                 );
             }
         }
+        // This binary's own claims are the strongest row.
+        assert_eq!(
+            stamp_trace_format(
+                CoordinationMode::FreeRun,
+                RecorderClaims::of_this_recorder(false)
+            ),
+            11
+        );
     }
 
     /// The mixed-regime refusal renders correctly, in both
@@ -33606,12 +34013,12 @@ mod recorder_info_version_tests {
                     // the consult term would stamp 7 over every row.
                     let folded = stamp_trace_format(
                         coordination,
-                        stream_needs_v4,
-                        stamps_roles,
-                        true,
-                        false,
-                        false,
-                        false,
+                        RecorderClaims {
+                            stream_needs_v4,
+                            stamps_roles,
+                            folds_runs: true,
+                            ..NO_CLAIMS
+                        },
                     );
                     assert!(
                         folded > PRE_FOLD_SUPPORTED,
@@ -33632,12 +34039,10 @@ mod recorder_info_version_tests {
         assert!(
             stamp_trace_format(
                 CoordinationMode::Lockstep,
-                false,
-                true,
-                false,
-                false,
-                false,
-                false
+                RecorderClaims {
+                    stamps_roles: true,
+                    ..NO_CLAIMS
+                }
             ) <= PRE_FOLD_SUPPORTED,
             "a non-folding lockstep recorder that records no consult stamps 5, \
              inside a format-5 reader's range"
@@ -33916,7 +34321,9 @@ mod recorder_info_version_tests {
     }
 
     /// From format 10 every complete checkpoint part of a stopped node carries
-    /// the stopped flag, and a bag with no `recorder.json` makes no such claim.
+    /// the stopped flag, so on every format from 10 to the supported one a part
+    /// without it states the node running, and a bag with no `recorder.json`
+    /// makes no such claim.
     #[test]
     fn checkpoint_stops_are_stated_from_format_ten() {
         for older in 1u32..=9 {
@@ -33925,8 +34332,28 @@ mod recorder_info_version_tests {
                 "a format-{older} part without the flag states nothing"
             );
         }
-        assert!(recorder_states_anchor_stops_at(Some(&recorder_info_at(10))));
+        for stated in 10u32..=SUPPORTED_TRACE_FORMAT {
+            assert!(
+                recorder_states_anchor_stops_at(Some(&recorder_info_at(stated))),
+                "a format-{stated} part without the flag states the node running"
+            );
+        }
         assert!(!recorder_states_anchor_stops_at(None));
+    }
+
+    /// From format 11 every read site names its writer again at every
+    /// checkpoint window head and the boundary there carries the reopen flag;
+    /// a bag with no `recorder.json` makes no such claim.
+    #[test]
+    fn window_heads_are_named_from_format_eleven() {
+        for older in 1u32..=10 {
+            assert!(
+                !recorder_names_window_heads_at(Some(&recorder_info_at(older))),
+                "a format-{older} bag names a writer only where its run starts"
+            );
+        }
+        assert!(recorder_names_window_heads_at(Some(&recorder_info_at(11))));
+        assert!(!recorder_names_window_heads_at(None));
     }
 
     /// One complete anchor part for a node saving a `u64`, carrying
@@ -41208,5 +41635,358 @@ mod verifier_budget_overrun_tests {
             assert_eq!(seconds_text(ns), want, "{ns} ns");
             assert_eq!(seconds_text(ns), seconds_text(ns), "two calls agree");
         }
+    }
+}
+
+// ===========================================================================
+// STEP_BOUNDARY flags: the decode, the refusal, the per-rank cursors
+// ===========================================================================
+
+#[cfg(test)]
+mod boundary_flag_tests {
+    use super::*;
+    use cerulion_bag::{BagWriter, BagWriterConfig};
+    use cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED;
+
+    /// A temp bag path unique to this process and call.
+    fn tmp_bag(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "boundary_flags_{tag}_{}_{}.mcap",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// `rank`'s STEP_BOUNDARY record of `step`, at target `(step + 1) * 10 ms`,
+    /// carrying the flags word `word`, rank-stamped as bagd stamps it.
+    fn boundary(rank: u32, step: u64, word: u32) -> TraceRingRecord {
+        TraceRingRecord {
+            step,
+            fire_time_ns: (step + 1) * 10_000_000,
+            duration_ns: 0,
+            node_idx: 0,
+            global_level: word,
+            record_type: RECORD_TYPE_STEP_BOUNDARY,
+            reserved: rank,
+        }
+    }
+
+    /// A bag holding exactly `records` on its scheduler-trace channel, in file
+    /// order, and the trace over it.
+    fn trace_of(tag: &str, records: &[TraceRingRecord]) -> (std::path::PathBuf, RecordedTrace) {
+        let path = tmp_bag(tag);
+        let mut w = BagWriter::create(&path, BagWriterConfig::default(), &[]).unwrap();
+        w.write_chunk(|c| {
+            for (i, r) in records.iter().enumerate() {
+                c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        w.finalize().unwrap();
+        let reader = cerulion_bag::BagReader::open(&path).unwrap();
+        (path, RecordedTrace::new(Arc::new(reader)))
+    }
+
+    /// The refusal over hand words: at trace format 11 the words 0 and bit 0
+    /// pass, and every word with another bit is refused on whichever rank
+    /// carries it, naming the rank, the step and exactly the undefined bits;
+    /// below 11 the same words are not read. The decode reads bit 0 only from
+    /// a defined word.
+    #[test]
+    fn boundary_flags_are_validated_only_where_the_format_defines_them() {
+        for word in [0u32, STEP_BOUNDARY_FLAG_RUNS_REOPENED] {
+            assert!(
+                boundary_flags_refusal(Some(11), 0, 4, word).is_none(),
+                "word {word:#x} is defined at 11"
+            );
+        }
+        for (rank, word, bits) in [
+            (0u32, 0b10u32, "0x2"),
+            (1, 0b11, "0x2"),
+            (1, 0x8000_0000, "0x80000000"),
+            (0, u32::MAX, "0xfffffffe"),
+        ] {
+            let Some(refusal) = boundary_flags_refusal(Some(11), rank, 7, word) else {
+                panic!("word {word:#x} on rank {rank} must be refused at 11");
+            };
+            assert_eq!(refusal.exit_code(), 2);
+            match refusal {
+                ReplayError::RecordingInconsistent { detail } => assert_eq!(
+                    detail,
+                    format!(
+                        "rank {rank}'s STEP_BOUNDARY record of step 7 sets flag bits {bits}, \
+                         which trace format 11 does not define (it defines bit 0 alone, the \
+                         reopened writer runs)"
+                    )
+                ),
+                other => panic!("a bag fault, RecordingInconsistent: {other:?}"),
+            }
+        }
+        for word in [0b10u32, 0b11, 0x8000_0000, u32::MAX] {
+            assert!(
+                boundary_flags_refusal(None, 1, 7, word).is_none(),
+                "below 11 the word {word:#x} is not read"
+            );
+        }
+        assert!(StepBoundary::from_record(&boundary(0, 3, 1)).runs_reopened);
+        assert!(!StepBoundary::from_record(&boundary(0, 3, 0)).runs_reopened);
+        assert!(
+            !StepBoundary::from_record(&boundary(0, 3, 0b11)).runs_reopened,
+            "a word with an undefined bit decodes as no flag"
+        );
+    }
+
+    /// The reopen mirror's inputs on a free-run pass: the flag of the boundary
+    /// the pass is at, as rank 0's, and no rank map even where the bag has
+    /// one, over a word that carries the flag and one that does not. No engine
+    /// fixture makes this arm observable through a replay: an external or
+    /// `multi_publisher_topics` stage is annotated before every read, so a
+    /// reopen adds nothing to it; a per-set `Sync` burst's read log already
+    /// differs, its reads being staged at the matcher's own site
+    /// (`a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence`);
+    /// a stage that pops one frame a step either fits the opening pair or
+    /// refuses it at every window, so a reopen moves no read past its rim; and
+    /// a read that pops several frames decides whether its batch frames fit
+    /// before its own run opens, so as its stage's first read in a window it
+    /// stages the same batch frames at a window head as mid-window, and the
+    /// annotation it adds there is stripped from both sides of the compare.
+    /// Only a batch read that another read of its stage precedes in a reopened
+    /// window can move with this arm (`cerulion_core`'s
+    /// `a_batch_at_a_reopen_window_stages_no_frames_when_only_the_openings_push_it_past_the_rim`),
+    /// and no engine fixture builds that shape.
+    #[test]
+    fn a_free_run_pass_hands_the_reopen_mirror_its_own_boundarys_flag_and_no_rank_map() {
+        let (path, trace) = trace_of("flags_rank", &[boundary(0, 0, 0)]);
+        let pass = PassBoundaries::Rank(BoundaryCursor::for_rank(&trace, 0).unwrap());
+        let ranks: std::collections::HashMap<Arc<str>, u32> =
+            [(Arc::from("near"), 0), (Arc::from("far"), 1)]
+                .into_iter()
+                .collect();
+        for (word, want) in [(0u32, [false]), (STEP_BOUNDARY_FLAG_RUNS_REOPENED, [true])] {
+            let at = StepBoundary::from_record(&boundary(0, 5, word));
+            for map in [Some(&ranks), None] {
+                let (flags, ranked) = reopen_flags(&pass, &at, map);
+                assert_eq!(flags, &want[..], "word {word:#x}, map {}", map.is_some());
+                assert!(ranked.is_none(), "a free-run pass is one rank's stream");
+            }
+        }
+        drop(pass);
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The reopen mirror's inputs on a lockstep pass: each rank's own flag from
+    /// its cursors, and the bag's rank map itself. Hand oracle: rank 0 flags
+    /// step 1 and rank 1 flags step 2, so the steps read `[false, false]`,
+    /// `[true, false]` and `[false, true]`.
+    #[test]
+    fn a_lockstep_pass_hands_the_reopen_mirror_each_ranks_own_flag_and_the_rank_map() {
+        let records: Vec<TraceRingRecord> = (0..3u64)
+            .flat_map(|step| {
+                [
+                    boundary(0, step, u32::from(step == 1)),
+                    boundary(1, step, u32::from(step == 2)),
+                ]
+            })
+            .collect();
+        let (path, trace) = trace_of("flags_lockstep", &records);
+        let mut pass = PassBoundaries::Lockstep(
+            RankBoundaryCursors::new(&trace, 2, CoordinationMode::Lockstep).unwrap(),
+        );
+        let ranks: std::collections::HashMap<Arc<str>, u32> =
+            [(Arc::from("near"), 0), (Arc::from("far"), 1)]
+                .into_iter()
+                .collect();
+        let mut seen = Vec::new();
+        while let Some(at) = pass.next().unwrap() {
+            let (flags, ranked) = reopen_flags(&pass, &at, Some(&ranks));
+            assert!(
+                ranked.is_some_and(|map| std::ptr::eq(map, &ranks)),
+                "a lockstep pass hands the bag's own rank map"
+            );
+            seen.push((at.step, flags.to_vec()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (0, vec![false, false]),
+                (1, vec![true, false]),
+                (2, vec![false, true]),
+            ]
+        );
+        drop(pass);
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The refusal names the format the bag itself is stamped with, not the
+    /// lowest format that defines the word: a bag stamped 11 reads "trace
+    /// format 11", and one stamped 12, a later format that defines the same
+    /// word, reads "trace format 12".
+    #[test]
+    fn the_undefined_flag_refusal_names_the_bags_own_format() {
+        for format in [11u32, 12] {
+            let Some(refusal) = boundary_flags_refusal(Some(format), 2, 9, 0b110) else {
+                panic!("bits 1 and 2 must be refused at format {format}");
+            };
+            match refusal {
+                ReplayError::RecordingInconsistent { detail } => assert_eq!(
+                    detail,
+                    format!(
+                        "rank 2's STEP_BOUNDARY record of step 9 sets flag bits 0x6, which \
+                         trace format {format} does not define (it defines bit 0 alone, the \
+                         reopened writer runs)"
+                    )
+                ),
+                other => panic!("a bag fault, RecordingInconsistent: {other:?}"),
+            }
+        }
+    }
+
+    /// The same refusal through the boundary walk over a real bag: a two-rank
+    /// bag whose rank 1 sets bit 1 on step 2 is refused at 11, naming rank 1
+    /// and step 2, and walks clean below 11 and when every word is defined.
+    #[test]
+    fn the_boundary_walk_refuses_an_undefined_flag_bit_on_any_rank_at_eleven() {
+        let records = |rank1_step2: u32| -> Vec<TraceRingRecord> {
+            (0..4u64)
+                .flat_map(|step| {
+                    let rank0 = if step == 1 { 1 } else { 0 };
+                    let rank1 = if step == 2 { rank1_step2 } else { 0 };
+                    [boundary(0, step, rank0), boundary(1, step, rank1)]
+                })
+                .collect()
+        };
+        let (path, trace) = trace_of("walk_bad", &records(0b10));
+        let Err(refusal) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, Some(11))
+        else {
+            panic!("an undefined bit on rank 1 must be refused at 11");
+        };
+        let ReplayError::RecordingInconsistent { detail } = &refusal else {
+            panic!("a bag fault, RecordingInconsistent: {refusal:?}");
+        };
+        assert!(
+            detail.starts_with("rank 1's STEP_BOUNDARY record of step 2 sets flag bits 0x2,"),
+            "{detail}"
+        );
+        if let Err(e) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, None) {
+            panic!("below 11 the flags word is not read: {e:?}");
+        }
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
+
+        let (path, trace) = trace_of("walk_good", &records(STEP_BOUNDARY_FLAG_RUNS_REOPENED));
+        if let Err(e) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, Some(11)) {
+            panic!("defined words on both ranks walk clean at 11: {e:?}");
+        }
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The reopen mirror's decision over a hand table: nothing below trace
+    /// format 11 even with bit 0 set, a rank's flag reaches only that rank's
+    /// nodes, a node no rank names is never reopened, and a single-rank bag
+    /// (no node-to-rank map) puts every node at rank 0.
+    #[test]
+    fn the_reopen_mirror_reaches_exactly_the_flagged_ranks_nodes() {
+        // (window_heads_named, per-rank flags, node's rank, reopened?)
+        let cases: [(bool, &[bool], Option<u32>, bool); 12] = [
+            // Below 11 the word is not read, whatever it holds.
+            (false, &[true], Some(0), false),
+            (false, &[true, true], Some(1), false),
+            // A free-run pass: its one flag, every node at rank 0.
+            (true, &[true], Some(0), true),
+            (true, &[false], Some(0), false),
+            // A rank-1-only flag reaches rank 1's nodes and no other.
+            (true, &[false, true], Some(1), true),
+            (true, &[false, true], Some(0), false),
+            // A rank-0-only flag reaches rank 0's nodes and no other.
+            (true, &[true, false], Some(0), true),
+            (true, &[true, false], Some(1), false),
+            // Both ranks flagged.
+            (true, &[true, true], Some(1), true),
+            // A node no rank names is never reopened.
+            (true, &[true, true], None, false),
+            // A rank past the buffer flagged nothing.
+            (true, &[true, true], Some(2), false),
+            // Nothing flagged.
+            (true, &[false, false], Some(1), false),
+        ];
+        for (named, reopened, rank, expected) in cases {
+            assert_eq!(
+                reopens_node(named, reopened, rank),
+                expected,
+                "named {named}, flags {reopened:?}, rank {rank:?}"
+            );
+        }
+
+        // The rank lookup: a single-rank bag has no map and every node is
+        // rank 0's; a multi-rank bag answers each node's recorded rank, and
+        // `None` for a node no rank manifest names.
+        assert_eq!(recorded_rank_of(None, "any"), Some(0));
+        assert!(reopens_node(true, &[true], recorded_rank_of(None, "any")));
+        let ranks: std::collections::HashMap<Arc<str>, u32> =
+            [(Arc::from("src"), 0u32), (Arc::from("sink"), 1u32)]
+                .into_iter()
+                .collect();
+        assert_eq!(recorded_rank_of(Some(&ranks), "src"), Some(0));
+        assert_eq!(recorded_rank_of(Some(&ranks), "sink"), Some(1));
+        assert_eq!(recorded_rank_of(Some(&ranks), "ghost"), None);
+        assert!(!reopens_node(
+            true,
+            &[true, true],
+            recorded_rank_of(Some(&ranks), "ghost")
+        ));
+    }
+
+    /// The lockstep cursors hand back each rank's OWN flag per step, into one
+    /// buffer allocated once, and never compare the flags across ranks.
+    ///
+    /// Hand oracle: rank 0 records steps 0 to 3 and flags 1 and 3; rank 1
+    /// records steps 0 to 2 (a ragged tail) and flags 2 only. Per step the
+    /// buffer reads `[false, false]`, `[true, false]`, `[false, true]`, then
+    /// `[true, false]` with rank 1's stream ended, and the walk ends.
+    #[test]
+    fn lockstep_cursors_report_each_ranks_own_reopen_flag() {
+        let mut records = Vec::new();
+        for step in 0..4u64 {
+            records.push(boundary(0, step, u32::from(step == 1 || step == 3)));
+            if step < 3 {
+                records.push(boundary(1, step, u32::from(step == 2)));
+            }
+        }
+        let (path, trace) = trace_of("cursors", &records);
+        let mut cursors = RankBoundaryCursors::new(&trace, 2, CoordinationMode::Lockstep).unwrap();
+        let buffer = cursors.reopened_ranks().as_ptr();
+        let mut seen = Vec::new();
+        while let Some(b) = cursors.next_authoritative().unwrap() {
+            assert_eq!(
+                cursors.reopened_ranks().as_ptr(),
+                buffer,
+                "the per-rank buffer is the one allocated in new"
+            );
+            assert_eq!(
+                b.runs_reopened,
+                cursors.reopened_ranks()[0],
+                "rank 0's entry is the authoritative boundary's own flag"
+            );
+            seen.push((b.step, cursors.reopened_ranks().to_vec()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (0, vec![false, false]),
+                (1, vec![true, false]),
+                (2, vec![false, true]),
+                (3, vec![true, false]),
+            ]
+        );
+        drop(cursors);
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
     }
 }
