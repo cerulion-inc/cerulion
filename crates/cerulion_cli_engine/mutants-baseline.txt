@@ -495,10 +495,13 @@ in prepare_pass_verification
 # per-step hold bound (`verify_period`, `verify_sync`), the walk that bounds
 # it and the fires and clocks it folds (`PreFireDeferral`,
 # `step_fire_instants`, `next_clock_ns`), the text of a stand down
-# (`StandDownReason`), and the excuse a held step keeps until its consumer's
+# (`StandDownReason`), the note a held node gets (`HeldRule`,
+# `HoldAllowedForNote`, `withdraw_hold_allowed_for`), and the excuse a held
+# step keeps until its consumer's
 # read confirms it or a release with no record voids it, which the FIFO rule
 # shares (`PendingExcuse`, `FifoCarry::step`). In src/replay_engine.rs: the
-# frames-past-fires gate (`writes_past_fires`), which compares a producer's
+# note's report entry (`hold_allowed_for_note`) and the frames-past-fires
+# gate (`writes_past_fires`), which compares a producer's
 # frames with the clocks its fires ran at. The walk that reads those clocks
 # off the bag's trace (`recorded_fire_clocks`) reads the bag, which the
 # mutation rule does not cover. It is pinned in tests/replay_engine_test.rs
@@ -548,6 +551,17 @@ in prepare_pass_verification
 #          of the fires it compares them with, with `--in-diff` that merge's
 #          diff of the two files against the merge before it and the same
 #          `--re`: 7 mutants, 7 caught, all in `writes_past_fires`.
+#          Re-run over the change that reports the held node as a judged note
+#          of its own kind (`HeldRule`, `HoldAllowedForNote`,
+#          `hold_allowed_for_note` in src/replay_engine.rs, and the note's
+#          withdrawal on a later Sync stand-down, `withdraw_hold_allowed_for`)
+#          and adds the vectors a held burst past what it owed and a held then
+#          unheld Sync step needed, with `--in-diff` that change's diff of the
+#          two files and the `--re` above plus
+#          `|HeldRule::|HoldAllowedForNote|hold_allowed_for_note|withdraw_hold_allowed_for`:
+#          14 mutants: 13 caught, 1 unviable, none missed. The unviable
+#          replaces `hold_allowed_for_note` with a default its type does not
+#          have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
