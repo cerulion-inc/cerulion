@@ -472,6 +472,23 @@ in prepare_pass_verification
 #          `a_capture_with_a_frame_no_fire_sent_at_its_last_covered_step_counts_no_slot`
 #          and
 #          `a_held_rank_ending_on_a_step_with_no_recorded_fire_is_judged_through_its_proven_steps`.
+#          Re-run over the change that compares the frames of a rank's last
+#          kept step only where the bag states a capture's end cut or the rank
+#          kept a fire at that step from a level after the producer's, and
+#          otherwise only the frames below that step's clock (the frames a
+#          trace can judge, `judged_frames`, and `writes_past_fires` over
+#          them), which deletes `proven_through_step` and
+#          `proven_through_target`, with the bag's end cut statement
+#          (`capture_states_end_cut`) and the walk that finds a rank's last
+#          kept step and the top level of its fires there (`last_kept_step`),
+#          both read off bags their lib tests write, with
+#          `--re 'writes_past_fires|judged_frames|last_kept_step|capture_states_end_cut'`
+#          and `--exclude-re 'delete field'`: 22 mutants, 20 caught, 2
+#          unviable, none missed. The unviable replace `last_kept_step` and
+#          `judged_frames` with a default their types do not have. The engine
+#          vectors `a_last_step_whose_trace_kept_an_earlier_fire_alone_is_judged_below_its_clock`
+#          and `a_last_step_whose_trace_lost_the_rest_of_a_burst_is_judged_below_its_clock`
+#          pin the pass planning that calls them.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
