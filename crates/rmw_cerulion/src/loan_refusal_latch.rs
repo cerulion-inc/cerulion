@@ -851,7 +851,8 @@ pub(crate) fn report_loan_copied(
 
 /// Record a loaned take served ZERO-COPY while NO copy is outstanding:
 /// closes an open served-by-copy regime (one recovery line if anything was
-/// suppressed) and re-arms. The caller skips it while copies are held: a
+/// suppressed) and re-arms. The caller skips it while no regime is open and
+/// while copies are held: a
 /// consumer that keeps the newest N messages alternates zero-copy takes and
 /// copies for as long as it runs, and closing on each zero-copy take would
 /// print a loud head and a recovery line every few messages.

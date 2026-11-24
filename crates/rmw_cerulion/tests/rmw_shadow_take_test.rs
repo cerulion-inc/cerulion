@@ -1209,6 +1209,11 @@ fn a_panic_in_the_serve_report_of_a_copy_frees_the_copy() {
             3,
             "the three loans are untouched"
         );
+        assert_eq!(
+            sub_data(subscription).loan_copy_count(),
+            1,
+            "the copy was reported before the seam fired, as for any copy"
+        );
         teardown(node, publisher, subscription);
     }
 }

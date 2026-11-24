@@ -4125,6 +4125,9 @@ fn report_copy_regime(
         } else {
             crate::loan_refusal_latch::report_loan_served_zero_copy(&data.loan_copies, &data.topic);
         }
+        // The serve-report seam, after the last report of a take that has one.
+        #[cfg(feature = "test-seams")]
+        crate::test_seams::maybe_panic_in_loaned_serve_report();
     }))
 }
 
@@ -4186,7 +4189,7 @@ fn build_copy_shadow(
 /// which is released before the take returns. `None` when the decode refuses
 /// the frame: it is consumed and dropped through the same latch as the forged
 /// arm, `taken` false, and the shadow's `fini` frees whatever the decode copied
-/// before it stopped.
+/// before it stopped. The shadow was built for `data.bridge`.
 #[cold]
 #[inline(never)]
 unsafe fn serve_forged_copy(
@@ -4213,7 +4216,8 @@ unsafe fn serve_forged_copy(
 /// A FIXED take served by COPY (past the reserve): the fixed section, which IS
 /// the C struct, into heap words (8-aligned, and `fixed_align` is at most 8),
 /// then the sample is released before the take returns. At least one word, so
-/// every copy has its own address.
+/// every copy has its own address. The caller has already passed the framing
+/// gate: the frame's body is exactly `fixed_size` bytes.
 #[cold]
 #[inline(never)]
 unsafe fn serve_fixed_copy(
@@ -4667,9 +4671,12 @@ unsafe fn take_loaned_impl(
             &data.topic,
             crate::loan_refusal_latch::LoanServed::Loaned,
         );
-        // The seam travels WITH this reporter, inside the guarded window.
+        // The seam fires after the last report of this take: here, unless
+        // the copy-regime report below runs, which then carries it.
         #[cfg(feature = "test-seams")]
-        crate::test_seams::maybe_panic_in_loaned_serve_report();
+        if !(by_copy || close_copy_regime) {
+            crate::test_seams::maybe_panic_in_loaned_serve_report();
+        }
     }));
     // The copy-regime report runs under its own guard, out of line, so the
     // common take's guarded window is the single reporter call it always was.

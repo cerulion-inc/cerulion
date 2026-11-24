@@ -306,6 +306,15 @@ unsafe fn zero_copy_held(subscription: *const ffi::rmw_subscription_t) -> usize 
         .len()
 }
 
+/// Whether the subscription's served-by-copy regime is open.
+unsafe fn copy_regime_open(subscription: *const ffi::rmw_subscription_t) -> bool {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .copy_regime_open
+}
+
 /// True when `loaned` is a zero-copy loan: one of the held SHM samples is
 /// keyed by it. A copy is keyed by private heap memory and holds no sample.
 unsafe fn is_zero_copy(subscription: *const ffi::rmw_subscription_t, loaned: *mut c_void) -> bool {
@@ -855,7 +864,8 @@ type ServedBlob = (u32, bool, [u8; 4]);
 /// and a loan returned, the next take is zero-copy and closes it (one INFO
 /// recovery, which prints because a repeat was suppressed). Regime 2 repeats
 /// the same shape: a second WARN head (the recovery re-armed the latch) and a
-/// second recovery. A zero-copy take while no regime is open reports nothing.
+/// second recovery. The regime flag reads open after each copy and closed after
+/// each closing take, and stays closed on a zero-copy take while none is open.
 #[test]
 #[serial]
 #[traced_test]
@@ -885,10 +895,16 @@ fn the_copy_regime_closes_and_opens_again_with_one_head_and_one_recovery_each() 
         };
         for _ in 0..3 {
             take(true, &mut held);
+            assert!(!copy_regime_open(subscription), "no regime before any copy");
         }
         for _regime in 0..2 {
             take(false, &mut held);
+            assert!(copy_regime_open(subscription), "a copy opens the regime");
             take(false, &mut held);
+            assert!(
+                copy_regime_open(subscription),
+                "a second copy keeps it open"
+            );
             // The two copies sit last; give them back, then the oldest loan.
             let last = held.len() - 1;
             give_back(&mut held, last);
@@ -897,9 +913,17 @@ fn the_copy_regime_closes_and_opens_again_with_one_head_and_one_recovery_each() 
             give_back(&mut held, 0);
             // Below the reserve with no copy outstanding: zero-copy, closing it.
             take(true, &mut held);
+            assert!(
+                !copy_regime_open(subscription),
+                "the zero-copy take closes it"
+            );
         }
         give_back(&mut held, 0);
         take(true, &mut held);
+        assert!(
+            !copy_regime_open(subscription),
+            "no regime opens on a zero-copy take"
+        );
         assert_eq!(copy_count(subscription), 4, "two copies in each regime");
 
         logs_assert(|lines: &[&str]| {
