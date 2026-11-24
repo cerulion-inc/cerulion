@@ -12598,8 +12598,12 @@ mod tests {
         assert_eq!(found[0].step, 4);
 
         // Past what the step owed: three fires where max_catchup 2 owed two.
+        // Depth 3, and the sink takes step 1's frame, so the slot counts 0
+        // before step 2's sends and 3 after them: full at the step, with no
+        // release. The three fires sit on the owed grid, so only the bound
+        // that a held burst fires fewer than it owed convicts the step.
         let extra = vec![
-            timed_step(1, 5 * MS, &src(5 * MS), &[]),
+            timed_step(1, 5 * MS, &src(5 * MS), &drained),
             timed_step(
                 2,
                 40 * MS,
@@ -12607,10 +12611,17 @@ mod tests {
                 &[],
             ),
         ];
-        let capped = [held_period(5 * MS, Some(2), src_holds(1, &extra))];
+        let capped = [held_period(5 * MS, Some(2), src_holds(3, &extra))];
         let found = verify_unrestored(&capped, &extra, &[], STAMPED).findings;
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].step, 2);
+        assert_eq!(
+            (found[0].step, &found[0].expected, &found[0].recorded),
+            (
+                2,
+                &StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 15 * MS]),
+                &StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 15 * MS, EPOCH + 20 * MS])
+            )
+        );
 
         // A `period_ms` change after the onset: the recording ran 5 ms (fires
         // 5, held at 40 while the sink takes that frame, fires the owed 10 at
@@ -12694,6 +12705,11 @@ mod tests {
             &owed,
             10,
             &[100, 110, 120, 130]
+        ));
+        assert!(!is_block_held_period_burst(
+            &owed,
+            10,
+            &[100, 110, 120, 130, 140]
         ));
         assert!(!is_block_held_period_burst(&owed, 10, &[101]));
         assert!(!is_block_held_period_burst(&owed, 10, &[110]));
@@ -12795,7 +12811,8 @@ mod tests {
     /// 2, which fills the slot again, and step 3's aligned set is left unfired
     /// too. Two held steps, one stand-down. Not held, or held before it has sent a
     /// frame, or after its consumer took the frame (a step later, or in the
-    /// step that sent it), the aligned unfired step is the finding.
+    /// step that sent it), the aligned unfired step is the finding, and so is
+    /// one at the step after a held step whose read emptied the slot.
     #[test]
     fn a_held_sync_node_stands_its_owed_fire_down_once_and_is_still_judged() {
         let unheld_node = node(
@@ -12935,6 +12952,29 @@ mod tests {
         let drained = verify_unrestored(&held_over(&freed), &freed, &[], STAMPED);
         assert_eq!(drained.findings.len(), 1, "{:?}", drained.findings);
         assert_eq!(drained.findings[0].step, 2);
+
+        // Held at step 1, then not: `ctl`'s read there empties the slot, so
+        // the aligned set step 2 leaves unfired owes its fire. That step is the
+        // finding, with no caveat, beside the one note of the held step.
+        let then_unheld = vec![
+            aligned(0, EPOCH, true),
+            quiet[1].clone(),
+            aligned(2, EPOCH + 20 * MS, false),
+        ];
+        let owed = verify_unrestored(&held_over(&then_unheld), &then_unheld, &[], STAMPED);
+        assert_eq!(
+            owed.findings,
+            vec![ScheduleFinding {
+                node_id: "fusion".to_string(),
+                step: 2,
+                decider: Decider::Sync,
+                expected: StepFires::count(1),
+                recorded: StepFires::count(0),
+                unread: None,
+                caveat: None,
+            }]
+        );
+        assert_eq!(owed.stand_downs, held.stand_downs);
 
         let unheld = verify_unrestored(&[unheld_node], &quiet, &[], STAMPED);
         assert_eq!(unheld.findings.len(), 1, "{:?}", unheld.findings);

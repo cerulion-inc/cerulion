@@ -61272,8 +61272,9 @@ fn an_unheld_relay_on_a_bag_that_states_its_drain_carries_no_caveat() {
 /// the first catch-up instant it owes and the re-check holds the rest, so its
 /// counter publishes `x` 1 to 7 and the sink drains 1 to 5. The bag carries
 /// a clean record-health stamp, so the Period rule allows for the hold where
-/// the bag shows the slot full: the step 3 fires the hold deferred are judged
+/// the bag shows the slot full: the step 3 fire the hold deferred is judged
 /// with it, noted once, and the replay reproduces both topics frame for frame.
+/// Two replays are byte-identical.
 #[test]
 #[serial]
 fn a_period_source_a_block_input_in_its_rank_holds_replays_clean() {
@@ -61298,6 +61299,12 @@ fn a_period_source_a_block_input_in_its_rank_holds_replays_clean() {
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
     let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
     bh_assert_period_held_replays(&outcome, "a held period source");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 /// A `period_ms` source held by the middle node of a `block` chain: `src` (5
@@ -61312,7 +61319,8 @@ fn a_period_source_a_block_input_in_its_rank_holds_replays_clean() {
 /// 1 to 5. The bag carries a clean record-health stamp, so both rules allow
 /// for the holds where the bag shows a slot full: the step 7 fire the relay's
 /// full queue deferred is judged with the hold, noted once, and the replay
-/// reproduces the three topics frame for frame.
+/// reproduces the three topics frame for frame. Two replays are
+/// byte-identical.
 #[test]
 #[serial]
 fn a_period_source_the_middle_of_a_block_chain_holds_replays_clean() {
@@ -61347,6 +61355,12 @@ fn a_period_source_the_middle_of_a_block_chain_holds_replays_clean() {
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
     let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
     bh_assert_period_held_replays(&outcome, "a period source held by a block chain");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 /// Assert a held `period_ms` source replays clean: no data violation, no
