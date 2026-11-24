@@ -1,6 +1,6 @@
 # Installation details
 
-The [README](../README.md#install) has the commands for every route. This page holds the rest: what the installer does to your machine, how the Rust compiler is provisioned on each route, and the cases where a node build needs care.
+The [README](../README.md#install) has the commands for the install script, Homebrew and crates.io, and [APT installation](packaging/apt.md#apt-installation) has the Debian and Ubuntu recipe. This page holds the rest: what the installer does to your machine, how the Rust compiler is provisioned on each route, and the cases where a node build needs care.
 
 ## What the install script does
 
@@ -46,6 +46,15 @@ sh install_rust.sh
 ```
 
 The 2.1.0 and 2.0.0 release binaries are built with Rust 1.95.0 and the 1.0.0 binaries were built with Rust 1.93.0, each pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. The workspace's minimum is Rust 1.95, and a node does not need the compiler that built the CLI.
+
+## Homebrew
+
+```bash
+brew tap cerulion-inc/cerulion
+brew install cerulion-inc/cerulion/cerulion
+```
+
+The formula lives in the tap repository `cerulion-inc/homebrew-cerulion` and tracks stable releases. If Homebrew refuses to load the formula from this tap, run `brew trust --formula cerulion-inc/cerulion/cerulion` and try again. `brew trust` is Homebrew's own command for formulae from a tap that Homebrew does not ship, and `brew help trust` describes it. On Linux the formula carries `rmw_cerulion`. No macOS package does, because ROS 2 Jazzy has no macOS binaries. The formula does not provision Rust: run `cerulion-install-rust` once, as [Rust on the other routes](#rust-on-the-other-routes) describes.
 
 ## What the Debian package requires and ships
 

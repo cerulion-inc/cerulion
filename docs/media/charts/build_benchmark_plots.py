@@ -12,6 +12,12 @@ a manifest of every source, point, floor and output hash under docs/media/charts
 by git). It refuses to run when anything under docs/benchmarks/results differs from HEAD, so a
 figure always describes a committed package.
 
+The two SVGs are theme-aware sources (light colours in `:root`, dark colours in one
+`prefers-color-scheme: dark` block; see THEME). After a run, write their fixed-palette twins
+(docs/media/<name>-light.svg and <name>-dark.svg) with:
+
+    python3 tools/scripts/build_media_theme_variants.py
+
 Inputs, all in the tree:
   docs/benchmarks/results/            the packages: CSVs, run.json, raw .bin samples, .rate sidecars
   expected-chart-points.json          the reviewed point ledger: every plotted p50 and p99, per series
@@ -32,6 +38,10 @@ Figure style: GitHub README typography, the in-plot mark key, filled p50 dots, p
 floors recorded and not drawn, all ten payload sizes labelled, "lower is better" after the title
 in the brand blue, the p50 at the last payload printed at the right end of every line in the
 series colour, no rate strip.
+
+Printed figures: every p50 the figure prints (the line-end values and the Mac footnote range) is
+spelled as its package's HEADLINE.md prints it, microseconds to two decimals and milliseconds to
+one, and the script asserts each one against the p50 cell of that package's row before it draws.
 """
 from __future__ import annotations
 import csv
@@ -74,6 +84,7 @@ HEROES_STOCK_ROS2_CELL = 'jazzy_stock_rclcpp_chrt0'
 JETSON = RESULTS/'9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx'
 MAC = RESULTS/'446db2afb7d26dbc-2026-11-13-fixed100-apple-m4'
 MAC_BUILD, MAC_OS = 'Cerulion 2.0.0', 'macOS 27.2.1'
+JETSON_OS = 'Linux for Tegra R36.4.3'
 EXPECTED_SIZES = [64,256,1024,4096,16384,65536,262144,1048576,4194304,16777216]
 SIZE_LABELS = ['64 B','256 B','1 KiB','4 KiB','16 KiB','64 KiB','256 KiB','1 MiB','4 MiB','16 MiB']
 COLORS = dict(multi='#2563EB', single='#089D9E', stock='#D36B26', composed='#74708C', zenoh='#B58900',
@@ -85,7 +96,33 @@ FRAME = '#CCD7E3'
 STRIP_BG = '#F6F8FA'
 STRIP_BAR = '#C5D0DC'
 KEY_INK = '#4B5F78'
-DASH = dict(solid='-', dashed=(0,(6,3)), shortdash=(0,(3,2.4)), dashdot=(0,(6,2.5,1.8,2.5)), dotted=(0,(1.4,2.6)))
+BRAND = '#5D7491'
+# The SVGs are theme-aware: every colour is a CSS custom property, with the light value in `:root`
+# and the dark value in one `prefers-color-scheme: dark` block. The light values are the colours
+# above, so the light drawing is unchanged; tools/scripts/build_media_theme_variants.py writes the
+# fixed `-light` and `-dark` twins the README names in a <picture> block. The dark values are for
+# GitHub's dark page (#0d1117): every series and every text colour at least 3:1 against it, and
+# the series more distinct than the light ones (oklab), with the line styles as a second encoding.
+# One entry per light colour: the stock ROS 2 and Jetson series share the orange. The PNG twins
+# under out/ keep the light palette.
+THEME = [  # (custom property, light, dark)
+    ('paper', '#ffffff', '#0d1117'),          # figure and plot ground, marker rims, the key box
+    ('text', TEXT, '#e6edf3'),
+    ('muted', MUTED, '#9198a1'),
+    ('grid', GRID, '#262c36'),
+    ('frame', FRAME, '#3d444d'),
+    ('key-ink', KEY_INK, '#9ba7b4'),
+    ('brand', BRAND, '#7d8fa6'),
+    ('blue', COLORS['multi'], '#4588f7'),
+    ('teal', COLORS['single'], '#1ba79f'),
+    ('orange', COLORS['stock'], '#d66400'),
+    ('slate', COLORS['composed'], '#b6aacd'),
+    ('gold', COLORS['zenoh'], '#dcbc33'),
+    ('magenta', COLORS['rmw'], '#c955c8'),
+    ('red', COLORS['mac'], '#e63e84'),
+]
+assert COLORS['jetson']==COLORS['stock'] and len({light.lower() for _,light,_ in THEME})==len(THEME)
+DASH =dict(solid='-', dashed=(0,(6,3)), shortdash=(0,(3,2.4)), dashdot=(0,(6,2.5,1.8,2.5)), dotted=(0,(1.4,2.6)))
 
 # --- typography -----------------------------------------------------------------
 LAYOUT_SANS = ['Helvetica Neue', 'Helvetica']
@@ -305,10 +342,11 @@ jetson_floor=floor_row_p50_range(JETSON/'results_iox2_chrt0.csv')
 assert not (MAC/'results_iox2_chrt0.csv').exists(), 'Mac package carries a raw iceoryx2 row: cite its floor like the Jetson one'
 assert all(t in (MAC/'PROVENANCE.txt').read_text() for t in (MAC_BUILD,MAC_OS)), 'Mac footnote build or OS missing from the package provenance'
 record_source(MAC/'PROVENANCE.txt',role='Mac build and OS named in the platform footnote')
+assert all(t in (JETSON/'HEADLINE.md').read_text() for t in (JETSON_OS,'schedutil governor')), 'Jetson footnote OS or governor missing from the package headline'
+assert "schedutil IS this Jetson's stock governor" in (JETSON/'PROVENANCE.txt').read_text(), 'Jetson footnote: the package no longer calls schedutil the stock governor'
+record_source(JETSON/'PROVENANCE.txt',role='Jetson OS and governor named in the platform footnote')
 
 def us(ns): return ns/1000
-def fmt_range_us(values_ns):
-    return f'{us(min(values_ns)):.2f} to {us(max(values_ns)):.2f} µs'
 def date_of(package_dir):
     m=re.search(r'(\d{4}-\d{2}-\d{2})',package_dir.name); return m.group(1)
 
@@ -364,8 +402,39 @@ def latency_axis(ax, ymin, ymax, ticks):
     ax.set_ylabel('Round-trip latency',labelpad=12)
 
 def fmt_value(ns):
+    """A p50 as the packages' HEADLINE.md prints it: microseconds to two decimals, milliseconds to one."""
     v=ns/1000
-    return f'{v/1000:.3g} ms' if v>=1000 else f'{v:.3g} µs'
+    return f'{v/1000:.1f} ms' if v>=1000 else f'{v:.2f} µs'
+
+# The HEADLINE.md cell name of each CSV cell, for the printed-figure assertion below.
+HEADLINE_CELLS={'cerulion_workspace_split':'Cerulion split','cerulion_workspace_mono':'Cerulion mono',
+                'jazzy_stock_rclcpp':'stock ROS 2','jazzy_composed_ipcon_rclcpp':'ROS 2 composed+IPC',
+                'zenoh_shm':'zenoh SHM','jazzy_cerulion_shm_loan_be1':'ROS 2 over rmw_cerulion (loan)'}
+def printed_p50(series, payload_bytes):
+    """The p50 of `series` at `payload_bytes`, spelled by fmt_value, asserted to be the p50 cell its package's
+    HEADLINE.md prints for that cell and size: a row `| cell | size | p50 |`, or `| size | p50 |` under a
+    `## cell` heading. A figure on a chart is a figure the package prints."""
+    point=next(p for p in series['points'] if p['payload_bytes']==payload_bytes)
+    label=fmt_value(point['p50_ns'])
+    csv_path=SOURCE/series['source']
+    cell=HEADLINE_CELLS[re.fullmatch(r'results_(.+)_chrt0\.csv',csv_path.name).group(1)]
+    package=next(d for d in csv_path.parents if (d/'HEADLINE.md').exists())
+    headline=(package/'HEADLINE.md').read_text()
+    size=SIZE_LABELS[EXPECTED_SIZES.index(payload_bytes)]
+    in_row=f'| {cell} | {size} | {label} |' in headline
+    in_section=any(sec.startswith(cell) and f'\n| {size} | {label} |' in sec for sec in headline.split('\n## ')[1:])
+    assert in_row or in_section, f'{package.name}/HEADLINE.md prints no p50 {label} for {cell} at {size}'
+    record_source(package/'HEADLINE.md',role='prints every p50 the figures print')
+    return label
+def end_label_entries(series_list, colors):
+    return [(us(s['points'][-1]['p50_ns']),c,printed_p50(s,s['points'][-1]['payload_bytes']))
+            for s,c in zip(series_list,colors,strict=True)]
+def printed_range(series):
+    """'lo to hi µs' over the series' p50s, each end a p50 its package prints."""
+    lo=min(series['points'],key=lambda p:p['p50_ns']); hi=max(series['points'],key=lambda p:p['p50_ns'])
+    a,b=printed_p50(series,lo['payload_bytes']),printed_p50(series,hi['payload_bytes'])
+    assert a.endswith(' µs') and b.endswith(' µs'), (a,b)
+    return f'{a[:-3]} to {b}'
 
 def curve(ax, series, label, color, linestyle='-', zorder=3):
     """Band p50..p99, line through the p50s, filled p50 dot. The per-point floor is
@@ -549,7 +618,7 @@ def footer(fig,height_pt,lines):
     for i,line in enumerate(wrapped):
         top=FOOT_LAST_TOP+FOOT_PITCH*(len(wrapped)-1-i)
         fig.text(LEFT,top/height_pt,line,fontsize=SIZE['footnote'],color=MUTED,ha='left',va='top')
-    fig.text(RIGHT+.035,BRAND_Y/height_pt,'CERULION',fontsize=SIZE['brand'],fontweight='bold',color='#5D7491',ha='right',va='baseline')
+    fig.text(RIGHT+.035,BRAND_Y/height_pt,'CERULION',fontsize=SIZE['brand'],fontweight='bold',color=BRAND,ha='right',va='baseline')
     return wrapped
 
 def wrapped_count(lines):
@@ -594,6 +663,32 @@ def uniquify_svg_ids(path,prefix):
     dup=sorted({i for i in ids if ids.count(i)>1}); assert not dup, f'duplicate svg ids in {path.name}: {dup[:8]}'
     path.write_text(text)
     return len(ids)
+
+MPL_STYLE='<style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>'
+def theme_aware(path):
+    """Replace every colour in the SVG with its THEME custom property and declare the light and the dark
+    values in the SVG's one style element. Refuse a colour THEME does not name, and a colour left behind."""
+    text=path.read_text(encoding='utf-8')
+    assert 'prefers-color-scheme' not in text and 'var(--' not in text and text.count(MPL_STYLE)==1, path.name
+    named=set(re.findall(r'\b(?:fill|stroke|color|stop-color): ([a-z]+)',text))
+    assert named<={'none'}, f'{path.name}: named colours {named}'
+    name_of={light.lower():name for name,light,_ in THEME}
+    used=[]
+    def swap(m):
+        light=m.group(0).lower()
+        assert light in name_of, f'{path.name}: colour {light} has no dark value in THEME'
+        if name_of[light] not in used: used.append(name_of[light])
+        return f'var(--{name_of[light]})'
+    # matplotlib writes every colour as a six-digit hex inside a style attribute
+    text=re.sub(r'style="[^"]*"',lambda s:re.sub(r'#[0-9a-fA-F]{6}\b',swap,s.group(0)),text)
+    # after uniquify_svg_ids every #reference starts with the figure name, which is not hex
+    assert not re.search(r'#[0-9a-fA-F]{3,8}\b',text), f'{path.name}: a colour outside a style attribute'
+    light=';'.join(f'--{n}:{l.lower()}' for n,l,_ in THEME if n in used)
+    dark=';'.join(f'--{n}:{d}' for n,_,d in THEME if n in used)
+    text=text.replace(MPL_STYLE,MPL_STYLE[:-len('</style>')]+f':root{{{light}}}@media(prefers-color-scheme:dark){{:root{{{dark}}}}}</style>')
+    path.write_text(text,encoding='utf-8')
+    return [n for n,_,_ in THEME if n in used]
+
 def scrub_check(text):
     assert not re.search('[\u2013\u2014]',text), 'en or em dash in output'
     for prefix in ('/'+'Users'+'/', '/'+'home'+'/'):
@@ -637,6 +732,7 @@ def save(fig,name,series,notes,extra,added=(),added_info=None):
     fig.savefig(svg,metadata=metadata)
     families=github_typography(svg)
     svg_ids=uniquify_svg_ids(svg,name)
+    svg_theme=theme_aware(svg)
     for legend in fig.legends:          # raster twin: one face per label, so uniform sans
         for text in legend.get_texts():
             text.set_fontfamily(LAYOUT_SANS)
@@ -652,7 +748,8 @@ def save(fig,name,series,notes,extra,added=(),added_info=None):
         'points_sha256':points_sha,'points_sha256_equals_reviewed_hash':True,
         'floors':floors,'floors_sha256':floors_sha,
         'svg_sha256':sha(svg),'png_sha256':sha(png),
-        'svg_font_families':families,'svg_id_prefix':name,'svg_id_count':svg_ids,'figure_size_in':[round(v,3) for v in fig.get_size_inches()],
+        'svg_font_families':families,'svg_id_prefix':name,'svg_id_count':svg_ids,
+        'svg_theme':{'custom_properties':svg_theme,'twins':[f'docs/media/{name}-light.svg',f'docs/media/{name}-dark.svg']},'figure_size_in':[round(v,3) for v in fig.get_size_inches()],
         'render_css_px':[round(fig.get_figwidth()*72*4/3),round(fig.get_figheight()*72*4/3)],
         **extra,
     }
@@ -695,7 +792,7 @@ for i,(series,label,color,style) in enumerate(zip(main_series,labels+[rmw_on_mai
     series['display_label']=label
     curve(ax,series,label,color,linestyle=style,zorder=10-i)
 payload_axis(ax,strip);latency_axis(ax,1,300000,[1,10,100,1000,10000,100000])
-ends=end_labels(ax,[(us(s['points'][-1]['p50_ns']),c,fmt_value(s['points'][-1]['p50_ns'])) for s,c in zip(main_series,main_colors,strict=True)])
+ends=end_labels(ax,end_label_entries(main_series,main_colors))
 series_legend(fig,height_pt,legend_top,*ax.get_legend_handles_labels(),ncol=2,columnspacing=2.2)
 key=draw_key(fig,height_pt,key_top)
 foot_lines=footer(fig,height_pt,foot)
@@ -738,9 +835,9 @@ def signed_range(values):
     return f'{lo:.1f} to {hi:.1f} µs above'
 foot=[
     'Commanded 100 Hz; five sessions, 10,000 samples per point. Always-on recording included. Payload fill excluded.',
-    'Jetson: NV Power Mode 40 W, governor schedutil, CPU clock capped at 1.4976 GHz (hardware max 1.984 GHz).',
+    f'Jetson: {JETSON_OS}, governor schedutil, the stock governor of the Jetson.',
     f'Mac: {MAC_BUILD} on {MAC_OS}, measured {mac_date}, a later build than the x86-64 and Jetson rows. A multi-process consumer wakes on the publish. '
-    f'Multi-process p50 {fmt_range_us(p50s(mac_split))}, single-process p50 {fmt_range_us(p50s(mac_mono))}.',
+    f'Multi-process p50 {printed_range(mac_split)}, single-process p50 {printed_range(mac_mono)}.',
 ]
 strip_pt=0
 legend_top,key_top,top_pt=header_height(len(subtitle),legend_rows=2)
@@ -751,7 +848,7 @@ for i,(series,color,style) in enumerate(zip(platforms,six_colors,six_styles,stri
 pl_floor=min(us(f['floor_ns']) for s_ in platforms for f in s_['v5']['floor'])
 ymin_pl=1.5 if pl_floor>=1.7 else 1
 payload_axis(ax,strip);latency_axis(ax,ymin_pl,300,[t for t in (1,2,3,10,30,100,300) if t>=ymin_pl])
-ends=end_labels(ax,[(us(s['points'][-1]['p50_ns']),c,fmt_value(s['points'][-1]['p50_ns'])) for s,c in zip(platforms,six_colors,strict=True)])
+ends=end_labels(ax,end_label_entries(platforms,six_colors))
 platform_handles=[Line2D([],[],color=c,lw=2.2,marker='o',markersize=6.4,markerfacecolor=c,markeredgecolor='white',markeredgewidth=.9) for c in platform_colors]
 shape_handles=[Line2D([],[],color=KEY_INK,lw=2.2,linestyle=s) for s in (DASH['solid'],DASH['dashed'])]
 series_legend(fig,height_pt,legend_top,platform_handles,platform_names,ncol=3,columnspacing=2.2)
@@ -765,7 +862,7 @@ save(fig,'platform-rtt',platforms,{'title':'Native Cerulion on three platforms',
     'platform_of_series':[{'series':i,'platform':platform_names[i//2],'shape':platforms[i]['display_label'],'colour':six_colors[i],'style':str(six_styles[i])} for i in range(6)],
     'footnote_numbers_read':{'jetson_floor_p50_ns':jetson_floor,'x86_floor_p50_ns':x86_floor,'jetson_elevation_ns':jet_elev,'x86_elevation_ns':x86_elev,
                              'mac_split_p50_ns':p50s(mac_split),'mac_mono_p50_ns':p50s(mac_mono),'mixed_cells':mixed_cells,
-                             'jetson_machine_configuration_source':'the footnote: machine configuration recorded after the campaign, not a measured latency'},
+                             'jetson_configuration_source':'the footnote: the OS and governor the package HEADLINE.md and PROVENANCE.txt print, not a measured latency'},
     'subtitle':subtitle,'footnote_lines':foot_lines,
 },{'mark_key':key,'end_labels':ends})
 

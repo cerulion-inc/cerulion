@@ -6,6 +6,10 @@ run it, record it, and verify a code change against the recording.
 
 New to Cerulion? Run the [README quickstart](../../README.md#quickstart) first: it records and verifies a ready-made version of this controller and tries the harness, and this tutorial then builds one from scratch.
 
+![A terminal creates the starter, records a run, gets replay PASS, changes the controller and gets a divergence on the same recording.](../media/quickstart-record-verify.gif)
+
+This is a recording of the commands of the README's [runtime trial](../../README.md#try-the-runtime) on Cerulion 2.1.0, made after an off-screen sign-in and warm-up build, with the waits sped up ([how it was recorded](../media/README.md#assets-the-root-readme-uses)).
+
 **What you'll build:**
 
 ```
