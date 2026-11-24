@@ -3678,6 +3678,25 @@ fn verify_sync(
             }
             continue;
         }
+        // A step whose slot answers void an earlier held step's excuse
+        // convicts that step, whatever this step's reads and fires give: the
+        // void rests on the slots alone, so it comes before a stand-down of
+        // the rule from this step's reads and before arms B and A.
+        if let Some(void) = PendingExcuse::voided(&excuses, deferral.slot_steps(), step.step) {
+            report.findings.push(ScheduleFinding {
+                node_id: node.node_id.clone(),
+                step: void.step,
+                decider: Decider::Sync,
+                expected: StepFires::count(void.supply),
+                // A held step fired no set.
+                recorded: StepFires::count(0),
+                unread: None,
+                caveat: Some(FindingCaveat::UnrecordedRelease {
+                    release_step: void.release_step,
+                }),
+            });
+            return;
+        }
         // Per-step WIDE evidence. `records` is the SUPPLY scale (a count, never
         // stored) and `candidates` the FEASIBILITY scale (bounded by
         // `SYNC_CANDIDATE_CAP`).
@@ -3915,21 +3934,14 @@ fn verify_sync(
                 OwedFire::StandsDown => {}
             }
         }
-        if let Some(void) = PendingExcuse::settle(&mut excuses, deferral.slot_steps(), step.step) {
-            report.findings.push(ScheduleFinding {
-                node_id: node.node_id.clone(),
-                step: void.step,
-                decider: Decider::Sync,
-                expected: StepFires::count(void.supply),
-                // A held step fired no set.
-                recorded: StepFires::count(0),
-                unread: None,
-                caveat: Some(FindingCaveat::UnrecordedRelease {
-                    release_step: void.release_step,
-                }),
-            });
-            return;
-        }
+        // The step's own excuse waits on the slots that held there, and a
+        // read of a slot confirms every excuse it gave; the check above
+        // already reported any void this step's slots give.
+        let voided = PendingExcuse::settle(&mut excuses, deferral.slot_steps(), step.step);
+        debug_assert!(
+            voided.is_none(),
+            "the check before the step's reads reports every void its slots give"
+        );
 
         // ── carry forward ─────────────────────────────────────────────────
         //
@@ -4156,6 +4168,20 @@ fn verify_fifo(
         let popped = match fifo_step_pops(&node.node_id, trigger_inputs, &step.reads, trust) {
             Ok(popped) => popped,
             Err(reason) => {
+                // The step's slot answers can void an earlier held step's
+                // excuse, which convicts that step whatever this step's reads
+                // give its pop count: the void rests on the slots alone.
+                if let Some(void) = carry.voided_at(
+                    step.step,
+                    step.clock_ns,
+                    next_clock,
+                    &fires,
+                    &step.reads,
+                    trust,
+                ) {
+                    report_fifo_void(node, steps, void, owed_fire, report);
+                    return;
+                }
                 report.stand_downs.push(StandDown {
                     node_id: node.node_id.clone(),
                     decider: Decider::FifoPop,
@@ -4177,30 +4203,7 @@ fn verify_fifo(
         );
         let supply = judged.supply;
         if let Some(void) = judged.voided {
-            let excused = steps
-                .iter()
-                .find(|s| s.step == void.step)
-                .map_or(StepFires::count(0), |s| {
-                    recorded_fires(s, &node.node_id, false)
-                });
-            match owed_fire {
-                OwedFire::Judged => report.findings.push(ScheduleFinding {
-                    node_id: node.node_id.clone(),
-                    step: void.step,
-                    decider: Decider::FifoPop,
-                    expected: StepFires::count(void.supply),
-                    recorded: excused,
-                    unread: None,
-                    caveat: Some(FindingCaveat::UnrecordedRelease {
-                        release_step: void.release_step,
-                    }),
-                }),
-                OwedFire::StandsDown => report.stand_downs.push(StandDown {
-                    node_id: node.node_id.clone(),
-                    decider: Decider::FifoPop,
-                    reason: StandDownReason::FifoUnfiredSinceAnchor,
-                }),
-            }
+            report_fifo_void(node, steps, void, owed_fire, report);
             return;
         }
 
@@ -4244,6 +4247,43 @@ fn verify_fifo(
             }
             return;
         }
+    }
+}
+
+/// Report the FIFO step a later release voided ([`VoidedExcuse`]): a finding
+/// at that step, its supply against the fires it recorded, with the caveat
+/// that says why; or, for a node the pass never ran whose stop the checkpoint
+/// does not state, the rule's stand-down by name.
+fn report_fifo_void(
+    node: &NodeDecl,
+    steps: &[RecordedStep],
+    void: VoidedExcuse,
+    owed_fire: OwedFire,
+    report: &mut RederivationReport,
+) {
+    let excused = steps
+        .iter()
+        .find(|s| s.step == void.step)
+        .map_or(StepFires::count(0), |s| {
+            recorded_fires(s, &node.node_id, false)
+        });
+    match owed_fire {
+        OwedFire::Judged => report.findings.push(ScheduleFinding {
+            node_id: node.node_id.clone(),
+            step: void.step,
+            decider: Decider::FifoPop,
+            expected: StepFires::count(void.supply),
+            recorded: excused,
+            unread: None,
+            caveat: Some(FindingCaveat::UnrecordedRelease {
+                release_step: void.release_step,
+            }),
+        }),
+        OwedFire::StandsDown => report.stand_downs.push(StandDown {
+            node_id: node.node_id.clone(),
+            decider: Decider::FifoPop,
+            reason: StandDownReason::FifoUnfiredSinceAnchor,
+        }),
     }
 }
 
@@ -5016,6 +5056,24 @@ impl PendingExcuse {
         }
     }
 
+    /// The earliest of the `pending` excuses that the last step's slot answers
+    /// (`slots`, at `step`) void: every slot that vouches for it shows a
+    /// release with no record there. It changes nothing: [`Self::settle`] voids
+    /// the same excuse, then confirms and drops the rest. A slot that holds at
+    /// a step shows no release there ([`SlotBound::step`]), so the step's own
+    /// excuse is never voided at that step, and a rule can ask this before it
+    /// judges the step.
+    fn voided(pending: &[Self], slots: &[SlotStep], step: u64) -> Option<VoidedExcuse> {
+        pending
+            .iter()
+            .find(|e| e.slots.iter().all(|&i| slots[i].unrecorded_release))
+            .map(|e| VoidedExcuse {
+                step: e.step,
+                supply: e.supply,
+                release_step: step,
+            })
+    }
+
     /// Settle the `pending` excuses on the last step's slot answers (`slots`,
     /// at `step`): a slot that showed a release stops vouching for each, and
     /// the earliest one no slot vouches for any more is voided; then a
@@ -5129,6 +5187,25 @@ impl FifoCarry {
             outcome,
             voided,
         }
+    }
+
+    /// Fold in `step`, which the rule cannot judge from its reads, and give
+    /// the earlier held step its slot answers void, if any
+    /// ([`PendingExcuse::voided`]). The rule stops at that step either way, so
+    /// nothing else is carried.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn voided_at(
+        &mut self,
+        step: u64,
+        clock_ns: u64,
+        next_clock_ns: Option<u64>,
+        fires: &[(&str, u64)],
+        reads: &[RecordedRead],
+        trust: RoleTrust,
+    ) -> Option<VoidedExcuse> {
+        self.deferral
+            .step(step, clock_ns, next_clock_ns, fires, reads, trust);
+        PendingExcuse::voided(&self.pending, self.deferral.slot_steps(), step)
     }
 
     /// Fold in a step the rule does not judge, so the bounds keep moving.
@@ -11835,6 +11912,30 @@ mod tests {
         );
     }
 
+    /// The step that shows the release voids the hold whatever the step's own
+    /// reads give its pop count: a truncated read of the relay's input at step
+    /// 4, which stands the rule down from there, comes after the void.
+    #[test]
+    fn a_hold_a_later_release_voids_is_the_finding_before_that_steps_stand_down() {
+        let mut steps = voided_hold_steps(("relay", 0, 0, 0));
+        steps[4].reads.push(read_with_role(
+            "relay",
+            "inp",
+            ReadOutcomeKind::Truncated,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        ));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        assert_eq!(
+            report.findings[0].caveat,
+            Some(FindingCaveat::UnrecordedRelease { release_step: 4 })
+        );
+        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+    }
+
     /// A read of the slot by its consumer after the hold shows the slot armed
     /// at it, so a later count past the depth leaves the hold standing: the
     /// same steps with the sink reading its frame at step 3 read clean.
@@ -13123,6 +13224,64 @@ mod tests {
             voided,
             verify_unrestored(&held_over(&unread), &unread, &[], STAMPED)
         );
+
+        // The step that shows the release voids the held step whatever else
+        // its reads or fires give: a stand-down of the rule from its own reads
+        // (a head stamped before step 1's, a truncated read, a drain-site read
+        // with no wire stamp), or a set-supply ceiling its two fires on one
+        // carried set would break, comes after the void.
+        let mut regressed = unread.clone();
+        regressed[2].reads = vec![head("a", EPOCH)];
+        let mut truncated = unread.clone();
+        truncated[2].reads = vec![read_with_role(
+            "fusion",
+            "a",
+            ReadOutcomeKind::Truncated,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        )];
+        let mut unstamped = unread.clone();
+        unstamped[2].reads = vec![read_with_role(
+            "fusion",
+            "a",
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            None,
+            ReadSiteRole::Drain,
+        )];
+        let mut twice = unread.clone();
+        twice[2].fires.push(fire("fusion", EPOCH + 100 * MS));
+        let shapes = [
+            ("regressed", regressed),
+            ("truncated", truncated),
+            ("unstamped", unstamped),
+            ("fired twice", twice),
+        ];
+        let judged: Vec<_> = shapes
+            .iter()
+            .map(|(shape, steps)| {
+                let report = verify_unrestored(&held_over(steps), steps, &[], STAMPED);
+                (
+                    *shape,
+                    report.findings,
+                    report.stand_downs,
+                    report.holds_allowed_for,
+                )
+            })
+            .collect();
+        let expected: Vec<_> = shapes
+            .iter()
+            .map(|(shape, _)| {
+                (
+                    *shape,
+                    voided.findings.clone(),
+                    Vec::new(),
+                    vec![held_note("fusion", HeldRule::Sync)],
+                )
+            })
+            .collect();
+        assert_eq!(judged, expected);
 
         let mut read = unread.clone();
         read[1].reads.push(read_with_role(
