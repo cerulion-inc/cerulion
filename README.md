@@ -487,6 +487,14 @@ The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-1
 
 On one x86-64 Linux desktop, a native Cerulion multi-process round trip had a median of 4.07 µs at 64 B and 4.08 µs at 1 MiB, with always-on recording. At the same sizes, ROS 2 Jazzy read 311.11 µs and 11.0 ms on `rmw_fastrtps_cpp` defaults, not a tuned setup, and 24.64 µs and 29.79 µs composed with intra-process. Jazzy nodes that publish and take loaned messages on `rmw_cerulion` read 10.45 µs at 64 B ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)). These figures time the transport only.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/native-rtt-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/media/native-rtt-light.svg">
+  <img src="docs/media/native-rtt.svg" alt="Native round-trip latency, with median lines and p50-to-p99 bands, from 64 B to 16 MiB.">
+</picture>
+
+The stock ROS 2 lane pipelines requests, so at 16 MiB a round trip outlasts the 10 ms pacing interval and requests overlap in flight. The [benchmark suite](benches/latency/README.md) documents the process layouts and timing boundaries.
+
 <details>
 <summary>The latency table, and what these figures leave out</summary>
 
@@ -516,6 +524,14 @@ The [evidence page](docs/evidence.md) has the rest: the cost of a solved start s
 Cerulion Studio (early access) streams a real six-axis arm's ROS 2 and MoveIt data through Cerulion into a live 3D view. No AI model drives the arm, and the pauses between moves are cut ([how it was made](docs/media/README.md#assets-the-root-readme-uses)).
 
 Cerulion has run this arm with MoveIt 2 on `rmw_cerulion`, and has run on an [NVIDIA Jetson Orin NX](docs/benchmarks/results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/) and an [Apple M4](docs/benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/), each with a latency package. The [examples](#examples) are written for a Unitree Go2, an Intel RealSense camera and a V4L2 camera.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/platform-rtt-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/media/platform-rtt-light.svg">
+  <img src="docs/media/platform-rtt.svg" alt="Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.">
+</picture>
+
+The Apple M4 row is measured on Cerulion 2.0.0 under macOS 27.2.1, a later build than the x86-64 and Jetson rows, in which a multi-process consumer wakes on the publish. [macOS two-process data wake](docs/PERFORMANCE.md#macos-two-process-data-wake) measures that change on its own, before and after, on an Apple M3 Max. Lines show p50 and bands extend to p99. Both figures show round trips.
 
 ## Build on the runtime
 
