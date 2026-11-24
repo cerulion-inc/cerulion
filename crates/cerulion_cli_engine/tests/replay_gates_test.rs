@@ -1077,7 +1077,8 @@ fn a_node_stop_record_past_its_manifest_is_exit_2() {
 }
 
 /// The version gate sits at the node-stops format: a bag stamped one past it
-/// is refused up front with the upgrade message (exit 2), whatever its records.
+/// is refused as a recording from a newer Cerulion (exit 2), whatever its
+/// records.
 #[test]
 fn a_bag_stamped_past_the_node_stops_format_is_refused_with_the_upgrade_message() {
     let (_dir, path) = tmp_bag("format_past_node_stops.mcap");
@@ -1086,17 +1087,11 @@ fn a_bag_stamped_past_the_node_stops_format_is_refused_with_the_upgrade_message(
     atts.push(recorder_att(Some(past)));
     write_bag(&path, &[fire(0, 1), fire(0, 2)], &atts, true);
     let err = gate(&path);
-    match &err {
-        ReplayError::RecordingInconsistent { detail } => {
-            assert!(
-                detail.contains(&format!("version {past}"))
-                    && detail.to_lowercase().contains("newer")
-                    && detail.to_lowercase().contains("upgrade"),
-                "expected the upgrade message for format {past}, got: {detail}"
-            );
-        }
-        other => panic!("expected RecordingInconsistent (format {past}), got {other:?}"),
-    }
+    assert!(
+        matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "expected TraceFormatTooNew (format {past}), got {err:?}"
+    );
+    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", past));
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -1719,29 +1714,47 @@ fn legitimately_marked_fire_passes_the_rank_gate() {
     );
 }
 
-/// Version gate — NEWER bag: a `trace_format` GREATER than this binary supports
-/// is refused up front with the explicit "newer Cerulion; upgrade to replay"
-/// message (exit 2), NOT a generic mis-decode.
+/// The sentence the format refusal renders, written out: `by` is the
+/// ` (<stamp>)` after "a newer Cerulion", or empty for a bag whose recorder
+/// stamp is absent or not a plain version token.
+fn format_too_new_sentence(by: &str, recorded: u32) -> String {
+    format!(
+        "this bag was recorded by a newer Cerulion{by}: its scheduler-trace format is version \
+         {recorded}, and this Cerulion ({}) reads up to version {}. Upgrade Cerulion to replay \
+         it.",
+        env!("CARGO_PKG_VERSION"),
+        cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT
+    )
+}
+
+/// The sentence the unknown-coordination refusal renders, written out: `by`
+/// as for [`format_too_new_sentence`], `value` the stamp as JSON text.
+fn coordination_unknown_sentence(by: &str, value: &str) -> String {
+    format!(
+        "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is {value}, \
+         which this Cerulion ({}) does not know. Upgrade Cerulion to replay it.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Version gate, NEWER bag: a `trace_format` GREATER than this binary supports
+/// is refused as a recording from a newer Cerulion, naming its recorder, both
+/// formats and the upgrade (exit 2), never a mis-decode and never a corrupt
+/// bag.
 #[test]
 fn newer_trace_format_is_refused_with_upgrade_message_exit_2() {
     let (_dir, path) = tmp_bag("newer_format.mcap");
     let mut atts = replay_grade_attachments(&["node0"]);
-    // Far newer than SUPPORTED_TRACE_FORMAT (whatever it currently is — the
+    // Far newer than SUPPORTED_TRACE_FORMAT, whatever it currently is (the
     // boundary itself is pinned by `supported_trace_format_at_boundary_is_accepted`).
     atts.push(recorder_att(Some(999)));
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    match &err {
-        ReplayError::RecordingInconsistent { detail } => {
-            assert!(
-                detail.contains("version 999")
-                    && detail.to_lowercase().contains("newer")
-                    && detail.to_lowercase().contains("upgrade"),
-                "expected an explicit upgrade message, got: {detail}"
-            );
-        }
-        other => panic!("expected RecordingInconsistent (newer trace_format), got {other:?}"),
-    }
+    assert!(
+        matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "expected TraceFormatTooNew, got {err:?}"
+    );
+    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", 999));
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -1755,13 +1768,11 @@ fn absent_trace_format_is_version_1_backcompat() {
     atts.push(recorder_att(None)); // legacy recorder.json (no trace_format)
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    // The version gate did not fire — the "upgrade to replay" message is absent.
-    if let ReplayError::RecordingInconsistent { detail } = &err {
-        assert!(
-            !detail.to_lowercase().contains("newer cerulion"),
-            "an absent trace_format must be treated as v1, not refused: {detail}"
-        );
-    }
+    // The version gate did not fire.
+    assert!(
+        !matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "an absent trace_format must be treated as v1, not refused: {err}"
+    );
 }
 
 /// Version gate — trace_format == SUPPORTED is accepted (the boundary): a bag at
@@ -1778,12 +1789,10 @@ fn supported_trace_format_at_boundary_is_accepted() {
     )));
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    if let ReplayError::RecordingInconsistent { detail } = &err {
-        assert!(
-            !detail.to_lowercase().contains("newer cerulion"),
-            "trace_format == SUPPORTED must be accepted: {detail}"
-        );
-    }
+    assert!(
+        !matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "trace_format == SUPPORTED must be accepted: {err}"
+    );
 }
 
 // ── The coordination stamp at the replay ENTRY ───────────────────────────
@@ -2017,25 +2026,57 @@ fn an_unknown_coordination_value_on_a_supported_format_is_refused_by_name() {
     ));
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    match &err {
-        ReplayError::RecordingInconsistent { detail } => {
-            assert!(
-                detail.contains("quantum_entangled"),
-                "the refusal quotes the VALUE it could not read: {detail}"
-            );
-            assert!(detail.contains("coordination"), "…names the key: {detail}");
-            assert!(
-                detail.to_uppercase().contains("NEWER") && detail.contains("upgrade"),
-                "…and says where the support is: {detail}"
-            );
-            assert!(
-                !detail.contains("version"),
-                "an unknown VALUE is not a version refusal — that arm is separate: {detail}"
-            );
-        }
-        other => panic!("expected RecordingInconsistent (unknown coordination), got {other:?}"),
-    }
+    assert!(
+        matches!(err, ReplayError::CoordinationUnknown { .. }),
+        "expected CoordinationUnknown, got {err:?}"
+    );
+    // The VALUE it could not read, quoted as JSON, the key, and the upgrade;
+    // no format number, since an unknown value is not the version arm.
+    assert_eq!(
+        err.to_string(),
+        coordination_unknown_sentence(" (0.1.0)", "\"quantum_entangled\"")
+    );
     assert_eq!(err.exit_code(), 2);
+}
+
+/// Bag text reaches the terminal escaped or not at all: an unknown
+/// `coordination` value holding an escape byte is quoted as JSON text, so the
+/// byte arrives as `\u001b`, and a `cerulion_version` stamp that is not a plain
+/// version token is left out of both refusals.
+#[test]
+fn a_refusal_prints_bag_text_escaped_or_not_at_all() {
+    let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
+    for (name, trace_format, want) in [
+        (
+            "coordination",
+            supported,
+            coordination_unknown_sentence("", "\"\\u001b[2Jbarrier\""),
+        ),
+        (
+            "format",
+            supported + 1,
+            format_too_new_sentence("", supported + 1),
+        ),
+    ] {
+        let (_dir, path) = tmp_bag(&format!("escaped_{name}.mcap"));
+        let mut atts = replay_grade_attachments(&["node0"]);
+        atts.push(recorder_att_raw(
+            &serde_json::to_vec(&serde_json::json!({
+                "arch": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+                "cerulion_version": "2.2.0\u{1b}[2J",
+                "recorded_at_ns": 42u64,
+                "trace_format": trace_format,
+                "coordination": "\u{1b}[2Jbarrier",
+            }))
+            .unwrap(),
+        ));
+        write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+        let err = gate(&path);
+        assert_eq!(err.to_string(), want, "{name}");
+        assert!(!err.to_string().contains('\u{1b}'), "{name}: {err}");
+        assert_eq!(err.exit_code(), 2, "{name}");
+    }
 }
 
 /// ANTI-TAUTOLOGY for the arm above: the SAME document with a KNOWN
@@ -2065,16 +2106,17 @@ fn a_known_coordination_value_on_a_supported_format_is_not_refused() {
 /// ORDERING: when a bag is BOTH from a newer format AND carries an unknown
 /// coordination value, the VERSION refusal wins.
 ///
-/// Both facts are true at once and they are ONE fact — a bag from a newer
-/// Cerulion. The version message states the CAUSE ("recorded by a NEWER
-/// Cerulion; upgrade to replay it"); the unknown-value message states only a
-/// SYMPTOM. So the more informative refusal is the one an operator gets, and
+/// Both facts are true at once and they are ONE fact: a bag from a newer
+/// Cerulion. The version message also names the format the bag carries and
+/// the one this build reads up to, the evidence; the unknown-value message
+/// names only a value this build does not know. So the more informative
+/// refusal is the one an operator gets, and
 /// the unknown-value arm above is what catches the same skew on a bag whose
 /// format version this binary DOES support.
 ///
 /// This arm exists because the ordering is otherwise invisible: both refusals
-/// are `RecordingInconsistent` at exit 2, so swapping the two blocks changes
-/// only the TEXT — and the text is the whole remedy.
+/// are exit 2, so swapping the two arms changes only the variant and the TEXT,
+/// and the text is the whole remedy.
 #[test]
 fn a_newer_format_wins_over_the_unknown_coordination_value() {
     let (_dir, path) = tmp_bag("coord_unknown_newer.mcap");
@@ -2086,25 +2128,11 @@ fn a_newer_format_wins_over_the_unknown_coordination_value() {
     ));
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    match &err {
-        ReplayError::RecordingInconsistent { detail } => {
-            assert!(
-                detail.contains(&format!("version {newer}")),
-                "the VERSION refusal is the one served: {detail}"
-            );
-            assert!(
-                detail.to_lowercase().contains("newer")
-                    && detail.to_lowercase().contains("upgrade"),
-                "…with its upgrade remedy: {detail}"
-            );
-            assert!(
-                !detail.contains("quantum_entangled"),
-                "…and NOT the unknown-value message, which states a symptom rather than \
-                 the cause: {detail}"
-            );
-        }
-        other => panic!("expected RecordingInconsistent (version wins), got {other:?}"),
-    }
+    assert!(
+        matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "the VERSION refusal is the one served, not the unknown-value one: {err:?}"
+    );
+    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", newer));
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -2179,13 +2207,11 @@ fn an_unreadable_stamp_on_a_newer_format_bag_reports_the_version_first() {
     atts.push(recorder_att_with_stamp(newer, Some(serde_json::json!(42))));
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    match &err {
-        ReplayError::RecordingInconsistent { detail } => assert!(
-            detail.contains(&format!("version {newer}")) && detail.contains("NEWER"),
-            "the version refusal is the one served: {detail}"
-        ),
-        other => panic!("expected the version refusal, got {other:?}"),
-    }
+    assert!(
+        matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "the version refusal is the one served: {err:?}"
+    );
+    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", newer));
     assert_eq!(err.exit_code(), 2);
 }
 

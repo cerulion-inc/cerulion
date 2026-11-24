@@ -2145,11 +2145,12 @@ pub struct RecorderInfo {
     /// consult wrote a kind-6 record, an empty drain's `NoFrame` included". A
     /// binary REFUSES a
     /// bag whose `trace_format` EXCEEDS the version it supports
-    /// ([`SUPPORTED_TRACE_FORMAT`]) with a plain "recorded by a newer Cerulion
-    /// — upgrade to replay" message (rather than silently mis-decoding a future
-    /// bit-layout). `#[serde(default)]` makes an absent field decode to v1 (full
-    /// back-compat), matching the recorder.json "unknown extra fields ignored"
-    /// forward-compat contract.
+    /// ([`SUPPORTED_TRACE_FORMAT`]) with exit 2 and a message that says a newer
+    /// Cerulion recorded the bag, names both formats and says to upgrade
+    /// (`replay_cmd::ReplayError::TraceFormatTooNew`), rather than silently
+    /// mis-decoding a future bit-layout. `#[serde(default)]` makes an absent
+    /// field decode to v1 (full back-compat), matching the recorder.json
+    /// "unknown extra fields ignored" forward-compat contract.
     #[serde(default = "trace_format_v1")]
     pub trace_format: u32,
     /// The COORDINATION contract the recording was taken under.
@@ -2962,10 +2963,10 @@ pub fn replay_stages_batch_frames(
 /// trace; format-2 bags, which carry no kind 6, stay fully replayable); bumped
 /// to 4 by free-run recording support (a bag may be stamped `coordination: free_run`, whose
 /// per-rank boundary streams do not share a timeline). A bag stamped with a
-/// `trace_format` GREATER than this is refused up front (exit 2) with a plain
-/// "upgrade to replay" message — which is exactly how an OLDER binary refuses a
-/// format-3 bag (its own SUPPORTED is 2, and its record-type gate also refuses
-/// kind 6 as reserved).
+/// `trace_format` GREATER than this is refused at the `recorder.json` gate
+/// (exit 2) with a message that says to upgrade Cerulion to replay it, which
+/// is how an OLDER binary refuses a format-3 bag (its own SUPPORTED is 2, and
+/// its record-type gate, which runs first, also refuses kind 6 as reserved).
 ///
 /// Bumped to 5 by read-site roles (a kind-6 record's `global_level` word carries
 /// the READ-SITE ROLE in bits 14..16 — see
