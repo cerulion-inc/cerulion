@@ -18,7 +18,7 @@ You do **not** import `cerulion_core::graph::*`, `cerulion_core::transport::*`, 
 
 ## Quick start
 
-The guided first run, through the runtime and the harness with a coding-agent prompt or commands, is the [README quickstart](../README.md#quickstart); this section is the empty-workspace flow of the API.
+The [README quickstart](../README.md#quickstart) is one coding-agent prompt that runs the harness, runtime and ROS 2 trials, and each trial after it gives the same steps as commands; this section is the empty-workspace flow of the API.
 
 ```bash
 # 0. Sign in once per machine; later commands read the result locally.

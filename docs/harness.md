@@ -16,7 +16,7 @@ You reach the harness through `cerulion rcp`, Cerulion's MCP server command:
 | `cerulion rcp bench` | Reruns one start state with and without the harness, against your own model: one of the published benchmark with `--cell`, otherwise one the harness was developed on. |
 | `cerulion rcp bench --verify` | Checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. |
 
-Both run under the free Cerulion account, as the other `cerulion` commands do: run `cerulion login` once.
+Both run under the free Cerulion account, as almost every `cerulion` command does: run `cerulion login` once.
 
 ## Try it
 
@@ -79,9 +79,9 @@ The hosted Cerulion MCP also serves the harness's tools on a simulated arm, with
 
 The hosted Cerulion MCP gives your model a simulated arm in Cerulion's cloud (paid in sim credits), analysis of
 your MCAP recordings and a view of your robots. It needs no install, only your Cerulion account. It is closed
-source and in early access: [request access](https://docs.cerulion.com/cerulion/hindsight). After you add it, run
+source and in early access: request access on the [Hindsight page](https://docs.cerulion.com/cerulion/hindsight). After you add it, run
 `/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account. Another MCP client takes the same
-URL. [Give your model Cerulion](../README.md#give-your-model-cerulion) shows the same steps.
+URL.
 
 ```bash
 claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
