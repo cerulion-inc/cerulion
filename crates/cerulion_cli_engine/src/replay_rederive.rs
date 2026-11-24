@@ -1143,7 +1143,7 @@ pub struct NodeDecl {
     /// for. The `period_ms` rule judges a step at which an edge's slot was
     /// full by the bag's own record on the first fires it owed, and the Sync
     /// rule does not convict an aligned set left unfired there; each notes the
-    /// node once ([`HoldAllowedForNote`]). The
+    /// node at most once ([`HoldAllowedForNote`]). The
     /// `consume = latest` rule holds such a node to no fire it did not
     /// record: the first step that would owe one stands the rule down
     /// ([`StandDownReason::LatestBlockHeld`]). A `block` edge is counted only
@@ -12945,7 +12945,7 @@ mod tests {
     /// one at the step after a held step whose read emptied the slot. Each of
     /// the rule's stand-downs at a later step withdraws the note.
     #[test]
-    fn a_held_sync_node_stands_its_owed_fire_down_once_and_is_still_judged() {
+    fn a_held_sync_node_is_noted_once_and_still_judged() {
         let unheld_node = node(
             "fusion",
             TriggerDecl::Sync {
