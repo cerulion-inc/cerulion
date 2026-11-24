@@ -779,7 +779,7 @@ subtitle=['Same-host comparison on an x86-64 Linux desktop (24-core Intel Core U
 COUNT_WORDS={5:'five'}
 foot=[
     'Commanded 100 Hz, achieved on every cell by the Cerulion and zenoh lanes; the two ROS 2 lanes record the rate offered, not what came back: from 1 MiB up a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap in flight. Native Cerulion includes always-on recording; the ROS 2 and zenoh runs do not. Payload fill excluded.',
-    'rmw_cerulion is ROS 2 Jazzy over Cerulion\'s transport with loaned publishing and loaned takes, measured in the same harness, posture and pacing as the other lines: three nodes in three processes with full process isolation. Loaned publishing is a code change in the nodes, and these figures are not for a publisher that copies. Non-POD, variable-length ROS messages work too.',
+    'rmw_cerulion is ROS 2 Jazzy over Cerulion\'s transport with loaned publishing and loaned takes, measured in the same harness, posture and pacing as the other lines: three nodes in three processes with full process isolation. Loaned publishing is a code change in the nodes. The figures are for a fixed-size message that both sides loan; non-POD, variable-length ROS messages also run on rmw_cerulion.',
     'ROS 2 composed + intra-process runs every node in one process: lower latency by giving up crash isolation, and its timed path bypasses the middleware, so outside tools do not see the traffic being measured.',
     'Five sessions per point. p50: median of the five session medians; p99: 10,000 pooled samples.',
 ]

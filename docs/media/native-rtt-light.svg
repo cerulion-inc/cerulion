@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8" standalone="no"?>
 <!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
   "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
-<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="936pt" height="754pt" viewBox="0 0 936 754" xmlns="http://www.w3.org/2000/svg" version="1.1">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="936pt" height="770.5pt" viewBox="0 0 936 770.5" xmlns="http://www.w3.org/2000/svg" version="1.1">
  <title>Round-trip latency across message sizes</title>
  <metadata>
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -23,8 +23,8 @@
  </defs>
  <g id="native-rtt-figure_1">
   <g id="native-rtt-patch_1">
-   <path d="M 0 754 
-L 936 754 
+   <path d="M 0 770.5 
+L 936 770.5 
 L 936 0 
 L 0 0 
 z
@@ -265,95 +265,95 @@ L 847.08 522
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_1">
     <defs>
-     <path id="native-rtt-m5d44bc95bc" d="M 116.108789 -317.359177 
-L 116.108789 -287.827189 
-L 194.572817 -288.11446 
-L 273.036845 -287.781632 
-L 351.500873 -287.985956 
-L 429.964902 -287.918043 
-L 508.42893 -288.273561 
-L 586.892958 -288.105465 
-L 665.356986 -289.305027 
-L 743.821014 -296.499139 
-L 822.285042 -300.049927 
-L 822.285042 -327.057043 
-L 822.285042 -327.057043 
-L 743.821014 -325.320311 
-L 665.356986 -318.032769 
-L 586.892958 -318.293414 
-L 508.42893 -326.562027 
-L 429.964902 -307.25027 
-L 351.500873 -310.116903 
-L 273.036845 -317.490329 
-L 194.572817 -322.585711 
-L 116.108789 -317.359177 
+     <path id="native-rtt-mf80966a5f1" d="M 116.108789 -333.859177 
+L 116.108789 -304.327189 
+L 194.572817 -304.61446 
+L 273.036845 -304.281632 
+L 351.500873 -304.485956 
+L 429.964902 -304.418043 
+L 508.42893 -304.773561 
+L 586.892958 -304.605465 
+L 665.356986 -305.805027 
+L 743.821014 -312.999139 
+L 822.285042 -316.549927 
+L 822.285042 -343.557043 
+L 822.285042 -343.557043 
+L 743.821014 -341.820311 
+L 665.356986 -334.532769 
+L 586.892958 -334.793414 
+L 508.42893 -343.062027 
+L 429.964902 -323.75027 
+L 351.500873 -326.616903 
+L 273.036845 -333.990329 
+L 194.572817 -339.085711 
+L 116.108789 -333.859177 
 z
 "/>
     </defs>
     <g clip-path="url(#native-rtt-p0b6fec33ed)">
-     <use xlink:href="#native-rtt-m5d44bc95bc" x="0" y="754" style="fill: var(--magenta); fill-opacity: 0.11"/>
+     <use xlink:href="#native-rtt-mf80966a5f1" x="0" y="770.5" style="fill: var(--magenta); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_2">
     <defs>
-     <path id="native-rtt-m5b7152255a" d="M 116.108789 -391.926569 
-L 116.108789 -380.28706 
-L 194.572817 -381.427506 
-L 273.036845 -378.314426 
-L 351.500873 -378.624406 
-L 429.964902 -375.287843 
-L 508.42893 -375.905905 
-L 586.892958 -381.6221 
-L 665.356986 -383.388097 
-L 743.821014 -381.791599 
-L 822.285042 -383.82255 
-L 822.285042 -391.023053 
-L 822.285042 -391.023053 
-L 743.821014 -391.020645 
-L 665.356986 -391.990461 
-L 586.892958 -389.716206 
-L 508.42893 -389.642115 
-L 429.964902 -386.157334 
-L 351.500873 -389.24626 
-L 273.036845 -391.707619 
-L 194.572817 -389.200804 
-L 116.108789 -391.926569 
+     <path id="native-rtt-macb5d5b357" d="M 116.108789 -408.426569 
+L 116.108789 -396.78706 
+L 194.572817 -397.927506 
+L 273.036845 -394.814426 
+L 351.500873 -395.124406 
+L 429.964902 -391.787843 
+L 508.42893 -392.405905 
+L 586.892958 -398.1221 
+L 665.356986 -399.888097 
+L 743.821014 -398.291599 
+L 822.285042 -400.32255 
+L 822.285042 -407.523053 
+L 822.285042 -407.523053 
+L 743.821014 -407.520645 
+L 665.356986 -408.490461 
+L 586.892958 -406.216206 
+L 508.42893 -406.142115 
+L 429.964902 -402.657334 
+L 351.500873 -405.74626 
+L 273.036845 -408.207619 
+L 194.572817 -405.700804 
+L 116.108789 -408.426569 
 z
 "/>
     </defs>
     <g clip-path="url(#native-rtt-p0b6fec33ed)">
-     <use xlink:href="#native-rtt-m5b7152255a" x="0" y="754" style="fill: var(--gold); fill-opacity: 0.11"/>
+     <use xlink:href="#native-rtt-macb5d5b357" x="0" y="770.5" style="fill: var(--gold); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_3">
     <defs>
-     <path id="native-rtt-me5526e83f4" d="M 116.108789 -314.043234 
-L 116.108789 -308.223787 
-L 194.572817 -311.547694 
-L 273.036845 -311.665777 
-L 351.500873 -311.594663 
-L 429.964902 -312.01984 
-L 508.42893 -309.365124 
-L 586.892958 -311.035125 
-L 665.356986 -312.740503 
-L 743.821014 -315.624574 
-L 822.285042 -315.471302 
-L 822.285042 -318.111262 
-L 822.285042 -318.111262 
-L 743.821014 -317.561504 
-L 665.356986 -317.887866 
-L 586.892958 -320.958247 
-L 508.42893 -314.00995 
-L 429.964902 -314.788139 
-L 351.500873 -313.853496 
-L 273.036845 -313.842063 
-L 194.572817 -313.522018 
-L 116.108789 -314.043234 
+     <path id="native-rtt-m17537237c9" d="M 116.108789 -330.543234 
+L 116.108789 -324.723787 
+L 194.572817 -328.047694 
+L 273.036845 -328.165777 
+L 351.500873 -328.094663 
+L 429.964902 -328.51984 
+L 508.42893 -325.865124 
+L 586.892958 -327.535125 
+L 665.356986 -329.240503 
+L 743.821014 -332.124574 
+L 822.285042 -331.971302 
+L 822.285042 -334.611262 
+L 822.285042 -334.611262 
+L 743.821014 -334.061504 
+L 665.356986 -334.387866 
+L 586.892958 -337.458247 
+L 508.42893 -330.50995 
+L 429.964902 -331.288139 
+L 351.500873 -330.353496 
+L 273.036845 -330.342063 
+L 194.572817 -330.022018 
+L 116.108789 -330.543234 
 z
 "/>
     </defs>
     <g clip-path="url(#native-rtt-p0b6fec33ed)">
-     <use xlink:href="#native-rtt-me5526e83f4" x="0" y="754" style="fill: var(--slate); fill-opacity: 0.11"/>
+     <use xlink:href="#native-rtt-m17537237c9" x="0" y="770.5" style="fill: var(--slate); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="native-rtt-line2d_33">
@@ -396,33 +396,33 @@ z
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_4">
     <defs>
-     <path id="native-rtt-m2e9a4a64ac" d="M 116.108789 -382.87178 
-L 116.108789 -368.545046 
-L 194.572817 -368.435608 
-L 273.036845 -375.094192 
-L 351.500873 -376.910772 
-L 429.964902 -378.057165 
-L 508.42893 -378.04091 
-L 586.892958 -379.016714 
-L 665.356986 -453.255587 
-L 743.821014 -457.172804 
-L 822.285042 -506.766033 
-L 822.285042 -516.585056 
-L 822.285042 -516.585056 
-L 743.821014 -481.536424 
-L 665.356986 -486.011852 
-L 586.892958 -386.1882 
-L 508.42893 -385.66918 
-L 429.964902 -384.724152 
-L 351.500873 -383.657531 
-L 273.036845 -384.336254 
-L 194.572817 -382.363091 
-L 116.108789 -382.87178 
+     <path id="native-rtt-m802a8137e8" d="M 116.108789 -399.37178 
+L 116.108789 -385.045046 
+L 194.572817 -384.935608 
+L 273.036845 -391.594192 
+L 351.500873 -393.410772 
+L 429.964902 -394.557165 
+L 508.42893 -394.54091 
+L 586.892958 -395.516714 
+L 665.356986 -469.755587 
+L 743.821014 -473.672804 
+L 822.285042 -523.266033 
+L 822.285042 -533.085056 
+L 822.285042 -533.085056 
+L 743.821014 -498.036424 
+L 665.356986 -502.511852 
+L 586.892958 -402.6882 
+L 508.42893 -402.16918 
+L 429.964902 -401.224152 
+L 351.500873 -400.157531 
+L 273.036845 -400.836254 
+L 194.572817 -398.863091 
+L 116.108789 -399.37178 
 z
 "/>
     </defs>
     <g clip-path="url(#native-rtt-p0b6fec33ed)">
-     <use xlink:href="#native-rtt-m2e9a4a64ac" x="0" y="754" style="fill: var(--orange); fill-opacity: 0.11"/>
+     <use xlink:href="#native-rtt-m802a8137e8" x="0" y="770.5" style="fill: var(--orange); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="native-rtt-line2d_34">
@@ -465,33 +465,33 @@ z
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_5">
     <defs>
-     <path id="native-rtt-m4452665bc9" d="M 116.108789 -285.336825 
-L 116.108789 -255.494694 
-L 194.572817 -255.4681 
-L 273.036845 -255.290048 
-L 351.500873 -255.423712 
-L 429.964902 -255.591949 
-L 508.42893 -256.029075 
-L 586.892958 -255.706377 
-L 665.356986 -256.150045 
-L 743.821014 -256.227487 
-L 822.285042 -256.509306 
-L 822.285042 -295.158149 
-L 822.285042 -295.158149 
-L 743.821014 -290.420477 
-L 665.356986 -288.462645 
-L 586.892958 -286.844555 
-L 508.42893 -286.620568 
-L 429.964902 -286.065903 
-L 351.500873 -285.212686 
-L 273.036845 -285.166921 
-L 194.572817 -285.578174 
-L 116.108789 -285.336825 
+     <path id="native-rtt-m6cd6864cc6" d="M 116.108789 -301.836825 
+L 116.108789 -271.994694 
+L 194.572817 -271.9681 
+L 273.036845 -271.790048 
+L 351.500873 -271.923712 
+L 429.964902 -272.091949 
+L 508.42893 -272.529075 
+L 586.892958 -272.206377 
+L 665.356986 -272.650045 
+L 743.821014 -272.727487 
+L 822.285042 -273.009306 
+L 822.285042 -311.658149 
+L 822.285042 -311.658149 
+L 743.821014 -306.920477 
+L 665.356986 -304.962645 
+L 586.892958 -303.344555 
+L 508.42893 -303.120568 
+L 429.964902 -302.565903 
+L 351.500873 -301.712686 
+L 273.036845 -301.666921 
+L 194.572817 -302.078174 
+L 116.108789 -301.836825 
 z
 "/>
     </defs>
     <g clip-path="url(#native-rtt-p0b6fec33ed)">
-     <use xlink:href="#native-rtt-m4452665bc9" x="0" y="754" style="fill: var(--teal); fill-opacity: 0.11"/>
+     <use xlink:href="#native-rtt-m6cd6864cc6" x="0" y="770.5" style="fill: var(--teal); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="native-rtt-line2d_35">
@@ -534,33 +534,33 @@ z
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_6">
     <defs>
-     <path id="native-rtt-m75d1660c70" d="M 116.108789 -276.92514 
-L 116.108789 -265.371956 
-L 194.572817 -264.773752 
-L 273.036845 -265.036207 
-L 351.500873 -265.030274 
-L 429.964902 -265.077696 
-L 508.42893 -265.24293 
-L 586.892958 -265.184049 
-L 665.356986 -265.424539 
-L 743.821014 -266.857048 
-L 822.285042 -267.427134 
-L 822.285042 -287.811254 
-L 822.285042 -287.811254 
-L 743.821014 -281.99451 
-L 665.356986 -279.539863 
-L 586.892958 -280.351248 
-L 508.42893 -277.462437 
-L 429.964902 -276.357004 
-L 351.500873 -277.409603 
-L 273.036845 -280.765173 
-L 194.572817 -276.97906 
-L 116.108789 -276.92514 
+     <path id="native-rtt-mc9cff47b21" d="M 116.108789 -293.42514 
+L 116.108789 -281.871956 
+L 194.572817 -281.273752 
+L 273.036845 -281.536207 
+L 351.500873 -281.530274 
+L 429.964902 -281.577696 
+L 508.42893 -281.74293 
+L 586.892958 -281.684049 
+L 665.356986 -281.924539 
+L 743.821014 -283.357048 
+L 822.285042 -283.927134 
+L 822.285042 -304.311254 
+L 822.285042 -304.311254 
+L 743.821014 -298.49451 
+L 665.356986 -296.039863 
+L 586.892958 -296.851248 
+L 508.42893 -293.962437 
+L 429.964902 -292.857004 
+L 351.500873 -293.909603 
+L 273.036845 -297.265173 
+L 194.572817 -293.47906 
+L 116.108789 -293.42514 
 z
 "/>
     </defs>
     <g clip-path="url(#native-rtt-p0b6fec33ed)">
-     <use xlink:href="#native-rtt-m75d1660c70" x="0" y="754" style="fill: var(--blue); fill-opacity: 0.11"/>
+     <use xlink:href="#native-rtt-mc9cff47b21" x="0" y="770.5" style="fill: var(--blue); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="native-rtt-line2d_36">
@@ -706,19 +706,22 @@ z
    <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="662.303359" transform="rotate(-0 93.6 662.303359)">and pacing as the other lines: three nodes in three processes with full process isolation. Loaned publishing is a code change in the</text>
   </g>
   <g id="native-rtt-text_27">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="678.905781" transform="rotate(-0 93.6 678.905781)">nodes, and these figures are not for a publisher that copies. Non-POD, variable-length ROS messages work too.</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="678.905781" transform="rotate(-0 93.6 678.905781)">nodes. The figures are for a fixed-size message that both sides loan; non-POD, variable-length ROS messages also run on</text>
   </g>
   <g id="native-rtt-text_28">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="695.405781" transform="rotate(-0 93.6 695.405781)">ROS 2 composed + intra-process runs every node in one process: lower latency by giving up crash isolation, and its timed path</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="695.211719" transform="rotate(-0 93.6 695.211719)"><tspan style="font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 0.9em">rmw_cerulion</tspan>.</text>
   </g>
   <g id="native-rtt-text_29">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="711.803359" transform="rotate(-0 93.6 711.803359)">bypasses the middleware, so outside tools do not see the traffic being measured.</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="711.905781" transform="rotate(-0 93.6 711.905781)">ROS 2 composed + intra-process runs every node in one process: lower latency by giving up crash isolation, and its timed path</text>
   </g>
   <g id="native-rtt-text_30">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="728.303359" transform="rotate(-0 93.6 728.303359)">Five sessions per point. p50: median of the five session medians; p99: 10,000 pooled samples.</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="728.303359" transform="rotate(-0 93.6 728.303359)">bypasses the middleware, so outside tools do not see the traffic being measured.</text>
   </g>
   <g id="native-rtt-text_31">
-   <text style="font-weight: 700; font-size: 10px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--brand)" x="879.84" y="742" transform="rotate(-0 879.84 742)">CERULION</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="744.803359" transform="rotate(-0 93.6 744.803359)">Five sessions per point. p50: median of the five session medians; p99: 10,000 pooled samples.</text>
+  </g>
+  <g id="native-rtt-text_32">
+   <text style="font-weight: 700; font-size: 10px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--brand)" x="879.84" y="758.5" transform="rotate(-0 879.84 758.5)">CERULION</text>
   </g>
   <g id="native-rtt-patch_5">
    <path d="M 88.609 204.375 
@@ -746,7 +749,7 @@ C 107.363512 187.970681 108.279269 188.35 109.234 188.35
 z
 " style="fill: var(--key-ink)"/>
   </g>
-  <g id="native-rtt-text_32">
+  <g id="native-rtt-text_33">
    <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.234" y="188.110703" transform="rotate(-0 132.234 188.110703)">dot = p50</text>
   </g>
   <g id="native-rtt-patch_7">
@@ -757,7 +760,7 @@ L 212.690562 180.25
 z
 " style="fill: var(--key-ink); opacity: 0.26"/>
   </g>
-  <g id="native-rtt-text_33">
+  <g id="native-rtt-text_34">
    <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="248.690562" y="188.110703" transform="rotate(-0 248.690562 188.110703)">band = p50 to p99</text>
   </g>
   <g id="native-rtt-legend_1">
@@ -770,7 +773,7 @@ L 123.084 106.142656
      <use xlink:href="#native-rtt-mf9d078ca8e" x="105.534" y="106.142656" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
-   <g id="native-rtt-text_34">
+   <g id="native-rtt-text_35">
     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.534" y="110.867656" transform="rotate(-0 132.534 110.867656)">Cerulion multi-process (default)</text>
    </g>
    <g id="native-rtt-line2d_40">
@@ -782,7 +785,7 @@ L 123.084 126.095234
      <use xlink:href="#native-rtt-mdc7b52a6fc" x="105.534" y="126.095234" style="fill: var(--teal); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
-   <g id="native-rtt-text_35">
+   <g id="native-rtt-text_36">
     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.534" y="130.820234" transform="rotate(-0 132.534 130.820234)">Cerulion single-process</text>
    </g>
    <g id="native-rtt-line2d_41">
@@ -794,7 +797,7 @@ L 123.084 146.638438
      <use xlink:href="#native-rtt-me8921d5b67" x="105.534" y="146.638438" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
-   <g id="native-rtt-text_36">
+   <g id="native-rtt-text_37">
     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.534" y="151.363438" transform="rotate(-0 132.534 151.363438)">ROS 2 Jazzy / <tspan style="font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 0.9em">rmw_fastrtps_cpp</tspan></text>
    </g>
    <g id="native-rtt-line2d_42">
@@ -806,7 +809,7 @@ L 441.156656 106.142656
      <use xlink:href="#native-rtt-mfc3b0f77b3" x="423.606656" y="106.142656" style="fill: var(--slate); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
-   <g id="native-rtt-text_37">
+   <g id="native-rtt-text_38">
     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="450.606656" y="110.867656" transform="rotate(-0 450.606656 110.867656)">ROS 2 composed + intra-process (one process, no isolation)</text>
    </g>
    <g id="native-rtt-line2d_43">
@@ -818,7 +821,7 @@ L 441.156656 125.867422
      <use xlink:href="#native-rtt-m1131e49ee3" x="423.606656" y="125.867422" style="fill: var(--gold); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
-   <g id="native-rtt-text_38">
+   <g id="native-rtt-text_39">
     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="450.606656" y="130.592422" transform="rotate(-0 450.606656 130.592422)">zenoh shared memory</text>
    </g>
    <g id="native-rtt-line2d_44">
@@ -830,7 +833,7 @@ L 441.156656 146.990703
      <use xlink:href="#native-rtt-m55ee99ece8" x="423.606656" y="146.990703" style="fill: var(--magenta); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
-   <g id="native-rtt-text_39">
+   <g id="native-rtt-text_40">
     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="450.606656" y="151.715703" transform="rotate(-0 450.606656 151.715703)"><tspan style="font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 0.9em">rmw_cerulion</tspan> (loaned publish and take)</text>
    </g>
   </g>
