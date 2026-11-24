@@ -695,7 +695,8 @@ def scrub_check(text):
         assert prefix not in text, 'home path in output'
     assert str(Path.home()) not in text and Path.home().name not in text, 'login name in output'
 
-LEGEND_ALIAS={'ROS 2 composed + intra-process (one process, no isolation)':'ROS 2 composed + intra-process'}
+LEGEND_ALIAS={'ROS 2 composed + intra-process (one process, no isolation)':'ROS 2 composed + intra-process',
+              'rmw_cerulion (loaned publish and take)':'rmw_cerulion'}
 def packet_view(series):
     """The exact dict shape the reviewed point hashes cover (the floor additions under 'v5' are
     left out); a legend text that only adds a note to a reviewed label hashes as the reviewed label,
@@ -770,15 +771,15 @@ def save(fig,name,series,notes,extra,added=(),added_info=None):
 labels=['Cerulion multi-process (default)','Cerulion single-process','ROS 2 Jazzy / rmw_fastrtps_cpp','ROS 2 composed + intra-process (one process, no isolation)','zenoh shared memory']
 colors=[COLORS['multi'],COLORS['single'],COLORS['stock'],COLORS['composed'],COLORS['zenoh']]
 styles=[DASH['solid'],DASH['dashed'],DASH['solid'],DASH['dashdot'],DASH['dotted']]
-rmw_on_main={**rmw_same,'display_label':'rmw_cerulion'}
+rmw_on_main={**rmw_same,'display_label':'rmw_cerulion (loaned publish and take)'}
 main_series=native+[rmw_on_main]; main_colors=colors+[COLORS['rmw']]; main_styles=styles+[DASH['shortdash']]
 native_date=date_of(HEROES); rmw_same_date=date_of(RMW_SAME)
 subtitle=['Same-host comparison on an x86-64 Linux desktop (24-core Intel Core Ultra 9 285K)',
           'STOCK  ·  recorder ON  ·  fixed 100 Hz  ·  k=5']
 COUNT_WORDS={5:'five'}
 foot=[
-    'Commanded 100 Hz, achieved on every cell by the Cerulion and zenoh lanes; the two ROS 2 lanes record the rate offered, not what came back: at 16 MiB a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap in flight. Native Cerulion includes always-on recording; the ROS 2 and zenoh runs do not. Payload fill excluded.',
-    'rmw_cerulion is ROS 2 Jazzy over Cerulion\'s transport, measured in the same harness, posture and pacing as the other lines: three nodes in three processes with full process isolation. Non-POD, variable-length ROS messages work too, with no code to rewrite.',
+    'Commanded 100 Hz, achieved on every cell by the Cerulion and zenoh lanes; the two ROS 2 lanes record the rate offered, not what came back: from 1 MiB up a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap in flight. Native Cerulion includes always-on recording; the ROS 2 and zenoh runs do not. Payload fill excluded.',
+    'rmw_cerulion is ROS 2 Jazzy over Cerulion\'s transport with loaned publishing and loaned takes, measured in the same harness, posture and pacing as the other lines: three nodes in three processes with full process isolation. Loaned publishing is a code change in the nodes, and these figures are not for a publisher that copies. Non-POD, variable-length ROS messages work too.',
     'ROS 2 composed + intra-process runs every node in one process: lower latency by giving up crash isolation, and its timed path bypasses the middleware, so outside tools do not see the traffic being measured.',
     'Five sessions per point. p50: median of the five session medians; p99: 10,000 pooled samples.',
 ]
