@@ -4,8 +4,9 @@
 # stand-downs a resumed replay applies to a node whose stop the recording
 # does not state, the verifier budget's pure decision functions, the
 # decisions a replay makes about checkpoint window heads, those it makes about
-# a recorded node stop, and how a replay judges and re-executes a node that a
-# `block` input in its own rank holds.
+# a recorded node stop, how a replay judges and re-executes a node that a
+# `block` input in its own rank holds, and the refusal a replay gives a
+# recording from a newer Cerulion.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -478,6 +479,39 @@ in prepare_pass_verification
 #          (nothing proves it), and
 #          `a_capture_whose_end_cut_keeps_a_held_producers_frame_replays_its_holds`
 #          (a frame past the last kept step).
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Eighth scope: the refusal a replay gives a recording from a newer Cerulion.
+#
+# Scope: the pure functions in src/replay_cmd.rs behind that refusal: which
+# refusal the `recorder.json` contract gate gives (`newer_recording_refusal`),
+# the version token a refusal may print (`RecorderVersion::from_stamp` and its
+# `Display`) and the ` (<version>)` it renders after "a newer Cerulion"
+# (`RecordedBy`'s `Display`). The rest of the file reads the bag, which the
+# mutation rule does not cover; the gate that calls the picker is pinned by
+# tests/replay_gates_test.rs.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_cmd.rs \
+#            --re 'RecorderVersion|RecordedBy|newer_recording_refusal' \
+#            --exclude-re 'tests::' --cap-lints true --in-place \
+#            --timeout 600 -- --lib -- replay_cmd::
+#          (the unmutated baseline passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  11 mutants: 9 caught, 2 unviable, 0 missed. Caught: each of
+#          `from_stamp` and `newer_recording_refusal` replaced with None, the
+#          `&&` and `||` of the token rule swapped, both `Display` bodies
+#          replaced with `Ok(())`, and the picker's `>` replaced with `==`, `<`
+#          and `>=`, each failing a test in replay_cmd::tests. The 2 unviable
+#          replace `from_stamp` and `newer_recording_refusal` with
+#          `Some(Default::default())`: `RecorderVersion` and `ReplayError` have
+#          no default.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
