@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, and a read log that cannot be ENFORCED on a graph-produced edge) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks whose topic has two or more in-graph producers, or whose topic has one in-graph producer and is not listed in `multi_publisher_topics:` and whose input sets `block_timeout_ms`) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |
@@ -631,6 +631,20 @@ pub enum ReplayError {
         reason: String,
     },
 
+    /// A NODE-STOP record (kind 7, which this build reads) whose stop cause
+    /// this build does not define, in a bag stamped past the formats this
+    /// build reads: a newer or foreign writer added the cause. Exit 2. At or
+    /// below the formats this build reads, which define no other cause, the
+    /// same record is a corrupt bag ([`ReplayError::RecordingInconsistent`]);
+    /// `replay_engine::unknown_stop_cause_refusal` picks between the two.
+    #[error("scheduler-trace record {index}: {reason}")]
+    TraceStopCauseUnknown {
+        /// The offending record's index in the trace channel (write order).
+        index: usize,
+        /// What the record carries and the remedy.
+        reason: String,
+    },
+
     /// A recorded topic is neither produced nor consumed by the bag's embedded
     /// graph — the recording and its graph.yaml disagree (corrupt or
     /// hand-edited). Exit 2. (Fires at classification time.)
@@ -805,6 +819,33 @@ pub enum ReplayError {
         detail: String,
     },
 
+    /// A free-run bag with more than one worker rank whose rank manifests split
+    /// a `block` edge from a topic that two or more in-graph producers write, one
+    /// or more of them in another rank than the consumer. A `block` edge
+    /// crosses ranks only on a credit word, which counts one producer's
+    /// frames. Exit 2, the not-replay-grade class: when the whole graph the
+    /// bag embeds builds with the replayed build's own declarations, it is
+    /// refused before the first pass and names where the input's `block`
+    /// comes from.
+    #[error("{edge}")]
+    SplitBlockEdgeUncreditable {
+        /// The refused edge and every producer's rank.
+        edge: crate::replay_rank::UncreditableSplitEdge,
+    },
+
+    /// A free-run bag with more than one worker rank whose rank manifests split
+    /// a one-producer `block` edge whose input sets `block_timeout_ms`: a
+    /// timeout release keeps a credit word's count exact only when the
+    /// producer and the consumer fire one at a time on one thread. Exit 2:
+    /// when the whole graph builds and validates (a `block_timeout_ms` on a
+    /// topic `multi_publisher_topics:` lists does not), it is refused before
+    /// the first pass, as [`Self::SplitBlockEdgeUncreditable`] is.
+    #[error("{edge}")]
+    SplitBlockEdgeTimeout {
+        /// The refused edge and both ends' ranks.
+        edge: crate::replay_rank::SplitEdgeTimeout,
+    },
+
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
     #[error("internal replay error: {reason}")]
     Internal {
@@ -826,6 +867,7 @@ impl ReplayError {
             | ReplayError::MultiRankManifestGap { .. }
             | ReplayError::DegradedRecordingDeparture { .. }
             | ReplayError::TraceRecordUnsupported { .. }
+            | ReplayError::TraceStopCauseUnknown { .. }
             | ReplayError::BagGraphMismatch { .. }
             | ReplayError::BagNoStepBoundaries
             | ReplayError::RecordingInconsistent { .. }
@@ -840,7 +882,12 @@ impl ReplayError {
             | ReplayError::FreeRunResumeUnsupported { .. }
             // A read log that cannot be ENFORCED on a graph-produced edge is
             // the same class: this bag is not replay-grade for this binary.
-            | ReplayError::ReadLogNotEnforceable { .. } => EXIT_NOT_REPLAY_GRADE,
+            | ReplayError::ReadLogNotEnforceable { .. }
+            // So is a `block` edge the bag splits across ranks that no credit
+            // word counts exactly: the bag (its graph or its rank split), or the
+            // build's `block` declaration, is the fault.
+            | ReplayError::SplitBlockEdgeUncreditable { .. }
+            | ReplayError::SplitBlockEdgeTimeout { .. } => EXIT_NOT_REPLAY_GRADE,
             ReplayError::NodeLoad { .. } => EXIT_NODE_FAILURE,
             ReplayError::ToleranceInvalid { .. } => EXIT_TOLERANCE_INVALID,
             ReplayError::Internal { .. } => EXIT_INTERNAL,
@@ -1735,6 +1782,15 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                         cerulion_core::trace_ring::trace_record_noun(record_type)
                     ),
                 },
+                TraceRecordFault::UnknownStopCause { rank, code } => {
+                    replay_engine::unknown_stop_cause_refusal(
+                        index,
+                        rank,
+                        code,
+                        stamped_trace_format(&reader),
+                        replay_engine::SUPPORTED_TRACE_FORMAT,
+                    )
+                }
                 TraceRecordFault::ZeroedRecord => ReplayError::TraceRecordUnsupported {
                     index,
                     record_type: 0,
@@ -2190,6 +2246,19 @@ struct RecorderRead {
     driver_stamp: replay_engine::RecordedDriverStamp,
 }
 
+/// The `trace_format` a bag's `recorder.json` stamps, read on its own for the
+/// one record refusal whose remedy depends on it, which the record walk raises
+/// before [`read_recorder_info`] runs. `1` when the attachment is absent or
+/// carries no readable stamp, as an absent field reads. Read through
+/// `cerulion_core::flashback::resim::recorded_trace_format`, as the capture
+/// judge reads it.
+fn stamped_trace_format(reader: &BagReader) -> u32 {
+    let attachment = reader.attachment(RECORDER_ATTACHMENT).ok().flatten();
+    cerulion_core::flashback::resim::recorded_trace_format(
+        attachment.as_ref().map(|att| att.data.as_slice()),
+    )
+}
+
 /// Read the OPTIONAL
 /// `__cerulion/recorder.json` attachment.
 ///
@@ -2344,6 +2413,7 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
         coordination,
         // Filled by the gate once the stamp is checked against the graph.
         driver_stamp: None,
+        input_queues: replay_engine::RecordedInputQueues::read(obj),
     };
     if !unreadable.is_empty() {
         tracing::warn!(
@@ -2831,6 +2901,13 @@ mod tests {
                 2,
             ),
             (
+                ReplayError::TraceStopCauseUnknown {
+                    index: 7,
+                    reason: "cause".to_string(),
+                },
+                2,
+            ),
+            (
                 ReplayError::BagGraphMismatch {
                     topic: "/x/n/out".to_string(),
                     detail: "not in graph".to_string(),
@@ -2882,6 +2959,36 @@ mod tests {
             (
                 ReplayError::RecordOutExists {
                     path: PathBuf::from("/x.mcap"),
+                },
+                2,
+            ),
+            // A `block` edge the bag splits across ranks that no credit word
+            // can count: the bag (or the build's `block`) is not replay-grade,
+            // never an internal error.
+            (
+                ReplayError::SplitBlockEdgeUncreditable {
+                    edge: crate::replay_rank::UncreditableSplitEdge::new(
+                        "/x/bus".to_string(),
+                        "sink".to_string(),
+                        "inp".to_string(),
+                        1,
+                        vec![("a".to_string(), 0), ("b".to_string(), 1)],
+                        crate::replay_rank::BlockDeclaredBy::Node,
+                    )
+                    .expect("two producers, one in another rank"),
+                },
+                2,
+            ),
+            (
+                ReplayError::SplitBlockEdgeTimeout {
+                    edge: crate::replay_rank::SplitEdgeTimeout {
+                        topic: "/x/a/out".to_string(),
+                        consumer_node: "sink".to_string(),
+                        consumer_input: "gate".to_string(),
+                        consumer_rank: 1,
+                        producer: "a".to_string(),
+                        producer_rank: 0,
+                    },
                 },
                 2,
             ),
@@ -3027,6 +3134,7 @@ mod tests {
             // binary writes today carries.
             coordination: Some(crate::replay_engine::CoordinationMode::Lockstep),
             driver_stamp: None,
+            input_queues: None,
         }
     }
 

@@ -15,9 +15,11 @@ User-facing recording docs live in `docs/bag.md`.
   (`cerulion trace inspect`).
 - Bags carry attachments under the reserved `__cerulion/` prefix:
   `recorder.json` (host identity: arch/os/version, used by replay's
-  cross-host advisory, plus the contract keys `trace_format`, `coordination`
-  and `node_external`, each native node's driver flag from its loaded
-  metadata, and `env_names_left_out`, the count of names `env.json` left out
+  cross-host advisory, plus the contract keys `trace_format`, `coordination`,
+  `node_external`, each native node's driver flag from its loaded
+  metadata, and `node_inputs`, each native node's inputs with the
+  backpressure and depth the run's topology reads them with
+  (`replay_engine::node_input_queues`), and `env_names_left_out`, the count of names `env.json` left out
   for not being valid UTF-8), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.
@@ -504,6 +506,6 @@ Related pins elsewhere:
 |---|---|
 | `crates/cerulion_core/tests/run_lifetime_iox2_test.rs` | The `RunWatcher` verdict logic over real iceoryx2 (last word survives; a successor does not keep a binding alive) |
 | `crates/cerulion_cli_engine/tests/bag_record_run_attach_test.rs` | `--run` mid-run attach over a REAL lapped live trace ring (the `open_at_live` path plain `open` refuses); the `*` arms are the attach half of the `state_ring_consumer` gate over hand-written manifests (refuse / proceed / could-not-tell), each asserting the bag's verdict AND whether the recorder really swept (read off `BagdSummary::state_coverage`) |
-| `crates/cerulion_cli/tests/plain_run_resim_e2e_test.rs` | The RUN half of the `state_ring_consumer` gate over the real binary (`a_run_writes_its_window_recorder_decision_into_run_json`): without it a build that never writes the key leaves every attach on the UNKNOWN arm, which PROCEEDS, so the feature would ship inert with the attach suite green |
+| `crates/cerulion_cli/tests/plain_run_resim_e2e_test.rs` | The RUN half of the `state_ring_consumer` gate over the real binary (`a_run_writes_its_window_recorder_decision_into_run_json`): without it a build that never writes the key leaves every attach on the UNKNOWN arm, which PROCEEDS, so the feature would ship inert with the attach suite green. The checkpoint window-head arms (Linux only): `a_one_rank_capture_whose_window_starts_after_the_first_reads_verifies_by_read_identity` (a capture whose shortened window holds none of the run's first reads begins at a flagged boundary and `--verify` feeds it by read identity) and `the_window_heads_of_the_plain_run_graph_stay_clear_of_its_stage_rims` (each stage's records at every window head against its rim, one `WINDOW_HEADS` line per stage, over two cadences); `mp_support_verdict_test.rs` pins the count on hand records |
 | `crates/cerulion_core/tests/notify_elision_iox2_test.rs` | A data-only recording tap keeps publisher notify-elision armed (a listener-full tap disarms it) |
 | `crates/cerulion_cli/tests/mp_record_e2e_test.rs` | Multi-process `graph run --record` acceptance over the real binary: one finalized bag, per-rank manifests, departure sentinel |

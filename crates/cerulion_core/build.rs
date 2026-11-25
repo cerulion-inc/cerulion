@@ -74,4 +74,15 @@ fn main() {
     // file changes, since none of them govern this fact.
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // The workspace's iceoryx2 fork sets `DEP_ICEORYX2_PUBLISHER_HISTORY`
+    // (its `links = "iceoryx2"` build script): its publisher builder takes a
+    // history size of its own. The released iceoryx2 sets nothing, and there
+    // every publisher retains the service's whole history. See
+    // `TransportManager::finish_publisher`.
+    println!("cargo:rustc-check-cfg=cfg(iceoryx2_publisher_history)");
+    println!("cargo:rerun-if-env-changed=DEP_ICEORYX2_PUBLISHER_HISTORY");
+    if env::var_os("DEP_ICEORYX2_PUBLISHER_HISTORY").is_some() {
+        println!("cargo:rustc-cfg=iceoryx2_publisher_history");
+    }
 }

@@ -279,6 +279,120 @@ re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
 clock, `Sync` alignment, FIFO pop counts from the read log, and a
 `consume = latest` node's one fire per step from the read log's drains) are
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
+
+**A node held by a `block` input in its own rank.** When a `block` input reads
+a topic that a node in the same rank produces, that edge's pre-fire check can
+hold the producer after its trigger drain popped a frame, and nothing records
+the hold. The FIFO rule allows for it only at a step where the recording shows
+the slot full: the frames the bag records on the topic, that step's included,
+outnumber those the consumer's body reads drained before that step by at least
+the input's depth.
+
+- A frame whose stamp several steps share counts at the last of them, and a
+  drain at an earlier one is owed against it there.
+- A body read that finds the queue empty, or any body read of a latest-value
+  input (`consume = latest`, or any input that is not a FIFO trigger), empties
+  the slot; inside a shared stamp, such a read leaves none of that stamp's
+  frames counted.
+- A FIFO input drains only at its consumer's recorded reads.
+- A fire the recording shows ended at an input the tick reads earlier drained
+  nothing of the `block` input. A `#[cerulion_node]` tick reads its inputs in
+  declaration order, `accumulate` ones aside, and ends at the first that serves
+  nothing; an empty read of a context input that the tick reads frozen at the
+  step boundary ends every fire of its step. The recording shows such an end
+  only for a consumer whose metadata says it needs a publisher for every
+  output, which that macro sets.
+
+The slot is released, and holds nothing from then on:
+
+- from the step after its consumer stops on a fatal error or a poisoned node
+  entry;
+- with no record, at a step where the recording shows the producer firing
+  while the slot already counts its depth before that step's frames, since,
+  while the slot holds, the check stops the producer at the depth before each
+  fire;
+- with no record, at a step where the slot counts past its depth, if the
+  producer's metadata says it needs a publisher for every output.
+
+The consecutive-panic breaker releases no slot. After a stop that releases
+the slot, the two releases with no record do not apply. `#[cerulion_node]`
+sets that metadata, a `--raw-ffi` node may set it by hand, and a Python node
+cannot. Without it, a count past the depth is no release, since a `--raw-ffi`
+node can send several frames in one fire. A step excused only by holds is a
+divergence, and the finding says why, if every slot that excused it shows a
+release with no record before its consumer next reads it.
+
+The slot allows for no hold where:
+
+- the bag records no frame of the topic, or a frame header it cannot parse;
+- its record-health stamp is absent or malformed, has no entry for the topic,
+  reports the topic lossy or written by several publishers (declared or
+  observed), or reports any frame in the bag drained and never written. A
+  Flashback capture carries no record-health stamp, so its slots allow for no
+  hold;
+- the bag has no `recorder.json`, or one stamped below `trace_format` 12;
+- the producer's metadata says it needs a publisher for every output, and the
+  recording shows it sending more frames at a stamp than it fired there. A
+  worker can stop after its last recorded step published a frame and before
+  that step's records reach the trace, so the frames of each worker process's
+  last recorded step are compared only where the trace keeps a fire of that
+  process at that step from a level after the producer's. Otherwise they are
+  not compared, and neither are the frames of an earlier step that shares that
+  step's clock. Frames stamped after a process's last recorded step are never
+  compared. This holds for a recording of one worker process or several;
+- the graph lists the topic in `multi_publisher_topics`;
+- the recording does not pin the input's `block` policy and depth: the
+  `node_inputs` entry of its `recorder.json` gives another policy or depth
+  than the replayed build, or, on a bag recorded before `node_inputs`, its
+  graph does not set both `backpressure: block` and `depth:` for the input;
+- the input sets `block_timeout_ms`;
+- the bag's fire records do not put the consumer on a later level than the
+  producer (a node fired at more than one level, or never, orders no edge);
+- the input is a Sync node's trigger input.
+
+It also allows for no hold:
+
+- from the step after a truncated read of the input, or a drain whose site
+  the read log does not say;
+- before any body read of the input is recorded, from the step after a
+  consumer fire that the recording does not show ended before the input;
+- on a resumed pass, until the consumer first reads its queue empty;
+- on a latest-value input, from the step after a consumer fire that can hide
+  a drain of it (no read of it recorded, and the recording does not show the
+  fire ended before it), through the consumer's next read of it.
+
+A step that neither the throttle nor the hold could defer owes every popped
+frame a fire; the throttle's window comes from the recorded clock. Read through
+one subscriber, a held node may leave one popped frame unfired at a step the
+throttle or the hold could defer, or at a step that fired the scheduler's cap
+of 64; the replay pops that frame after the step's last fire, as the live burst
+did, so the next fire serves it. Read through two subscribers (a `block` or
+`sample(N)` trigger input, or `CERULION_DRAIN_DISCIPLINE=separate`), it carries
+every signal such a step left unfired, up to the same cap. On a bag that does
+not record how a FIFO input was read, a `drop_oldest` trigger input is judged
+without the hold, and a divergence on a short step there at which the bag
+shows the slot full says so.
+
+A `period_ms` node or a `Sync` node that such an input holds is judged on the
+same count of the slot, and a step excused only by holds is a divergence on
+the same terms. At a step where the recording shows the slot full, a
+`period_ms` node may fire fewer of the fires its schedule owes there: none, or
+the first of them at their instants. Its next deadline is then the first owed
+instant it did not fire, a fire off that schedule is still a divergence, and
+the node carries at most one note for it (a `hold_allowed_for` note of code
+`period_block_held`). At such a step a `Sync` node may leave an aligned set
+unfired. The node carries at most one note for it (a `hold_allowed_for` note
+of code `sync_block_held`), and the node is still judged on every other step
+and on the sets it fired. At any other step either node owes every fire. A
+`hold_allowed_for` note is not a `stand_down`: the rule judged the node. A
+neutral `--resim all` reaches the `Sync` rule for such a node. A `--verify`
+replay of a free-run bag from trace format 8 refuses a per-set `Sync` node
+before its first step (`read_identity_ungateable_stage`, exit 2), whichever
+worker process its trigger topics come from, so it does not reach the rule
+there. Where such an input holds a `Sync` node, the neutral `--resim all`
+reports a read-log divergence at the node's first fire after the hold, and
+exits 0.
+
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
 node's last fire than that fire's read took, plus two per writer still
@@ -307,10 +421,12 @@ judges no fire of it, and judges a node the checkpoint states as running in
 full. A
 from-start pass re-executes the stop, and a node that fires or reads in its
 body anywhere in a resumed pass is still judged. A `--verify` replay of a
-one-rank bag this build recorded mid-run is refused before its first step when
-a single-writer read in it continues a writer run that began before the bag
-(`read_identity_absent`, exit 2), so on such a bag a neutral `--resim all` is
-the replay that reaches this rule. From `trace_format` 8 on a writer change on any edge stages a producer
+one-rank bag recorded mid-run below trace format 11 is refused before its first
+step when a single-writer read in it continues a writer run that began before
+the bag (`read_identity_absent`, exit 2), so on such a bag a neutral `--resim
+all` is the replay that reaches this rule; from format 11 every read site names
+its writer again after each checkpoint, so `--verify` feeds such a bag and
+reaches this rule too. From `trace_format` 8 on a writer change on any edge stages a producer
 annotation, so the counts a bag that begins mid-run records before the trigger
 drain's first annotation are frames of the one writer whose run it began inside,
 counted as one writer more. That rule stands down by name where a count needs an

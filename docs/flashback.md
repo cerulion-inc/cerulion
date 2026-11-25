@@ -153,7 +153,7 @@ Open one with `cerulion bag info`. Beyond the frames, a capture carries:
 | `__cerulion/flashback.json` | What the capture was ABOUT: `causes[]` (each with the `detail` your `--note` became), the window it claimed (`span_ms`) against the window it achieved (`achieved_span_ms`), a `handoff` object saying what this recorder was given, and `anchor.resimmable`, whether `bag play --resim all --verify` can judge this bag: its trace, its checkpoint and every frame its trace reads are in it. |
 | `__cerulion/state_coverage.json` | The node-state side: which nodes have an anchor, and which were skipped and why. Absent when the recorder had nothing to say about the state plane. |
 | `graph.yaml`, `env.json` | The graph as executed and the environment it ran in. Bare names, not `__cerulion/`-prefixed: that namespace is reserved for manifests the recorder mints itself. |
-| `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew, and the replay contract its trace is judged under (`trace_format`, `coordination`, `node_external`). A run that could not write it into its run directory warns, and a capture of it that carries the trace carries no `graph.yaml` either, so `anchor.resimmable` is false. A capture whose `recorder.json` cannot be read as a JSON object, or stamps a `coordination` this build does not know, is not resimmable either, since `bag play --resim` refuses it. |
+| `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew, and the replay contract its trace is judged under (`trace_format`, `coordination`, `node_external`, `node_inputs`). A run that could not write it into its run directory warns, and a capture of it that carries the trace carries no `graph.yaml` either, so `anchor.resimmable` is false. A capture whose `recorder.json` cannot be read as a JSON object, or stamps a `coordination` this build does not know, is not resimmable either, since `bag play --resim` refuses it. |
 | `__cerulion/trace_manifest_rank<N>.json` | Which node ids the rank's trace records refer to. `bag play --resim` needs it to resolve a FIRE to a node. |
 
 `anchor.resimmable` is the field to read first: a plain `true`/`false`, always
@@ -239,9 +239,19 @@ When the run reports no standing consumer, the attach discovers available state
 rings. It does not arm checkpoints itself, so discovery alone does not promise
 a usable anchor. `bag info` reports the captured state coverage and
 `bag play --resim all --verify` checks the actual trace and resume boundary.
-Mid-run free-run recordings require independent per-rank resume support, which
-is not supported; recordings beginning at step zero do not need a resume
-anchor.
+Recordings beginning at step zero do not need a resume anchor.
+
+A free-run capture of one worker rank that begins mid-run resumes from its
+checkpoint, and from trace format 11 `bag play --resim all --verify` feeds its
+reads by read identity: at every checkpoint the recorder names each read
+site's writer again at its first read that serves a frame after it, so a
+capture whose window starts after the run's first reads still names the writer
+of every read it holds. A capture recorded below format 11 is refused under
+`--verify` when a single-writer read in it continues a writer run begun before
+the capture (`read_identity_absent`, with a message to record the run again);
+`--resim all` without `--verify` replays it. A process that runs several
+executor units takes no checkpoints. A mid-run free-run recording of several
+worker ranks is refused, since per-rank resume is not supported.
 
 ---
 

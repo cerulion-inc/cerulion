@@ -16,11 +16,11 @@ You reach the harness through `cerulion rcp`, Cerulion's MCP server command:
 | `cerulion rcp bench` | Reruns one start state with and without the harness, against your own model: one of the published benchmark with `--cell`, otherwise one the harness was developed on. |
 | `cerulion rcp bench --verify` | Checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. |
 
-Both run under the free Cerulion account, as the other `cerulion` commands do: run `cerulion login` once.
+Both run under the free Cerulion account, as almost every `cerulion` command does: run `cerulion login` once.
 
 ## Try it
 
-The [README quickstart](../README.md#quickstart) starts the local `cerulion rcp --sim --http` server and runs one task on it from one coding-agent prompt, together with the runtime's record and verify.
+The [README](../README.md#try-the-harness) starts the local `cerulion rcp --sim --http` server and runs one task on it.
 
 Every release package installs the harness folder beside `cerulion`: the install script, the release archives,
 the Debian package (`/usr/bin/harness`) and the Homebrew formula. A release's `cerulion` finds it there with no
@@ -72,12 +72,44 @@ export OPENAI_API_KEY=your-key
 cerulion rcp bench --model YOUR_MODEL --cell CELL_ID
 ```
 
-The hosted Cerulion MCP also serves the harness's tools on a simulated arm, with nothing to install: run
-`claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion` and sign in with your Cerulion
-account from `/mcp` in Claude Code. Your model starts the arm in Cerulion's cloud with `sim_start` and stops it
-with `sim_end`, and the simulator runs on your account's sim credits, one credit for each second it is held
-open. The hosted endpoints are in early access; [Give your model Cerulion](../README.md#give-your-model-cerulion)
-shows a prompt.
+The hosted Cerulion MCP also serves the harness's tools on a simulated arm, with nothing to install
+([The hosted Cerulion MCP](#the-hosted-cerulion-mcp)).
+
+## The hosted Cerulion MCP
+
+The hosted Cerulion MCP gives your model a simulated arm in Cerulion's cloud (paid in sim credits), analysis of
+your MCAP recordings and a view of your robots. It needs no install, only your Cerulion account. It is closed
+source and in early access: request access on the
+[Hindsight page](https://docs.cerulion.com/cerulion/hindsight). After you add it, run `/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account. Another MCP client takes the same
+URL.
+
+```bash
+claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
+```
+
+What the hosted tools do:
+
+- **A simulated arm in Cerulion's cloud.** Ask: "Start the simulated arm and put the bowl on the plate." Your
+  model starts it (`sim_start`), reads its task (`sim_read` on `robot://task`), looks through its cameras
+  (`look`) and uses the harness's other tools. `sim_end` stops it and reports the sim credits charged: the
+  simulator runs on your account's sim credits, one credit for each second it is held open. The scenes are
+  `bowl-on-plate`, `open-drawer` and `soup-in-basket`.
+- **Recording analysis.** Put an MCAP recording at a public or presigned `https://` URL and ask: "Open the
+  recording at https://<your host>/run.mcap. Summarize it and show me the worst anomaly, with its topic and
+  time." Your model indexes it (`open_bag`), reads its summary (`get_debrief`), ranks anomalies
+  (`find_anomalies`), looks around one (`scrub`) and cites each finding as `[topic @ t=<nanoseconds>]`, with a
+  Foxglove link when the URL is public (`get_foxglove_link`).
+- **Your robots and cloud instances.** `robot_list` shows your robots and which are online.
+  `cloud_instance_start` and `cloud_instance_connect` reach your Cerulion Cloud instance.
+
+The hosted tools cannot read a file on your machine, run a graph, record or verify; the `cerulion` CLI does
+those. Hindsight serves only the recording-analysis tools, as its own connector:
+
+```bash
+claude mcp add --transport http hindsight https://mcp.cerulion.com/mcp/hindsight
+```
+
+Guide: [Connect an MCP client](https://docs.cerulion.com/cerulion/guides/connect-an-mcp-client).
 
 ## What the first run installs
 
@@ -110,8 +142,8 @@ so the network kill switch (`CERULION_NETWORK=off`) does not refuse it.
 ## What it measured
 
 The benchmark is LIBERO-PRO: simulated robot manipulation tasks, each start state run twice with the same model.
-Once without Cerulion, through the three-tool interface the benchmark's authors published for zero-shot models
-(`move_to`, `done`, `give_up`). Once with Cerulion, through the harness's tools. Same simulator, same start
+Once without Cerulion, through the three-tool interface a published zero-shot study used (arXiv:2610.30051:
+`move_to`, `done`, `give_up`). Once with Cerulion, through the harness's tools. Same simulator, same start
 state, same budget of 80 model replies and 900 control steps, and the benchmark's own success check. Sixteen
 models, 100 start states each, one episode a start state an arm. The start states are new start states of task
 rows the harness was developed on at other start states, so the tasks themselves are not new to it.

@@ -126,9 +126,12 @@ pub fn with_history_floor(
 }
 
 /// Whether an opened data service was created with a history floor
-/// ([`HISTORY_FLOOR_ATTRIBUTE_KEY`]): its history then holds whatever every
-/// publisher sent, VOLATILE ones included, so a subscriber that asks for no
-/// particular history must ask for none.
+/// ([`HISTORY_FLOOR_ATTRIBUTE_KEY`]): its history is then room for the
+/// deepest publisher that may open, not a request. A publisher on it retains
+/// only its own history request, and a subscriber that asks for no particular
+/// history asks for none. Under an iceoryx2 build without per-publisher
+/// history every publisher there retains the whole floor, VOLATILE ones
+/// included.
 pub fn history_is_floor(attributes: &AttributeSet) -> bool {
     match HISTORY_FLOOR_ATTRIBUTE_KEY.try_into() {
         Ok(key) => attributes.number_of_key_values(&key) > 0,
