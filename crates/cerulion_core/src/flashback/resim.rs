@@ -31,11 +31,11 @@
 //!
 //! # The order is the precedence, and it is not cosmetic
 //!
-//! The arms are asked in the order `run_replay` asks them, the `recorder.json`
-//! contract first, so a capture reports the SAME gap resim would report first.
-//! Reporting a later one would send an
-//! operator to fix something that is not what stops them — the "report the arm
-//! an operator can ACT on" rule the trigger gate already follows.
+//! The arms are asked in the order `run_replay` asks them, the coordination
+//! stamp first, so a capture reports the SAME gap resim would report first.
+//! Reporting a later one would send an operator to fix something that is not
+//! what stops them: the "report the arm an operator can ACT on" rule the
+//! trigger gate already follows.
 //!
 //! Within the trace-record arm that order is RECORD ORDER, not a precedence
 //! between KINDS of record. `run_replay` walks the trace once and refuses per
@@ -65,7 +65,10 @@
 //! apart and holds a worker rank with no boundary stream names the mixed start,
 //! while the replay refuses that rank first; the remedy is the same. The
 //! mixed-start sentence gives the remedy the free-run mid-run refusal gives:
-//! record the run from its first step.
+//! record the run from its first step. The judge has no arm for the
+//! `trace_format` half of the `recorder.json` contract, so a capture stamped
+//! past the formats this build reads, or with a `trace_format` that is not a
+//! version, names a later gap or none, while resim refuses its format first.
 
 use std::collections::BTreeMap;
 
@@ -811,8 +814,9 @@ pub enum ResimGap {
     },
     /// The capture's `__cerulion/recorder.json` states no coordination
     /// contract this build can read: resim refuses such a bag when it reads
-    /// that attachment (`BagInvalidAttachment`, or `CoordinationUnknown` for
-    /// an unknown stamp).
+    /// the coordination stamp (`BagInvalidAttachment` when the attachment is
+    /// not a JSON object, `CoordinationUnknown` for an unknown stamp), unless
+    /// it refuses the bag's `trace_format` there first.
     CoordinationUnreadable(UnreadableCoordination),
     /// The trace carries records but no step boundary — resim's
     /// `BagNoStepBoundaries`.
@@ -1384,8 +1388,9 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// PURE: may this capture claim `resimmable`?
 ///
 /// `Ok(())` means yes. The arms are asked in `run_replay`'s own order, the
-/// `recorder.json` contract first: see the module docs on why that is a
-/// correctness property rather than a style.
+/// coordination stamp first: see the module docs on why that is a correctness
+/// property rather than a style, and for the format check this judge does not
+/// make.
 ///
 /// # The step-0 arm is a genuine YES, not an oversight
 ///
@@ -2177,9 +2182,10 @@ mod tests {
         assert_eq!(judge_resimmable(&healthy(&nodes, &anchors)), Ok(()));
     }
 
-    /// The earlier claim, still true and still first: no trace, no resume.
+    /// The earlier claim, still true and first after the coordination stamp:
+    /// no trace, no resume.
     #[test]
-    fn a_capture_with_no_trace_is_refused_before_anything_else_is_examined() {
+    fn a_capture_with_no_trace_is_refused_first_after_the_coordination_stamp() {
         let nodes = vec!["a".to_string()];
         // Every OTHER fact is also broken, so this pins the ORDER as well as the
         // arm: a judge that asked them in any other sequence would report a
@@ -3799,8 +3805,10 @@ mod tests {
                 })
             };
             for (arm, facts) in [
-                // Every arm the judge asks, each otherwise refusing or
-                // accepting the capture.
+                // The arms with a row below, each otherwise refusing or
+                // accepting the capture. The no-trace row is what proves the
+                // stamp arm sits above all of them: the judge asks every other
+                // arm after the no-trace arm.
                 (
                     "no trace",
                     ResimFacts {

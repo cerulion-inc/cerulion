@@ -1022,8 +1022,9 @@ impl std::fmt::Display for RecordedBy<'_> {
 /// to 0x7E) is written as a JSON `\uXXXX` escape in lowercase hex, and a char
 /// above U+FFFF as its surrogate pair, so DEL, C1 controls and bidi controls in
 /// bag text never reach the terminal raw. Printable ASCII is written as is.
-/// Applied to JSON text, the output is JSON text for the same value: such a
-/// char can sit only inside a JSON string, where the escape stands for it.
+/// Applied to compact JSON text (serde_json's `to_string`), the output is JSON
+/// text for the same value: in compact JSON such a char can sit only inside a
+/// string, where the escape stands for it.
 pub(crate) struct PrintableAscii<'a>(pub(crate) &'a str);
 
 impl std::fmt::Display for PrintableAscii<'_> {
