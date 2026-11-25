@@ -55,6 +55,44 @@ pub fn schema_hash_verdict(frame_hash: u64, expected_hash: u64) -> HashVerdict {
     }
 }
 
+/// The size rule for a FIXED (recursively plain) message's loaned take: at
+/// most this many bytes is the private-copy shape, more is the shared-memory
+/// shape ([`fixed_loan_shape`]).
+///
+/// A private copy is the struct in rmw-owned memory with its sample released
+/// at once, so a `std::shared_ptr<MsgT>` callback may write it; the
+/// shared-memory shape is the struct inside the held sample, read-only, so the
+/// take stays zero-copy. The rule for the value: a private copy may add at most
+/// 10% to one hop at the smallest measured size, which gives 4 KiB. Every test
+/// derives its boundary types from it, so a new value changes nothing else.
+pub const RMW_FIXED_LOAN_COPY_MAX_BYTES: usize = 4 * 1024;
+
+/// The shape the size rule ([`fixed_loan_shape`]) gives a FIXED type's loaned
+/// take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedLoanShape {
+    /// A private copy of the struct in rmw-owned memory, writable; the sample
+    /// is released before the take returns.
+    PrivateCopy,
+    /// The struct inside the held shared-memory sample, read-only (the
+    /// subscriber's mapping is read-only), until the loan is returned.
+    SharedMemory,
+}
+
+/// The fixed loaned take's shape for a message of `fixed_size` bytes: a
+/// private copy up to and including [`RMW_FIXED_LOAN_COPY_MAX_BYTES`], the
+/// shared-memory struct above it.
+///
+/// Total over `usize`, allocation-free, and dependent on nothing but its
+/// argument: a legal mutation target.
+pub fn fixed_loan_shape(fixed_size: usize) -> FixedLoanShape {
+    if fixed_size <= RMW_FIXED_LOAN_COPY_MAX_BYTES {
+        FixedLoanShape::PrivateCopy
+    } else {
+        FixedLoanShape::SharedMemory
+    }
+}
+
 /// What one of a frame's VARIABLE entries says about
 /// whether the frame can be decoded at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +169,24 @@ pub fn var_entry_decodable(entry: Option<&[u8]>, elem_size: Option<usize>) -> En
         Some(elem) if !bytes.len().is_multiple_of(elem) => EntryVerdict::PartialElement,
         _ => EntryVerdict::Decodable,
     }
+}
+
+/// Whether a loaned take is served by COPY rather than as a zero-copy loan.
+///
+/// `held_loans` is the number of zero-copy loans the subscription holds, each
+/// pinning one SHM borrow; `ceiling` is how many borrows the subscription may
+/// hold at once (`min(RMW_TAKE_LOAN_BORROW_BUDGET, the service's
+/// max_borrowed_samples)`). One borrow is kept in reserve: the take that would
+/// hold the last one receives into it, copies the message into private memory
+/// and releases it at once, so a consumer that retains loans keeps receiving
+/// and never reaches the transport's borrow refusal. Zero-copy loans held are
+/// therefore at most `ceiling - 1`, and a ceiling of 1 serves every take by
+/// copy.
+///
+/// Total over `usize x usize` (`held_loans + 1` saturates), allocation-free,
+/// and dependent on nothing but its two arguments.
+pub fn loaned_take_serves_copy(held_loans: usize, ceiling: usize) -> bool {
+    held_loans.saturating_add(1) >= ceiling
 }
 
 #[cfg(test)]
@@ -319,6 +375,47 @@ mod tests {
         }
     }
 
+    /// The fixed loan's shape against a table of sizes, each row placed
+    /// relative to the limit so the table holds for any value of it: real
+    /// messages far below it, the limit and its two neighbours (an off-by-one
+    /// in the comparison moves one of them), and sizes far above it.
+    #[test]
+    fn the_fixed_loan_shape_matches_its_oracle_table() {
+        let limit = RMW_FIXED_LOAN_COPY_MAX_BYTES;
+        let oracle: &[(usize, FixedLoanShape, &str)] = &[
+            (1, FixedLoanShape::PrivateCopy, "std_msgs/Empty's one byte"),
+            (48, FixedLoanShape::PrivateCopy, "a geometry_msgs/Twist"),
+            (
+                limit - 1,
+                FixedLoanShape::PrivateCopy,
+                "one byte under the limit",
+            ),
+            (
+                limit,
+                FixedLoanShape::PrivateCopy,
+                "exactly the limit: inclusive",
+            ),
+            (
+                limit + 1,
+                FixedLoanShape::SharedMemory,
+                "one byte past the limit",
+            ),
+            (
+                16 * 1024 * 1024,
+                FixedLoanShape::SharedMemory,
+                "a 16 MiB fixed message keeps its zero-copy take",
+            ),
+            (
+                usize::MAX,
+                FixedLoanShape::SharedMemory,
+                "saturated: never wraps to a copy",
+            ),
+        ];
+        for &(size, want, why) in oracle {
+            assert_eq!(fixed_loan_shape(size), want, "fixed_size={size}: {why}");
+        }
+    }
+
     /// Anti-tautology for the table above: all three verdicts really occur,
     /// so a gate stuck on any one of them fails it.
     #[test]
@@ -335,5 +432,54 @@ mod tests {
             var_entry_decodable(Some(&[0u8; 5]), Some(4)),
             EntryVerdict::PartialElement
         );
+    }
+
+    /// The reserve rule against a hand-written table: the boundary sits one
+    /// below the ceiling, a ceiling of 1 copies every take, and a held
+    /// count at or past the ceiling (unreachable through the take, which never
+    /// passes the reserve) still copies.
+    #[test]
+    fn the_loaned_take_copies_from_one_below_the_ceiling() {
+        let oracle: &[(usize, usize, bool, &str)] = &[
+            (0, 4, false, "nothing held: zero-copy"),
+            (1, 4, false, "one held: zero-copy"),
+            (2, 4, false, "two held: the third loan is zero-copy"),
+            (3, 4, true, "three held: the fourth borrow stays in reserve"),
+            (4, 4, true, "at the ceiling: copy"),
+            (9, 4, true, "past the ceiling: copy"),
+            (
+                0,
+                2,
+                false,
+                "an iceoryx2-default service: one zero-copy loan",
+            ),
+            (1, 2, true, "...and the second take copies"),
+            (
+                0,
+                1,
+                true,
+                "a ceiling of 1 has no borrow to lend: every take copies",
+            ),
+            (usize::MAX, 4, true, "the increment saturates"),
+            (
+                usize::MAX - 1,
+                usize::MAX,
+                true,
+                "one below a saturated ceiling",
+            ),
+            (
+                usize::MAX - 2,
+                usize::MAX,
+                false,
+                "two below a saturated ceiling",
+            ),
+        ];
+        for &(held, ceiling, want, why) in oracle {
+            assert_eq!(
+                loaned_take_serves_copy(held, ceiling),
+                want,
+                "held={held} ceiling={ceiling}: {why}"
+            );
+        }
     }
 }

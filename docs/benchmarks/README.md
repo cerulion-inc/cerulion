@@ -13,13 +13,14 @@ delivery receipts, because its caveats are counted from them.
 
 | package | what it is | cited by |
 |---|---|---|
-| [Native fixed100 campaign](results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/) | the six STOCK hero cells (Cerulion multi-process and single-process, raw iceoryx2, zenoh SHM, ROS 2 defaults, ROS 2 composed) on an x86-64 Linux desktop, k=5, fixed 100 Hz, recorder on | the README latency table and five of the six series of its round-trip chart; `docs/PERFORMANCE.md` |
-| [ROS 2 over rmw_cerulion in the native harness](results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/) | ROS 2 Jazzy over `rmw_cerulion` with loaned messages both ways, measured by `benches/latency` itself in the chart's stock posture on the same desktop: ten sizes, k=5, fixed 100 Hz; with a stock ROS 2 parity spot check and the acceptance smoke | the `rmw_cerulion` series of the README round-trip chart and the figures under the README's "ROS 2 over Cerulion"; `docs/PERFORMANCE.md` "ROS 2 over `rmw_cerulion`, in the same harness"; `docs/ros2_compatibility.md` |
-| [Free run against lockstep](results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/) | the Cerulion multi-process cell under the free-run default and under the `CERULION_EXECUTION_MODE=lockstep` opt out, one build on one x86-64 Linux machine, ten sizes, k=6 per mode with reps interleaved, fixed 100 Hz, recorder on | the README "Free run and lockstep" table; `docs/PERFORMANCE.md` "Free run against lockstep" |
-| [macOS data wake, before and after](results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/) | the Cerulion two-process and single-process cells before and after the macOS data wake, on an Apple M3 Max, three sizes, k=5 per build with the builds alternating, quiescent pacing | `docs/PERFORMANCE.md` "macOS two-process data wake", linked from the README "Across platforms" note |
-| [Jetson Orin NX campaign](results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/) | the two Cerulion rows on an NVIDIA Jetson Orin NX, k=5, fixed 100 Hz, recorder on | the README three-platform chart |
-| [Apple M4 campaign, macOS 27](results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/) | the two Cerulion rows on an Apple M4 laptop under macOS 27.2.1, Cerulion 2.0.0, k=5, fixed 100 Hz, recorder on | the README three-platform chart and `docs/PERFORMANCE.md` "macOS two-process data wake" |
-| [Apple M4 campaign, macOS 26](results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/) | the two Cerulion rows on the same Apple M4 laptop under macOS 26, before the macOS data wake, k=5, fixed 100 Hz, recorder on | kept as the macOS 26 record. The README chart draws the macOS 27.2.1 package |
+| [Native fixed100 campaign](results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/) | the six STOCK hero cells (Cerulion multi-process and single-process, raw iceoryx2, zenoh SHM, ROS 2 defaults, ROS 2 composed) on an x86-64 Linux desktop, k=5, fixed 100 Hz, recorder on | the latency table and five of the six series of the round-trip chart, on the README and the evidence page; `docs/PERFORMANCE.md` |
+| [ROS 2 over rmw_cerulion in the native harness](results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/) | ROS 2 Jazzy over `rmw_cerulion` with loaned messages both ways, measured by `benches/latency` itself in the chart's stock posture on the same desktop: ten sizes, k=5, fixed 100 Hz; with a stock ROS 2 parity spot check and the acceptance smoke | the `rmw_cerulion` series of the round-trip chart and the `rmw_cerulion` figures, on the README and the evidence page; `docs/PERFORMANCE.md` "ROS 2 over `rmw_cerulion`, in the same harness"; `docs/ros2_compatibility.md` |
+| [Free run against lockstep](results/3e0b99a7a88f0f38-2026-10-20-fixed100-free-run-vs-lockstep/) | the Cerulion multi-process cell under the free-run default and under the `CERULION_EXECUTION_MODE=lockstep` opt out, one build on one x86-64 Linux machine, ten sizes, k=6 per mode with reps interleaved, fixed 100 Hz, recorder on | `docs/PERFORMANCE.md` "Free run against lockstep", linked from the evidence page |
+| [macOS data wake, before and after](results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/) | the Cerulion two-process and single-process cells before and after the macOS data wake, on an Apple M3 Max, three sizes, k=5 per build with the builds alternating, quiescent pacing | `docs/PERFORMANCE.md` "macOS two-process data wake", linked from the platform chart's note on the README and the evidence page |
+| [Jetson Orin NX campaign](results/9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx/) | the two Cerulion rows on an NVIDIA Jetson Orin NX, k=5, fixed 100 Hz, recorder on | the three-platform chart on the README and the evidence page |
+| [Apple M4 campaign, macOS 27](results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/) | the two Cerulion rows on an Apple M4 laptop under macOS 27.2.1, Cerulion 2.0.0, k=5, fixed 100 Hz, recorder on | the three-platform chart on the README and the evidence page, and `docs/PERFORMANCE.md` "macOS two-process data wake" |
+| [Apple M4 campaign, macOS 26](results/0b7bc3994f78e232-2026-09-17-fixed100-apple-m4/) | the two Cerulion rows on the same Apple M4 laptop under macOS 26, before the macOS data wake, k=5, fixed 100 Hz, recorder on | kept as the macOS 26 record. The platform chart draws the macOS 27.2.1 package |
+| [The Cerulion harness on LIBERO-PRO](results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) | 16 models on 100 new start states of LIBERO-PRO, each start state run once without Cerulion (a published three-tool interface) and once with the Cerulion harness's tools, zero-shot, in simulation; every scored episode with its cost at list price, the reading rules, each frozen before the rows of its own lists, six transcripts, and, added after the first grid rows had been seen, for two of the models 400 further start states of LIBERO-PRO, 395 of LIBERO-10 and 40 LIBERO-10 development start states printed apart as counts | the charts `harness-results.svg`, `harness-success-rate.svg` and `harness-cost-per-success.svg` in `docs/media/` |
 
 Package directories are named `<machine_hash>-<date>-<campaign>`. The machine
 hash is a 16-character sha256 prefix of the host's plaintext identity fields,
@@ -28,6 +29,13 @@ those fields in each `run.json`, so two packages from one machine share the
 prefix while those fields are unchanged. On macOS the CPU fields are not
 readable and the hash covers only the kernel release, so an operating system
 update gives the same machine a new prefix.
+
+The harness package ran on nine cloud machines, so no one machine hash
+names it: its prefix is the first 16 characters of the snapshot id of the
+code it measured, the SHA-256 its README prints. Its layout is its own: one
+CSV row per episode, the reading rules (`RULES.md`), a `SUMMARY.md` that
+renders the cited tables, and `recompute.py`, which computes `SUMMARY.md`
+again from the CSV files.
 
 ## Publishing a run
 

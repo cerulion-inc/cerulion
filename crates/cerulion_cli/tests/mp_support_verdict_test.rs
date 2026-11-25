@@ -13,6 +13,10 @@
 //! — `worker_pids_of`'s `pgrep` against a real supervisor — stays covered by the
 //! e2e arms, which is the only place a real `run-worker` subtree exists.
 //!
+//! It also pins `window_head_occupancy_of` on hand records: the count the
+//! Linux window-head measurement in `plain_run_resim_e2e_test` runs on, which
+//! that binary does not build on macOS.
+//!
 //! Its OWN binary rather than a `#[cfg(test)]` module inside `mp_support`:
 //! that module is `mod mp_support;`-included by fourteen e2e binaries, so an
 //! inline test would be compiled and RUN fourteen times.
@@ -201,7 +205,7 @@ fn assert_clean_panics_on_leaked_and_passes_otherwise() {
 /// A guard whose "worker" subtree appears LATE, over a real process group.
 ///
 /// The pgrep the guard uses is `pgrep -P <child> -f run-worker`, so the fixture
-/// spawns a group leader that — after a delay — forks a CHILD whose command line
+/// spawns a group leader that, after GO, forks a CHILD whose command line
 /// carries that needle. A copied script name is used rather than `exec -a`, which
 /// is a bash builtin: a `/bin/sh` that is dash would not have it.
 /// The token `worker_pids_of` greps for in a child's argv.
@@ -216,10 +220,12 @@ fn guard_with_a_late_worker(
 ) -> (ChildGuard, std::path::PathBuf, std::process::ChildStdin) {
     let worker = dir.join(WORKER_NEEDLE);
     let ready = dir.join("worker-arrived");
-    // NO `exec`: an `exec sleep 30` REPLACES this process and the "run-worker"
-    // name is lost from its command line, so `pgrep -f run-worker` then matched
-    // only the PARENT (whose argv carries the script path) and never a child.
-    // Keeping the script process alive is what puts the needle on a child.
+    // Park this script in a shell builtin, so it keeps its "run-worker" argv
+    // without starting a sleep grandchild that could outlive its killed parent.
+    // The test keeps the GO pipe writer open until this worker has been reaped.
+    // The supervisor saves the input on fd 3 before starting an asynchronous
+    // list: POSIX shells otherwise replace a background command's stdin with
+    // /dev/null before applying its explicit redirections.
     //
     // The worker PUBLISHES ITS OWN ARRIVAL before it settles, and the order is
     // what makes the file a sound witness: the `exec` that gives this process its
@@ -228,7 +234,7 @@ fn guard_with_a_late_worker(
     // in the right direction, never ahead of the thing it stands for.
     fresh_executable::install_script(
         &worker,
-        "#!/bin/sh\n: > \"$CER_WORKER_ARRIVED\"\nsleep 30\n",
+        "#!/bin/sh\n: > \"$CER_WORKER_ARRIVED\"\nread _finish\n",
     );
     // THE NEEDLE MUST NOT APPEAR IN THE SUPERVISOR'S OWN ARGV, so the worker path
     // and the witness path travel in the ENVIRONMENT rather than in `-c`.
@@ -245,7 +251,8 @@ fn guard_with_a_late_worker(
     // on a loaded machine, that was 2 failures in 24 runs.
     //
     // With the paths in the environment the supervisor's argv is
-    // `read _go; "$CER_WORKER" & wait` — no pre-exec child can inherit a matching
+    // `exec 3<&0; read _go; "$CER_WORKER" <&3 3<&- & exec 3<&-; wait`:
+    // no pre-exec child can inherit a matching
     // command line, so the window is closed BY CONSTRUCTION rather than by timing.
     // Every other `spawn_group_leader` fixture in this tree was checked: their
     // supervisor is the real `cerulion` binary (`graph run <graph> ...`), whose
@@ -266,7 +273,7 @@ fn guard_with_a_late_worker(
     // until then. There is no timing anywhere in the arm.
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg("read _go; \"$CER_WORKER\" & wait")
+        .arg("exec 3<&0; read _go; \"$CER_WORKER\" <&3 3<&- & exec 3<&-; wait")
         .env("CER_WORKER", &worker)
         .env("CER_WORKER_ARRIVED", &ready)
         .stdin(Stdio::piped())
@@ -357,7 +364,7 @@ fn a_late_appearing_worker_is_noted_through_the_cached_path() {
     use std::io::Write as _;
     go.write_all(b"go\n").expect("release the supervisor");
     go.flush().expect("flush the GO");
-    drop(go);
+    // Keep stdin open: the worker blocks in its builtin read until killed.
 
     // RENDEZVOUS ON THE WORKER'S OWN EVIDENCE — a file it creates once and never
     // removes. A pid set from `pgrep` is a TRANSIENT (see the fixture's note); a
@@ -369,6 +376,10 @@ fn a_late_appearing_worker_is_noted_through_the_cached_path() {
     }
     let workers = worker_pids_of(guard.id());
     assert_eq!(workers.len(), 1, "one late worker, got {workers:?}");
+    assert!(
+        !pid_is_gone(workers[0]),
+        "the arrived worker must stay live while its input writer is open"
+    );
 
     // A LATER poll through the same cached path must now find it. Under the
     // reverted fix the empty set is already cached and this notes nothing.
@@ -394,6 +405,19 @@ fn a_late_appearing_worker_is_noted_through_the_cached_path() {
         OrphanVerdict::Clean { checked: 1 },
         "the same noted set reads Clean once the worker is gone"
     );
+
+    // The worker is reaped above. Keep its input pipe open while its supervisor
+    // finishes waiting, so EOF cannot be what made the worker disappear.
+    let supervisor_pid = guard.id();
+    let _status = guard
+        .wait_bounded(Duration::from_secs(10))
+        .expect("the supervisor must reap its worker and exit");
+    assert!(
+        pid_is_gone(supervisor_pid),
+        "the fixture supervisor must be reaped, pid {supervisor_pid} survived"
+    );
+    drop(go);
+    assert_eq!(guard.finish(), OrphanVerdict::Clean { checked: 1 });
 }
 
 /// A `single_process` guard stays `NotChecked` — correct by design.
@@ -512,4 +536,108 @@ fn an_unreaped_child_is_still_signalled_on_teardown() {
              (leader={leader})"
         );
     }
+}
+
+/// `window_head_occupancy_of` counts each stage's records at the first step of
+/// each of its rank's checkpoint windows at which the stage holds any, and
+/// nowhere else.
+///
+/// Hand oracle. Rank 0: heads at steps 3, 7 and 9 (bit 0), steps 4, 10 and 11
+/// unflagged. `relay` owns one stage (rim 12): two records at step 3, three at
+/// step 4, a later step of step 3's window, at step 7 an annotation, a read and
+/// an overflow marker, nothing at step 9, an annotation and a read at step 10,
+/// the first step of step 9's window it reads at, and one read at step 11.
+/// `sink` owns a body stage and a drain stage (rim 8 each): at step 3 one body
+/// read, one drain read and one peek, which the drain stage holds, nothing
+/// after. Rank 1: its one head is step 5, and its `meter` (rim 6) reads at
+/// steps 3 and 5, so only its step-5 read is in a window, while rank 0's heads
+/// are not its own. So `relay` measures three windows of at most three records
+/// with one marker, `sink`'s body stage one window of one record and its drain
+/// stage one of two, and `meter` one window of one record.
+#[test]
+fn window_head_occupancy_counts_each_stage_at_the_first_step_it_reads_in_each_window() {
+    use cerulion_core::read_outcome::ReadOutcomeKind::{DrainedBatch, Served};
+    use cerulion_core::read_outcome::ReadSiteRole::Peek;
+    use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
+    use cerulion_core::trace_ring::{
+        ReadRun, TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+    };
+    let boundary = |rank: u32, step: u64, flags: u32| TraceRingRecord {
+        step,
+        fire_time_ns: step * 50_000_000,
+        duration_ns: 0,
+        node_idx: 0,
+        global_level: flags,
+        record_type: RECORD_TYPE_STEP_BOUNDARY,
+        reserved: rank,
+    };
+    let on_rank = |rank: u32, r: TraceRingRecord| TraceRingRecord {
+        reserved: rank,
+        ..r
+    };
+    let read = |step: u64, node: u32, kind, seq: u32, role| {
+        TraceRingRecord::read_outcome(step, node, 0, kind, Some(seq), ReadRun::once(1), role)
+    };
+    let trace = vec![
+        boundary(0, 3, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        TraceRingRecord::read_outcome_producer(3, 1, 0, Some(3), 0xA, Drain),
+        read(3, 1, DrainedBatch, 3, Drain),
+        read(3, 2, Served, 3, Body),
+        read(3, 2, DrainedBatch, 3, Drain),
+        read(3, 2, DrainedBatch, 4, Peek),
+        boundary(1, 3, 0),
+        on_rank(1, read(3, 0, Served, 3, Body)),
+        boundary(0, 4, 0),
+        read(4, 1, DrainedBatch, 4, Drain),
+        read(4, 1, DrainedBatch, 5, Drain),
+        read(4, 1, DrainedBatch, 6, Drain),
+        boundary(1, 5, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        on_rank(1, read(5, 0, Served, 5, Body)),
+        boundary(0, 7, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        TraceRingRecord::read_outcome_producer(7, 1, 0, Some(7), 0xA, Drain),
+        read(7, 1, DrainedBatch, 7, Drain),
+        TraceRingRecord::read_outcome_truncated(7, 1, 0, 1, Body),
+        boundary(0, 9, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        boundary(0, 10, 0),
+        TraceRingRecord::read_outcome_producer(10, 1, 0, Some(10), 0xA, Drain),
+        read(10, 1, DrainedBatch, 10, Drain),
+        boundary(0, 11, 0),
+        read(11, 1, DrainedBatch, 11, Drain),
+    ];
+    let ranks = std::collections::BTreeMap::from([
+        (
+            0,
+            (
+                vec![
+                    "ticker".to_string(),
+                    "relay".to_string(),
+                    "sink".to_string(),
+                ],
+                serde_json::json!({"relay": [[0, 0, 12]], "sink": [[0, 0, 8], [0, 1, 8]]}),
+            ),
+        ),
+        (
+            1,
+            (
+                vec!["meter".to_string()],
+                serde_json::json!({"meter": [[0, 0, 6]]}),
+            ),
+        ),
+    ]);
+    let stage = |stage: &str, rim, max_occupancy, windows, truncated| WindowHeadOccupancy {
+        stage: stage.to_string(),
+        rim,
+        max_occupancy,
+        windows,
+        truncated,
+    };
+    assert_eq!(
+        window_head_occupancy_of(&trace, &ranks),
+        vec![
+            stage("r0:relay[0]/body", 12, 3, 3, 1),
+            stage("r0:sink[0]/body", 8, 1, 1, 0),
+            stage("r0:sink[0]/drain", 8, 2, 1, 0),
+            stage("r1:meter[0]/body", 6, 1, 1, 0),
+        ]
+    );
 }

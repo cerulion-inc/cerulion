@@ -146,7 +146,10 @@ The inspection verbs and `schema info` also stay local under the network
 daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
 parse), opening no discovery session of their own. `cerulion viz --robot`
 refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
-`CERULION_VIZD_NETWORK=off`.
+`CERULION_VIZD_NETWORK=off`. `cerulion graph live` and `cerulion graph fires`
+refuse under `CERULION_NETWORK` or `CERULION_NETD_NETWORK=off` before they
+contact `cerulion-netd` or a `--connect` locator, so no runs or fires query
+reaches a robot and no robot starts recording fires.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and
@@ -422,7 +425,27 @@ serialized plan + the run's iceoryx2 namespace.
   RUNTIME (a `ros2 attach` raw route, hash-only over the reg-channel) is NAMED by
   its reg-channel hash. The `schema` selector is ALWAYS explicit (robot AND the
   full type name, `pkg/Type` or a bare `Name`): a mid-key wildcard would compute
-  an empty route on a strict connect-only link. The
+  an empty route on a strict connect-only link. The `fires` verb answers a
+  `cerulion_q/{robot}/fires/{run_id}/{after}` GET about a run the robot hosts
+  in memory (`NetworkManager::hosted_runs`) with the node ticks that run
+  recorded: metadata only, no payload bytes and no topic names. `{run_id}` is
+  the canonical run id (`0x` and 32 lowercase hex digits); `{after}` is `-`
+  (from now) or the last sequence the desk holds, in decimal. Any other tail is
+  not the verb and gets no reply. Each GET arms or extends the run's
+  fire-recording lease, so the run records ticks only while a desk asks. A
+  `served` reply (JSON, `version` 1) carries at most 512 rows
+  `[seq, at_ns, dur_ns, node, cause, flags, wrote]` in increasing `seq`, plus
+  `now_ns`, `armed_since_ns`, `in_tick` (the nodes inside a tick now), `next`
+  and `lost`. `next` is the last sequence the reply accounts for, inclusive:
+  the next GET passes it back unchanged. `lost` counts the sequences in that
+  range the run no longer holds (overwritten or dropped), so rows plus `lost`
+  equal `next` minus `after`. A full page may have more waiting, so the desk
+  asks again; that ask can come back empty. A lost sequence takes no row, so
+  a shorter page reached the newest fire. The other
+  outcomes are `unknown_run` (the robot hosts no such run, or the run is
+  local-only and `runs` hides it: ask `runs` again),
+  `not_served` (the run records no fires) and `refused` (the access gate that
+  also guards `runs`; nothing is read and no lease is armed). The
   key space is DISTINCT from
   the `cerulion_lv`/`cerulion_ann` liveliness spaces, which STAY.
   The queryable handler calls the SAME `enable_bridge` seam (the allow-list gate
@@ -1141,7 +1164,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":11,"wire_header":2}
+{"hello":"cerulion-netd","protocol":12,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":[],"lan_access":"paired"}
 ```
 
@@ -1166,6 +1189,8 @@ Interpreting `connect_endpoints`:
   as "this daemon dialed nothing". An explicit `[]` is the real "nothing folded".
 
 ## Two-machine quickstart (Go2: Mac ↔ robot)
+
+Start with the single-machine [README quickstart](../README.md#quickstart); this section adds a second machine.
 
 Sign in with the same account on both machines, or use an established explicit
 pairing. Each real-clock graph registers its exports automatically. Add a

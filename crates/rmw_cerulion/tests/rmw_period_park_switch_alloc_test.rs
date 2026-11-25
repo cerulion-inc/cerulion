@@ -9,6 +9,12 @@
 //! with the variable set than unset. Here they count exactly the same with it unset, `0` and
 //! a near miss, on the measured thread.
 //!
+//! The publisher-event pump's first pass runs before any window is measured. The pump runs
+//! inside `rmw_wait` once per 20 ms of wall clock from `rmw_init`, and its first pass takes the
+//! publisher registry's lock for the first time; where `std`'s `Mutex` is pthread-backed
+//! (macOS) that first lock allocates the mutex, one allocation in whichever window the pass
+//! lands in. Every later pass, with no publisher registered, allocates nothing.
+//!
 //! Where the park runs (a Linux build that carries it, on a CPU with a monitor-wait
 //! primitive), the test also pins the read-once rule through `predicting_waits`: a wait set
 //! created with the variable unset keeps running the park after `0` is set, and a wait set
@@ -31,6 +37,7 @@ use std::cell::Cell;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rmw_cerulion::ffi::{self, RMW_RET_OK};
 use rmw_cerulion::test_seams::EnvVarGuard;
@@ -163,6 +170,21 @@ unsafe fn wait_once(subscription: *mut ffi::rmw_subscription_t, ws: *mut ffi::rm
     assert_eq!(ret, ffi::RMW_RET_TIMEOUT, "nothing was published");
 }
 
+/// Returns once the publisher-event pump has run a pass, so its first pass, which allocates
+/// the registry's lock on its first use where that lock is pthread-backed, is behind every
+/// measured window. The pump claims a pass once per 20 ms of wall clock and says whether it
+/// ran.
+fn run_a_publisher_event_pump_pass() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !rmw_cerulion::runtime::pump_publisher_events() {
+        assert!(
+            Instant::now() < deadline,
+            "the publisher-event pump ran no pass in 5 s: the runtime is not initialized"
+        );
+        std::thread::yield_now();
+    }
+}
+
 /// Allocations on this thread over [`WAITS`] waits, after a warm-up that fills every reused
 /// buffer.
 unsafe fn allocs_over_waits(
@@ -213,13 +235,15 @@ fn the_period_park_switch_costs_rmw_wait_no_allocation_and_is_read_at_wait_set_c
         // No publisher: the subscription's wait maps the topic's doorbell page by creating it,
         // so where the park runs every call takes the period-learned park, and the
         // publisher-event pump, which runs on a 20 ms wall-clock cadence, has no publisher to
-        // pump, so no measured window depends on whether it came due.
+        // pump, so once its first pass has run no measured window depends on whether it came
+        // due.
         let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
         assert!(!subscription.is_null());
 
         // One wait set, created with the variable unset; the variable then changes under it.
         let ws = rmw_create_wait_set(context, 8);
         assert!(!ws.is_null());
+        run_a_publisher_event_pump_pass();
         let unset = allocs_over_waits(subscription, ws);
         let off_guard = EnvVarGuard::set(VAR, "0");
         let off = allocs_over_waits(subscription, ws);

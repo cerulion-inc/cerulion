@@ -2,7 +2,7 @@
 //! The `rcp-eye` thread's own guarantees, on a private shared-memory root:
 //!
 //! - An ask flood is answered up to the ask bound and no further: the asks
-//!   over it get no answer and no receipt.
+//!   over it get no answer and no receipt, and each is counted as dropped.
 //! - A key placed after the eye started still gets the data notice, logged
 //!   before the first request leaves.
 //! - An answer whose receipt cannot be written is not published.
@@ -12,7 +12,9 @@
 //!   them then and answers.
 //!
 //! The first test installs the process's log subscriber and reads every
-//! line; the second runs with no key on file, so it logs no data notice.
+//! line; the second runs with no key on file, so it logs no data notice. The
+//! third starts no eye: it pins the answer wait the other two use, which
+//! reads the answer topic once more when its budget has run out.
 
 mod eye_common;
 
@@ -27,12 +29,12 @@ use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_rcpd::eye::config::JevConfig;
 use cerulion_rcpd::eye::host::{EyeHost, EyeSettings};
 use cerulion_rcpd::eye::limits::{jpeg_header_for_test, ASKS_PER_SECOND, ASK_BURST};
-use cerulion_rcpd::eye::switch::write_switch;
+use cerulion_rcpd::eye::switch::{read_status, write_switch};
 use cerulion_rcpd::eye::verdict::Outcome;
 use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
 use cerulion_rcpd::tools::ReceiptSink;
-use eye_common::{good_body, Reply, Stub, ANSWERED_MODEL};
+use eye_common::{good_body, Reply, Stub, ANSWERED_MODEL, EYE_WAIT};
 use native_ros2_messages::sensor_msgs::CompressedImage;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::{json, Value};
@@ -77,6 +79,9 @@ fn install_logs() -> Logs {
 
 /// The words every data notice line holds.
 const NOTICE: &str = "so those frames leave this robot";
+
+/// The asks in the flood.
+const FLOOD: u64 = 1_000;
 
 /// The gate's side of the eye's topics; it lives on the thread that made it.
 struct Gate {
@@ -140,11 +145,15 @@ impl Gate {
         proxy.set_data(&ask.to_string()).expect("set");
     }
 
-    /// Every answer that arrives within `within`, by ask id.
+    /// Every answer that arrives until `within` after the first one, by ask
+    /// id, waiting at most [`EYE_WAIT`] for the first. The topic is read once
+    /// more after the deadline has passed, as in [`answer_on`].
     fn answers(&self, within: Duration) -> Vec<(u64, String)> {
-        let deadline = Instant::now() + within;
+        let mut deadline = Instant::now() + EYE_WAIT;
+        let mut opened = false;
         let mut out = Vec::new();
-        while Instant::now() < deadline {
+        loop {
+            let last = Instant::now() >= deadline;
             self.answers
                 .try_receive(|m| {
                     let text = RosString::build_reader(m.payload())
@@ -157,33 +166,50 @@ impl Gate {
                     out.push((id, text));
                 })
                 .expect("receive");
+            if !opened && !out.is_empty() {
+                opened = true;
+                deadline = Instant::now() + within;
+            } else if last {
+                return out;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
-        out
     }
 
     /// The answer to `id`, waiting at most `within`.
     fn answer(&self, id: u64, within: Duration) -> Option<String> {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
-            let mut found = None;
-            self.answers
-                .try_receive(|m| {
-                    let text = RosString::build_reader(m.payload())
-                        .data()
-                        .expect("utf-8")
-                        .to_owned();
-                    if serde_json::from_str::<Value>(&text).expect("json")["ask_id"] == id {
-                        found = Some(text);
-                    }
-                })
-                .expect("receive");
-            if found.is_some() {
-                return found;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        answer_on(&self.answers, id, within)
+    }
+}
+
+/// The answer to `id` on `answers`, waiting at most `within`; answers to
+/// other asks are read and dropped. The topic is read once more after the
+/// deadline has passed, so a thread that was not scheduled until after it
+/// still returns an answer queued meanwhile.
+fn answer_on(
+    answers: &cerulion_core::CerulionSubscriber,
+    id: u64,
+    within: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let last = Instant::now() >= deadline;
+        let mut found = None;
+        answers
+            .try_receive(|m| {
+                let text = RosString::build_reader(m.payload())
+                    .data()
+                    .expect("utf-8")
+                    .to_owned();
+                if serde_json::from_str::<Value>(&text).expect("json")["ask_id"] == id {
+                    found = Some(text);
+                }
+            })
+            .expect("receive");
+        if found.is_some() || last {
+            return found;
         }
-        None
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -273,22 +299,44 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
     let gate_sink = sink.clone();
     let gate_requests = Arc::clone(&requests);
     let gate = std::thread::spawn(move || {
+        // The graph creates the ask topic deep enough to hold the whole
+        // flood, so the eye reads every ask and the ask bound alone decides
+        // which are answered. At the transport's default depth, below the
+        // bound's burst, the queue drops the oldest asks while the eye writes
+        // its synced receipts, and slow receipts let the refill cover every
+        // ask the eye does read.
+        let mut deep = gate_mgr.default_topic_config();
+        deep.subscriber_max_buffer_size = FLOOD as usize;
+        let _ask_topic = gate_mgr
+            .precreate_topic_services(&gate_jev.ask_topic, deep)
+            .expect("the graph creates its ask topic");
         let mut gate = Gate::open(&gate_mgr, &gate_jev);
         let seq = gate.publish_frame();
 
         // A flood of 1,000 asks with Jev off: each answered ask is
         // `disabled` at once, and only the ask bound's worth are answered
         // and receipted. One ask is answered first, so the eye reads the ask
-        // topic and the gate the answer topic before the flood is counted.
+        // topic and the gate the answer topic before the flood is counted:
+        // `Gate::open` saw the eye's ask subscriber before this ask is
+        // published, and the eye's answer publisher connects to the gate's
+        // subscriber when it sends. The eye writes the answer's receipt
+        // before it publishes the answer, so `before` counts it.
         write_switch(&gate_state, false).expect("off");
         gate.ask(9_000, seq);
-        let first = gate
-            .answer(9_000, Duration::from_secs(5))
-            .expect("answer 9000");
+        // A receipt with no answer means the answer was published late or
+        // not at all; a dropped or replay ask count, that the eye refused the
+        // ask; neither, that the eye had not reached it.
+        let first = gate.answer(9_000, EYE_WAIT).unwrap_or_else(|| {
+            panic!(
+                "no answer to ask 9000: {} eye receipts, status {:?}",
+                eye_receipts(&gate_receipts),
+                read_status(&gate_state)
+            )
+        });
         assert_eq!(outcome(&first).0, Outcome::Disabled);
         let before = eye_receipts(&gate_receipts);
         let flood = Instant::now();
-        for id in 0..1_000u64 {
+        for id in 0..FLOOD {
             gate.ask(10_000 + id, seq);
             if id % 10 == 9 {
                 std::thread::sleep(Duration::from_millis(1));
@@ -302,7 +350,7 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         let bound = ASK_BURST as usize
             + (f64::from(ASKS_PER_SECOND) * elapsed.as_secs_f64()).ceil() as usize;
         assert!(
-            bound < 1_000 / 2,
+            bound < FLOOD as usize / 2,
             "the flood outran the ask bound ({published:?} to publish 1,000 asks)"
         );
         assert!(
@@ -321,14 +369,36 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         assert!(answered
             .iter()
             .all(|(_, a)| outcome(a).0 == Outcome::Disabled));
+        // The eye reads every queued ask in one pass and answers the ones it
+        // took (here `disabled`, at once) before it reads again, so a flood
+        // ask still queued when ask 1 arrives is read with it and can spend
+        // the token ask 1 needs. Wait until the receipts and the status
+        // file's drop count cover every flood ask.
+        let deadline = Instant::now() + EYE_WAIT;
+        loop {
+            let last = Instant::now() >= deadline;
+            let dropped = read_status(&gate_state).map_or(0, |s| s.dropped_asks_today);
+            let settled = dropped + (eye_receipts(&gate_receipts) - before) as u64;
+            if settled >= FLOOD {
+                break;
+            }
+            assert!(
+                !last,
+                "{settled} of {FLOOD} flood asks receipted or counted as dropped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         write_switch(&gate_state, true).expect("on");
         // A full ask bucket again.
         std::thread::sleep(Duration::from_millis(2_100));
 
         // No key: answered at once, nothing sent, no notice.
         gate.ask(1, seq);
-        let first = gate.answer(1, Duration::from_secs(5)).expect("answer 1");
+        let first = gate.answer(1, EYE_WAIT).expect("answer 1");
         assert_eq!(outcome(&first).0, Outcome::NoCredential);
+        // Ask 1 is read after every ask of the flood, so each flood ask the
+        // eye answered is receipted by now, before ask 1's own receipt.
+        let flood_answered = eye_receipts(&gate_receipts) - before - 1;
         // The owner places the key: the next look sends, after the notice.
         cerulion_rcpd::eye::credential::write_credential(&gate_key, eye_common::TEST_KEY)
             .expect("key");
@@ -339,7 +409,7 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         );
         let seq = gate.publish_frame();
         gate.ask(2, seq);
-        let second = gate.answer(2, Duration::from_secs(5)).expect("answer 2");
+        let second = gate.answer(2, EYE_WAIT).expect("answer 2");
         assert_eq!(outcome(&second).0, Outcome::Ok, "{second}");
 
         // A receipt that cannot be written keeps its answer unpublished.
@@ -353,15 +423,24 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         // The next answer is receipted and published.
         let seq = gate.publish_frame();
         gate.ask(4, seq);
-        let fourth = gate.answer(4, Duration::from_secs(5)).expect("answer 4");
+        let fourth = gate.answer(4, EYE_WAIT).expect("answer 4");
         assert_eq!(outcome(&fourth).0, Outcome::Ok, "{fourth}");
+        flood_answered
     });
-    tokio::task::spawn_blocking(move || gate.join())
+    let flood_answered = tokio::task::spawn_blocking(move || gate.join())
         .await
         .expect("join")
         .expect("gate");
     drop(eye);
 
+    // Every ask of the flood was answered with a receipt or dropped and
+    // counted; the stopped eye wrote its counts.
+    let status = read_status(&state_dir).expect("status file");
+    assert_eq!(
+        status.dropped_asks_today + flood_answered as u64,
+        FLOOD,
+        "{flood_answered} flood asks answered: {status:?}"
+    );
     let text = logs.text();
     assert!(
         text.contains("dropped an ask over the ask bound"),
@@ -408,7 +487,7 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         let mut gate = Gate::open(&mgr_b, &b_jev);
         let seq = gate.publish_frame();
         gate.ask(5, seq);
-        gate.answer(5, Duration::from_secs(5)).expect("answer 5")
+        gate.answer(5, EYE_WAIT).expect("answer 5")
     });
     let answer = tokio::task::spawn_blocking(move || gate.join())
         .await
@@ -472,7 +551,7 @@ async fn an_eye_started_before_the_graph_leaves_the_graphs_topics_to_the_graph()
         let mut gate = Gate::open(&gate_mgr, &gate_jev);
         let seq = gate.publish_frame();
         gate.ask(1, seq);
-        gate.answer(1, Duration::from_secs(5)).expect("answer 1")
+        gate.answer(1, EYE_WAIT).expect("answer 1")
     });
     let answer = tokio::task::spawn_blocking(move || gate.join())
         .await
@@ -485,5 +564,27 @@ async fn an_eye_started_before_the_graph_leaves_the_graphs_topics_to_the_graph()
             Outcome::NoCredential,
             Some(String::from("credential_missing"))
         )
+    );
+}
+
+#[test]
+fn a_wait_whose_budget_has_run_out_still_returns_the_answer_already_queued() {
+    let mgr = manager("queued");
+    let topic = format!("/rcpd_eye_queued_{}/eye/answer", std::process::id());
+    let answers = mgr.create_subscriber(&topic).expect("answer subscriber");
+    let mut stand_in = mgr
+        .create_publisher_simple(&topic, MaxSliceLen::const_new(16 * 1024))
+        .expect("answer publisher");
+    let other = r#"{"ask_id":8,"outcome":"disabled","detail":"switched_off"}"#;
+    let seven = r#"{"ask_id":7,"outcome":"disabled","detail":"switched_off"}"#;
+    for text in [other, seven] {
+        let mut proxy = stand_in.loan_proxy::<RosString>().expect("loan answer");
+        proxy.set_data(text).expect("set");
+    }
+    // A thread first scheduled after its deadline: the budget is spent
+    // before the first read, and the answer to 7 is already queued.
+    assert_eq!(
+        answer_on(&answers, 7, Duration::ZERO).as_deref(),
+        Some(seven)
     );
 }

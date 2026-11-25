@@ -80,7 +80,7 @@
 
 #![cfg(unix)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,16 +90,18 @@ use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::{
     BackpressurePolicy, ClosureNodeEntry, InputMeta, MacroPolicy, NodeEntry, NodeInfo, OutputMeta,
 };
-use cerulion_core::graph::GraphRuntime;
+use cerulion_core::graph::{GraphRuntime, FUSE_CHAINS_ENV};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::read_outcome::ReadSiteRole;
+use cerulion_core::state_arm::MappedStateArm;
 use cerulion_core::trace_ring::{
-    default_capacity_records, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
-    TraceRingConsumer, TraceRingOwner, TraceRingRecord, READ_OUTCOME_BATCH_FRAME,
-    READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
-    READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED,
-    RECORD_TYPE_READ_OUTCOME,
+    default_capacity_records, read_site_role, step_boundary_flags, unpack_read_outcome_meta,
+    unpack_read_outcome_popped, TraceRingConsumer, TraceRingOwner, TraceRingRecord,
+    READ_OUTCOME_BATCH_FRAME, READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH,
+    READ_OUTCOME_HELD, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER,
+    READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED, RECORD_TYPE_READ_OUTCOME,
+    RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::MaxSliceLen;
 use indexmap::IndexMap;
@@ -7020,5 +7022,927 @@ fn an_external_edge_is_annotated_and_uncapped() {
         "per-set Sync (site 2) at MAX_CONSUMER_DEPTH on an annotated External \
          edge: max(2*64 + 64, 2*2*64 + 1) + 1 = 258, doubled = 516 — the value \
          the pure oracle pins, now reached by a real build"
+    );
+}
+
+// ===========================================================================
+// A node stopped by `NodeError::Fatal`, and a resume that restores the stop
+// ===========================================================================
+
+/// A data-trigger consumer that returns `NodeError::Fatal` from its
+/// `stop_at`-th fire (0 = never), which stops it.
+#[cerulion_node]
+#[derive(Default)]
+struct StoppingTrigSink {
+    #[input(trigger)]
+    inp: Vector3,
+    fires: u32,
+    stop_at: u32,
+}
+
+#[cerulion_node_impl]
+impl StoppingTrigSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        self.fires += 1;
+        if self.fires == self.stop_at {
+            return Err(NodeError::Fatal("the sink stops here".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// A [`StoppingTrigSink`] that stops at its `stop_at`-th fire.
+fn stopping_sink(stop_at: u32) -> Box<dyn NodeEntry> {
+    Box::new(StoppingTrigSinkEntry::with_state(StoppingTrigSink {
+        stop_at,
+        ..Default::default()
+    }))
+}
+
+/// `producer -> consumer` recorded for `steps` steps of 10 ms, with `before`
+/// run on the fresh runtime before step 0: the consumer's kind-6 reads, and
+/// its pending count after each step.
+fn run_stopping(
+    tag: &str,
+    producer: Box<dyn NodeEntry>,
+    consumer: Box<dyn NodeEntry>,
+    steps: u64,
+    before: impl FnOnce(&mut GraphRuntime),
+) -> (Vec<ReadRec>, Vec<u64>) {
+    let (config, factories) = two_node_graph(&format!("ro{tag}"), producer, consumer);
+    let mut pending = Vec::new();
+    let (kind6, _all, _inputs) = run_recorded_driven(
+        tag,
+        config,
+        factories,
+        &["producer", "consumer"],
+        &[&[], &["inp"]],
+        |runtime, _clock| {
+            before(runtime);
+            for _ in 0..steps {
+                runtime.step(Duration::from_millis(10));
+                pending.push(
+                    runtime
+                        .node_handle("consumer")
+                        .expect("consumer handle")
+                        .pending_data_count(),
+                );
+            }
+        },
+    );
+    let consumer: Vec<ReadRec> = kind6.into_iter().filter(|r| r.node_idx == 1).collect();
+    (consumer, pending)
+}
+
+/// What a FIFO trigger drain records once its node is stopped. `StepSrc`
+/// commits seq k at step k, and the sink returns `Fatal` from its second fire:
+///
+///   step 0: pop seq 0 -> DB(0,1); fire 1 serves it.
+///   step 1: pop seq 1 -> DB(1,1); fire 2 serves it and returns `Fatal`.
+///   step 2: no head is held, so the drain pops seq 2 -> DB(2,1) and freezes
+///           it; the node is stopped and no tick takes it.
+///   steps 3 to 7: the drain re-offers held seq 2 and records nothing.
+///
+/// The pending count after each step: 0 while each fire consumes the arrival
+/// its pop minted, then 1 from step 2, the arrival of the held frame, which a
+/// stopped node never consumes and the re-offer does not mint again.
+#[test]
+#[serial]
+fn a_stopped_fifo_trigger_drain_takes_one_more_frame_then_records_nothing() {
+    let (kind6, pending) = run_stopping(
+        "stpa",
+        Box::new(StepSrcEntry::new()),
+        stopping_sink(2),
+        8,
+        |_| {},
+    );
+    assert_eq!(
+        kind6,
+        vec![
+            rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
+            rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
+            rec(2, READ_OUTCOME_DRAINED_BATCH, 2, 1),
+        ],
+        "one more frame after the stop, then nothing"
+    );
+    assert_eq!(pending, vec![0, 0, 1, 1, 1, 1, 1, 1]);
+}
+
+/// The same stop with the writer silent between frames: `SlowSrc` commits
+/// seq 0, 1, 2 at steps 2, 5, 8, and the sink returns `Fatal` from its first
+/// fire (step 2). The stopped drain holds nothing while its queue is empty, so
+/// it consults and records `NoFrame` at steps 3 and 4, pops and holds seq 1 at
+/// step 5, and records nothing after (seq 2 stays queued). Its pending count
+/// stays 0 until that pop and is 1 from step 5.
+#[test]
+#[serial]
+fn a_stopped_fifo_trigger_drain_keeps_consulting_until_a_frame_arrives() {
+    let none = |k| rec(k, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0);
+    let (kind6, pending) = run_stopping(
+        "stpb",
+        Box::new(SlowSrcEntry::new()),
+        stopping_sink(1),
+        10,
+        |_| {},
+    );
+    assert_eq!(
+        kind6,
+        vec![
+            none(0),
+            none(1),
+            rec(2, READ_OUTCOME_DRAINED_BATCH, 0, 1),
+            none(3),
+            none(4),
+            rec(5, READ_OUTCOME_DRAINED_BATCH, 1, 1),
+        ]
+    );
+    assert_eq!(pending, vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+}
+
+/// A resume that restores the consumer stopped before step 0. With an
+/// unconsumed arrival its FIFO trigger input resumes holding a frame: the drain
+/// records nothing at any step, as the recorded drain of a stopped node
+/// holding a frame did, and the held frame's one arrival is pending from step
+/// 0. Without one the drain pops the step-0 frame and holds it, as a live stop
+/// with nothing held does: DB(0,1), then nothing. Neither fires.
+#[test]
+#[serial]
+fn a_restored_stop_with_an_unconsumed_arrival_holds_its_fifo_trigger_input() {
+    for (tag, unconsumed_arrival, expected, held) in [
+        ("stpc", true, vec![], vec!["consumer".to_string()]),
+        (
+            "stpd",
+            false,
+            vec![rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1)],
+            vec![],
+        ),
+    ] {
+        let mut marked = None;
+        let (kind6, pending) = run_stopping(
+            tag,
+            Box::new(StepSrcEntry::new()),
+            stopping_sink(0),
+            6,
+            |runtime| {
+                let stops = [(
+                    "consumer".to_string(),
+                    cerulion_core::state_restore::StoppedAtAnchor { unconsumed_arrival },
+                )]
+                .into_iter()
+                .collect();
+                marked = Some(
+                    runtime
+                        .restore_stopped_nodes(&stops)
+                        .expect("the consumer is in the graph"),
+                );
+            },
+        );
+        assert_eq!(
+            marked,
+            Some(held.into_iter().collect::<BTreeSet<_>>()),
+            "{tag}"
+        );
+        assert_eq!(kind6, expected, "{tag}");
+        assert_eq!(pending, vec![1; 6], "{tag}");
+    }
+}
+
+/// A refused stop restore marks no frame held. Each run asks to restore the
+/// consumer with an unconsumed arrival and is refused (an unknown id beside
+/// it, or a runtime that has collected its external sources), then runs with
+/// the sink returning `Fatal` from its first fire: its drain records the live
+/// stop's own shape, DB(0,1) and then the post-stop pop DB(1,1), which a held
+/// mark left behind by the refusal would have answered with nothing.
+#[test]
+#[serial]
+fn a_refused_stop_restore_leaves_the_trigger_input_unheld() {
+    for (tag, collect_first) in [("stpe", false), ("stpf", true)] {
+        let (kind6, _pending) = run_stopping(
+            tag,
+            Box::new(StepSrcEntry::new()),
+            stopping_sink(1),
+            4,
+            |runtime| {
+                if collect_first {
+                    runtime.collect_external_sources_for_test();
+                }
+                let stops = ["consumer", "unknown"]
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id.to_string(),
+                            cerulion_core::state_restore::StoppedAtAnchor {
+                                unconsumed_arrival: true,
+                            },
+                        )
+                    })
+                    .collect();
+                match runtime.restore_stopped_nodes(&stops) {
+                    Err(TransportError::NodeNotFound { node_id }) if !collect_first => {
+                        assert_eq!(node_id, "unknown");
+                    }
+                    Err(TransportError::GraphError { .. }) if collect_first => {}
+                    other => panic!("{tag}: expected a refusal, got {other:?}"),
+                }
+            },
+        );
+        assert_eq!(
+            kind6,
+            vec![
+                rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
+                rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
+            ],
+            "{tag}"
+        );
+    }
+}
+
+/// Two runs of a resume that restores the consumer stopped with an unconsumed
+/// arrival give one stream: every fire and read record the ring holds, a
+/// fire's measured tick duration left out, and the consumer's pending count
+/// after each step. Hand oracle: the producer fires once at each of the 6
+/// steps and nothing else is recorded (the stopped consumer neither fires nor
+/// reads), and the pending count is 1 from step 0.
+#[test]
+#[serial]
+fn a_restored_held_frame_gives_one_stream_in_two_runs() {
+    const STEPS: u64 = 6;
+    let run = |tag: &str| {
+        let (config, factories) = two_node_graph(
+            &format!("ro{tag}"),
+            Box::new(StepSrcEntry::new()),
+            stopping_sink(0),
+        );
+        let mut pending = Vec::new();
+        let (_kind6, all, _inputs) = run_recorded_driven(
+            tag,
+            config,
+            factories,
+            &["producer", "consumer"],
+            &[&[], &["inp"]],
+            |runtime, _clock| {
+                let stops = [(
+                    "consumer".to_string(),
+                    cerulion_core::state_restore::StoppedAtAnchor {
+                        unconsumed_arrival: true,
+                    },
+                )]
+                .into_iter()
+                .collect();
+                runtime
+                    .restore_stopped_nodes(&stops)
+                    .expect("the consumer is in the graph");
+                for _ in 0..STEPS {
+                    runtime.step(Duration::from_millis(10));
+                    pending.push(
+                        runtime
+                            .node_handle("consumer")
+                            .expect("consumer handle")
+                            .pending_data_count(),
+                    );
+                }
+            },
+        );
+        let fire = cerulion_core::trace_ring::RECORD_TYPE_FIRE;
+        let stream: Vec<(u32, u64, u32, u32, u64, u64)> = all
+            .iter()
+            .filter(|r| r.record_type == fire || r.record_type == RECORD_TYPE_READ_OUTCOME)
+            .map(|r| {
+                let duration = if r.record_type == fire {
+                    0
+                } else {
+                    r.duration_ns
+                };
+                (
+                    r.record_type,
+                    r.step,
+                    r.node_idx,
+                    r.global_level,
+                    r.fire_time_ns,
+                    duration,
+                )
+            })
+            .collect();
+        (stream, pending)
+    };
+    let (first, first_pending) = run("stpg");
+    let (second, second_pending) = run("stph");
+    assert_eq!(first, second, "two runs record one stream");
+    assert_eq!(first_pending, second_pending, "and one pending count");
+    assert_eq!(
+        first
+            .iter()
+            .map(|(kind, step, node, ..)| (*kind, *step, *node))
+            .collect::<Vec<_>>(),
+        (0..STEPS)
+            .map(|k| (cerulion_core::trace_ring::RECORD_TYPE_FIRE, k, 0))
+            .collect::<Vec<_>>(),
+        "the producer's six fires, and nothing of the stopped consumer"
+    );
+    assert_eq!(first_pending, vec![1; STEPS as usize]);
+}
+
+// ===========================================================================
+// Checkpoint window heads: the writer of every site's first read
+// ===========================================================================
+
+/// What one window-head run recorded.
+struct WindowHeadRun {
+    /// Every kind-6 record in ring order, with the step its merge stamped.
+    stream: Vec<(u64, AnnotRec)>,
+    /// The build's publisher table, which the writer tokens are derived from.
+    publishers: WiringPublisherTable,
+    /// The chain calls the stepped runtime made.
+    chain_calls: u64,
+    /// The steps whose STEP_BOUNDARY record carries the reopen flag, in order.
+    flagged_steps: Vec<u64>,
+}
+
+/// The recorded-run harness for the window-head arms: a REAL trace ring AND a
+/// checkpoint arm word, armed from step 0 every `cadence` steps as a recorder
+/// arms it, on one runtime stepped `steps` times by 10 ms. The live step
+/// reopens every stage's writer runs at the end of each due step, so a
+/// checkpoint window opens at step 0 and at the step after each due step.
+///
+/// No state ring is installed, so each due step's anchor walk returns at its
+/// ring check and the reopen is the due step's whole effect on the read log.
+/// The manifest tables are read off `config` in its node and input order, the
+/// order the build assigns `node_idx` and `input_idx` in.
+fn run_at_window_heads(
+    tag: &str,
+    config: GraphConfig,
+    factories: IndexMap<String, Box<dyn NodeEntry>>,
+    cadence: u64,
+    steps: u64,
+) -> WindowHeadRun {
+    let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
+    let node_inputs: Vec<Vec<String>> = config
+        .nodes
+        .iter()
+        .map(|n| n.inputs.iter().map(|i| i.name.clone()).collect())
+        .collect();
+    let id_refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
+    let input_refs: Vec<Vec<&str>> = node_inputs
+        .iter()
+        .map(|inputs| inputs.iter().map(String::as_str).collect())
+        .collect();
+    let input_slices: Vec<&[&str]> = input_refs.iter().map(Vec::as_slice).collect();
+    let ring_tag = format!("{tag}_{}", std::process::id());
+    let mut owner = TraceRingOwner::create_with_inputs(
+        &ring_tag,
+        default_capacity_records(),
+        0,
+        &id_refs,
+        &input_slices,
+    )
+    .expect("create ring");
+    let ring_name = owner.name().to_string();
+    let producer_handle = owner.producer().expect("mint producer");
+
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime =
+        GraphRuntime::build_for_test(config, factories, clock, 8).expect("build graph");
+    runtime.set_trace_ring_producer(producer_handle, &node_ids);
+    assert!(
+        runtime.read_outcome_stages_armed_for_test() > 0,
+        "installing the ring must ARM the wired read-outcome stages"
+    );
+    // Held until the run ends: dropping the owning handle unlinks the word.
+    let arm = Arc::new(MappedStateArm::create_owned(&format!("{ring_tag}_arm")).expect("arm word"));
+    arm.arm(cadence, 0);
+    runtime.attach_state_arm(Arc::clone(&arm));
+
+    for _ in 0..steps {
+        runtime.step(Duration::from_millis(10));
+    }
+    let publishers = runtime.read_log_publisher_ids().clone();
+    let chain_calls = runtime.chain_calls_made();
+
+    let mut ring_consumer = TraceRingConsumer::open(&ring_name).expect("open consumer");
+    let mut records = Vec::new();
+    ring_consumer.drain(&mut records).expect("drain ring");
+    drop(ring_consumer);
+    runtime.shutdown();
+    drop(arm);
+    drop(owner);
+    let flagged_steps = records
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .filter(|r| {
+            step_boundary_flags(r.global_level)
+                .expect("a recorder writes only defined boundary bits")
+                .runs_reopened()
+        })
+        .map(|r| r.step)
+        .collect();
+    WindowHeadRun {
+        stream: stepped_annot_stream(&records),
+        publishers,
+        chain_calls,
+        flagged_steps,
+    }
+}
+
+/// Every kind-6 record in ring order, aux word intact, with the step its merge
+/// stamped: the window-head arms need the checkpoint window each record fell
+/// in.
+fn stepped_annot_stream(records: &[TraceRingRecord]) -> Vec<(u64, AnnotRec)> {
+    records
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .map(|r| r.step)
+        .zip(annot_stream(records))
+        .collect()
+}
+
+/// The reopen flag sits on the boundary of every window head but the first:
+/// the recording's first window opens when its stages are armed, and each
+/// later one at the step after a due step, the step whose boundary the live
+/// step flags. `window_starts` ascends from 0.
+fn assert_flagged_at_window_heads(run: &WindowHeadRun, window_starts: &[u64], shape: &str) {
+    assert_eq!(
+        run.flagged_steps,
+        window_starts[1..].to_vec(),
+        "{shape}: the reopen flag is on exactly the boundaries where a reopened window starts"
+    );
+}
+
+/// One kind-6 record as the window-head arms write it by hand:
+/// `(step, node_idx, input_idx, kind, served sequence, call-site role)`.
+type HeadRow = (u64, u32, u16, u16, u64, ReadSiteRole);
+
+/// A hand [`HeadRow`] on input 0, the only input every hand-checked edge
+/// below reads through.
+fn head_row(step: u64, node_idx: u32, kind: u16, seq: u64, role: ReadSiteRole) -> HeadRow {
+    (step, node_idx, 0, kind, seq, role)
+}
+
+/// The [`HeadRow`] projection of a window-head run's stream.
+fn head_rows(stream: &[(u64, AnnotRec)]) -> Vec<HeadRow> {
+    stream
+        .iter()
+        .map(|(step, r)| (*step, r.node_idx, r.input_idx, r.kind, r.seq, r.role))
+        .collect()
+}
+
+/// Whether a read record served a frame, and so names a writer, over the
+/// shapes the window-head arms run: a `NoFrame` read served nothing, and a
+/// `Truncated` marker is no read. `Decimated` is left out because the kind
+/// alone cannot say: a decimated boundary snapshot on a held frame is
+/// annotated, while a decimated live or trigger read is not. No window-head
+/// shape gates a sample, and the rule check refuses a `Decimated` record
+/// rather than guess.
+fn serves_a_frame(kind: u16) -> bool {
+    matches!(
+        kind,
+        READ_OUTCOME_SERVED
+            | READ_OUTCOME_HELD
+            | READ_OUTCOME_DRAINED_BATCH
+            | READ_OUTCOME_BATCH_FRAME
+    )
+}
+
+/// THE WINDOW-HEAD RULE over one recorded stream, for single-writer edges:
+/// in every checkpoint window (`window_starts`, ascending from 0), each read
+/// site of each `(node, input)` stages exactly one `Producer` annotation when
+/// it serves any frame in the window and none otherwise; the annotation comes
+/// before the site's first frame-serving read of the window, binds to the read
+/// right after it (same node, input, step and served sequence) and names the
+/// edge's writer (`writer_of`). Reads that served nothing may come first.
+///
+/// A stream holding a `Decimated` record is refused, not classified.
+///
+/// Returns how many `(node, input, site, window)` heads carried an annotation,
+/// so a caller can floor it and a check over nothing fails.
+fn assert_every_window_head_names_its_writer(
+    stream: &[(u64, AnnotRec)],
+    window_starts: &[u64],
+    writer_of: impl Fn(u32, u16) -> u64,
+) -> usize {
+    let window_of = |step: u64| {
+        window_starts
+            .iter()
+            .rposition(|&start| start <= step)
+            .expect("the first window starts at step 0")
+    };
+    // (node, input, site, window) -> (annotations, frame-serving reads).
+    let mut heads = BTreeMap::new();
+    for (i, (step, r)) in stream.iter().enumerate() {
+        let site = cerulion_core::read_outcome::writer_run_site(r.role);
+        let key = (r.node_idx, r.input_idx, site, window_of(*step));
+        assert_ne!(
+            r.kind, READ_OUTCOME_DECIMATED,
+            "record {i} is a Decimated read, which this rule check does not classify"
+        );
+        let entry: &mut (usize, usize) = heads.entry(key).or_insert((0, 0));
+        if r.kind == READ_OUTCOME_PRODUCER {
+            let (read_step, read) = stream
+                .get(i + 1)
+                .unwrap_or_else(|| panic!("an annotation ends the stream at record {i}"));
+            assert!(
+                *read_step == *step
+                    && read.kind != READ_OUTCOME_PRODUCER
+                    && (read.node_idx, read.input_idx, read.seq)
+                        == (r.node_idx, r.input_idx, r.seq),
+                "the annotation at record {i} binds to the read right after it: {:?}",
+                head_rows(stream)
+            );
+            assert_eq!(
+                entry.1,
+                0,
+                "an annotation at record {i} after its site's first frame-serving read of \
+                 the window: that read named no writer: {:?}",
+                head_rows(stream)
+            );
+            assert_eq!(
+                r.aux,
+                writer_of(r.node_idx, r.input_idx),
+                "the annotation at record {i} names the edge's writer"
+            );
+            entry.0 += 1;
+        } else if serves_a_frame(r.kind) {
+            assert_eq!(
+                entry.0,
+                1,
+                "record {i}, a frame-serving read at step {step}, follows exactly one \
+                 annotation of its site in its window {key:?}: {:?}",
+                head_rows(stream)
+            );
+            entry.1 += 1;
+        }
+    }
+    for (key, (annotations, serving)) in &heads {
+        assert_eq!(
+            *annotations,
+            usize::from(*serving > 0),
+            "(node, input, site, window) {key:?}: one annotation where the site served a \
+             frame, none where it served nothing"
+        );
+    }
+    heads
+        .values()
+        .filter(|(annotations, _)| *annotations == 1)
+        .count()
+}
+
+/// THE WINDOW-HEAD RULE on real runs: a checkpoint arm attached beside the
+/// trace ring makes the live step reopen every stage's writer runs at the end
+/// of each due step, so every read site's first frame-serving read of each
+/// checkpoint window is preceded by its writer's annotation, and no other read
+/// of a single-writer edge is.
+///
+/// Armed from step 0 every 2 steps, a run is due at 0, 2, 4 and so on, so its
+/// windows open at steps 0, 1, 3, 5 and so on, and every shape also pins that
+/// the reopen flag sits on exactly the boundaries of the windows after the
+/// first. Five shapes:
+///
+/// 1. UNIFIED with REFILL: a data trigger's boundary drain and its
+///    between-fires refill, both drain-site reads on the body stage (full hand
+///    oracle).
+/// 2. SEPARATE: the body's own pops on the body stage and the runtime's batch
+///    drain on the drain stage, each site opening its own run, the drain's
+///    opening carried by its batch frame (full hand oracle).
+/// 3. PER-SET SYNC with a PEEK: in-graph sources at 10 ms and 30 ms, so the
+///    fast input queues frames at later stamps while the slow one has none,
+///    and the matcher peeks behind the fast head when the slow frame lands
+///    (the rule, and the premise that a peek opened a run).
+/// 4. CHAIN CALL: `src -> mid -> far` with chain calls on, so both members
+///    drain their input in a chain call after the head's level (full hand
+///    oracle, and the premise that both members were called every step).
+/// 5. PLAIN-INPUT SNAPSHOT: a slow source into a polling sink, whose boundary
+///    snapshot serves a new frame or holds the last one at the body site, so
+///    a window can open on a HELD frame popped in an earlier window and still
+///    names that frame's writer (full hand oracle).
+///
+/// Every stage is drained by its level's merge before the due boundary, so no
+/// read staged before a reopen lands after it: such a read would be merged
+/// into the next window ahead of its site's annotation, and the rule check
+/// names it.
+#[test]
+#[serial]
+fn every_sites_first_read_after_a_due_step_carries_its_writer() {
+    use cerulion_core::trace_ring::{
+        READ_OUTCOME_BATCH_FRAME as FRAME, READ_OUTCOME_DRAINED_BATCH as DRAINED,
+        READ_OUTCOME_HELD as HELD, READ_OUTCOME_NONE as NO_FRAME_KIND,
+        READ_OUTCOME_NO_FRAME as NO_SEQ, READ_OUTCOME_PRODUCER as PRODUCER,
+        READ_OUTCOME_SERVED as SERVED,
+    };
+    use ReadSiteRole::{Body, Drain};
+    const STEPS: u64 = 6;
+    const HEADS: [u64; 4] = [0, 1, 3, 5];
+
+    // (1) UNIFIED with REFILL. `FastSrc` commits 2k and 2k+1 on step k; the
+    // boundary drain pops 2k and the refill 2k+1, both at the drain site.
+    {
+        let (config, factories) = two_node_graph(
+            "whuni",
+            Box::new(FastSrcEntry::new()),
+            Box::new(TrigSinkEntry::new()),
+        );
+        let run = run_at_window_heads("whuni", config, factories, 2, STEPS);
+        assert_flagged_at_window_heads(&run, &HEADS, "UNIFIED");
+        let writer = expected_token(publisher_id_of(&run.publishers, "producer", "out"));
+        let mut expected: Vec<HeadRow> = Vec::new();
+        for k in 0..STEPS {
+            if HEADS.contains(&k) {
+                expected.push(head_row(k, 1, PRODUCER, 2 * k, Drain));
+            }
+            expected.push(head_row(k, 1, DRAINED, 2 * k, Drain));
+            expected.push(head_row(k, 1, DRAINED, 2 * k + 1, Drain));
+        }
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "UNIFIED: the boundary pop of each window's first step names the writer, and \
+             every other read of the window is bare"
+        );
+        let heads = assert_every_window_head_names_its_writer(&run.stream, &HEADS, |_, _| writer);
+        assert_eq!(
+            heads,
+            HEADS.len(),
+            "UNIFIED: one drain-site opening per window"
+        );
+    }
+
+    // (2) SEPARATE. The body stage's records merge before the drain stage's.
+    {
+        let _separate = WaveEnvGuard::set("CERULION_DRAIN_DISCIPLINE", "separate");
+        let (config, factories) = two_node_graph(
+            "whsep",
+            Box::new(FastSrcEntry::new()),
+            Box::new(TrigSinkEntry::new()),
+        );
+        let run = run_at_window_heads("whsep", config, factories, 2, STEPS);
+        assert_flagged_at_window_heads(&run, &HEADS, "SEPARATE");
+        let writer = expected_token(publisher_id_of(&run.publishers, "producer", "out"));
+        let mut expected: Vec<HeadRow> = Vec::new();
+        for k in 0..STEPS {
+            let head = HEADS.contains(&k);
+            if head {
+                expected.push(head_row(k, 1, PRODUCER, 2 * k, Body));
+            }
+            expected.push(head_row(k, 1, SERVED, 2 * k, Body));
+            expected.push(head_row(k, 1, SERVED, 2 * k + 1, Body));
+            if head {
+                expected.push(head_row(k, 1, PRODUCER, 2 * k, Drain));
+            }
+            expected.push(head_row(k, 1, FRAME, 2 * k, Drain));
+            expected.push(head_row(k, 1, DRAINED, 2 * k + 1, Drain));
+        }
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "SEPARATE: each site names the writer at its first read of each window; the \
+             drain site's opening is carried by the batch frame it stages first"
+        );
+        let heads = assert_every_window_head_names_its_writer(&run.stream, &HEADS, |_, _| writer);
+        assert_eq!(
+            heads,
+            2 * HEADS.len(),
+            "SEPARATE: one opening per site per window"
+        );
+    }
+
+    // (3) PER-SET SYNC with a PEEK.
+    {
+        const SYNC_STEPS: u64 = 9;
+        const SYNC_HEADS: [u64; 5] = [0, 1, 3, 5, 7];
+        let config = graph_of(
+            "whsync",
+            vec![
+                src_def("pa"),
+                src_def("pb"),
+                sink_def("consumer", &[("a", "pa/out"), ("b", "pb/out")]),
+            ],
+        );
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("pa".to_string(), Box::new(StepSrcEntry::new()));
+        factories.insert("pb".to_string(), Box::new(SlowSrcEntry::new()));
+        factories.insert("consumer".to_string(), Box::new(SyncSinkEntry::new()));
+        let run = run_at_window_heads("whsync", config, factories, 2, SYNC_STEPS);
+        assert_flagged_at_window_heads(&run, &SYNC_HEADS, "SYNC");
+        let writer_a = expected_token(publisher_id_of(&run.publishers, "pa", "out"));
+        let writer_b = expected_token(publisher_id_of(&run.publishers, "pb", "out"));
+        assert!(
+            run.stream
+                .iter()
+                .any(|(_, r)| r.kind == READ_OUTCOME_PRODUCER && r.role == ReadSiteRole::Peek),
+            "PREMISE: a peek opened a writer run, so the peek site is covered: {:?}",
+            head_rows(&run.stream)
+        );
+        let heads = assert_every_window_head_names_its_writer(
+            &run.stream,
+            &SYNC_HEADS,
+            |node, input| match (node, input) {
+                (2, 0) => writer_a,
+                (2, 1) => writer_b,
+                other => panic!("no read-logged edge at (node, input) {other:?}"),
+            },
+        );
+        assert!(
+            heads >= SYNC_HEADS.len(),
+            "SYNC: at least as many openings as windows, a floor so a check over nothing fails ({heads} over {} windows)",
+            SYNC_HEADS.len()
+        );
+    }
+
+    // (4) CHAIN CALL. `src` publishes k on step k, `mid` relays it as k, and
+    // both members drain at the drain site from the chain call.
+    {
+        let _fuse = WaveEnvGuard::set(FUSE_CHAINS_ENV, "1");
+        let config = graph_of(
+            "whchain",
+            vec![
+                src_def("src"),
+                relay_def("mid", "inp", "src/out", None),
+                sink_def("far", &[("inp", "mid/out")]),
+            ],
+        );
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("src".to_string(), Box::new(StepSrcEntry::new()));
+        factories.insert("mid".to_string(), Box::new(TrigRelayEntry::new()));
+        factories.insert("far".to_string(), Box::new(TrigSinkEntry::new()));
+        let run = run_at_window_heads("whchain", config, factories, 2, STEPS);
+        assert_flagged_at_window_heads(&run, &HEADS, "CHAIN CALL");
+        assert_eq!(
+            run.chain_calls,
+            2 * STEPS,
+            "PREMISE: both members were called on every step"
+        );
+        let writer_src = expected_token(publisher_id_of(&run.publishers, "src", "out"));
+        let writer_mid = expected_token(publisher_id_of(&run.publishers, "mid", "out"));
+        let mut expected: Vec<HeadRow> = Vec::new();
+        for k in 0..STEPS {
+            for node in [1u32, 2] {
+                if HEADS.contains(&k) {
+                    expected.push(head_row(k, node, PRODUCER, k, Drain));
+                }
+                expected.push(head_row(k, node, DRAINED, k, Drain));
+            }
+        }
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "CHAIN CALL: each member's chain-called drain names its writer at the first \
+             step of each window"
+        );
+        let heads =
+            assert_every_window_head_names_its_writer(&run.stream, &HEADS, |node, input| {
+                match (node, input) {
+                    (1, 0) => writer_src,
+                    (2, 0) => writer_mid,
+                    other => panic!("no read-logged edge at (node, input) {other:?}"),
+                }
+            });
+        assert_eq!(
+            heads,
+            2 * HEADS.len(),
+            "CHAIN CALL: one opening per member per window"
+        );
+    }
+
+    // (5) PLAIN-INPUT SNAPSHOT. `SlowSrc` publishes 0, 1 and 2 on steps 2, 5
+    // and 8 on a plain edge, so the poller shares its level and each step's
+    // boundary snapshot reads what the steps before it published: nothing on
+    // steps 0 to 2, then a new frame (`Served`) on 3, 6 and 9, and the held
+    // one (`Held`) between. Windows open at 3, 5, 7 and 9 with a frame to
+    // name; at 5 and 7 that frame is HELD, popped in the window before, and
+    // the annotation still names its writer.
+    {
+        const HOLD_STEPS: u64 = 10;
+        const HOLD_HEADS: [u64; 6] = [0, 1, 3, 5, 7, 9];
+        let (config, factories) = two_node_graph(
+            "whhold",
+            Box::new(SlowSrcEntry::new()),
+            Box::new(PollSinkEntry::new()),
+        );
+        let run = run_at_window_heads("whhold", config, factories, 2, HOLD_STEPS);
+        assert_flagged_at_window_heads(&run, &HOLD_HEADS, "SNAPSHOT");
+        let writer = expected_token(publisher_id_of(&run.publishers, "producer", "out"));
+        let expected: Vec<HeadRow> = vec![
+            head_row(0, 1, NO_FRAME_KIND, NO_SEQ, Body),
+            head_row(1, 1, NO_FRAME_KIND, NO_SEQ, Body),
+            head_row(2, 1, NO_FRAME_KIND, NO_SEQ, Body),
+            head_row(3, 1, PRODUCER, 0, Body),
+            head_row(3, 1, SERVED, 0, Body),
+            head_row(4, 1, HELD, 0, Body),
+            head_row(5, 1, PRODUCER, 0, Body),
+            head_row(5, 1, HELD, 0, Body),
+            head_row(6, 1, SERVED, 1, Body),
+            head_row(7, 1, PRODUCER, 1, Body),
+            head_row(7, 1, HELD, 1, Body),
+            head_row(8, 1, HELD, 1, Body),
+            head_row(9, 1, PRODUCER, 2, Body),
+            head_row(9, 1, SERVED, 2, Body),
+        ];
+        assert_eq!(
+            head_rows(&run.stream),
+            expected,
+            "SNAPSHOT: no annotation before the first frame; each later window names \
+             the writer at its first served or held read, the held frame's included"
+        );
+        let heads =
+            assert_every_window_head_names_its_writer(&run.stream, &HOLD_HEADS, |_, _| writer);
+        assert_eq!(
+            heads, 4,
+            "SNAPSHOT: the windows at 3, 5, 7 and 9 open on a frame; 0 and 1 to 2 serve none"
+        );
+    }
+}
+
+/// `GraphRuntime::reopen_writer_runs_where` reopens ONLY the stages of the
+/// nodes `keep` accepts. One source feeds two data-trigger sinks, `a` and `b`;
+/// after two steps the test reopens the runs of `a` alone, so at step 2 `a`'s
+/// read names its writer again while `b`'s stays bare, its run still open
+/// from step 0. No checkpoint arm is attached, so the only reopen is the
+/// test's own and no boundary carries the flag.
+///
+/// Hand oracle per sink: `src` publishes k on step k, and each sink's boundary
+/// drain pops it at the drain site (the refill that follows finds nothing and
+/// stages nothing).
+#[test]
+#[serial]
+fn a_reopen_kept_to_one_node_leaves_every_other_nodes_run_open() {
+    use cerulion_core::trace_ring::{
+        READ_OUTCOME_DRAINED_BATCH as DRAINED, READ_OUTCOME_PRODUCER as PRODUCER,
+    };
+    use ReadSiteRole::Drain;
+
+    let config = graph_of(
+        "whkeep",
+        vec![
+            src_def("src"),
+            sink_def("a", &[("inp", "src/out")]),
+            sink_def("b", &[("inp", "src/out")]),
+        ],
+    );
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("src".to_string(), Box::new(StepSrcEntry::new()));
+    factories.insert("a".to_string(), Box::new(TrigSinkEntry::new()));
+    factories.insert("b".to_string(), Box::new(TrigSinkEntry::new()));
+    let mut publishers = None;
+    let (_kind6, all, _inputs) = run_recorded_driven(
+        "whkeep",
+        config,
+        factories,
+        &["src", "a", "b"],
+        &[&[], &["inp"], &["inp"]],
+        |runtime, _clock| {
+            for _ in 0..2 {
+                runtime.step(Duration::from_millis(10));
+            }
+            runtime.reopen_writer_runs_where(|node| node == "a");
+            for _ in 0..2 {
+                runtime.step(Duration::from_millis(10));
+            }
+            publishers = Some(runtime.read_log_publisher_ids().clone());
+        },
+    );
+    let publishers = publishers.expect("the drive ran");
+    let writer = expected_token(publisher_id_of(&publishers, "src", "out"));
+    let stream = stepped_annot_stream(&all);
+    assert!(
+        stream
+            .iter()
+            .filter(|(_, r)| r.kind == READ_OUTCOME_PRODUCER)
+            .all(|(_, r)| r.aux == writer),
+        "every annotation names `src`'s writer: {:?}",
+        head_rows(&stream)
+    );
+    assert!(
+        all.iter()
+            .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+            .all(|r| r.global_level == 0),
+        "CONTROL: with no arm attached no boundary carries a flag"
+    );
+    let rows_of = |node: u32| -> Vec<HeadRow> {
+        head_rows(&stream)
+            .into_iter()
+            .filter(|row| row.1 == node)
+            .collect()
+    };
+    assert_eq!(
+        rows_of(1),
+        vec![
+            head_row(0, 1, PRODUCER, 0, Drain),
+            head_row(0, 1, DRAINED, 0, Drain),
+            head_row(1, 1, DRAINED, 1, Drain),
+            head_row(2, 1, PRODUCER, 2, Drain),
+            head_row(2, 1, DRAINED, 2, Drain),
+            head_row(3, 1, DRAINED, 3, Drain),
+        ],
+        "`a`, the node kept: its first read after the reopen names its writer again"
+    );
+    assert_eq!(
+        rows_of(2),
+        vec![
+            head_row(0, 2, PRODUCER, 0, Drain),
+            head_row(0, 2, DRAINED, 0, Drain),
+            head_row(1, 2, DRAINED, 1, Drain),
+            head_row(2, 2, DRAINED, 2, Drain),
+            head_row(3, 2, DRAINED, 3, Drain),
+        ],
+        "`b`, the node left out: its run continues bare from step 0"
     );
 }

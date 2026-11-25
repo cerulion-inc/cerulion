@@ -54,6 +54,9 @@ members = [
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_stable_abi_cross_compiler",
     "crates/test_fixtures/test_node_macro_cdylib",
+    # The #[cerulion_node] diagnostics suite: trybuild compile-fail cases and
+    # the compile-pass programs as binaries.
+    "crates/test_fixtures/node_macro_ui",
     "crates/test_fixtures/test_node_failing_cdylib",
     # Returns one chosen NodeError arm (env-selected) from init, a chosen
     # tick, or shutdown: the typed error kind across the cdylib boundary.
@@ -83,6 +86,16 @@ members = [
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
     # Oracle-vector fixture for raw-FFI template emit.
     "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    # The two nodes graph_start_order_e2e_test scaffolds with `node create` and
+    # `node modify`, prebuilt: a period producer with one Vector3 output and a
+    # period consumer with one plain Vector3 input. Each lib.rs is the scaffold's
+    # bytes and each manifest is the scaffold's with the package renamed, kept off
+    # crates.io and inheriting the lint table; the test compares both against a
+    # live scaffold before `graph run` loads the libraries.
+    "crates/test_fixtures/test_node_start_order_prod_cdylib",
+    "crates/test_fixtures/test_node_start_order_cons_cdylib",
+    # The raw template created with one output, after two `node modify` calls.
+    "crates/test_fixtures/test_node_modified_raw_cdylib",
     "crates/test_fixtures/test_node_unknown_schema_cdylib",
     # Variable-schema spill round-trip across FFI.
     "crates/test_fixtures/test_node_macro_overflow_cdylib",
@@ -233,6 +246,12 @@ members = [
     # gateway that demands one topic without reading a catalog first, so the
     # e2e can show a paired app refuses a LAN data demand and sends no frame.
     "crates/test_fixtures/android_e2e_demand_probe",
+    # A node crate as `node create` writes it, and an app library that depends
+    # on it with `default-features = false`. Built and inspected by
+    # `crates/cerulion_cli_engine/tests/node_links_as_library_test.rs`, which
+    # also checks the node against `node create`'s output.
+    "crates/test_fixtures/test_node_links_timer",
+    "crates/test_fixtures/test_node_links_host_app",
     # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
     #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
@@ -399,9 +418,9 @@ default-members = [
     "crates/cerulion_ops_proto",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
-    # The RCP daemon adds only rmcp, sse-stream, a second base64, a second
-    # sha2 (with its digest 0.11 stack) and `h2` to the default build: its
-    # HTTP server and its Jev client run on hyper, already here.
+    # The RCP daemon adds only rmcp, sse-stream, a second base64 and `h2` to
+    # the default build: its HTTP server and its Jev client run on hyper,
+    # already here.
     "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a
@@ -429,7 +448,7 @@ resolver = "2"
 # `<field>.workspace = true`. Bump `version` here to release
 # all crates in lockstep.
 [workspace.package]
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 repository = "https://github.com/cerulion-inc/cerulion"
@@ -540,25 +559,25 @@ disallowed_methods = "deny"
 # matching on a 0.0.x prerelease is surprising, and these crates are released
 # in lockstep anyway, so `=<workspace version>` is both correct and clearest.
 [workspace.dependencies]
-cerulion_node_abi = { path = "crates/cerulion_node_abi", version = "=2.0.0" }
-cerulion_macros = { path = "crates/cerulion_macros", version = "=2.0.0" }
-cerulion_core = { path = "crates/cerulion_core", version = "=2.0.0" }
-cerulion_bag = { path = "crates/cerulion_bag", version = "=2.0.0" }
-cerulion_bagd = { path = "crates/cerulion_bagd", version = "=2.0.0" }
-cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=2.0.0" }
+cerulion_node_abi = { path = "crates/cerulion_node_abi", version = "=2.1.0" }
+cerulion_macros = { path = "crates/cerulion_macros", version = "=2.1.0" }
+cerulion_core = { path = "crates/cerulion_core", version = "=2.1.0" }
+cerulion_bag = { path = "crates/cerulion_bag", version = "=2.1.0" }
+cerulion_bagd = { path = "crates/cerulion_bagd", version = "=2.1.0" }
+cerulion_cli_engine = { path = "crates/cerulion_cli_engine", version = "=2.1.0" }
 indexmap = "2.8"
-cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=2.0.0" }
-cerulion_dds = { path = "crates/cerulion_dds", version = "=2.0.0", default-features = false }
-cerulion_discovery = { path = "crates/cerulion_discovery", version = "=2.0.0" }
-cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=2.0.0" }
-cerulion_link = { path = "crates/cerulion_link", version = "=2.0.0" }
-cerulion_mdns = { path = "crates/cerulion_mdns", version = "=2.0.0" }
-cerulion_msgio = { path = "crates/cerulion_msgio", version = "=2.0.0" }
-cerulion_netd = { path = "crates/cerulion_netd", version = "=2.0.0", default-features = false }
-cerulion_pairing = { path = "crates/cerulion_pairing", version = "=2.0.0" }
-cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=2.0.0" }
-cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=2.0.0" }
-native_ros2_messages = { path = "crates/native_ros2_messages", version = "=2.0.0" }
+cerulion_cli_tui = { path = "crates/cerulion_cli_tui", version = "=2.1.0" }
+cerulion_dds = { path = "crates/cerulion_dds", version = "=2.1.0", default-features = false }
+cerulion_discovery = { path = "crates/cerulion_discovery", version = "=2.1.0" }
+cerulion_hygiene = { path = "crates/cerulion_hygiene", version = "=2.1.0" }
+cerulion_link = { path = "crates/cerulion_link", version = "=2.1.0" }
+cerulion_mdns = { path = "crates/cerulion_mdns", version = "=2.1.0" }
+cerulion_msgio = { path = "crates/cerulion_msgio", version = "=2.1.0" }
+cerulion_netd = { path = "crates/cerulion_netd", version = "=2.1.0", default-features = false }
+cerulion_pairing = { path = "crates/cerulion_pairing", version = "=2.1.0" }
+cerulion_telemetry = { path = "crates/cerulion_telemetry", version = "=2.1.0" }
+cerulion_wireclient = { path = "crates/cerulion_wireclient", version = "=2.1.0" }
+native_ros2_messages = { path = "crates/native_ros2_messages", version = "=2.1.0" }
 
 # ───────────────────────────── Published DDS forks ─────────────────────────
 # The DDS stack is published as the distinct crates
@@ -648,12 +667,14 @@ native_ros2_messages = { path = "crates/native_ros2_messages", version = "=2.0.0
 # on any `rerun` feature change.
 re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev = "92d8feeeb583289b5b976ab121f90b50d4eb2e50" }
 
-# A FORK of iceoryx2 0.10.0 with three fixes: it removes the process umask from
+# A FORK of iceoryx2 0.10.0 with four fixes: it removes the process umask from
 # `UnixDatagramSocket::bind` (iceoryx2-bb-posix), fixes the macOS shm descriptor
-# table (iceoryx2-pal-posix, below) and initializes the node counter of the
-# global management segment (iceoryx2, below). It also adds Android support
-# (below). The revision is held by the tag
-# `cerulion-pin-282f479b` on the fork, so it does not depend on a branch.
+# table (iceoryx2-pal-posix, below), initializes the node counter of the global
+# management segment (iceoryx2, below) and empties a listener's event trigger
+# before it re-arms the listener (iceoryx2-cal, below). It also adds Android
+# support and a per-publisher history size (both below). The revision is held
+# by the tag `cerulion-pin-c9e5c085` on the fork, so it does not depend on a
+# branch.
 #
 # `bind` installed a process global umask of `!permission` for the duration of
 # the bind and restored it on scope exit. The umask is per PROCESS, so while one
@@ -697,9 +718,32 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # started from whatever bytes the newly created segment held. The fork writes
 # the default state, a zero counter, when it creates the segment.
 #
+# The same revision also changes the order of a listener's event drain in
+# `iceoryx2-cal`. The released drain stored the idle state before it emptied the
+# trigger, so a notify that claimed the idle state and sent its byte between the
+# two lost that byte to the drain and then marked the listener notified. Every
+# later notify saw the notified state and sent nothing, so the listener's
+# descriptor stayed unreadable until a later drain reset the state, and a
+# subscription whose wait blocks on that descriptor stopped waking on
+# publishes. The fork empties the trigger, then stores the idle state, then
+# drains the event bits, so a notify that lands during a drain is delivered by
+# that drain or leaves the trigger holding a byte for the next wait.
+#
 # The same revision also adds Android support: filesystem paths, file-backed
 # named shared memory with private-directory checks, abstract-namespace Unix
 # datagram sockets and POSIX timers for the watchdog.
+#
+# The same revision also lets a publisher retain less history than its service
+# (`PortFactoryPublisher::history_size`, `Publisher::history_size`). The released
+# publisher kept a ring of the service's whole history, so on a ROS topic, which
+# every rmw endpoint creates with a history of 16 (12 above the 16 MiB tier), a
+# VOLATILE publisher held its last 16 samples: each loan came from a slot last
+# written 16 sends earlier and the process kept 16 more payload-sized slots
+# resident. `cerulion_core` bounds a publisher on such a service to its own
+# history. The fork's `iceoryx2` declares `links = "iceoryx2"` and sets
+# `DEP_ICEORYX2_PUBLISHER_HISTORY`, from which `cerulion_core`'s build script
+# derives the cfg `iceoryx2_publisher_history`, so a `cerulion_core` built
+# against the released iceoryx2 still compiles and keeps the released behavior.
 #
 # SCOPE: this reaches THIS workspace's builds only. `[patch.crates-io]` does not
 # follow our published crates, so anyone depending on a released `cerulion_core`
@@ -708,31 +752,34 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # recovers on its own.
 #
 # EXIT CONDITION: drop this entry when an iceoryx2 release carries every change
-# this fork revision adds: the three fixes and the Android support above.
+# this fork revision adds: all four fixes, the Android support and the
+# per-publisher history size above. Then delete the `iceoryx2_publisher_history`
+# probe in `crates/cerulion_core/build.rs` and its cfg-off branches, and call
+# `history_size` unconditionally.
 #
 # THE WHOLE FAMILY, one rev. Patching `iceoryx2-bb-posix` alone does not
 # build: the fork's copy takes the fork's `iceoryx2-bb-container`, while the
 # crates.io members keep theirs, and the same types then exist twice. Every
 # member the graph carries is listed so exactly one copy of each is resolved.
-iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
-iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "282f479b5c2ae607a461c0f4bc6c70f452d1c604" }
+iceoryx2 = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-concurrency = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-container = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-derive-macros = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-elementary = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-elementary-traits = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-flatbuffers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-linux = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-lock-free = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-loggers = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-memory = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-bb-system-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-cal = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-log = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-log-types = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-pal-concurrency-sync = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-pal-configuration = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-pal-os-api = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-pal-posix = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }
+iceoryx2-pal-print = { git = "https://github.com/cerulion-inc/iceoryx2", rev = "c9e5c0853679f32294e62ab6abb1560a80d04482" }

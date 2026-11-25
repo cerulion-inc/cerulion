@@ -1,0 +1,15 @@
+# The jobs a required status context is made of. A `ci.yml` job that reports a
+# context in tools/ci/required_contexts.txt under a job-level `always()` is an
+# aggregate: it waits for the jobs it needs and fails unless every one of them
+# succeeded. Those jobs report no context of their own, so a red one fails its
+# required context only once the aggregate ends.
+#
+# One row per part: `<part job name>|<required context>`. The merge-queue
+# watchdog (tools/scripts/ci_queue_watchdog.sh) reads a part that ended
+# failure, timed_out or cancelled as its context failing, and cancels the run
+# then rather than when the aggregate ends. The workflow walk in
+# crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs holds these rows
+# equal to the aggregates' `needs` in `ci.yml`, both ways.
+Lint (clippy)|Lint
+Lint (fmt)|Lint
+Lint (gates)|Lint

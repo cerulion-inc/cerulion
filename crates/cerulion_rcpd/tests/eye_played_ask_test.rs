@@ -33,7 +33,7 @@ use cerulion_rcpd::eye::verdict::Outcome;
 use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
 use cerulion_rcpd::tools::ReceiptSink;
-use eye_common::{good_body, Reply, Stub, ANSWERED_MODEL};
+use eye_common::{good_body, Reply, Stub, ANSWERED_MODEL, EYE_WAIT};
 use native_ros2_messages::sensor_msgs::CompressedImage;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::{json, Value};
@@ -82,7 +82,11 @@ const PLAYED: &str = "dropped an ask from a replay or an unnamed publisher";
 /// What the eye logs once for each replay publisher it names.
 const REPLAY_PUBLISHER: &str = "a replay publishes on an eye topic";
 
-/// Long enough for the eye's loop to read everything published before it.
+/// How long the test looks for an answer, a request or a receipt that must
+/// NOT appear, after the eye has had the chance to make it. A window that a
+/// loaded machine makes too short can miss a wrong answer, never fail a right
+/// run, so it stays short; every wait for something that must appear gets
+/// [`EYE_WAIT`] instead.
 const SETTLE: Duration = Duration::from_millis(300);
 
 /// The depth the ask topic is created with. The eye's subscriber takes the
@@ -206,18 +210,33 @@ impl Answers {
             .expect("receive");
     }
 
-    /// The outcome of the answer to `id`, waiting at most `within`.
-    fn outcome(&mut self, id: u64, within: Duration) -> Option<Outcome> {
-        let deadline = Instant::now() + within;
-        while Instant::now() < deadline {
+    /// The outcome of the answer to `id`, waiting at most [`EYE_WAIT`]. The
+    /// topic is read once more after the deadline has passed, so a thread
+    /// that was not scheduled until after it still sees an answer that
+    /// arrived meanwhile.
+    fn outcome(&mut self, id: u64) -> Option<Outcome> {
+        let deadline = Instant::now() + EYE_WAIT;
+        loop {
+            let last = Instant::now() >= deadline;
             self.read();
             if let Some((_, text)) = self.seen.iter().find(|(seen, _)| *seen == id) {
                 let value = serde_json::from_str::<Value>(text).expect("json");
                 return value["outcome"].as_str().and_then(Outcome::parse);
             }
+            if last {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
-        None
+    }
+
+    /// The answer to `id` as published, for a failure message: its detail
+    /// and latency say whether the eye ran out of the ask's deadline.
+    fn text(&self, id: u64) -> &str {
+        self.seen
+            .iter()
+            .find(|(seen, _)| *seen == id)
+            .map_or("no answer", |(_, text)| text.as_str())
     }
 
     /// How many answers to `id` arrived.
@@ -229,9 +248,10 @@ impl Answers {
 
 /// Wait until the status file in `state_dir` counts `n` asks dropped from
 /// a replay, so a replay leaves only after the eye has read and named it.
-/// A count other than `n` after 10 s fails with the whole status file.
+/// The count is read once more after [`EYE_WAIT`], and a count other than
+/// `n` then fails with the whole status file.
 fn wait_replayed(state_dir: &Path, n: usize) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EYE_WAIT;
     let counted = || read_status(state_dir).map_or(0, |s| s.replay_asks_today);
     while counted() < n as u64 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
@@ -344,18 +364,17 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
             .expect("frame tap"));
         let ask_tap = Tap(live_mgr.create_subscriber(&jev.ask_topic).expect("ask tap"));
 
-        // Two live looks, recorded by the taps.
+        // Two live looks, recorded by the taps, one at a time. The eye
+        // writes each answer's receipt, a synced write, before it takes the
+        // next reply, and an ask it reads at once has its 1.5 s deadline
+        // from when it was published, so on a loaded machine the reply to a
+        // second ask in flight beside the first can be taken past that
+        // deadline, and the ask answered `timeout`.
         let held = live.publish_frame();
         live.ask(1, held);
+        assert_eq!(answers.outcome(1), Some(Outcome::Ok), "{}", answers.text(1));
         live.ask(6, held);
-        assert_eq!(
-            answers.outcome(1, Duration::from_secs(5)),
-            Some(Outcome::Ok)
-        );
-        assert_eq!(
-            answers.outcome(6, Duration::from_secs(5)),
-            Some(Outcome::Ok)
-        );
+        assert_eq!(answers.outcome(6), Some(Outcome::Ok), "{}", answers.text(6));
         let recorded_frames = frame_tap.take();
         let recorded_asks = ask_tap.take();
         assert_eq!((recorded_frames.len(), recorded_asks.len()), (1, 2));
@@ -400,9 +419,10 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
             "the played ask nearest the host clock was stamped {nearest_ms} ms from it"
         );
         assert_eq!(
-            answers.outcome(9, Duration::from_secs(5)),
+            answers.outcome(9),
             Some(Outcome::Ok),
-            "the live ask made during the sweep"
+            "the live ask made during the sweep: {}",
+            answers.text(9)
         );
         // The same resim stamping an hour back and an hour ahead.
         replay_clock.set(cerulion_core::real_ns().saturating_sub(hour));
@@ -414,17 +434,16 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         played += 4;
         std::thread::sleep(SETTLE);
         live.ask(2, held);
-        assert_eq!(
-            answers.outcome(2, Duration::from_secs(5)),
-            Some(Outcome::Ok)
-        );
+        assert_eq!(answers.outcome(2), Some(Outcome::Ok), "{}", answers.text(2));
         // The played frames were not held: a live ask for a sequence number
         // only the resim published waits for it and is refused.
         assert!(last_played_seq > held);
         live.ask(5, last_played_seq);
         assert_eq!(
-            answers.outcome(5, Duration::from_secs(5)),
-            Some(Outcome::Refused)
+            answers.outcome(5),
+            Some(Outcome::Refused),
+            "{}",
+            answers.text(5)
         );
         std::thread::sleep(SETTLE);
         for id in (1_000..1_000 + swept as u64).chain(101..=104) {
@@ -442,10 +461,7 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         std::thread::sleep(SETTLE);
         let held = live.publish_frame();
         live.ask(3, held);
-        assert_eq!(
-            answers.outcome(3, Duration::from_secs(5)),
-            Some(Outcome::Ok)
-        );
+        assert_eq!(answers.outcome(3), Some(Outcome::Ok), "{}", answers.text(3));
         std::thread::sleep(SETTLE);
         for id in [1, 6] {
             assert_eq!(answers.count(id), 1, "recorded ask {id} was answered again");
@@ -467,9 +483,10 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         assert!(resumed_seq > held);
         paused.ask(7, resumed_seq);
         assert_eq!(
-            answers.outcome(7, Duration::from_secs(5)),
+            answers.outcome(7),
             Some(Outcome::Ok),
-            "a resumed run's ask"
+            "a resumed run's ask: {}",
+            answers.text(7)
         );
         assert_eq!(sent(), 6);
         assert_eq!(eye_receipts(&receipts), 7);
@@ -493,8 +510,10 @@ async fn a_played_ask_gets_no_request_no_answer_and_no_receipt() {
         drop(player);
         live.ask(4, held);
         assert_eq!(
-            answers.outcome(4, Duration::from_secs(5)),
-            Some(Outcome::Disabled)
+            answers.outcome(4),
+            Some(Outcome::Disabled),
+            "{}",
+            answers.text(4)
         );
         std::thread::sleep(SETTLE);
         for id in [201, 202] {

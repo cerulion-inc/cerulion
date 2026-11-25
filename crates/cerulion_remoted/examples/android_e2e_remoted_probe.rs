@@ -276,9 +276,23 @@ async fn run(mode: Mode) -> Result<String> {
     Ok(fact)
 }
 
+/// The arguments after the program name, or the failure naming the first one
+/// that is not valid UTF-8 by its position.
+fn utf8_args() -> Result<Vec<String>> {
+    std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                let position = index + 1;
+                format!("argument {position} is not valid UTF-8: {arg:?}").into()
+            })
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let outcome = parse(&args).and_then(|mode| {
+    let outcome = utf8_args().and_then(|args| parse(&args)).and_then(|mode| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()

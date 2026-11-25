@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "cerud"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_ops_proto",
  "clap",
@@ -435,7 +435,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror 2.0.17",
  "tracing",
  "tracing-subscriber",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android_remote"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_android",
  "cerulion_core",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bag"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "crc32fast",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bagd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_core",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_engine"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_bag",
@@ -524,7 +524,7 @@ dependencies = [
  "cerulion_netd",
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hex",
  "iceoryx2",
  "if-addrs",
@@ -541,16 +541,17 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "syn 2.0.114",
  "thiserror 2.0.17",
  "toml",
  "tracing",
+ "zenoh",
 ]
 
 [[package]]
 name = "cerulion_core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
@@ -599,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_dds"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "thiserror 2.0.17",
  "tracing",
@@ -607,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_discovery"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "serde",
@@ -617,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_hygiene"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libc",
  "rustix",
@@ -626,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_link"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "iroh",
  "rustls",
@@ -637,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -648,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_mdns"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_discovery",
  "mdns-sd",
@@ -660,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_msgio"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -675,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_netd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "cerulion_discovery",
@@ -698,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_node_abi"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libloading",
  "stabby",
@@ -707,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_ops_proto"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -718,16 +719,16 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
- "getrandom 0.3.4",
- "hmac",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
  "pake-cpace",
  "postcard",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.17",
  "tracing",
@@ -736,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_remoted"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerud",
  "cerulion_core",
@@ -747,18 +748,19 @@ dependencies = [
  "cerulion_pairing",
  "cerulion_wireclient",
  "clap",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "http-body-util",
  "hyper",
  "hyper-util",
  "indexmap 2.14.0",
  "libc",
  "postcard",
+ "rustix",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.17",
  "tokio",
@@ -779,13 +781,13 @@ dependencies = [
 
 [[package]]
 name = "cerulion_wireclient"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
  "cerulion_link",
  "cerulion_pairing",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "hex",
  "postcard",
  "serde",
@@ -1305,7 +1307,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 2.0.114",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -1431,7 +1433,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -1748,9 +1752,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -2150,6 +2154,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "hmac-sha512"
 version = "1.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2311,7 +2324,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "flatbuffers",
  "iceoryx2-bb-concurrency",
@@ -2337,7 +2350,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-concurrency"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-elementary-traits",
  "iceoryx2-pal-concurrency-sync",
@@ -2346,7 +2359,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-container"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-derive-macros",
@@ -2359,7 +2372,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-derive-macros"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-elementary",
  "iceoryx2-bb-elementary-traits",
@@ -2371,7 +2384,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-elementary"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-elementary-traits",
@@ -2383,12 +2396,12 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-elementary-traits"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 
 [[package]]
 name = "iceoryx2-bb-flatbuffers"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "flatbuffers",
  "iceoryx2-bb-container",
@@ -2402,7 +2415,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-linux"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-container",
@@ -2416,7 +2429,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-lock-free"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-derive-macros",
@@ -2428,7 +2441,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-loggers"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-print",
  "iceoryx2-log-types",
@@ -2439,7 +2452,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-memory"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-derive-macros",
@@ -2453,7 +2466,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-posix"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "enum-iterator",
  "iceoryx2-bb-concurrency",
@@ -2473,7 +2486,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-print"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-pal-print",
 ]
@@ -2481,7 +2494,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-bb-system-types"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-container",
  "iceoryx2-bb-derive-macros",
@@ -2496,7 +2509,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-cal"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-bb-concurrency",
  "iceoryx2-bb-container",
@@ -2519,7 +2532,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-log"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-log-types",
  "iceoryx2-pal-concurrency-sync",
@@ -2528,22 +2541,22 @@ dependencies = [
 [[package]]
 name = "iceoryx2-log-types"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 
 [[package]]
 name = "iceoryx2-pal-concurrency-sync"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 
 [[package]]
 name = "iceoryx2-pal-configuration"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 
 [[package]]
 name = "iceoryx2-pal-os-api"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "bindgen",
  "cc",
@@ -2554,7 +2567,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-pal-posix"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "bindgen",
  "cc",
@@ -2567,7 +2580,7 @@ dependencies = [
 [[package]]
 name = "iceoryx2-pal-print"
 version = "0.10.0"
-source = "git+https://github.com/cerulion-inc/iceoryx2?rev=282f479b5c2ae607a461c0f4bc6c70f452d1c604#282f479b5c2ae607a461c0f4bc6c70f452d1c604"
+source = "git+https://github.com/cerulion-inc/iceoryx2?rev=c9e5c0853679f32294e62ab6abb1560a80d04482#c9e5c0853679f32294e62ab6abb1560a80d04482"
 dependencies = [
  "iceoryx2-pal-posix",
 ]
@@ -3406,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
 ]
@@ -5910,9 +5923,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",
@@ -6789,7 +6802,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e281a36cfd351ba9232a24899d946a782d0ff3ac0c3d759f87f3e7cbe09a4553"
 dependencies = [
  "aes",
- "hmac",
+ "hmac 0.12.1",
  "rand 0.8.5",
  "rand_chacha",
  "sha3",

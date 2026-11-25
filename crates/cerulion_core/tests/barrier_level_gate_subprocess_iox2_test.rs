@@ -76,7 +76,7 @@
 //! macOS boundary spin + chunked sleep-recheck). BOTH supervisor tests —
 //! `box_two_process_split_merges_to_oracle` and
 //! `box_stalled_peer_poisons_and_exits_nonzero` — stay `#[ignore]`'d so they run
-//! only on demand on real hardware (x86 WAITPKG / aarch64 WFE / macOS). The
+//! only on demand on real hardware (x86 WAITPKG or MWAITX / aarch64 WFE / macOS). The
 //! CI gate stays the in-process `barrier_level_gate_iox2_test` (OS-portable).
 //!
 //! ### What CI runs in this binary: ONE of three arms, and it asserts NOTHING
@@ -588,6 +588,7 @@ fn reconstruct(flats: &[FlatEntry]) -> Vec<TraceEntry> {
             global_level: f.global_level,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         })
         .collect()
 }

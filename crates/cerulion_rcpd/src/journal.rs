@@ -609,7 +609,10 @@ impl Ports {
             if let Some(frame) = drain_stamped_strings(subscriber, topic).pop() {
                 // Private frames and queued frames from a retired publisher must
                 // never become public when the producer's exclusion disappears.
-                let local_scope = self.manager.retain_local_topic_scope(topic);
+                // The refresh loop never waits for a marker being torn down.
+                let local_scope = self
+                    .manager
+                    .retain_local_topic_scope(topic, cerulion_core::transport::TeardownWait::Never);
                 let remotely_visible =
                     self.manager
                         .topic_publisher_nodes(topic)
