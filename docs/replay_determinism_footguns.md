@@ -373,6 +373,26 @@ not record how a FIFO input was read, a `drop_oldest` trigger input is judged
 without the hold, and a divergence on a short step there at which the bag
 shows the slot full says so.
 
+A `period_ms` node or a `Sync` node that such an input holds is judged on the
+same count of the slot, and a step excused only by holds is a divergence on
+the same terms. At a step where the recording shows the slot full, a
+`period_ms` node may fire fewer of the fires its schedule owes there: none, or
+the first of them at their instants. Its next deadline is then the first owed
+instant it did not fire, a fire off that schedule is still a divergence, and
+the node carries at most one note for it (a `hold_allowed_for` note of code
+`period_block_held`). At such a step a `Sync` node may leave an aligned set
+unfired. The node carries at most one note for it (a `hold_allowed_for` note
+of code `sync_block_held`), and the node is still judged on every other step
+and on the sets it fired. At any other step either node owes every fire. A
+`hold_allowed_for` note is not a `stand_down`: the rule judged the node. A
+neutral `--resim all` reaches the `Sync` rule for such a node. A `--verify`
+replay of a free-run bag from trace format 8 refuses a per-set `Sync` node
+before its first step (`read_identity_ungateable_stage`, exit 2), whichever
+worker process its trigger topics come from, so it does not reach the rule
+there. Where such an input holds a `Sync` node, the neutral `--resim all`
+reports a read-log divergence at the node's first fire after the hold, and
+exits 0.
+
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
 node's last fire than that fire's read took, plus two per writer still

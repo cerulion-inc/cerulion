@@ -4,8 +4,9 @@
 # stand-downs a resumed replay applies to a node whose stop the recording
 # does not state, the verifier budget's pure decision functions, the
 # decisions a replay makes about checkpoint window heads, those it makes about
-# a recorded node stop, and how a replay judges and re-executes a node that a
-# `block` input in its own rank holds.
+# a recorded node stop, how a replay judges and re-executes a FIFO node that a
+# `block` input in its own rank holds, and how it judges a `period_ms` or Sync
+# node that such an input holds.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -323,7 +324,7 @@ in prepare_pass_verification
 # (`fifo_step_backlog`, `fifo_supply`, `fifo_carry_out`), the deferral
 # predicate and the per-step walk that feeds it, with the slot bound it folds
 # and its count of a consumer's fires that ended before the input
-# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`,
+# (`fifo_carry_deferrable`, `PreFireDeferral`, `SlotBound`,
 # `fires_ended_before`), the carry walk the
 # verdict and the refill plan share (`FifoCarry`), the caveat a finding on a
 # node whose drain the bag does not record carries and its text
@@ -347,7 +348,7 @@ in prepare_pass_verification
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain|fires_ended_before|consumer_reads_before' \
+#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|PreFireDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain|fires_ended_before|consumer_reads_before' \
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
@@ -376,7 +377,7 @@ in prepare_pass_verification
 #          with a value their types do not have.
 #          Re-run over the change that keeps the count at or below the
 #          slot's, in 2 shards, with
-#          `--re 'SlotBound::|FifoDeferral::|FifoCarry::|verify_fifo|\bverify\b|topic_recorded_whole|fifo_trailing_refills|PassRestore::|PassStart::'`:
+#          `--re 'SlotBound::|PreFireDeferral::|FifoCarry::|verify_fifo|\bverify\b|topic_recorded_whole|fifo_trailing_refills|PassRestore::|PassStart::'`:
 #          47 mutants: 39 caught, 4 unviable, 4 missed, three killed since.
 #          `PassRestore::with_anchor_prev_target` replaced with
 #          `Default::default()`: no vector resumed a pass through it; the
@@ -391,14 +392,14 @@ in prepare_pass_verification
 #          `--re 'PassRestore::with_anchor_prev_target|SlotBound::step'`:
 #          29 mutants, 28 caught, 1 missed. The 4 unviable
 #          replace `PassRestore::none`, `PassRestore::start`,
-#          `FifoDeferral::step` and `FifoCarry::step` with a value their types
+#          `PreFireDeferral::step` and `FifoCarry::step` with a value their types
 #          do not have.
 #          Re-run over the change that gives a slot whose input sets
 #          `block_timeout_ms` no count and deletes the resumed pass's anchor
 #          tie (where the one missed mutant sat, a tie that changed no
 #          verdict) with `PassRestore::with_anchor_prev_target` and
 #          `PassStart`, with
-#          `--re 'local_block_holds|SlotBound::step|FifoDeferral::new|FifoCarry::new|\bverify\b|fifo_trailing_refills'`:
+#          `--re 'local_block_holds|SlotBound::step|PreFireDeferral::new|FifoCarry::new|\bverify\b|fifo_trailing_refills'`:
 #          14 mutants, 12 caught, 2 unviable, which replace
 #          `local_block_holds` with a map of an edge its type cannot default.
 #          Re-run over the change that gives a slot whose input does not
@@ -427,29 +428,29 @@ in prepare_pass_verification
 #          more frames at a stamp than it fired at that stamp, releases a
 #          slot at a consumer stop only where the stop releases it live, and
 #          keeps one pending excuse per set of slots, in 6 shards, with
-#          `--re 'writes_past_fires|StopPoint::|PassStops::|SlotBound::|FifoDeferral::|FifoCarry::|FindingCaveat|verify_fifo|local_block_holds'`
+#          `--re 'writes_past_fires|StopPoint::|PassStops::|SlotBound::|PreFireDeferral::|FifoCarry::|PendingExcuse::|FindingCaveat|verify_fifo|local_block_holds'`
 #          (shards 1/6 to 5/6 with `--baseline skip --build-timeout 600
 #          --timeout 120`, the unmutated baseline having passed in 0/6):
 #          78 mutants: 69 caught, 5 unviable, 4 timed out, none missed. Three
 #          of the 4 never end a loop: `==` replaced with `!=` where
 #          `writes_past_fires` counts the frames at a stamp, and `+=` with
-#          `*=` where `writes_past_fires` and `FifoCarry::settle_excuses` step
+#          `*=` where `writes_past_fires` and `PendingExcuse::settle` step
 #          their index. The fourth, `==` replaced with `!=` where
-#          `FifoCarry::settle_excuses` compares two excuses' slots, keeps every
+#          `PendingExcuse::settle` compares two excuses' slots, keeps every
 #          excuse, which the pending-length vector fails on, while the
 #          10003-step vector's settling grows with the list and does not
 #          finish. The 5 unviable replace `local_block_holds` (twice) with a
-#          map of an edge its type cannot default, and `FifoDeferral::step`,
-#          `FifoCarry::step` and `FifoCarry::settle_excuses` with a value
+#          map of an edge its type cannot default, and `PreFireDeferral::step`,
+#          `FifoCarry::step` and `PendingExcuse::settle` with a value
 #          their types do not have.
 #          Re-run over the change that reads a slot past its depth as a
 #          release only from a producer that sends at most one frame per fire,
 #          and a fire at a step whose slot already counts its depth as a
 #          release from any producer, in 3 shards, with
-#          `--re 'SlotBound::|local_block_holds|producer_sends_per_fire|FifoDeferral::step'`:
+#          `--re 'SlotBound::|local_block_holds|producer_sends_per_fire|PreFireDeferral::step'`:
 #          21 mutants: 17 caught, 4 unviable, none missed. The 4 unviable
 #          replace `producer_sends_per_fire`, `local_block_holds` (twice, a map
-#          of an edge) and `FifoDeferral::step` with a value their types do not
+#          of an edge) and `PreFireDeferral::step` with a value their types do not
 #          have.
 #          Re-run over the change that refuses a slot for frames past fires
 #          only from a producer that sends at most one frame per fire, in 3
@@ -478,6 +479,101 @@ in prepare_pass_verification
 #          (nothing proves it), and
 #          `a_capture_whose_end_cut_keeps_a_held_producers_frame_replays_its_holds`
 #          (a frame past the last kept step).
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Eighth scope: a `period_ms` or Sync node that a `block` input in its own
+# rank holds.
+#
+# Scope: the pure decision functions on the lines the change added or
+# changed. In src/replay_rederive.rs: the held Period burst
+# (`is_block_held_period_burst`), the two rules that read it and the
+# per-step hold bound (`verify_period`, `verify_sync`), the walk that bounds
+# it and the fires and clocks it folds (`PreFireDeferral`,
+# `step_fire_instants`, `next_clock_ns`), the note a held node gets
+# (`HeldRule`, `HoldAllowedForNote`, `withdraw_hold_allowed_for`), and the
+# excuse a held
+# step keeps until its consumer's
+# read confirms it or a release with no record voids it, which the FIFO rule
+# shares (`PendingExcuse`, `FifoCarry::step`). In src/replay_engine.rs: the
+# note's report entry (`hold_allowed_for_note`) and the frames-past-fires
+# gate (`writes_past_fires`), which compares a producer's
+# frames with the clocks its fires ran at. The walk that reads those clocks
+# off the bag's trace (`recorded_fire_clocks`) reads the bag, which the
+# mutation rule does not cover. It is pinned in tests/replay_engine_test.rs
+# by `a_period_source_a_block_input_in_its_rank_holds_replays_clean` and
+# `a_period_source_the_middle_of_a_block_chain_holds_replays_clean`, which
+# fail when it gives a `period_ms` fire's own instant, its deadline.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --in-diff <the change's diff of the file> \
+#            --re 'is_block_held_period_burst|verify_period|verify_sync|PreFireDeferral::|step_fire_instants|next_clock_ns|StandDownReason::' \
+#            --cap-lints true --in-place --timeout 600 \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (in 2 shards; the unmutated baseline passed)
+# Result:  first run, before the three rules shared one next-step clock:
+#          31 mutants: 30 caught, 0 unviable, 1 missed, killed since: `+`
+#          replaced with `*` in `verify_sync`'s next-step clock. A held Sync
+#          vector now fails with it: the node sends a frame its consumer takes
+#          in the same step, and counted a step late that frame fills the
+#          slot at the next step. The three rules now share that clock
+#          (`next_clock_ns`). Re-run with
+#          `--re 'next_clock_ns|verify_sync|verify_period'`: 14 mutants, 14
+#          caught. Re-run over the change once the count it reads stays at
+#          or below the slot's, in 2 shards, with the full `--re`: 32
+#          mutants, 32 caught. Re-run over the change once the rules take
+#          whether the pass resumed again and the held Period rule's note
+#          names the rank (a stand-down reason then, which the
+#          `hold_allowed_for` note later replaced), with
+#          `--re 'verify_period|verify_sync|StandDownReason::label'`:
+#          11 mutants, 11 caught.
+#          Re-run over the merge with the FIFO rules of the Seventh scope, which
+#          voids a held Period or Sync step as it voids a FIFO one, through
+#          the settle that moved from `FifoCarry` to `PendingExcuse`, and
+#          compares a producer's frames with the clocks its fires ran at, with
+#          `-f` both files, `--in-diff` the merge's diff of them against the
+#          FIFO change, `--re` the full one above plus
+#          `|PendingExcuse::|FifoCarry::step|writes_past_fires`, and
+#          `--timeout 120 --build-timeout 900`: 54 mutants: 48 caught, 3
+#          unviable, 3 timed out, none missed. The 3 timeouts never end a
+#          loop, as in the Seventh scope's run: `==` replaced with `!=` where
+#          `writes_past_fires` counts the frames at a stamp, `+=` with `*=`
+#          where `PendingExcuse::settle` steps its index, and `==` with `!=`
+#          where it compares two excuses' slots, which keeps every excuse.
+#          The 3 unviable replace `PendingExcuse::held`, `PendingExcuse::settle`
+#          (with `Some(Default::default())`) and `FifoCarry::step` with a
+#          value their types do not have.
+#          Re-run over the merge with the Seventh scope's judged frames, which
+#          bounds the frames `writes_past_fires` compares and keeps the clocks
+#          of the fires it compares them with, with `--in-diff` that merge's
+#          diff of the two files against the merge before it and the same
+#          `--re`: 7 mutants, 7 caught, all in `writes_past_fires`.
+#          Re-run over the change that reports the held node as a judged note
+#          of its own kind (`HeldRule`, `HoldAllowedForNote`,
+#          `hold_allowed_for_note` in src/replay_engine.rs, and the note's
+#          withdrawal on a later Sync stand-down, `withdraw_hold_allowed_for`)
+#          and adds the vectors a held burst past what it owed and a held then
+#          unheld Sync step needed, with `--in-diff` that change's diff of the
+#          two files and the `--re` above plus
+#          `|HeldRule::|HoldAllowedForNote|hold_allowed_for_note|withdraw_hold_allowed_for`:
+#          14 mutants: 13 caught, 1 unviable, none missed. The unviable
+#          replaces `hold_allowed_for_note` with a default its type does not
+#          have.
+#          Re-run over the change that reports a held step's void before a
+#          stand-down or arm of the step that voids it, in the Sync and FIFO
+#          rules (`PendingExcuse::voided`, `FifoCarry::voided_at`,
+#          `report_fifo_void`, `verify_sync`, `verify_fifo`), and qualifies the
+#          note's sentences by that void, with `--in-diff` that change's diff
+#          of the two files and the `--re` above plus
+#          `|verify_fifo|FifoCarry::|report_fifo_void`: 10 mutants: 8 caught,
+#          2 unviable, none missed. The unviable replace
+#          `PendingExcuse::voided` and `FifoCarry::voided_at` with
+#          `Some(Default::default())`, a default `VoidedExcuse` does not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

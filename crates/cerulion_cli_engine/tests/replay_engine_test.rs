@@ -7466,7 +7466,20 @@ fn rederivation_note_serde_spelling_is_pinned() {
         "a before-first-fire note mints no token: {json}"
     );
 
-    // …and the six spellings are DISTINCT, which a per-variant assertion
+    // The SEVENTH kind: a `period_ms` or Sync node judged with a hold by a
+    // `block` input in its rank allowed for. Judged, so never a `stand_down`;
+    // unlike the before-first-fire note it carries the rule's code, a closed
+    // set.
+    let held = replay_engine::RederivationNote {
+        kind: replay_engine::RederivationNoteKind::HoldAllowedFor,
+        code: Some("sync_block_held".to_string()),
+        ..excused
+    };
+    let json = serde_json::to_value(&held).unwrap();
+    assert_eq!(json["kind"], "hold_allowed_for");
+    assert_eq!(json["code"], "sync_block_held");
+
+    // …and the seven spellings are DISTINCT, which a per-variant assertion
     // above cannot see (two variants renamed to one string would satisfy both).
     let all = [
         replay_engine::RederivationNoteKind::StandDown,
@@ -7475,6 +7488,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
         replay_engine::RederivationNoteKind::ProducerLabels,
         replay_engine::RederivationNoteKind::CarriedHeads,
         replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
+        replay_engine::RederivationNoteKind::HoldAllowedFor,
     ];
     let kinds: std::collections::BTreeSet<String> = all
         .iter()
@@ -7486,9 +7500,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
                 .to_string()
         })
         .collect();
-    assert_eq!(kinds.len(), 6, "every note kind has its own wire spelling");
+    assert_eq!(kinds.len(), 7, "every note kind has its own wire spelling");
     // The list above is TOTAL — an EXHAUSTIVE match over the
-    // enum, with no wildcard, so adding a seventh kind (or deleting one) fails
+    // enum, with no wildcard, so adding an eighth kind (or deleting one) fails
     // to COMPILE here rather than leaving the spelling walk one short.
     for k in &all {
         let _spelled: &str = match k {
@@ -7500,6 +7514,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
             replay_engine::RederivationNoteKind::LatestBeforeFirstFire => {
                 "latest_before_first_fire"
             }
+            replay_engine::RederivationNoteKind::HoldAllowedFor => "hold_allowed_for",
         };
         assert_eq!(serde_json::to_value(k).unwrap(), _spelled);
     }
@@ -61139,6 +61154,94 @@ fn a_last_step_whose_trace_lost_the_rest_of_a_burst_is_judged_below_its_clock() 
     );
 }
 
+/// A `period_ms` source whose topic a NON-trigger `block` input reads:
+/// `reader` (10 ms period, non-trigger `block` input, depth 2) is declared
+/// before `pulse` (5 ms period). Both sit at level 0, and nodes on a `block`
+/// edge tick one at a time in graph order within a level, so the reader
+/// drains the pulse's topic before the pulse decides in the same step. The
+/// hand oracle, from the declared schedules at the reference run's 5 ms step
+/// (step `k` runs at `(k + 1) * 5` ms):
+///
+/// * the pulse fires at every step, `x = k + 1` at step `k`, its frame
+///   carrying sequence `k`: the reader empties the queue before the pulse
+///   decides, so the slot holds at most one frame at a decide and nothing
+///   holds the pulse;
+/// * the reader fires at the 10 ms steps 1, 3, 5, 7 and 9: at step `2j + 1`
+///   it serves the pulse's step `2j` frame (`x = 2j + 1`), not the step
+///   `2j + 1` one, which the pulse publishes after it.
+///
+/// Then the pulse's step 9 fire record is taken out, its frame still
+/// recorded, so the clean stamp still states the bag's frames. The pulse had
+/// room at step 9, since the reader drained the queue before it decided, so
+/// the fire its schedule owed there (at 50 ms) is the finding. The bag records
+/// the reader at the pulse's level, so the slot is unaccounted, the pulse is
+/// judged as if nothing held it, and the recording as it ran still replays
+/// clean.
+#[test]
+#[serial]
+fn a_period_fire_dropped_at_a_step_its_non_trigger_block_reader_drained_first_is_the_finding() {
+    let yaml = "name: ntpgraph\nprefix: nt\nnodes:\n\
+         \x20 - id: reader\n    type: paced_block_reader_node\n    inputs:\n      - name: inp\n        source: pulse/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: pulse\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("reader", Box::new(PacedBlockReaderNodeEntry::new())),
+            ("pulse", Box::new(SourceNodeEntry::new())),
+        ])
+    };
+    let mut rec = record_uniform_with_read_log(yaml, make, &[], NT_STEPS);
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("pulse".to_string(), std::collections::BTreeSet::from([0])),
+            ("reader".to_string(), std::collections::BTreeSet::from([0])),
+        ]),
+        "the reader and the pulse both fire at level 0"
+    );
+    assert_eq!(
+        bh_xs(&rec, "/nt/pulse/out"),
+        (1..=10).map(f64::from).collect::<Vec<_>>(),
+        "the pulse fires at every step: nothing holds it"
+    );
+    assert_eq!(bh_fire_steps(&rec, "pulse"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "reader"), vec![1, 3, 5, 7, 9]);
+    assert_eq!(
+        bh_xs(&rec, "/nt/reader/out"),
+        vec![1.0, 3.0, 5.0, 7.0, 9.0],
+        "the reader reads before the pulse fires in its step"
+    );
+    assert_eq!(
+        nt_reader_served(&rec),
+        vec![(1, 0), (3, 2), (5, 4), (7, 6), (9, 8)],
+        "at step 2j + 1 the reader serves the pulse's step 2j frame"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let whole = dir.path().join("ntp_whole.mcap");
+    ri_bag_labelled(&rec, &whole, ri_free_run_recorder_json(), false);
+    let clean = bh_replay_stamped(&whole, make, bh_clean_stamp(&rec));
+    bh_assert_replays(&clean, "the recording as it ran");
+
+    let pulse = rec.node_ids.iter().position(|n| n == "pulse").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == pulse && r.step == 9)
+        .expect("the pulse fires at step 9");
+    rec.trace.remove(at);
+    let fed = dir.path().join("ntp_dropped_fire.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'pulse' \
+             step 9 period_ms schedule \u{2014} re-derived 1 fire(s) at [50000000], recorded 0 \
+             fire(s)"
+        )
+    );
+    assert!(!outcome.passed);
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.
@@ -61175,4 +61278,241 @@ fn an_unheld_relay_on_a_bag_that_states_its_drain_carries_no_caveat() {
          FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
     );
     assert!(!outcome.passed);
+}
+
+/// A `period_ms` source that the sink's `block` input holds. The hand
+/// oracle: `src` fires at steps 0 to 2 and the sink drains the first frame;
+/// from step 3 the sink's queue holds two frames and `src` is held at its
+/// deadline (20 ms). Each step after a sink fire (11, 21, 31, 41) `src` fires
+/// the first catch-up instant it owes and the re-check holds the rest, so its
+/// counter publishes `x` 1 to 7 and the sink drains 1 to 5. The bag carries
+/// a clean record-health stamp, so the Period rule allows for the hold where
+/// the bag shows the slot full: the step 3 fire the hold deferred is judged
+/// with it, noted once, and the replay reproduces both topics frame for frame.
+/// Two replays are byte-identical.
+#[test]
+#[serial]
+fn a_period_source_a_block_input_in_its_rank_holds_replays_clean() {
+    let yaml = "name: bhperiod\nprefix: bhp\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: slow_block_sink_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("sink", Box::new(SlowBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], BH_STEPS);
+    assert_eq!(
+        bh_xs(&rec, "/bhp/src/out"),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    );
+    assert_eq!(bh_xs(&rec, "/bhp/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(bh_fire_steps(&rec, "src"), vec![0, 1, 2, 11, 21, 31, 41]);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("bh_period.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    bh_assert_period_held_replays(&outcome, "a held period source");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// A `period_ms` source held by the middle node of a `block` chain: `src` (5
+/// ms) -> `relay` (its trigger input `block`, depth 4) -> `sink` (`block`,
+/// depth 2, `throttle_ms = 50`). The sink holds the relay, and the relay's
+/// full queue holds `src`. The hand oracle: steps 0 to 2 pass one frame down
+/// the chain; `src` fills the
+/// relay's queue at steps 3 to 6 and is held from step 7; each step after a
+/// sink fire (11, 21, 31, 41) the relay fires the next frame it counted, and
+/// the step after that `src` fires one owed instant into the room it freed.
+/// No frame is lost: `src` publishes `x` 1 to 11, the relay 1 to 7, the sink
+/// 1 to 5. The bag carries a clean record-health stamp, so both rules allow
+/// for the holds where the bag shows a slot full: the step 7 fire the relay's
+/// full queue deferred is judged with the hold, noted once, and the replay
+/// reproduces the three topics frame for frame. Two replays are
+/// byte-identical.
+#[test]
+#[serial]
+fn a_period_source_the_middle_of_a_block_chain_holds_replays_clean() {
+    let yaml = "name: bhpchain\nprefix: bhq\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: block_relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: slow_block_sink_node\n    inputs:\n      - name: inp\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(BlockRelayNodeEntry::new())),
+            ("sink", Box::new(SlowBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], BH_STEPS);
+    assert_eq!(
+        bh_xs(&rec, "/bhq/src/out"),
+        (1..=11).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bh_xs(&rec, "/bhq/relay/out"),
+        (1..=7).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(bh_xs(&rec, "/bhq/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(
+        bh_fire_steps(&rec, "src"),
+        vec![0, 1, 2, 3, 4, 5, 6, 12, 22, 32, 42]
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), vec![0, 1, 2, 11, 21, 31, 41]);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("bh_period_chain.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    bh_assert_period_held_replays(&outcome, "a period source held by a block chain");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// A per-set Sync node that a `block` input in its own rank holds: `a_src`
+/// and `b_src` (5 ms) feed `fusion` (`sync_window_ms = 50`), whose output the
+/// sink reads (`block`, depth 2, `throttle_ms = 50`). The hand oracle: both
+/// sources fire at every step and stamp their frames with the step's clock,
+/// so `fusion` has an aligned set at every step. Steps 0 to 2 fire it and the
+/// sink drains the first frame; from step 3 the sink's queue holds two frames,
+/// so `fusion` is held with its set left unfired. Each step after a sink fire
+/// (11, 21, 31, 41) `fusion` fires one set and the re-check holds the rest, so
+/// it publishes `x` 1 to 7 (its fire count) and the sink drains 1 to 5.
+///
+/// Under a neutral `--resim all` the re-derivation judges the node with the
+/// hold allowed for: no fire-schedule divergence, and the one
+/// `hold_allowed_for` note of code `sync_block_held`. The replay delivers every
+/// topic's frames as recorded, and two replays are byte-identical. The test
+/// asserts neither the read log nor the run's pass: after each live fire that
+/// a hold follows, the burst's align pass pops the next frame into each head
+/// before the re-check holds the next set, and the replay of that fire makes no
+/// such pop, so the replayed read log differs from step 11.
+#[test]
+#[serial]
+fn a_held_sync_node_is_judged_with_the_hold_allowed_for_under_a_neutral_resim() {
+    let yaml = "name: bhsync\nprefix: bhs\nnodes:\n\
+         \x20 - id: a_src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: b_src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: fusion\n    type: fusion\n    inputs:\n      - name: a\n        source: a_src/out\n      - name: b\n        source: b_src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: slow_block_sink_node\n    inputs:\n      - name: inp\n        source: fusion/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("a_src", Box::new(SourceNodeEntry::new())),
+            ("b_src", Box::new(SourceNodeEntry::new())),
+            ("fusion", Box::new(FusionNodeEntry::new())),
+            ("sink", Box::new(SlowBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], BH_STEPS);
+    let every_step: Vec<f64> = (1..=BH_STEPS as u32).map(f64::from).collect();
+    assert_eq!(bh_xs(&rec, "/bhs/a_src/out"), every_step);
+    assert_eq!(bh_xs(&rec, "/bhs/b_src/out"), every_step);
+    assert_eq!(
+        bh_xs(&rec, "/bhs/fusion/out"),
+        (1..=7).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(bh_xs(&rec, "/bhs/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(bh_fire_steps(&rec, "fusion"), vec![0, 1, 2, 11, 21, 31, 41]);
+    assert_eq!(bh_fire_steps(&rec, "sink"), vec![0, 10, 20, 30, 40]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_sync.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let resim = || {
+        ri_replay_stamped(
+            &bag,
+            make,
+            replay_engine::ReplayPurpose::Resim,
+            None,
+            None,
+            None,
+            bh_clean_stamp(&rec),
+            None,
+        )
+        .0
+        .expect("the neutral resim runs")
+    };
+    let outcome = resim();
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(
+        !outcome
+            .divergence_classes
+            .contains(&replay_engine::DivergenceClass::FireSchedule),
+        "{:?}",
+        outcome.divergence_classes
+    );
+    assert_eq!(bh_violations(&outcome), Vec::<String>::new());
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (4, 4),
+        "every topic's frames, the sink's delivered ones included, are compared and reproduced"
+    );
+    assert_eq!(
+        rederivation_note_rows(&outcome),
+        vec![(
+            "hold_allowed_for".to_string(),
+            "fusion".to_string(),
+            Some("sync_block_held".to_string())
+        )]
+    );
+    assert_eq!(
+        outcome.rederivation_notes[0].detail,
+        "node 'fusion' sync alignment: judged with a hold allowed for, since a block input in its \
+         own rank reads a topic the node produces and its pre-fire check can hold an aligned \
+         set's fire with no record in the bag; at a step where the bag shows the slot full an \
+         aligned set left unfired is not convicted, unless every slot that held it there shows a \
+         release with no record before its consumer next reads it, and every other step and every \
+         set the node fired is still judged (report-only; the allowance can only drop a finding, \
+         never invent one)"
+    );
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&resim()).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// Assert a held `period_ms` source replays clean: no data violation, no
+/// read-log divergence, a clean verdict, and one note, the `hold_allowed_for`
+/// of `src` with code `period_block_held`, and no stand-down.
+fn bh_assert_period_held_replays(outcome: &ReplayOutcome, label: &str) {
+    assert_eq!(bh_violations(outcome), Vec::<String>::new(), "{label}");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "{label}: {:?}",
+        outcome.read_log_divergence
+    );
+    assert_clean_verdict(outcome, label);
+    assert_eq!(
+        rederivation_note_rows(outcome),
+        vec![(
+            "hold_allowed_for".to_string(),
+            "src".to_string(),
+            Some("period_block_held".to_string())
+        )],
+        "{label}"
+    );
+    assert_eq!(
+        outcome.rederivation_notes[0].detail,
+        "node 'src' period_ms schedule: judged with a hold allowed for, since a block input in \
+         its own rank reads a topic the node produces and its pre-fire check can hold the period \
+         fires a step owed with no record in the bag; at a step where the bag shows the slot full \
+         the node is judged on the first fires it owed, unless every slot that held it there \
+         shows a release with no record before its consumer next reads it, and the rest of its \
+         schedule is still judged (report-only; the allowance can only drop a finding, never \
+         invent one)",
+        "{label}"
+    );
 }
