@@ -1940,8 +1940,8 @@ pub struct ReplayInputShortfall {
 
 /// What a [`RederivationNote`] can be — a CLOSED set, so no producer can emit
 /// a spelling by typo and no reader has to guess which arm an unknown one
-/// belongs in. SEVEN variants; the count is pinned by the exhaustive `match`
-/// in `rederivation_note_serde_spelling_is_pinned` (an eighth is a
+/// belongs in. EIGHT variants; the count is pinned by the exhaustive `match`
+/// in `rederivation_note_serde_spelling_is_pinned` (a ninth is a
 /// compile error there), not by an ordinal claim here — each variant's own
 /// doc says what it adds and why it is additive on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2024,6 +2024,17 @@ pub enum RederivationNoteKind {
     /// [`replay_rederive::HoldAllowedForNote`]. Additive on the wire, as the
     /// third to sixth variants are.
     HoldAllowedFor,
+    /// A `block` input the rank manifests split from its producer, which the
+    /// replay feeds from the recording: the bag does not record when the
+    /// input's block events fired, so the replay delivers none to the node,
+    /// and a difference in the node's outputs or state can come from one the
+    /// live run delivered. The subject is the consumer node, one note per
+    /// such input, with no code.
+    ///
+    /// NOT a [`RederivationNoteKind::StandDown`]: nothing stood down, and
+    /// every rule judged what it judges. Additive on the wire, as the third to
+    /// seventh variants are.
+    BlockEventNotReproduced,
 }
 
 /// One thing the rank-local re-derivation verifier said that is
@@ -2051,9 +2062,10 @@ pub struct RederivationNote {
     /// undeclared value by typo.
     pub kind: RederivationNoteKind,
     /// What it is about: the node id for a node's stand-down, a read-site
-    /// census, a carried-heads note, a before-first-fire note or a
-    /// hold-allowed-for note; the topic for a conservation breach, a `block`
-    /// edge's conservation stand-down or a producer-label note.
+    /// census, a carried-heads note, a before-first-fire note, a
+    /// hold-allowed-for note or a block-event note (the consumer); the topic
+    /// for a conservation breach, a `block` edge's conservation stand-down or
+    /// a producer-label note.
     pub subject: String,
     /// The rendered sentence, from the pure module's own `Display`.
     pub detail: String,
@@ -2081,7 +2093,8 @@ pub struct RederivationNote {
     /// `consumer_stopped` and `credit_unknown_at_anchor`, one token per cause.
     ///
     /// Still `None` for a conservation breach, a read-site census, a
-    /// carried-heads note and a `latest_before_first_fire` note: those are
+    /// carried-heads note, a `latest_before_first_fire` note and a
+    /// `block_event_not_reproduced` note: those are
     /// addressed by [`Self::subject`] and carry no enum-valued cause, so a
     /// token there would be one this module invented. `None` too on the two
     /// stand-downs whose cause is no closed set: a node whose declared
@@ -2106,6 +2119,34 @@ fn hold_allowed_for_note(
         subject: note.node_id.clone(),
         detail: note.to_string(),
         code: Some(note.rule.code().to_string()),
+    }
+}
+
+/// The warning the replay gives once per split `block` edge whose consumer a
+/// pass holds ([`block_event_note`]).
+const BLOCK_EVENT_NOT_REPRODUCED_WARNING: &str = "replay: the bag does not record when this \
+     split `block` input's block events fired, so the replay delivers none to its node; if the \
+     node reads `BackpressureEvent`s on this input, a difference in its outputs or state can come \
+     from one the live run delivered";
+
+/// The `--report` note for the split `block` edge `edge`, whose consumer the
+/// pass of `rank` holds: kind [`RederivationNoteKind::BlockEventNotReproduced`],
+/// the consumer node as its subject, and no code.
+fn block_event_note(rank: u32, edge: &crate::multiprocess::CreditEdgePlan) -> RederivationNote {
+    let (node, input, topic) = (&edge.consumer_node, &edge.consumer_input, &edge.topic);
+    // A minted edge names its one producer's rank.
+    let producer_rank = edge.producer_ranks.first().copied().unwrap_or_default();
+    RederivationNote {
+        rank,
+        kind: RederivationNoteKind::BlockEventNotReproduced,
+        subject: node.clone(),
+        detail: format!(
+            "block input '{node}.{input}' reads '{topic}' from rank {producer_rank}; the bag does \
+             not record when that input's block events fired, so the replay delivers none to \
+             node '{node}', and if the node reads `BackpressureEvent`s on this input a \
+             difference in its outputs or state can come from one the live run delivered."
+        ),
+        code: None,
     }
 }
 
@@ -18128,6 +18169,25 @@ fn run_rank_pass(
     // And what PLANNING said about this bag's record-time producer
     // labels. Minted before the step loop, reported with the rest.
     rederivation_notes.append(&mut verification.notes);
+    // Each split `block` edge this pass consumes: the replay feeds it from
+    // the bag and delivers its input no block event, whatever the verifier
+    // makes of the pass.
+    for edge in pass
+        .split_block_edges
+        .iter()
+        .filter(|e| plan.members().contains(&e.consumer_node))
+    {
+        let note = block_event_note(plan.rank(), edge);
+        tracing::warn!(
+            rank = plan.rank(),
+            topic = %edge.topic,
+            consumer_node = %edge.consumer_node,
+            consumer_input = %edge.consumer_input,
+            producer_rank = edge.producer_ranks.first().copied().unwrap_or_default(),
+            "{BLOCK_EVENT_NOT_REPRODUCED_WARNING}"
+        );
+        rederivation_notes.push(note);
+    }
     if !lockstep {
         // A split `block` edge the replay feeds from the bag has no credit
         // word in this runtime, so it has no entry here; the re-derived check
@@ -33835,6 +33895,20 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         }
     }
 
+    // The block events of a split `block` edge's consumer, which the replay
+    // does not deliver, rendered in BOTH the PASS and the FAIL path: one
+    // line, every such input's sentence in it, so a difference on that
+    // consumer's outputs has its possible cause in sight.
+    let block_events: Vec<&str> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| n.kind == RederivationNoteKind::BlockEventNotReproduced)
+        .map(|n| n.detail.as_str())
+        .collect();
+    if !block_events.is_empty() {
+        let _ = writeln!(s, "NOTE: {}", block_events.join(" "));
+    }
+
     // The topics whose frame comparison was DECLINED. Rendered
     // for the same reason as the two blocks below — an operator reading the terminal
     // must see what was NOT judged — and FIRST, because unlike those two it
@@ -43092,6 +43166,36 @@ mod fed_block_edge_tests {
         let consumer = pass_fed_block_edges(&edges, &members(&["sink_a"]));
         assert_eq!(named(&consumer), vec![("/t/a", "sink_a", vec!["src_a"])]);
         assert!(pass_fed_block_edges(&[], &members(&["src_a"])).is_empty());
+    }
+
+    /// A split edge's block-event note names the input, its topic and its
+    /// producer's rank, with the consumer as its subject and no code.
+    #[test]
+    fn a_split_edges_block_event_note_names_its_input_and_its_producers_rank() {
+        let mut split = edge("/t/a", "sink_a", "src_a");
+        split.producer_ranks = vec![2];
+        let note = block_event_note(3, &split);
+        assert_eq!(
+            (
+                note.rank,
+                note.kind,
+                note.subject.as_str(),
+                note.code.as_deref()
+            ),
+            (
+                3,
+                RederivationNoteKind::BlockEventNotReproduced,
+                "sink_a",
+                None
+            )
+        );
+        assert_eq!(
+            note.detail,
+            "block input 'sink_a.inp' reads '/t/a' from rank 2; the bag does not record when \
+             that input's block events fired, so the replay delivers none to node 'sink_a', and \
+             if the node reads `BackpressureEvent`s on this input a difference in its outputs or \
+             state can come from one the live run delivered."
+        );
     }
 }
 

@@ -7479,7 +7479,22 @@ fn rederivation_note_serde_spelling_is_pinned() {
     assert_eq!(json["kind"], "hold_allowed_for");
     assert_eq!(json["code"], "sync_block_held");
 
-    // …and the seven spellings are DISTINCT, which a per-variant assertion
+    // The EIGHTH kind: a split `block` input whose block events the replay
+    // does not deliver. Nothing stood down, so never a `stand_down`; like the
+    // before-first-fire note it carries no code.
+    let block_event = replay_engine::RederivationNote {
+        kind: replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+        code: None,
+        ..held
+    };
+    let json = serde_json::to_value(&block_event).unwrap();
+    assert_eq!(json["kind"], "block_event_not_reproduced");
+    assert!(
+        json.get("code").is_none(),
+        "a block-event note mints no token: {json}"
+    );
+
+    // …and the eight spellings are DISTINCT, which a per-variant assertion
     // above cannot see (two variants renamed to one string would satisfy both).
     let all = [
         replay_engine::RederivationNoteKind::StandDown,
@@ -7489,6 +7504,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
         replay_engine::RederivationNoteKind::CarriedHeads,
         replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
         replay_engine::RederivationNoteKind::HoldAllowedFor,
+        replay_engine::RederivationNoteKind::BlockEventNotReproduced,
     ];
     let kinds: std::collections::BTreeSet<String> = all
         .iter()
@@ -7500,9 +7516,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
                 .to_string()
         })
         .collect();
-    assert_eq!(kinds.len(), 7, "every note kind has its own wire spelling");
+    assert_eq!(kinds.len(), 8, "every note kind has its own wire spelling");
     // The list above is TOTAL — an EXHAUSTIVE match over the
-    // enum, with no wildcard, so adding an eighth kind (or deleting one) fails
+    // enum, with no wildcard, so adding a ninth kind (or deleting one) fails
     // to COMPILE here rather than leaving the spelling walk one short.
     for k in &all {
         let _spelled: &str = match k {
@@ -7515,6 +7531,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
                 "latest_before_first_fire"
             }
             replay_engine::RederivationNoteKind::HoldAllowedFor => "hold_allowed_for",
+            replay_engine::RederivationNoteKind::BlockEventNotReproduced => {
+                "block_event_not_reproduced"
+            }
         };
         assert_eq!(serde_json::to_value(k).unwrap(), _spelled);
     }
@@ -43136,16 +43155,36 @@ fn a_crafted_cross_rank_block_edge_verifies() {
     assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 2));
     assert_eq!(
         sp_notes(&outcome),
-        vec![(
-            0,
-            replay_engine::RederivationNoteKind::StandDown,
-            "src",
-            Some("block_gated")
-        )]
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "src",
+                Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+        ]
     );
     assert!(
         !logs_contain("takes its `block` from the consumer's declaration"),
         "the graph sets `block` on the input"
+    );
+    // The pass path's verdict carries the block-event line once.
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert_eq!(verdict.matches("NOTE: block input").count(), 1, "{verdict}");
+    assert!(
+        verdict.contains(
+            "NOTE: block input 'sink.inp' reads '/sp/src/out' from rank 0; the bag does not \
+             record when that input's block events fired, so the replay delivers none to node \
+             'sink', and if the node reads `BackpressureEvent`s on this input a difference in its \
+             outputs or state can come from one the live run delivered.\n"
+        ),
+        "{verdict}"
     );
 }
 
@@ -43189,6 +43228,12 @@ fn a_split_block_edge_whose_consumer_rank_ends_early_reports_one_over_run() {
             ),
             (
                 1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+            (
+                1,
                 replay_engine::RederivationNoteKind::Conservation,
                 SP_SRC_TOPIC,
                 None
@@ -43196,7 +43241,7 @@ fn a_split_block_edge_whose_consumer_rank_ends_early_reports_one_over_run() {
         ]
     );
     assert_eq!(
-        outcome.rederivation_notes[1].detail,
+        outcome.rederivation_notes[2].detail,
         "block credit conservation broken on '/sp/src/out' -> sink.inp: outstanding 4 exceeds \
          depth 3 (published 7, drained 3) (report-only \u{2014} never a replay verdict)"
     );
@@ -43225,12 +43270,20 @@ fn a_held_relay_split_from_its_block_consumer_replays_the_frames_its_hold_froze(
     assert_clean_verdict(&stamped, "a held relay split from its consumer");
     assert_eq!(
         sp_notes(&stamped),
-        vec![(
-            0,
-            replay_engine::RederivationNoteKind::StandDown,
-            "relay",
-            Some("block_gated")
-        )]
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "relay",
+                Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+        ]
     );
     assert!(logs_contain(
         "replay: a split `block` edge takes its `block` from the consumer's declaration in the \
@@ -43260,6 +43313,12 @@ fn a_held_relay_split_from_its_block_consumer_replays_the_frames_its_hold_froze(
                 replay_engine::RederivationNoteKind::StandDown,
                 "relay",
                 Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
             ),
             (
                 1,
@@ -43339,6 +43398,12 @@ fn a_split_block_edge_whose_consumer_stops_stands_its_conservation_down() {
             ),
             (
                 1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+            (
+                1,
                 replay_engine::RederivationNoteKind::StandDown,
                 BH_RELAY_TOPIC,
                 Some("consumer_stopped")
@@ -43406,6 +43471,12 @@ fn a_split_block_edge_on_a_listed_topic_stands_its_conservation_down() {
                 replay_engine::RederivationNoteKind::StandDown,
                 "p1",
                 Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
             ),
             (
                 1,
@@ -43503,12 +43574,20 @@ fn a_period_consumer_of_a_split_block_edge_is_judged_with_its_conservation() {
     assert_clean_verdict(&outcome, "a Period consumer of a split block edge");
     assert_eq!(
         sp_notes(&outcome),
-        vec![(
-            0,
-            replay_engine::RederivationNoteKind::StandDown,
-            "relay",
-            Some("block_gated")
-        )]
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "relay",
+                Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "reader",
+                None
+            ),
+        ]
     );
 
     // RAGGED HEAD: the reader's rank begins at step 1, as a worker that
@@ -43538,6 +43617,12 @@ fn a_period_consumer_of_a_split_block_edge_is_judged_with_its_conservation() {
                 replay_engine::RederivationNoteKind::StandDown,
                 "relay",
                 Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "reader",
+                None
             ),
             (
                 1,
@@ -43594,6 +43679,117 @@ fn a_split_block_edge_replays_byte_identically_twice() {
         "two replays write the same report bytes"
     );
     assert!(runs[0].1 == runs[1].1, "and the same output messages");
+}
+
+/// [`SlowBlockSinkNode`] that counts the block events of its input and
+/// publishes the count beside each frame it read (`y`). Its handler runs
+/// after the tick, so a fire publishes the count before that fire's event.
+#[cerulion_node(throttle_ms = 50)]
+#[derive(Default)]
+struct BlockEventCountSinkNode {
+    #[input(trigger, backpressure = block, depth = 2)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    events: f64,
+}
+
+#[cerulion_node_impl]
+impl BlockEventCountSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        self.out.y = self.events;
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, _e: BackpressureEvent) {
+        self.events += 1.0;
+    }
+}
+
+/// The block-held graph with [`BlockEventCountSinkNode`] as its sink.
+fn bh_event_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("relay", Box::new(RelayNodeEntry::new())),
+        ("sink", Box::new(BlockEventCountSinkNodeEntry::new())),
+    ])
+}
+
+/// A split `block` consumer that reads its input's block events. Recorded in
+/// one process, the sink's slot reads its depth (2) at its step 10 drain,
+/// which raises the one block event of the run (the slot never reads below
+/// its depth again, so the latch never rearms), and the handler counts it
+/// after that fire: the sink publishes `y` 0, 0, 1, 1 and 1. Split, the replay
+/// delivers no block event, so the sink publishes `y` 0 throughout and the
+/// verdict is a difference at its frame 2 (exit 1), with the block-event note
+/// and its line on the fail path's verdict.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_split_block_consumer_that_reads_its_block_events_differs_with_the_note() {
+    let rec = record_uniform_with_read_log(
+        &bh_yaml("block_event_count_sink_node", ""),
+        bh_event_factories,
+        &[],
+        BH_STEPS,
+    );
+    let ys: Vec<f64> = rec.messages[BH_SINK_TOPIC]
+        .iter()
+        .map(|f| frame_y(f))
+        .collect();
+    assert_eq!(ys, vec![0.0, 0.0, 1.0, 1.0, 1.0], "one live block event");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_split_events.mcap");
+    ri_two_rank_bag_labelled(&rec, &bag, |id| id == "sink", false);
+    let outcome = bh_replay_stamped(&bag, bh_event_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        bh_violations(&outcome),
+        vec![
+            "/bh/sink/out: frame 2 on '/bh/sink/out' differs at y: recorded 1.0, replayed 0.0 \
+             (recorded 64 B, replayed 64 B)"
+        ]
+    );
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert_eq!(resim_exit(&outcome, true), 1);
+    assert_eq!(
+        sp_notes(&outcome),
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "relay",
+                Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+        ]
+    );
+    assert!(logs_contain(
+        "replay: the bag does not record when this split `block` input's block events fired, so \
+         the replay delivers none to its node; if the node reads `BackpressureEvent`s on this \
+         input, a difference in its outputs or state can come from one the live run delivered"
+    ));
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert_eq!(verdict.matches("NOTE: block input").count(), 1, "{verdict}");
+    assert!(
+        verdict.contains(
+            "NOTE: block input 'sink.inp' reads '/bh/relay/out' from rank 0; the bag does not \
+             record when that input's block events fired, so the replay delivers none to node \
+             'sink', and if the node reads `BackpressureEvent`s on this input a difference in its \
+             outputs or state can come from one the live run delivered.\n"
+        ),
+        "{verdict}"
+    );
 }
 
 /// The split fixture under a `--duration` bound of five steps (0 to 4): the
@@ -43653,6 +43849,12 @@ fn a_split_block_edge_under_a_duration_bound_makes_no_conservation_claim() {
             ),
             (
                 1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+            (
+                1,
                 replay_engine::RederivationNoteKind::StandDown,
                 SP_SRC_TOPIC,
                 None
@@ -43681,6 +43883,12 @@ fn a_split_block_edge_under_a_duration_bound_makes_no_conservation_claim() {
                 replay_engine::RederivationNoteKind::StandDown,
                 "src",
                 Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
             ),
             (
                 1,
