@@ -192,6 +192,15 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Session work ownership**: `session_work::SessionWork` registers work before
+  starting it and retains the first failure. A `CriticalTicket` stays outstanding
+  until dropped; marking it complete records its result, while an unfinished
+  drop records failure. Dropping a blocking task's join handle does not detach it
+  from the registry. After the session driver has joined, `drain` waits for every
+  ticket and seals admission. Nested producers retain their parent ticket until
+  registering their children. `settled` reports sealing, including failed work;
+  it is not a success result. Callers own cancellation and any shutdown deadline.
+
 - **Session audit inspection**: `remote_session::list_recordings_with_incomplete`
   returns sorted complete heads and unfinished paths. A locally computed head
   checks structure, not authenticity; `verify_recording_file` and
