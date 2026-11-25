@@ -987,8 +987,9 @@ fn a_node_stop_record_on_a_node_stops_format_bag_passes_the_gates() {
     assert_eq!(err.exit_code(), 3);
 }
 
-/// A bag holding a NODE-STOP record of cause 9 under `stamp`, refused by the
-/// record gate.
+/// A bag holding a NODE-STOP record of cause 9 under `stamp`: refused by the
+/// record gate at or below the supported format, and by the format refusal
+/// past it.
 fn gate_unknown_stop_cause(name: &str, stamp: u32) -> ReplayError {
     let (_dir, path) = tmp_bag(name);
     let mut atts = replay_grade_attachments(&["node0"]);
@@ -1025,18 +1026,26 @@ fn a_stop_cause_unknown_at_the_supported_format_is_a_corrupt_bag_exit_2() {
     assert_eq!(err.exit_code(), 2);
 }
 
-/// One format past what this build reads, a newer or foreign writer added the
-/// cause: the record gate, which walks the records before the version gate,
-/// refuses it with the upgrade remedy the unknown record kind gets (exit 2).
+/// One format past what this build reads, the same bag is refused by its
+/// format before any record is read, so its unknown stop cause is never
+/// reached: the format refusal, string 1 with the bag's 99.0.0 stamp (exit 2).
 #[test]
-fn a_stop_cause_unknown_past_the_supported_format_names_a_newer_writer_exit_2() {
+fn the_format_refusal_wins_over_an_unknown_stop_cause_in_a_bag_stamped_past_the_supported_format() {
     let past = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT + 1;
     let err = gate_unknown_stop_cause("stop_cause_newer.mcap", past);
+    assert!(
+        matches!(err, ReplayError::TraceFormatTooNew { .. }),
+        "expected TraceFormatTooNew, got {err:?}"
+    );
     assert_eq!(
         err.to_string(),
-        "scheduler-trace record 2: a NODE-STOP record of rank 0 carries stop cause 9, which \
-         this Cerulion version does not define; the bag was written by a newer or foreign \
-         writer; upgrade cerulion to replay it"
+        format!(
+            "this bag was recorded by a newer Cerulion (99.0.0): its scheduler-trace format is \
+             version {past}, and this Cerulion ({}) reads up to version {}. Upgrade Cerulion to \
+             replay it.",
+            env!("CARGO_PKG_VERSION"),
+            cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT
+        )
     );
     assert_eq!(err.exit_code(), 2);
 }
@@ -3131,4 +3140,43 @@ fn tolerance_error_wins_over_schema_drift_ordering_pin() {
         other => panic!("expected ToleranceInvalid, got {other:?}"),
     }
     assert_eq!(err.exit_code(), 4);
+}
+
+/// A bag from a newer Cerulion is named as such before any step that would
+/// read its graph or its records: one whose graph carries a key this build
+/// does not define, and one whose FIRE records set a `reserved` bit this build
+/// reads as part of the rank, each get the newer-recording refusal.
+#[test]
+fn a_newer_bag_is_named_before_its_graph_or_its_records_are_read() {
+    let newer = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT + 1;
+    let mut graph_key = replay_grade_attachments(&["node0"]);
+    graph_key[0] = att(
+        "graph.yaml",
+        "application/yaml",
+        b"name: replaytest\nprefix: replaytest\nfuture_setting: 1\nnodes:\n  - id: pub1\n    \
+          type: test_pub\n    outputs:\n      - name: data\n        schema: test/Data\n"
+            .to_vec(),
+    );
+    let mut flagged = fire(0, 1);
+    flagged.reserved = 1 << 30;
+    for (name, atts, trace) in [
+        ("graph_key", graph_key, vec![fire(0, 0), fire(0, 1)]),
+        (
+            "rank_bit",
+            replay_grade_attachments(&["node0"]),
+            vec![fire(0, 0), flagged],
+        ),
+    ] {
+        let (_dir, path) = tmp_bag(&format!("newer_{name}.mcap"));
+        let mut atts = atts;
+        atts.push(recorder_att(Some(newer)));
+        write_bag(&path, &trace, &atts, true);
+        let err = gate(&path);
+        assert_eq!(
+            err.to_string(),
+            format_too_new_sentence(" (99.0.0)", newer),
+            "{name}"
+        );
+        assert_eq!(err.exit_code(), 2, "{name}");
+    }
 }

@@ -1711,6 +1711,67 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         });
     }
 
+    // 2b. `__cerulion/recorder.json`: OPTIONAL recorder-host identity
+    //     attachment. Absent = silent (pre-recorder.json bags); arch/os
+    //     mismatch vs THIS host = loud WARN (cross-arch float/libm ULP
+    //     advisory). Its contract keys are gated below. Read right after
+    //     completeness, so an unreadable one is refused before the steps
+    //     below; its `node_external` stamp is admitted at 6b, once the graph
+    //     is parsed.
+    let RecorderRead {
+        info: mut recorder,
+        unknown_coordination,
+        driver_stamp,
+    } = read_recorder_info(&reader, bag)?;
+
+    // 2b'. Trace-format version gate: a bag stamped with a `trace_format`
+    //      GREATER than this binary supports carries a layout this Cerulion
+    //      cannot decode: its graph, its trace records or both may use what
+    //      a newer format defines. It is refused here as
+    //      `ReplayError::TraceFormatTooNew` (exit 2, not replay-grade), naming
+    //      the newer recording and saying to upgrade, rather than mis-replayed.
+    //      ORDER: the gate runs right after completeness (step 2) and BEFORE
+    //      the trace presence check (3), the graph parse (4) and the
+    //      trace-record walk (5), so no step that reads the graph or the
+    //      records judges a newer bag. A graph key this build does not
+    //      define, a record kind it does not define, a `reserved` bit it reads
+    //      as part of the rank, or a node-stop cause it does not define would
+    //      each be refused by that step in its own words, some calling the
+    //      bag corrupt, where the format number is the fact that decides it.
+    //      ABSENT `trace_format` decodes to version 1 (full back-compat:
+    //      every unstamped bag). A recorder.json this binary cannot read AT
+    //      ALL never reaches here: an unparseable CONTRACT CARRIER is a
+    //      refusal inside `read_recorder_info` rather than a silent
+    //      treated-as-absent.
+    //
+    // 2b''. There is no free-run refusal here: `run_engine` replays a free-run
+    //       bag through the SEQUENTIAL PER-RANK executor, so a bag this binary
+    //       can decode is a bag it can re-execute. What this gate refuses is an
+    //       UNKNOWN `coordination` value, a contract this binary has no variant
+    //       for at all (`ReplayError::CoordinationUnknown`).
+    //
+    //       ORDER: the UNKNOWN-value refusal sits BELOW the version gate on
+    //       purpose. Both can be true at once, and a bag from a newer Cerulion
+    //       stamping a format PAST `SUPPORTED_TRACE_FORMAT` and a coordination
+    //       mode this binary has no variant for is ONE fact. The version refusal
+    //       names the format the bag carries and the one this build reads up
+    //       to, the evidence that a newer Cerulion wrote it, while the
+    //       unknown-value refusal names only a value this build does not know.
+    //       The more informative refusal therefore wins whenever both apply; the
+    //       unknown-value arm is what catches the same skew on a bag whose
+    //       format version this binary DOES support. `newer_recording_refusal`
+    //       holds that order.
+    if let Some(info) = &recorder {
+        if let Some(refusal) = newer_recording_refusal(
+            info.trace_format,
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            unknown_coordination.as_deref(),
+            info.cerulion_version.as_deref(),
+        ) {
+            return Err(refusal);
+        }
+    }
+
     // 3. Scheduler-trace presence — strict replay is driven by the recorded
     //    trace. An empty channel is refused with the precise re-record message.
     //    A wrong-sized trace payload is data corruption (exit 2 via BagOpen).
@@ -2037,62 +2098,10 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         None
     };
 
-    // 6b. `__cerulion/recorder.json`: OPTIONAL recorder-host identity
-    //     attachment. Absent = silent (pre-recorder.json bags); arch/os
-    //     mismatch vs THIS host = loud WARN (cross-arch float/libm ULP
-    //     advisory). Its contract keys are gated below.
-    let RecorderRead {
-        info: mut recorder,
-        unknown_coordination,
-        driver_stamp,
-    } = read_recorder_info(&reader, bag)?;
-
-    // 6b'. Trace-format version gate: a bag stamped with a `trace_format`
-    //      GREATER than this binary supports carries a scheduler-trace layout
-    //      this Cerulion cannot decode. It is refused here as
-    //      `ReplayError::TraceFormatTooNew` (exit 2, not replay-grade), naming
-    //      the newer recording and saying to upgrade, rather than mis-replayed.
-    //      The gate runs after the graph parse (step 4) and the trace-record
-    //      walk (step 5): a newer bag whose `graph.yaml` this build cannot
-    //      parse, whose trace holds a record kind this build does not define,
-    //      or whose records set a `reserved` bit this build reads as part of
-    //      the rank (a rank with no manifest), is refused there first, by that
-    //      step's own message. ABSENT `trace_format` decodes to version 1 (full
-    //      back-compat: every unstamped bag). A recorder.json this binary cannot
-    //      read AT ALL never reaches here: an unparseable CONTRACT CARRIER is a
-    //      refusal inside `read_recorder_info` rather than a silent
-    //      treated-as-absent.
-    //
-    // 6b''. There is no free-run refusal here: `run_engine` replays a free-run
-    //       bag through the SEQUENTIAL PER-RANK executor, so a bag this binary
-    //       can decode is a bag it can re-execute. What this gate refuses is an
-    //       UNKNOWN `coordination` value, a contract this binary has no variant
-    //       for at all (`ReplayError::CoordinationUnknown`).
-    //
-    //       ORDER: the UNKNOWN-value refusal sits BELOW the version gate on
-    //       purpose. Both can be true at once, and a bag from a newer Cerulion
-    //       stamping a format PAST `SUPPORTED_TRACE_FORMAT` and a coordination
-    //       mode this binary has no variant for is ONE fact. The version refusal
-    //       names the format the bag carries and the one this build reads up
-    //       to, the evidence that a newer Cerulion wrote it, while the
-    //       unknown-value refusal names only a value this build does not know.
-    //       The more informative refusal therefore wins whenever both apply; the
-    //       unknown-value arm is what catches the same skew on a bag whose
-    //       format version this binary DOES support. `newer_recording_refusal`
-    //       holds that order.
-    if let Some(info) = &recorder {
-        if let Some(refusal) = newer_recording_refusal(
-            info.trace_format,
-            replay_engine::SUPPORTED_TRACE_FORMAT,
-            unknown_coordination.as_deref(),
-            info.cerulion_version.as_deref(),
-        ) {
-            return Err(refusal);
-        }
-    }
-    // 6b'''. The driver stamp (`node_external`): refused when unreadable, and
-    //        checked against the embedded graph (its ros2 entries were taken
-    //        out above) when present. Below the version gate for the same
+    // 6b. The driver stamp (`node_external`, read at 2b): refused when
+    //        unreadable, and checked against the embedded graph (its ros2
+    //        entries were taken out above) when present, so it is admitted
+    //        here, after the graph parse. Below the version gate for the same
     //        reason as the unknown-coordination refusal: a bag from a newer
     //        Cerulion is named as such first. A validated stamp is what the
     //        engine classifies drivers by; an absent one leaves the build
@@ -2417,8 +2426,9 @@ struct RecorderRead {
 }
 
 /// The `trace_format` a bag's `recorder.json` stamps, read on its own for the
-/// one record refusal whose remedy depends on it, which the record walk raises
-/// before [`read_recorder_info`] runs. `1` when the attachment is absent or
+/// one record refusal whose remedy depends on it, the record walk's unknown
+/// stop cause. The format gate runs before the walk, so a bag the walk reaches
+/// is stamped at or below this build's format. `1` when the attachment is absent or
 /// carries no readable stamp, as an absent field reads. Read through
 /// `cerulion_core::flashback::resim::recorded_trace_format`, as the capture
 /// judge reads it.

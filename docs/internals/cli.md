@@ -261,7 +261,7 @@ Rules that must not drift:
   `driver_frames_uncompared` (`DriverInputsReport::leaves_driver_frames_out`). The driver set
   comes from the recording: `recorder.json`'s `node_external` (each native node's flag, from
   the LOADED `info()` through `replay_engine::is_external_policy`, the predicate the
-  candidate set `external_node_ids` uses too) is read at gate 6b as contract key 3
+  candidate set `external_node_ids` uses too) is read at gate 2b, right after the completeness check, as contract key 3
   (`RecordedDriverStamp`; unreadable refuses `BagInvalidAttachment` after the version gate)
   and admitted against the embedded graph's native nodes (`DriverStamp::admit`, the type's
   only constructor; a node too many or too few refuses `RecordingInconsistent`).

@@ -1166,7 +1166,7 @@ describe current behaviour.
 **A bag from a newer Cerulion is refused with the upgrade remedy.** A resim
 refuses (exit 2) a bag stamped with a `trace_format` above the highest this
 build reads, and a bag whose `coordination` stamp this build does not know at
-a format it reads. The message says a newer Cerulion recorded the bag, adds
+a format it reads, before it reads the bag's graph or any trace record. The message says a newer Cerulion recorded the bag, adds
 the bag's `cerulion_version` in parentheses when it is a plain version token
 (ASCII letters, digits, `.`, `-` and `+`, at most 64 bytes) whose
 `MAJOR.MINOR.PATCH` is above this build's, names the format
@@ -1519,16 +1519,16 @@ compared, because a resim never gives a driver its device. A stop the resim
 makes in a short rank's tolerated ragged tail is tolerated with the re-fire
 that made it, under the same window as the fire comparison.
 
-A NODE-STOP record whose cause is none of the three is refused (exit 2). In a
-bag stamped past the formats this build reads, a newer or foreign writer added
-the cause, and the resim refuses it as it refuses an unknown record kind,
-saying to upgrade cerulion. In a bag stamped 12 or below, the cause cannot be
-a newer writer's, since a format at or below this build's defines no other
-cause, so the bag is corrupt (`bag internal consistency check failed`).
+A NODE-STOP record whose cause is none of the three is refused (exit 2). A
+bag stamped past the formats this build reads never reaches its records:
+`cerulion bag play --resim` refuses it by its format first, saying a newer
+Cerulion recorded it and to upgrade. In a bag stamped 12 or below, the cause
+cannot be a newer writer's, since a format at or below this build's defines no
+other cause, so the bag is corrupt (`bag internal consistency check failed`).
 A Flashback capture that holds one is not resimmable, and its
-`anchor.resimmable_reason` reads the capture's own stamp the same way: a newer
-or foreign writer's cause, with the upgrade remedy, past the formats this
-build reads, and a corrupt trace at 12 or below.
+`anchor.resimmable_reason` reads the capture's own stamp: a newer or foreign
+writer's cause, with the upgrade remedy, past the formats this build reads,
+and a corrupt trace at 12 or below.
 Four more stop records are refused before the first replayed step as a
 corrupt bag (`bag internal consistency check failed`, exit 2): one stamped
 with a rank the bag has no trace manifest for, and three shapes no recorder
