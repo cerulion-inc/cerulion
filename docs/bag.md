@@ -1168,7 +1168,8 @@ refuses (exit 2) a bag stamped with a `trace_format` above the highest this
 build reads, and a bag whose `coordination` stamp this build does not know at
 a format it reads. The message says a newer Cerulion recorded the bag, adds
 the bag's `cerulion_version` in parentheses when it is a plain version token
-(ASCII letters, digits, `.`, `-` and `+`, at most 64 bytes), names the format
+(ASCII letters, digits, `.`, `-` and `+`, at most 64 bytes) whose
+`MAJOR.MINOR.PATCH` is above this build's, names the format
 or the stamp and this Cerulion's version, and ends
 `Upgrade Cerulion to replay it.` The recording is sound, and an upgraded
 Cerulion replays it. On 2.0.0 and 2.1.0 the same refusal names the newer

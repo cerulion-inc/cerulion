@@ -1091,7 +1091,7 @@ fn a_bag_stamped_past_the_node_stops_format_is_refused_with_the_upgrade_message(
         matches!(err, ReplayError::TraceFormatTooNew { .. }),
         "expected TraceFormatTooNew (format {past}), got {err:?}"
     );
-    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", past));
+    assert_eq!(err.to_string(), format_too_new_sentence(" (99.0.0)", past));
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -1575,7 +1575,7 @@ fn recorder_att(trace_format: Option<u32>) -> Att {
     let mut obj = serde_json::json!({
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
-        "cerulion_version": "0.1.0",
+        "cerulion_version": "99.0.0",
         "recorded_at_ns": 42u64,
     });
     if let Some(tf) = trace_format {
@@ -1640,7 +1640,7 @@ fn recorder_att_with(
     let mut obj = serde_json::json!({
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
-        "cerulion_version": "0.1.0",
+        "cerulion_version": "99.0.0",
         "recorded_at_ns": 42u64,
     });
     if let Some(tf) = trace_format {
@@ -1754,7 +1754,7 @@ fn newer_trace_format_is_refused_with_upgrade_message_exit_2() {
         matches!(err, ReplayError::TraceFormatTooNew { .. }),
         "expected TraceFormatTooNew, got {err:?}"
     );
-    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", 999));
+    assert_eq!(err.to_string(), format_too_new_sentence(" (99.0.0)", 999));
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -1768,15 +1768,17 @@ fn absent_trace_format_is_version_1_backcompat() {
     atts.push(recorder_att(None)); // legacy recorder.json (no trace_format)
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
-    // The version gate did not fire.
+    // The version gate did not fire, nor did any other: the bag reaches the
+    // node load.
     assert!(
-        !matches!(err, ReplayError::TraceFormatTooNew { .. }),
-        "an absent trace_format must be treated as v1, not refused: {err}"
+        matches!(err, ReplayError::NodeLoad { .. }),
+        "an absent trace_format must be treated as v1, not refused: {err:?}"
     );
 }
 
 /// Version gate — trace_format == SUPPORTED is accepted (the boundary): a bag at
-/// exactly the supported version clears the version gate.
+/// exactly the supported version clears the version gate and reaches the
+/// downstream cdylib NodeLoad.
 #[test]
 fn supported_trace_format_at_boundary_is_accepted() {
     let (_dir, path) = tmp_bag("supported_format.mcap");
@@ -1790,8 +1792,8 @@ fn supported_trace_format_at_boundary_is_accepted() {
     write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
     let err = gate(&path);
     assert!(
-        !matches!(err, ReplayError::TraceFormatTooNew { .. }),
-        "trace_format == SUPPORTED must be accepted: {err}"
+        matches!(err, ReplayError::NodeLoad { .. }),
+        "trace_format == SUPPORTED must be accepted: {err:?}"
     );
 }
 
@@ -2034,7 +2036,7 @@ fn an_unknown_coordination_value_on_a_supported_format_is_refused_by_name() {
     // no format number, since an unknown value is not the version arm.
     assert_eq!(
         err.to_string(),
-        coordination_unknown_sentence(" (0.1.0)", "\"quantum_entangled\"")
+        coordination_unknown_sentence(" (99.0.0)", "\"quantum_entangled\"")
     );
     assert_eq!(err.exit_code(), 2);
 }
@@ -2064,7 +2066,7 @@ fn a_refusal_prints_bag_text_escaped_or_not_at_all() {
             &serde_json::to_vec(&serde_json::json!({
                 "arch": std::env::consts::ARCH,
                 "os": std::env::consts::OS,
-                "cerulion_version": "2.2.0\u{1b}[2J",
+                "cerulion_version": "99.0.0-\u{1b}[2J",
                 "recorded_at_ns": 42u64,
                 "trace_format": trace_format,
                 "coordination": "\u{1b}[2Jbarrier",
@@ -2076,6 +2078,43 @@ fn a_refusal_prints_bag_text_escaped_or_not_at_all() {
         assert_eq!(err.to_string(), want, "{name}");
         assert!(!err.to_string().contains('\u{1b}'), "{name}: {err}");
         assert_eq!(err.exit_code(), 2, "{name}");
+    }
+}
+
+/// Through the real reader, a refusal names the recorder only when its stamp's
+/// release is above this build's: a stamp equal to this build's version, a
+/// lower one and one with no patch number are left out; a pre-release of a
+/// higher release is named, suffix and all.
+#[test]
+fn a_refusal_names_the_recorder_only_when_its_release_is_above_this_builds() {
+    let newer = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT + 1;
+    for (stamp, by) in [
+        (env!("CARGO_PKG_VERSION"), ""),
+        ("0.1.0", ""),
+        ("99.0", ""),
+        ("99.0.0-rc.1", " (99.0.0-rc.1)"),
+    ] {
+        let (_dir, path) = tmp_bag("stamp_release.mcap");
+        let mut atts = replay_grade_attachments(&["node0"]);
+        atts.push(recorder_att_raw(
+            &serde_json::to_vec(&serde_json::json!({
+                "arch": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+                "cerulion_version": stamp,
+                "recorded_at_ns": 42u64,
+                "trace_format": newer,
+                "coordination": "lockstep",
+            }))
+            .unwrap(),
+        ));
+        write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+        let err = gate(&path);
+        assert_eq!(
+            err.to_string(),
+            format_too_new_sentence(by, newer),
+            "{stamp}"
+        );
+        assert_eq!(err.exit_code(), 2, "{stamp}");
     }
 }
 
@@ -2132,7 +2171,7 @@ fn a_newer_format_wins_over_the_unknown_coordination_value() {
         matches!(err, ReplayError::TraceFormatTooNew { .. }),
         "the VERSION refusal is the one served, not the unknown-value one: {err:?}"
     );
-    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", newer));
+    assert_eq!(err.to_string(), format_too_new_sentence(" (99.0.0)", newer));
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -2144,7 +2183,7 @@ fn recorder_att_with_stamp(trace_format: u32, stamp: Option<serde_json::Value>) 
     let mut obj = serde_json::json!({
         "arch": std::env::consts::ARCH,
         "os": std::env::consts::OS,
-        "cerulion_version": "0.1.0",
+        "cerulion_version": "99.0.0",
         "recorded_at_ns": 42u64,
         "trace_format": trace_format,
         "coordination": "lockstep",
@@ -2211,7 +2250,7 @@ fn an_unreadable_stamp_on_a_newer_format_bag_reports_the_version_first() {
         matches!(err, ReplayError::TraceFormatTooNew { .. }),
         "the version refusal is the one served: {err:?}"
     );
-    assert_eq!(err.to_string(), format_too_new_sentence(" (0.1.0)", newer));
+    assert_eq!(err.to_string(), format_too_new_sentence(" (99.0.0)", newer));
     assert_eq!(err.exit_code(), 2);
 }
 

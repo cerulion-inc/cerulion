@@ -708,9 +708,9 @@ pub enum ReplayError {
         recorded: u32,
         /// The highest format this build reads.
         supported: u32,
-        /// The bag's `cerulion_version` stamp, when it is a plain version
-        /// token.
-        recorded_by: Option<RecorderVersion>,
+        /// The bag's `cerulion_version` stamp, when it names a release above
+        /// this build's.
+        recorded_by: Option<NewerRecorderVersion>,
     },
 
     /// The bag's `recorder.json` stamps a `coordination` value this build has
@@ -729,9 +729,9 @@ pub enum ReplayError {
         /// The stamp as JSON text, as the reader carries it out: a string
         /// keeps its quotes, and a control byte in it is escaped.
         value: String,
-        /// The bag's `cerulion_version` stamp, when it is a plain version
-        /// token.
-        recorded_by: Option<RecorderVersion>,
+        /// The bag's `cerulion_version` stamp, when it names a release above
+        /// this build's.
+        recorded_by: Option<NewerRecorderVersion>,
     },
 
     /// One or more recorded graph-produced topics were recorded
@@ -945,39 +945,60 @@ impl ReplayError {
 /// refusal names this build the way a bag names its recorder.
 const CERULION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// A recording's `cerulion_version` stamp, held only when it is a plain
-/// version token: 1 to [`RecorderVersion::MAX_LEN`] bytes, each an ASCII
-/// letter or digit, `.`, `-` or `+`.
+/// A recording's `cerulion_version` stamp, held only when it names a release
+/// above this build's: a plain version token (1 to
+/// [`NewerRecorderVersion::MAX_LEN`] bytes, each an ASCII letter or digit, `.`,
+/// `-` or `+`) whose leading `MAJOR.MINOR.PATCH`, read as three integers, is
+/// above this build's. A pre-release or build suffix is not compared.
 ///
-/// The stamp is bag text, and a refusal prints it only through this type, so
-/// a stamp that holds a control byte, a space or any other byte reads as
-/// absent and never reaches the terminal.
+/// A refusal prints the stamp after "a newer Cerulion", and the stamp is bag
+/// text, so a refusal prints it only through this type. A stamp that holds any
+/// other byte, whose leading part is not three integers, or whose release is
+/// not above this build's reads as absent, and the refusal names no version.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecorderVersion(String);
+pub struct NewerRecorderVersion(String);
 
-impl RecorderVersion {
+impl NewerRecorderVersion {
     /// The longest stamp held, in bytes.
     pub const MAX_LEN: usize = 64;
 
-    /// `stamp` as a plain version token, or `None` when it is not one.
-    pub fn from_stamp(stamp: &str) -> Option<Self> {
+    /// `stamp` when it is a plain version token whose release is above the
+    /// release of `ours`, this build's version; `None` otherwise, and when
+    /// `ours` has no `MAJOR.MINOR.PATCH` either.
+    pub fn newer_than(stamp: &str, ours: &str) -> Option<Self> {
         let plain = (1..=Self::MAX_LEN).contains(&stamp.len())
             && stamp
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'));
-        plain.then(|| Self(stamp.to_string()))
+        let newer = match (release_number(stamp), release_number(ours)) {
+            (Some(theirs), Some(ours)) => theirs > ours,
+            _ => false,
+        };
+        (plain && newer).then(|| Self(stamp.to_string()))
     }
 }
 
-impl std::fmt::Display for RecorderVersion {
+impl std::fmt::Display for NewerRecorderVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
+/// PURE: the leading `MAJOR.MINOR.PATCH` of `version` as three integers. The
+/// release is the text before the first `-` or `+`, and it must be exactly
+/// three `.`-separated whole numbers, each fitting a `u64`; `None` otherwise.
+fn release_number(version: &str) -> Option<[u64; 3]> {
+    let mut parts = version.split(['-', '+']).next()?.split('.');
+    let mut number = [0u64; 3];
+    for slot in &mut number {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    parts.next().is_none().then_some(number)
+}
+
 /// What follows "a newer Cerulion" in a newer-recording refusal: ` (<version>)`
-/// when the bag names its recorder with a plain version token, else nothing.
-struct RecordedBy<'a>(Option<&'a RecorderVersion>);
+/// when the bag names a recorder release above this build's, else nothing.
+struct RecordedBy<'a>(Option<&'a NewerRecorderVersion>);
 
 impl std::fmt::Display for RecordedBy<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -994,7 +1015,8 @@ impl std::fmt::Display for RecordedBy<'_> {
 /// `trace_format` is the bag's stamp, `supported` the highest format this build
 /// reads, `unknown_coordination` the `coordination` stamp the reader could not
 /// map to a contract (as JSON text), and `cerulion_version` the bag's recorder
-/// stamp, printed only when [`RecorderVersion::from_stamp`] holds it.
+/// stamp, printed only when [`NewerRecorderVersion::newer_than`] holds it
+/// against this build's version.
 ///
 /// The format is judged first. A bag stamped past `supported` that also
 /// carries an unknown `coordination` value gets
@@ -1009,7 +1031,9 @@ fn newer_recording_refusal(
     unknown_coordination: Option<&str>,
     cerulion_version: Option<&str>,
 ) -> Option<ReplayError> {
-    let recorded_by = || cerulion_version.and_then(RecorderVersion::from_stamp);
+    let recorded_by = || {
+        cerulion_version.and_then(|stamp| NewerRecorderVersion::newer_than(stamp, CERULION_VERSION))
+    };
     if trace_format > supported {
         return Some(ReplayError::TraceFormatTooNew {
             recorded: trace_format,
@@ -3044,7 +3068,7 @@ mod tests {
                 ReplayError::TraceFormatTooNew {
                     recorded: 13,
                     supported: 12,
-                    recorded_by: RecorderVersion::from_stamp("2.2.0"),
+                    recorded_by: NewerRecorderVersion::newer_than("99.0.0", "2.1.0"),
                 },
                 2,
             ),
@@ -3281,7 +3305,7 @@ mod tests {
     fn a_format_past_this_build_names_the_newer_recording_and_says_to_upgrade() {
         let ours = env!("CARGO_PKG_VERSION");
         let stamped = format!(
-            "this bag was recorded by a newer Cerulion (2.2.0): its scheduler-trace format is \
+            "this bag was recorded by a newer Cerulion (99.0.0): its scheduler-trace format is \
              version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade Cerulion \
              to replay it."
         );
@@ -3291,7 +3315,7 @@ mod tests {
              it."
         );
         assert_eq!(
-            newer_refusal(13, None, Some("2.2.0")),
+            newer_refusal(13, None, Some("99.0.0")),
             Some((stamped.clone(), 2))
         );
         assert_eq!(newer_refusal(13, None, None), Some((unstamped.clone(), 2)));
@@ -3315,7 +3339,7 @@ mod tests {
     fn an_unknown_coordination_names_the_newer_recording_and_says_to_upgrade() {
         let ours = env!("CARGO_PKG_VERSION");
         let stamped = format!(
-            "this bag was recorded by a newer Cerulion (2.2.0): its `coordination` stamp is \
+            "this bag was recorded by a newer Cerulion (99.0.0): its `coordination` stamp is \
              \"barrier\", which this Cerulion ({ours}) does not know. Upgrade Cerulion to \
              replay it."
         );
@@ -3325,7 +3349,7 @@ mod tests {
              replay it."
         );
         assert_eq!(
-            newer_refusal(12, Some("\"barrier\""), Some("2.2.0")),
+            newer_refusal(12, Some("\"barrier\""), Some("99.0.0")),
             Some((stamped.clone(), 2))
         );
         assert_eq!(
@@ -3348,9 +3372,9 @@ mod tests {
     fn the_format_refusal_wins_over_an_unknown_coordination() {
         let ours = env!("CARGO_PKG_VERSION");
         assert_eq!(
-            newer_refusal(13, Some("\"barrier\""), Some("2.2.0")).map(|(text, _)| text),
+            newer_refusal(13, Some("\"barrier\""), Some("99.0.0")).map(|(text, _)| text),
             Some(format!(
-                "this bag was recorded by a newer Cerulion (2.2.0): its scheduler-trace format \
+                "this bag was recorded by a newer Cerulion (99.0.0): its scheduler-trace format \
                  is version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade \
                  Cerulion to replay it."
             ))
@@ -3363,13 +3387,15 @@ mod tests {
                  Cerulion to replay it."
             ))
         );
-        assert_eq!(newer_refusal(12, None, Some("2.2.0")), None);
+        assert_eq!(newer_refusal(12, None, Some("99.0.0")), None);
         assert_eq!(newer_refusal(1, None, None), None);
     }
 
     /// The recorder stamp is printed only when it is a plain version token
-    /// (ASCII letters, digits, `.`, `-`, `+`; 1 to 64 bytes). Any other stamp
-    /// reads as absent, so the sentence is the unstamped one.
+    /// (ASCII letters, digits, `.`, `-`, `+`; 1 to 64 bytes). Each stamp below
+    /// names release 99.0.0, above this build's, so only the token rule leaves
+    /// it out: the offending byte sits in the suffix, and the sentence is the
+    /// unstamped one.
     #[test]
     fn a_recorder_stamp_is_printed_only_as_a_plain_version_token() {
         let ours = env!("CARGO_PKG_VERSION");
@@ -3378,15 +3404,15 @@ mod tests {
              13, and this Cerulion ({ours}) reads up to version 12. Upgrade Cerulion to replay \
              it."
         );
-        let sixty_five = "9".repeat(65);
+        let sixty_five = format!("99.0.0-{}", "a".repeat(58));
         for (stamp, what) in [
-            ("2.2.0\u{7}", "a control byte"),
-            ("\u{1b}[31m2.2.0", "an escape sequence"),
-            ("2.2.0 beta", "a space"),
+            ("99.0.0-rc\u{7}", "a control byte"),
+            ("99.0.0-\u{1b}[31m", "an escape sequence"),
+            ("99.0.0-rc 1", "a space"),
             ("", "an empty stamp"),
             (sixty_five.as_str(), "65 bytes"),
-            ("2.2.0_beta", "an underscore"),
-            ("2.2.\u{e9}", "a byte past ASCII"),
+            ("99.0.0-rc_1", "an underscore"),
+            ("99.0.0-\u{e9}", "a byte past ASCII"),
         ] {
             assert_eq!(
                 newer_refusal(13, None, Some(stamp)).map(|(text, _)| text),
@@ -3402,8 +3428,8 @@ mod tests {
                 "{what}: {stamp:?}"
             );
         }
-        let sixty_four = "9".repeat(64);
-        for stamp in ["2.2.0-rc.1+abc", sixty_four.as_str()] {
+        let sixty_four = format!("99.0.0-{}", "a".repeat(57));
+        for stamp in ["99.0.0-rc.1+abc", sixty_four.as_str()] {
             assert_eq!(
                 newer_refusal(13, None, Some(stamp)).map(|(text, _)| text),
                 Some(format!(
@@ -3412,6 +3438,88 @@ mod tests {
                      Upgrade Cerulion to replay it."
                 )),
             );
+        }
+    }
+
+    /// "a newer Cerulion (<stamp>)" names only a release above this build's:
+    /// the stamp's leading `MAJOR.MINOR.PATCH` against this build's, as three
+    /// integers, its suffix not compared. A stamp equal to this build's
+    /// version, a lower one, and one whose leading part is not three integers
+    /// read as absent, so the sentence is the unstamped one.
+    #[test]
+    fn a_recorder_stamp_is_printed_only_when_its_release_is_above_this_builds() {
+        let ours = env!("CARGO_PKG_VERSION");
+        let format_refusal = |by: &str| {
+            format!(
+                "this bag was recorded by a newer Cerulion{by}: its scheduler-trace format is \
+                 version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade \
+                 Cerulion to replay it."
+            )
+        };
+        let coordination_refusal = |by: &str| {
+            format!(
+                "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is \
+                 \"barrier\", which this Cerulion ({ours}) does not know. Upgrade Cerulion to \
+                 replay it."
+            )
+        };
+        for (stamp, by) in [
+            ("99.0.0", " (99.0.0)"),
+            ("99.0.0-rc.1", " (99.0.0-rc.1)"),
+            // 100 is above 2 as a number, and below it as text.
+            ("100.0.0", " (100.0.0)"),
+            (ours, ""),
+            ("0.1.0", ""),
+            ("99.0", ""),
+            ("99.0.0.1", ""),
+            ("99", ""),
+        ] {
+            assert_eq!(
+                newer_refusal(13, None, Some(stamp)).map(|(text, _)| text),
+                Some(format_refusal(by)),
+                "{stamp:?}"
+            );
+            assert_eq!(
+                newer_refusal(12, Some("\"barrier\""), Some(stamp)).map(|(text, _)| text),
+                Some(coordination_refusal(by)),
+                "{stamp:?}"
+            );
+        }
+    }
+
+    /// The release comparison reads each of the three numbers as an integer,
+    /// in order, and holds nothing when either side has no
+    /// `MAJOR.MINOR.PATCH`, this build's version included.
+    #[test]
+    fn a_newer_release_is_three_integers_above_this_builds() {
+        let held = |stamp: &str, ours: &str| {
+            NewerRecorderVersion::newer_than(stamp, ours).map(|v| v.to_string())
+        };
+        for (stamp, ours) in [
+            ("2.10.0", "2.9.0"),
+            ("2.1.1", "2.1.0"),
+            ("3.0.0", "2.99.99"),
+            ("2.1.1-rc.1", "2.1.0"),
+            ("2.1.1+abc", "2.1.0-rc.2"),
+        ] {
+            assert_eq!(
+                held(stamp, ours).as_deref(),
+                Some(stamp),
+                "{stamp} > {ours}"
+            );
+        }
+        for (stamp, ours) in [
+            ("2.9.0", "2.10.0"),
+            ("2.1.0", "2.1.0"),
+            ("2.1.0-rc.9", "2.1.0"),
+            ("2.1.0", "2.1.1"),
+            ("2.99.99", "3.0.0"),
+            ("3.0.0", "2.1"),
+            ("3.0.0", ""),
+            ("3.x.0", "2.1.0"),
+            ("18446744073709551616.0.0", "2.1.0"),
+        ] {
+            assert_eq!(held(stamp, ours), None, "{stamp} vs {ours}");
         }
     }
 

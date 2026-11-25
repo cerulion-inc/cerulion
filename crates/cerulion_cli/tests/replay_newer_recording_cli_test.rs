@@ -102,8 +102,9 @@ fn resim_verify(bag: &Path, root: &Path) -> Output {
 }
 
 /// A bag stamped one format past this build, by a recorder that stamps
-/// `2.2.0`, exits 2 with the sentence an operator reads, written out by hand,
-/// and nothing that calls the recording corrupt or says to re-record it.
+/// `99.0.0`, exits 2 with one `Error:` line, the sentence an operator reads,
+/// written out by hand, and nothing that calls the recording corrupt or says
+/// to re-record it.
 #[test]
 fn a_bag_from_a_newer_cerulion_exits_2_and_says_to_upgrade() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -114,7 +115,7 @@ fn a_bag_from_a_newer_cerulion_exits_2_and_says_to_upgrade() {
         &serde_json::to_vec(&serde_json::json!({
             "arch": std::env::consts::ARCH,
             "os": std::env::consts::OS,
-            "cerulion_version": "2.2.0",
+            "cerulion_version": "99.0.0",
             "recorded_at_ns": 42u64,
             "trace_format": newer,
             "coordination": "lockstep",
@@ -125,12 +126,15 @@ fn a_bag_from_a_newer_cerulion_exits_2_and_says_to_upgrade() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "stderr: {stderr}");
     let line = format!(
-        "Error: this bag was recorded by a newer Cerulion (2.2.0): its scheduler-trace format \
+        "Error: this bag was recorded by a newer Cerulion (99.0.0): its scheduler-trace format \
          is version {newer}, and this Cerulion ({}) reads up to version \
-         {SUPPORTED_TRACE_FORMAT}. Upgrade Cerulion to replay it.\n",
+         {SUPPORTED_TRACE_FORMAT}. Upgrade Cerulion to replay it.",
         env!("CARGO_PKG_VERSION")
     );
-    assert!(stderr.contains(&line), "want {line:?} in stderr: {stderr}");
+    // Every line that carries `Error:`, wherever on the line: exactly the one
+    // sentence, whole, on a line of its own.
+    let errors: Vec<&str> = stderr.lines().filter(|l| l.contains("Error:")).collect();
+    assert_eq!(errors, [line.as_str()], "stderr: {stderr}");
     for word in [
         "corrupt",
         "re-record",
