@@ -1050,12 +1050,12 @@ impl PooledCopy {
     /// The pointer handed to the caller: the copy's address, mutable because
     /// the memory is private to this take.
     pub(crate) fn loaned_ptr(&mut self) -> *mut std::os::raw::c_void {
-        self.buffer.words.as_mut_ptr() as *mut std::os::raw::c_void
+        self.buffer.words_mut().as_mut_ptr() as *mut std::os::raw::c_void
     }
 
     /// The return's key: the copy's address.
     pub fn key(&self) -> usize {
-        self.buffer.words.as_ptr() as usize
+        self.buffer.words().as_ptr() as usize
     }
 
     /// The buffer, for [`FixedCopyPool::release`]; the held sample, if any,
@@ -1070,31 +1070,70 @@ impl PooledCopy {
 /// words, so the struct it holds is 8-aligned (`WireLayout::fixed_align` is
 /// at most 8). Only the pool builds one, so every buffer is the pool's size.
 pub struct CopyBuffer {
-    words: Vec<u64>,
+    page: Box<CopyPage>,
+    /// The words of `page` the struct occupies.
+    len: usize,
 }
 
+/// The words in one copy page.
+const COPY_PAGE_WORDS: usize = 4096 / std::mem::size_of::<u64>();
+
+// Every fixed type that takes a private copy fits in one page.
+const _: () = {
+    if crate::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES > COPY_PAGE_WORDS * std::mem::size_of::<u64>() {
+        panic!("a private copy must fit in one copy page");
+    }
+};
+
+/// A page-aligned page of words: a copy of at most 4 KiB never straddles two
+/// pages, so a cold take touches one page of the destination.
+#[repr(C, align(4096))]
+struct CopyPage([u64; COPY_PAGE_WORDS]);
+
 impl CopyBuffer {
+    /// A zeroed buffer for a struct of `words` words, at most one page.
+    pub(crate) fn new(words: usize) -> Self {
+        assert!(words <= COPY_PAGE_WORDS, "a private copy larger than a copy page");
+        Self {
+            // hot-path-alloc-ok: built once per pool buffer, at most the
+            // pool's capacity per subscription; every later take recycles it.
+            page: Box::new(CopyPage([0; COPY_PAGE_WORDS])),
+            len: words,
+        }
+    }
+
+    /// The words the struct occupies.
+    pub(crate) fn words(&self) -> &[u64] {
+        &self.page.0[..self.len]
+    }
+
+    /// The words the struct occupies, writable.
+    pub(crate) fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.page.0[..self.len]
+    }
+
     /// Copy `body` (a frame's fixed section) into the front of the buffer, in
     /// native byte order, so the words hold the struct's bytes as laid out; the
     /// rest of the word holding `body`'s last byte is zeroed, and words past it
     /// keep their contents. A body longer than the buffer
     /// panics (caught by `ffi_guard`) instead of being cut short.
     pub(crate) fn fill(&mut self, body: &[u8]) {
+        let words = self.words_mut();
         assert!(
-            body.len() <= self.words.len() * std::mem::size_of::<u64>(),
+            body.len() <= words.len() * std::mem::size_of::<u64>(),
             "a frame body longer than the copy buffer"
         );
         // Whole words as `[u8; 8]` chunks, which the compiler turns into one
         // bulk copy of all of them; a partial last word is copied on its own
         // into a zeroed word.
         let (whole, tail) = body.as_chunks::<8>();
-        for (word, chunk) in self.words.iter_mut().zip(whole) {
+        for (word, chunk) in words.iter_mut().zip(whole) {
             *word = u64::from_ne_bytes(*chunk);
         }
         if !tail.is_empty() {
             let mut bytes = [0u8; 8];
             bytes[..tail.len()].copy_from_slice(tail);
-            self.words[body.len() / 8] = u64::from_ne_bytes(bytes);
+            words[body.len() / 8] = u64::from_ne_bytes(bytes);
         }
     }
 }
@@ -1137,11 +1176,7 @@ impl FixedCopyPool {
             return None;
         }
         self.built += 1;
-        Some(CopyBuffer {
-            // hot-path-alloc-ok: built once per buffer, at most `capacity`
-            // times per subscription; every later take recycles it.
-            words: vec![0u64; self.words],
-        })
+        Some(CopyBuffer::new(self.words))
     }
 
     /// Return a buffer for the next take; its stale contents are overwritten
@@ -1549,7 +1584,14 @@ mod tests {
 
     /// The bytes a copy buffer holds, word by word in native order.
     fn held_bytes(buffer: &super::CopyBuffer) -> Vec<u8> {
-        buffer.words.iter().flat_map(|w| w.to_ne_bytes()).collect()
+        buffer.words().iter().flat_map(|w| w.to_ne_bytes()).collect()
+    }
+
+    /// A buffer of `words` words whose stale contents are all 0xFF.
+    fn stale_buffer(words: usize) -> super::CopyBuffer {
+        let mut buffer = super::CopyBuffer::new(words);
+        buffer.words_mut().fill(u64::MAX);
+        buffer
     }
 
     /// `CopyBuffer::fill` holds the body's bytes in order and zeroes the last
@@ -1583,9 +1625,7 @@ mod tests {
             (&[], 1, &[0xFF; 8]),
         ];
         for &(body, words, want) in cases {
-            let mut buffer = super::CopyBuffer {
-                words: vec![u64::MAX; words],
-            };
+            let mut buffer = stale_buffer(words);
             buffer.fill(body);
             assert_eq!(held_bytes(&buffer), want, "body of {} bytes", body.len());
         }
@@ -1600,9 +1640,7 @@ mod tests {
         let limit = crate::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES;
         for n in [limit - 1, limit] {
             let body: Vec<u8> = (0..n).map(|i| ((i ^ (i >> 8)) * 31 + 7) as u8).collect();
-            let mut buffer = super::CopyBuffer {
-                words: vec![u64::MAX; n.div_ceil(8)],
-            };
+            let mut buffer = stale_buffer(n.div_ceil(8));
             buffer.fill(&body);
             let held = held_bytes(&buffer);
             assert_eq!(held.len(), n.next_multiple_of(8), "n={n}");
@@ -1624,7 +1662,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a frame body longer than the copy buffer")]
     fn a_copy_buffer_refuses_a_longer_body() {
-        let mut buffer = super::CopyBuffer { words: vec![0; 1] };
+        let mut buffer = super::CopyBuffer::new(1);
         buffer.fill(&[0; 9]);
     }
 }
