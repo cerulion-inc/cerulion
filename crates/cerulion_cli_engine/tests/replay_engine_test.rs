@@ -43792,6 +43792,311 @@ fn a_split_block_consumer_that_reads_its_block_events_differs_with_the_note() {
     );
 }
 
+/// The split fixture with the edge reversed across ranks: `src` alone on rank
+/// 1 and `sink` on rank 0, so the consumer's pass runs first. The verdict is
+/// the forward split's: every frame and read reproduced, `src` stood down on
+/// its rank, the edge judged on the sink's drains with no note, and the
+/// block-event note naming rank 1 as the producer's.
+#[test]
+#[serial]
+fn a_split_block_edge_with_its_consumer_on_rank_0_verifies() {
+    let rec = sp_reference();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sp_split_reversed.mcap");
+    ri_two_rank_bag_labelled(&rec, &bag, |id| id == "src", false);
+    let outcome = bh_replay_stamped(&bag, sp_factories, bh_clean_stamp(&rec));
+    ri_assert_fed(&outcome);
+    assert_clean_verdict(&outcome, "the reversed split");
+    assert_eq!(resim_exit(&outcome, true), 0);
+    assert_eq!(
+        sp_notes(&outcome),
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::StandDown,
+                "src",
+                Some("block_gated")
+            ),
+        ]
+    );
+    assert!(
+        outcome.rederivation_notes[0]
+            .detail
+            .starts_with("block input 'sink.inp' reads '/sp/src/out' from rank 1; "),
+        "{}",
+        outcome.rederivation_notes[0].detail
+    );
+}
+
+/// A 10 ms source: it first fires at step 1 (10 ms) and then at every second
+/// step, writing its fire count, so its rank records nothing at step 0 but
+/// its boundary.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct PacedSourceNode {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl PacedSourceNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// The steps the paced fixture runs.
+const PACED_SPLIT_STEPS: usize = 8;
+
+/// [`PacedSourceNode`] -> the split fixture's sink, `block` and `depth: 3` on
+/// its input from the graph.
+fn paced_split_yaml() -> &'static str {
+    "name: pkgraph\nprefix: pk\nnodes:\n\
+     \x20 - id: src\n    type: paced_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: paced_block_sink_node\n    inputs:\n      - name: inp\n        source: src/out\n        backpressure: block\n        depth: 3\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn paced_split_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(PacedSourceNodeEntry::new())),
+        ("sink", Box::new(PacedBlockSinkNodeEntry::new())),
+    ])
+}
+
+/// The producer's rank beginning late, which only a producer past rank 0 can
+/// show: the paced fixture with `src` alone on rank 1 and `sink` on rank 0.
+/// The hand oracle at the reference run's 5 ms step: `src` fires at steps 1,
+/// 3, 5 and 7 (`x` 1 to 4) and nothing at step 0; the sink, its throttle open
+/// at each of those steps, drains each frame the step it arrives (`x` 1 to 4).
+/// So rank 1's step 0 holds only its boundary, and cutting it is a rank that
+/// joined at step 1 with nothing lost. Whole, the edge is judged on the
+/// sink's four drains with no note. Cut, every frame and read still
+/// reproduces, and the edge stands down because the producer's rank begins
+/// past step 0.
+#[test]
+#[serial]
+fn a_split_block_edge_whose_producer_rank_begins_late_stands_its_conservation_down() {
+    let rec = record_uniform_with_read_log(
+        paced_split_yaml(),
+        paced_split_factories,
+        &[],
+        PACED_SPLIT_STEPS,
+    );
+    assert_eq!(bh_fire_steps(&rec, "src"), vec![1, 3, 5, 7]);
+    assert_eq!(bh_xs(&rec, "/pk/src/out"), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(bh_fire_steps(&rec, "sink"), vec![1, 3, 5, 7]);
+    assert_eq!(bh_xs(&rec, "/pk/sink/out"), vec![1.0, 2.0, 3.0, 4.0]);
+    let dir = tempfile::tempdir().unwrap();
+    let block_event = (
+        0,
+        replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+        "sink",
+        None,
+    );
+    let src_gated = (
+        1,
+        replay_engine::RederivationNoteKind::StandDown,
+        "src",
+        Some("block_gated"),
+    );
+
+    let whole = dir.path().join("pk_split_reversed.mcap");
+    ri_two_rank_bag_labelled(&rec, &whole, |id| id == "src", false);
+    let judged = bh_replay_stamped(&whole, paced_split_factories, bh_clean_stamp(&rec));
+    assert_clean_verdict(&judged, "the producer's rank whole");
+    assert_eq!(sp_notes(&judged), vec![block_event, src_gated]);
+
+    let late = dir.path().join("pk_split_producer_late.mcap");
+    ri_ranked_bag_cut(
+        &rec,
+        &late,
+        |id: &str| u32::from(id == "src"),
+        2,
+        &[],
+        ri_free_run_recorder_json(),
+        |per_rank| per_rank[1].retain(|r| r.step >= 1),
+        None,
+    );
+    let outcome = bh_replay_stamped(&late, paced_split_factories, bh_clean_stamp(&rec));
+    assert_clean_verdict(&outcome, "the producer's rank begins at step 1");
+    assert_eq!(
+        sp_notes(&outcome),
+        vec![
+            block_event,
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "/pk/src/out",
+                Some("credit_unknown_at_anchor")
+            ),
+            src_gated,
+        ]
+    );
+    assert_eq!(
+        sp_note_detail(&outcome, "/pk/src/out", "credit_unknown_at_anchor"),
+        "the rank-local re-derivation verifier makes NO credit-conservation claim about \
+         '/pk/src/out' -> sink.inp: rank 1, which produces '/pk/src/out', begins at step 1, \
+         past step 0, and the bag records no edge's outstanding count there"
+    );
+}
+
+/// The split fixture recorded with a checkpoint due at step 4: the recorder
+/// reopens every read stage's writer runs after step 4 and flags the step 5
+/// boundary, so the sink's next read (step 6) names its writer again. The
+/// window head changes no fire and no frame (the premise is the split
+/// fixture's). Split as in [`a_crafted_cross_rank_block_edge_verifies`], a fed
+/// `--verify` replay reopens the consumer's read stages before step 5 as the
+/// recorder did, and reproduces every frame and every recorded read: exit 0,
+/// the read log clean.
+#[test]
+#[serial]
+fn a_split_block_edge_fed_across_a_reopened_window_head_verifies() {
+    let rec = record_uniform_with_read_log_at(sp_yaml(), sp_factories, &[], SP_STEPS, &[4]);
+    assert_eq!(bh_fire_steps(&rec, "src"), (0..=8).collect::<Vec<u64>>());
+    assert_eq!(
+        bh_xs(&rec, SP_SRC_TOPIC),
+        vec![1.0, 2.0, 4.0, 5.0, 7.0, 8.0, 9.0]
+    );
+    assert_eq!(bh_fire_steps(&rec, "sink"), vec![0, 2, 4, 6, 8]);
+    assert_eq!(bh_xs(&rec, SP_SINK_TOPIC), vec![1.0, 2.0, 4.0, 5.0, 7.0]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sp_split_window_head.mcap");
+    ri_two_rank_bag_labelled(&rec, &bag, sp_sink_alone, false);
+    let outcome = bh_replay_stamped(&bag, sp_factories, bh_clean_stamp(&rec));
+    ri_assert_fed(&outcome);
+    assert_clean_verdict(&outcome, "a split edge across a reopened window head");
+    assert_eq!(resim_exit(&outcome, true), 0);
+    assert_eq!(
+        sp_notes(&outcome),
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "src",
+                Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+        ]
+    );
+}
+
+/// The block-held graph's relay as a build that fires at most once per 10
+/// ms, so it skips fires the plain relay owes: [`bh_yaml`]'s relay recorded
+/// with this build, replayed with [`RelayNode`].
+#[cerulion_node(throttle_ms = 10)]
+#[derive(Default)]
+struct HalfRateRelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl HalfRateRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// The cost of standing a held producer down. The block-held graph recorded
+/// with [`HalfRateRelayNode`] as its relay, replayed with the plain relay,
+/// which owes a fire for every frame. The hand oracle at the reference run's
+/// 5 ms step (step `k` at `(k + 1) * 5` ms): the relay fires at step 0 (`x`
+/// 1, which the sink drains at once); at step 1 it pops `src`'s second frame
+/// and its throttle defers the fire, while the sink's slot holds nothing (its
+/// one frame drained at step 0), so no hold explains it; at steps 2 and 4 it
+/// fires the frame it froze and its refill pops the next, which the throttle
+/// freezes; from step 6 the slot holds two frames and holds it, until the
+/// sink's step 10 drain lets it fire at step 11.
+///
+/// In one rank the plain relay is judged, and the step 1 pop it left unfired
+/// with nothing to defer it is the finding (exit 6). Split from its consumer
+/// it stands down (`block_gated`), so the same changed build replays clean
+/// (exit 0): a held producer's rule is not judged at all.
+#[test]
+#[serial]
+fn a_held_producer_split_from_its_consumer_is_not_judged_on_its_own_rule() {
+    let half_rate = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(HalfRateRelayNodeEntry::new())),
+            (
+                "sink",
+                Box::new(SlowBlockSinkNodeEntry::with_state(SlowBlockSinkNode {
+                    stop_at: None,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let rec = record_uniform_with_read_log(
+        &bh_yaml("slow_block_sink_node", ""),
+        half_rate,
+        &[],
+        BH_STEPS,
+    );
+    let (fires, pops) = bh_relay_trace(&rec);
+    assert_eq!(fires[..4], [0, 2, 4, 11], "the relay's first fires");
+    assert_eq!(
+        pops[..4],
+        [(0, 0), (1, 1), (2, 2), (4, 3)],
+        "step 1 pops sequence 1 and fires nothing"
+    );
+    assert_eq!(bh_fire_steps(&rec, "sink")[..2], [0, 10]);
+    let dir = tempfile::tempdir().unwrap();
+
+    let one = dir.path().join("bh_half_rate_one_rank.mcap");
+    ri_bag_labelled(&rec, &one, ri_free_run_recorder_json(), false);
+    let judged = bh_replay_stamped(&one, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        judged.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step 1 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+        )
+    );
+    assert_eq!(resim_exit(&judged, true), 6);
+
+    let split = dir.path().join("bh_half_rate_split.mcap");
+    ri_two_rank_bag_labelled(&rec, &split, |id| id == "sink", false);
+    let outcome = bh_replay_stamped(&split, bh_held_factories, bh_clean_stamp(&rec));
+    assert_clean_verdict(&outcome, "the held relay split from its consumer");
+    assert_eq!(resim_exit(&outcome, true), 0);
+    assert_eq!(
+        sp_notes(&outcome),
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::StandDown,
+                "relay",
+                Some("block_gated")
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+        ]
+    );
+}
+
 /// The split fixture under a `--duration` bound of five steps (0 to 4): the
 /// bound cuts the sink's drains short and leaves the bag's publish count
 /// whole, so the edge's conservation stands down with a note that carries no
@@ -43838,6 +44143,7 @@ fn a_split_block_edge_under_a_duration_bound_makes_no_conservation_claim() {
         "{:?}",
         stamped.trace_divergence
     );
+    assert_eq!(resim_exit(&stamped, true), 1, "a data violation");
     assert_eq!(
         sp_notes(&stamped),
         vec![
