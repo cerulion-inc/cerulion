@@ -412,12 +412,14 @@ Every figure below comes from a results package in this repository. The [evidenc
 Each of 16 models ran the same 100 LIBERO-PRO start states twice, with the same simulator, budget and success check: with Cerulion, and without it on a published three-tool interface (arXiv:2610.30051). On the main test, declared before the first episode, Gemini 3.8 Flash solved 73 against 25 (exact two-sided sign test p = 1.10e-11). After Holm's correction, the gain is established for 9 of 16 models.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/media/harness-success-rate-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/media/harness-success-rate-light.svg">
-  <img src="docs/media/harness-success-rate.svg" alt="Success rate per model, without and with Cerulion, for 16 models on the same 100 start states.">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/harness-results-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/media/harness-results-light.svg">
+  <img src="docs/media/harness-results.svg" alt="Robot task success rate per model, without and with Cerulion, for 16 models on the same 100 LIBERO-PRO start states, and how many times cheaper or dearer, and faster or slower, a scored episode was with Cerulion; Claude Fable 5.2's was dearer and slower.">
 </picture>
 
-**Limits:** one benchmark family, and while the 100 start states are new, their 25 task rows are ones the harness was developed on; the run with Cerulion also reads the robot's calibration record; the 4 models that solved fewer are the 4 with the highest scores without Cerulion; simulation only. The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) has every episode and a script that recomputes every figure.
+Cost and wall time are per scored episode: cost is model spend at the list prices of one dated table, cached input at the cached rate, and part of the gap is caching; wall time includes each endpoint's stalls and resent requests, on machines shared with other work. A red arrow marks the one model whose episodes cost more (up) and took longer (down) with Cerulion; counting its one episode the 90 minute clock ended, Claude Fable 5.2's episodes averaged 2.00 against 1.50 USD and 535.0 against 250.4 seconds.
+
+**Limits:** one benchmark family, and while the 100 start states are new, their 25 task rows are ones the harness was developed on; the run with Cerulion also reads the robot's calibration record; the 4 models that solved fewer are the 4 with the highest scores without Cerulion, and none of those 4 is significant at 0.05, so each reads "no difference shown"; GPT-6.1 Terra was added after the grid's first rows had been seen and Gemini 4 Neon after every other column had finished and been read; simulation only. The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) has every episode and a script that recomputes every figure.
 
 <a id="performance"></a>
 
