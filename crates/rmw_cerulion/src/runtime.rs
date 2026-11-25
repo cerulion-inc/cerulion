@@ -1060,17 +1060,25 @@ pub struct CopyBuffer {
 impl CopyBuffer {
     /// Copy `body` (a frame's fixed section) into the front of the buffer, in
     /// native byte order, so the words hold the struct's bytes as laid out; the
-    /// last word's bytes past `body` are zeroed. A body longer than the buffer
+    /// rest of the word holding `body`'s last byte is zeroed, and words past it
+    /// keep their contents. A body longer than the buffer
     /// panics (caught by `ffi_guard`) instead of being cut short.
     pub(crate) fn fill(&mut self, body: &[u8]) {
         assert!(
             body.len() <= self.words.len() * std::mem::size_of::<u64>(),
             "a frame body longer than the copy buffer"
         );
-        for (word, chunk) in self.words.iter_mut().zip(body.chunks(8)) {
+        // Whole words as `[u8; 8]` chunks, which the compiler turns into one
+        // bulk copy of all of them; a partial last word is copied on its own
+        // into a zeroed word.
+        let (whole, tail) = body.as_chunks::<8>();
+        for (word, chunk) in self.words.iter_mut().zip(whole) {
+            *word = u64::from_ne_bytes(*chunk);
+        }
+        if !tail.is_empty() {
             let mut bytes = [0u8; 8];
-            bytes[..chunk.len()].copy_from_slice(chunk);
-            *word = u64::from_ne_bytes(bytes);
+            bytes[..tail.len()].copy_from_slice(tail);
+            self.words[body.len() / 8] = u64::from_ne_bytes(bytes);
         }
     }
 }
@@ -1521,5 +1529,86 @@ mod tests {
             segment.contains("never repairs"),
             "the message must state the no-repair rule: {segment}"
         );
+    }
+
+    /// The bytes a copy buffer holds, word by word in native order.
+    fn held_bytes(buffer: &super::CopyBuffer) -> Vec<u8> {
+        buffer.words.iter().flat_map(|w| w.to_ne_bytes()).collect()
+    }
+
+    /// `CopyBuffer::fill` holds the body's bytes in order and zeroes the last
+    /// word's bytes past it, over a buffer whose stale bytes are all 0xFF:
+    /// hand oracles for a one-byte body, one whole word, a word and one byte,
+    /// two words less one byte, a short body at the front of a longer buffer
+    /// (the words past it untouched), and an empty body (nothing written).
+    #[test]
+    fn a_copy_buffer_holds_the_body_and_zeroes_the_partial_word() {
+        let cases: &[(&[u8], usize, &[u8])] = &[
+            (&[0xAA], 1, &[0xAA, 0, 0, 0, 0, 0, 0, 0]),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], 1, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            (
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+                2,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                &[9, 8, 7, 6, 5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 7],
+                2,
+                &[9, 8, 7, 6, 5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 7, 0],
+            ),
+            (
+                &[1, 2, 3],
+                3,
+                &[
+                    1, 2, 3, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+            ),
+            (&[], 1, &[0xFF; 8]),
+        ];
+        for &(body, words, want) in cases {
+            let mut buffer = super::CopyBuffer {
+                words: vec![u64::MAX; words],
+            };
+            buffer.fill(body);
+            assert_eq!(held_bytes(&buffer), want, "body of {} bytes", body.len());
+        }
+    }
+
+    /// A body of the largest size the copy limit admits, and one byte less (one
+    /// of the two ends in a partial word), is held byte for byte: the byte at
+    /// index `i` is `((i ^ (i >> 8)) * 31 + 7) mod 256`, which does not repeat
+    /// every 256 bytes, and the partial word's tail is zeroed.
+    #[test]
+    fn a_copy_buffer_holds_a_body_at_the_copy_limit_byte_for_byte() {
+        let limit = crate::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES;
+        for n in [limit - 1, limit] {
+            let body: Vec<u8> = (0..n).map(|i| ((i ^ (i >> 8)) * 31 + 7) as u8).collect();
+            let mut buffer = super::CopyBuffer {
+                words: vec![u64::MAX; n.div_ceil(8)],
+            };
+            buffer.fill(&body);
+            let held = held_bytes(&buffer);
+            assert_eq!(held.len(), n.next_multiple_of(8), "n={n}");
+            for (i, b) in held.iter().take(n).enumerate() {
+                assert_eq!(
+                    usize::from(*b),
+                    ((i ^ (i >> 8)) * 31 + 7) % 256,
+                    "n={n} byte {i}"
+                );
+            }
+            assert!(
+                held[n..].iter().all(|b| *b == 0),
+                "n={n}: the partial word's tail is zeroed"
+            );
+        }
+    }
+
+    /// A body longer than the buffer panics instead of being cut short.
+    #[test]
+    #[should_panic(expected = "a frame body longer than the copy buffer")]
+    fn a_copy_buffer_refuses_a_longer_body() {
+        let mut buffer = super::CopyBuffer { words: vec![0; 1] };
+        buffer.fill(&[0; 9]);
     }
 }
