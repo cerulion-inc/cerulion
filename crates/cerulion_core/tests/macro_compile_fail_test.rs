@@ -1,53 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Compile-fail tests for `#[cerulion_node]`.
+//! Compile-fail tests whose diagnostics rustc renders, run on demand.
 //!
-//! Uses `trybuild` to verify that the macro produces clear errors
-//! for invalid usage. Run with:
+//! The blocking suite, the `#[cerulion_node]` diagnostics the macros emit
+//! themselves plus the compile-pass programs, lives in
+//! `crates/test_fixtures/node_macro_ui` (`cargo test -p node_macro_ui`).
+//! This file keeps the groups that pin a core type contract through an error
+//! rustc writes, beside the types they pin.
 //!
-//! ```bash
-//! cargo test -p cerulion_core --test macro_compile_fail_test
-//! ```
-//!
-//! To regenerate `.stderr` snapshots:
-//!
-//! ```bash
-//! TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test
-//! ```
-//!
-//! # Do NOT split this into one `TestCases` per expectation — measured, a net loss
-//!
-//! `compile_fail_tests` mixes 80 compile-fail fixtures with 11 compile-pass ones, and that
-//! is deliberate. Because the set contains a `pass` case, trybuild sets `has_pass`, which
-//! costs the batch path (`run.rs`: `else if project.keep_going && !project.has_pass`) — so
-//! the group pays a `cargo clean` + `cargo build --bin` per fixture. Splitting the groups to
-//! recover batching looks obviously right and is a NET LOSS on CI; the measurement
-//! is below.
-//!
-//! `has_pass` also pins the cargo PROFILE for the whole set (`cargo.rs` picks `build` vs
-//! `check` from it), so two groups mean two `build_dependencies` passes over the dependency
-//! tree — `.rlib` for the pass group, `.rmeta` for the compile-fail group. CI's cargo cache
-//! does not restore trybuild's scratch project (`target/tests/trybuild/`; shard 0 is the
-//! saver and does not run this binary), so that extra pass is paid on every run and costs
-//! more than batching saves. MEASURED on CI: a split drops `compile_fail_tests` 545 s → 355 s,
-//! but the separate pass group costs ~348 s of its own, taking the shard's nextest wall
-//! 560–574 s → 711 s (**+158 s**, ~+2.5 min on the step). A local cold A/B suggests a
-//! 1.51× WIN that does not transfer — on a developer machine the dependency passes are a much smaller
-//! share of the total than on CI, so local timings are not a valid proxy here.
-//!
-//! The constraint is structural: nothing inside a split can avoid the second dependency
-//! pass while trybuild derives one profile per `TestCases`. Attack the ~545 s some other
-//! way; a split changes no diagnostic output, only the time.
-//!
-//! # Two case groups
-//!
-//! `tests/ui/*.rs` — the **blocking** group: every fixture asserts an error
-//! message that *we* emit (macro-attribute validation, our own `compile_error!`
-//! diagnostics). Those strings are fully under our control, so the snapshots are
-//! stable across rustc versions and safe to gate CI on. The glob is
-//! **non-recursive**, so it does NOT descend into the subdirectories below
-//! (`const_eval/`, `type_error/`, `pass/`).
-//!
-//! `tests/ui/const_eval/*.rs` and `tests/ui/type_error/*.rs` — the **ignored**
+//! `tests/ui/const_eval/*.rs` and `tests/ui/type_error/*.rs` are the **ignored**
 //! group: these fixtures assert diagnostics whose *rendering* is produced by
 //! rustc, not by us, and is NOT stabilized across toolchains. Gating CI on that
 //! rendering plants a time-bomb that breaks on the next compiler bump for purely
@@ -84,19 +44,6 @@
 //! cargo test -p cerulion_core --test macro_compile_fail_test -- --ignored
 //! TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test -- --ignored
 //! ```
-
-#[test]
-fn compile_fail_tests() {
-    let t = trybuild::TestCases::new();
-    // `tests/ui/*.rs` is a non-recursive glob — it does NOT descend into
-    // `tests/ui/pass/`, so the determinism pass fixtures below are not
-    // double-claimed as compile-fail cases.
-    t.compile_fail("tests/ui/*.rs");
-    // Nodes that opt out via `allow_non_deterministic` /
-    // `uses_live_io` must COMPILE (the lint is suppressed). Pass fixtures
-    // live in `tests/ui/pass/` so the compile-fail glob above skips them.
-    t.pass("tests/ui/pass/*.rs");
-}
 
 /// Rustc-diagnostic compile-fail cases — `#[ignore]`d because they assert
 /// rustc's unstable diagnostic rendering (const-eval panic rendering in

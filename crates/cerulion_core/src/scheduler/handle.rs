@@ -963,6 +963,12 @@ impl NodeHandle {
         }
     }
 
+    /// The raw in-tick marker word, for a reader that samples it off the
+    /// executing thread and decodes `0` itself (the fire tap's `in_tick`).
+    pub(crate) fn in_tick_marker(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.in_tick_since_ns)
+    }
+
     /// Per-node count of publisher-loss transitions
     /// observed on this node's inputs by the runtime liveliness sweep
     /// (every `Lost` transition — a publisher disconnecting or crashing
@@ -1203,26 +1209,46 @@ pub struct TraceEntry {
     /// trip on it, and the flat-vs-level / rayon byte-identity assertions must
     /// stay green.
     pub discarded: bool,
+    /// This fire stopped the node, and why; `None` on every other fire.
+    ///
+    /// Set on the ONE fire at which the scheduler saw the stop: the fire whose
+    /// tick returned `NodeError::Fatal`, the fire whose tick panicked inside the
+    /// runtime's tick callback or first found the node's entry poisoned, or the
+    /// fire that opened the consecutive-panic breaker. A recording pushes a
+    /// `RECORD_TYPE_NODE_STOP` trace record directly after this fire's FIRE
+    /// record, so the record's place in its rank's stream is this fire's place
+    /// among the node's fires. INCLUDED in `PartialEq`/`Eq`: a stop is the
+    /// fire's own outcome, which a replay reproduces at the same fire.
+    pub stop: Option<crate::scheduler::NodeStopCause>,
 }
 
 // `PartialEq`/`Eq` are HAND-WRITTEN to exclude `duration_ns` AND
 // `discarded` (both non-replayable data-frame annotations — Principle #7) but
 // INCLUDE `step` + `global_level` (both replay-deterministic — the logical-step
-// counter and the DAG topology). If a `Hash` impl is ever needed (e.g. to key a
-// `HashSet<TraceEntry>`), HAND-WRITE it over `(node_id, step, fire_time_ns,
-// global_level)` to match this `eq` — do NOT `#[derive(Hash)]`, which would hash
-// `duration_ns`/`discarded` too and break the `k1 == k2 ⇒ hash(k1) == hash(k2)`
-// contract.
+// counter and the DAG topology) and `stop` (the fire's own outcome). If a
+// `Hash` impl is ever needed (e.g. to key a `HashSet<TraceEntry>`), HAND-WRITE
+// it over `(node_id, step, fire_time_ns, global_level, stop)` to match this
+// `eq`; do NOT `#[derive(Hash)]`, which would hash `duration_ns`/`discarded`
+// too and break the `k1 == k2 ⇒ hash(k1) == hash(k2)` contract.
 impl PartialEq for TraceEntry {
     fn eq(&self, other: &Self) -> bool {
         self.node_id == other.node_id
             && self.step == other.step
             && self.fire_time_ns == other.fire_time_ns
             && self.global_level == other.global_level
+            && self.stop == other.stop
     }
 }
 
 impl Eq for TraceEntry {}
+
+// The per-entry size stated for `--trace-limit` in `docs/user-api.md` and
+// `docs/multi_process.md`, and in the docs of `Scheduler::set_trace_limit`,
+// `GraphRuntime::set_trace_limit` and the CLI engine's `PRODUCTION_TRACE_LIMIT`
+// (each `set_trace_limit` reserves `limit` entries of it up front). A field
+// change that moves it fails here; update all five.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<TraceEntry>() == 56);
 
 // ---------------------------------------------------------------------------
 // This module's half of the ABI LAYOUT PIN (see `crate::abi_layout`).

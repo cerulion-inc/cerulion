@@ -121,7 +121,7 @@ pub enum CpuDmaLockMode {
 
 /// How the live-loop CPU monitor-wait park is selected. Auto-ON for a
 /// LIVE graph on every target: a real shallow CPU monitor-wait where the CPU
-/// has a primitive (Linux x86_64 WAITPKG / Linux aarch64 WFE), the degraded
+/// has a primitive (Linux x86_64 WAITPKG or MWAITX / Linux aarch64 WFE), the degraded
 /// sleep-recheck park elsewhere; `--no-monitor-wait` is the hard opt-out. Env
 /// overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"` force-on /
 /// `"0"` disable) resolve through `Auto`; an explicit `CERULION_MONITOR_WAIT=0`
@@ -174,7 +174,7 @@ const CPU_DMA_LOCK_US_ENV: &str = "CERULION_CPU_DMA_LOCK_US";
 
 /// Production trace cap for `graph run` / `graph run-worker`: the scheduler's
 /// execution trace becomes a ring keeping the NEWEST 100k `TraceEntry`s.
-/// Math: ~48 B/entry × 100_000 ≈ ~4.8 MB resident; at a busy 3k fires/s that
+/// Math: 56 B/entry × 100_000 = 5.6 MB, reserved up front; at a busy 3k fires/s that
 /// is a ≈33 s observability window. WITHOUT a cap the trace grows unbounded —
 /// ~2 GB/h at 1 kHz × 10 nodes — because no production build path ever set
 /// `max_trace_entries`. The trace is an OBSERVABILITY window, not a replay
@@ -194,6 +194,10 @@ const CPU_DMA_LOCK_US_ENV: &str = "CERULION_CPU_DMA_LOCK_US";
 /// `WorkerPlan::trace_limit`. `0` (unbounded) is REJECTED at the CLI parse
 /// (`value_parser` range `1..`): unbounded growth costs ~2 GB/h at
 /// 1 kHz × 10 nodes, and there is deliberately no unbounded escape hatch.
+///
+/// `cerulion_core` cannot name this const: its `GRAPH_RUN_DEFAULT_TRACE_LIMIT`
+/// test copies (the scheduler unit tests, `tests/step_zero_alloc_test.rs`)
+/// and the 5.6 MB on both doc pages move with it.
 pub const PRODUCTION_TRACE_LIMIT: usize = 100_000;
 
 /// Free-run mode: the count of cross-process `block` credit words above which the
@@ -536,7 +540,7 @@ struct MonitorWaitInputs<'a> {
     /// parks).
     is_live: bool,
     /// `cerulion_core::monitor_wait::monitor_wait_available()` — false off
-    /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
+    /// Linux x86_64 with WAITPKG or MWAITX / Linux aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
@@ -573,7 +577,7 @@ struct MonitorWaitInputs<'a> {
 ///    the flag won, because a request that cannot be honoured is never dropped in
 ///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
-///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
+///    macOS or x86 with neither WAITPKG nor MWAITX) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
 ///    p50 was unstable 15-54µs on macOS; the degraded park held a
 ///    stable ~8.5-11.5µs p50 / 16.4µs p99 with zero busy-spin).
@@ -6642,10 +6646,21 @@ pub fn graph_run(
     let run_recorded_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
+    // How many names the run directory's `env.json` left out, stamped into the
+    // run directory's `recorder.json` once the nodes load. It stays 0 when no
+    // run directory is written, and then no `recorder.json` is either.
+    #[cfg(unix)]
+    let mut run_env_names_left_out = 0;
     #[cfg(unix)]
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
             Ok(graph_yaml) => {
+                // This process owns the run and renders the run directory's
+                // `env.json` before it records, so the run's `env.json`
+                // warnings print here, once.
+                let env_json = render_env_json(record_env, std::env::vars_os());
+                warn_run_env_json(&env_json);
+                run_env_names_left_out = env_json.left_out_names.len();
                 crate::run_dir::begin_run_descriptor(crate::run_dir::RunDescriptorSpec {
                     // The chain census THIS run's graph implies, under the
                     // colocation this run EXECUTES: the settled
@@ -6724,7 +6739,7 @@ pub fn graph_run(
                     // here: it carries each node's driver flag, so it is
                     // written once the nodes load (`write_run_recorder_best_effort`).
                     graph_yaml,
-                    env_json: render_env_json(record_env, std::env::vars()),
+                    env_json: env_json.bytes,
                 })
             }
             Err(e) => {
@@ -6857,6 +6872,11 @@ pub fn graph_run(
                 // rest of the description; the supervisor writes the file once
                 // its nodes load.
                 run_recorded_at,
+                // The count of names its `env.json` left out, for the same file.
+                #[cfg(unix)]
+                run_env_names_left_out,
+                #[cfg(not(unix))]
+                0,
                 // ONE resolved tag for the whole deployment, so
                 // every rank opens the SAME word (onset agreement is
                 // arithmetic only if the word is shared).
@@ -6952,6 +6972,8 @@ pub fn graph_run(
             // COPIES these bytes verbatim).
             resolve_run_coordination(execution_mode),
             &crate::replay_engine::node_external_flags(&infos),
+            &crate::replay_engine::node_input_queues(&config, &infos),
+            run_env_names_left_out,
         );
     }
 
@@ -7096,6 +7118,9 @@ pub fn graph_run(
                 clock.clone(),
                 Some(&schema_hashes),
             )?;
+            // This single process owns the run: it reports what its one build
+            // left out of the nodes' environment.
+            runtime.node_env_left_out().warn();
             // Production trace cap — `--trace-limit` (defaults to
             // PRODUCTION_TRACE_LIMIT; 0 rejected at the CLI parse).
             runtime.set_trace_limit(trace_limit);
@@ -7201,8 +7226,8 @@ pub fn graph_run(
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
             // locals first so the `.as_deref()` borrows outlive the struct
-            // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
-            // host (e.g. aarch64 macOS) `monitor_wait_available()` is
+            // (mirrors `env_lock`/`env_us` above). On a host with no CPU
+            // monitor-wait primitive (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
             // default-ON for live: monitor_wait per the arm-3 flag ladder, and
             // the doorbell where a consumer can kernel-block on one. The
@@ -7243,6 +7268,9 @@ pub fn graph_run(
                     Some(&schema_hashes),
                     mw_policy,
                 )?;
+            // This single process owns the run: it reports what its one build
+            // left out of the nodes' environment.
+            runtime.node_env_left_out().warn();
             let gateway_child = establish_network_egress(
                 gateway_launch.as_ref(),
                 graph_name,
@@ -11338,6 +11366,9 @@ fn graph_run_supervisor(
     // the rest of the description. The file is written HERE, once the nodes
     // load, because it carries each node's driver flag.
     run_recorded_at: Duration,
+    // How many names the run directory's `env.json` left out, stamped into the
+    // same `recorder.json`.
+    run_env_names_left_out: usize,
     // The deployment's checkpoint arm tag, RESOLVED by `graph_run`
     // (explicit env, else derived from this run's `run_id`) and stamped from
     // here into every worker plan.
@@ -11531,15 +11562,21 @@ fn graph_run_supervisor(
     // unless the write failed, and then embeds no graph.
     #[cfg(unix)]
     let node_external = crate::replay_engine::node_external_flags(&loaded_entry_infos);
+    // Each native node's inputs with the backpressure and depth the run reads
+    // them with: the `node_inputs` key, from the same loaded metadata.
+    #[cfg(unix)]
+    let node_inputs = crate::replay_engine::node_input_queues(&config, &loaded_entry_infos);
     #[cfg(unix)]
     write_run_recorder_best_effort(
         run_dir,
         run_recorded_at,
         resolve_run_coordination(execution_mode),
         &node_external,
+        &node_inputs,
+        run_env_names_left_out,
     );
     #[cfg(not(unix))]
-    let _ = run_recorded_at;
+    let _ = (run_recorded_at, run_env_names_left_out);
     #[cfg(unix)]
     let record_entry_infos: Option<
         &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
@@ -11592,6 +11629,10 @@ fn graph_run_supervisor(
         // the top of every recorded run read as the run's result.
         cerulion_core::graph::BuildPurpose::PlanningOnly,
     )?;
+    // The supervisor owns the run: it reports what the planning build left out
+    // of the nodes' environment, once, before any worker spawns. Each worker
+    // builds its subgraph from the same environment and reports nothing.
+    runtime.node_env_left_out().warn();
     // Snapshot the impure planner inputs, then tear the planning runtime down
     // (releases its ports). `Levels` is `Clone`. `shutdown` consumes the runtime.
     let levels = runtime.levels().clone();
@@ -12885,6 +12926,7 @@ fn graph_run_supervisor(
                 // the bag's `coordination` stamp is its pure map.
                 execution_mode,
                 node_external: &node_external,
+                node_inputs: &node_inputs,
                 // The always-on plane's departure ring is what the
                 // recorder's `--ring` set is completed from. `None` (declined or
                 // refused) is unreachable under `--record`: `--no-rings`
@@ -15503,6 +15545,9 @@ pub fn graph_profile(
         Some(&schema_hashes),
         mw_policy,
     )?;
+    // This single process owns the profiling run: it reports what its one
+    // build left out of the nodes' environment.
+    runtime.node_env_left_out().warn();
     runtime.set_live_transport(transport.clone());
 
     // Size the trace ring for the profiling window: per-node target × nodes
@@ -17072,6 +17117,14 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
 /// share (bug reports, replay-as-CI, support), so the default must not leak
 /// secrets. Sorted-key JSON (BTreeMap) in every mode — deterministic bytes for
 /// a given environment.
+///
+/// In every mode a variable whose name is not valid UTF-8 is left out, because
+/// a JSON key must be text. In [`RecordEnvMode::Allowlist`] and
+/// [`RecordEnvMode::All`] a value that is not valid UTF-8 is stored as
+/// `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, its FNV-1a 64 hash
+/// over the raw bytes. A run warns once per list, naming each variable left
+/// out and each variable whose value the mode would otherwise have recorded
+/// verbatim; no warning prints a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordEnvMode {
     /// The DEFAULT: record every variable NAME; record VALUES only for names
@@ -17084,7 +17137,8 @@ pub enum RecordEnvMode {
     /// secret itself.
     #[default]
     Allowlist,
-    /// Verbatim values for EVERY variable (full replay fidelity). A loud
+    /// Verbatim values for EVERY variable whose value is valid UTF-8 (full
+    /// replay fidelity). A loud
     /// `tracing::warn!` fires at record time: the bag embeds secrets.
     All,
     /// Variable NAMES only (values `null`). Replay env-fidelity is off
@@ -17291,39 +17345,161 @@ fn env_value_allowlisted(name: &str) -> bool {
         && !env_name_marks_a_secret(name)
 }
 
-/// Render the `env.json` attachment bytes for `mode`
-/// over `vars`. Pure (injectable vars) so every mode's shape is unit-testable
-/// without process-env mutation. Keys are SORTED (BTreeMap) — deterministic
-/// bytes for a given environment.
+/// What `env.json` stores for one variable whose name is valid UTF-8, as
+/// [`env_json_value`] decides it.
 #[cfg(unix)]
-fn render_env_json(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvJsonValue {
+    /// The value as text.
+    Text(String),
+    /// `{"fnv64": "<hex>", "redacted": true}`: a UTF-8 value the mode hashes.
+    Hash { fnv64: u64 },
+    /// `{"fnv64": "<hex>", "redacted": true, "utf8": false}`: a value that is
+    /// not valid UTF-8, hashed over its raw bytes. `withheld` is true when the
+    /// mode would have stored the value as text had it been UTF-8.
+    NotUtf8 { fnv64: u64, withheld: bool },
+    /// `null`: the mode records names only.
+    NameOnly,
+}
+
+#[cfg(unix)]
+impl EnvJsonValue {
+    /// The JSON this entry is written as. Keys serialize sorted, so a hash
+    /// object reads `fnv64`, `redacted`, then `utf8`.
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            EnvJsonValue::Text(text) => serde_json::Value::String(text.clone()),
+            EnvJsonValue::Hash { fnv64 } => serde_json::json!({
+                "redacted": true,
+                "fnv64": format!("{fnv64:016x}"),
+            }),
+            EnvJsonValue::NotUtf8 { fnv64, .. } => serde_json::json!({
+                "redacted": true,
+                "fnv64": format!("{fnv64:016x}"),
+                "utf8": false,
+            }),
+            EnvJsonValue::NameOnly => serde_json::Value::Null,
+        }
+    }
+}
+
+/// Decide what `env.json` stores under `mode` for the variable `name` (valid
+/// UTF-8) with `value`. Pure.
+///
+/// `none` stores `null`. Otherwise the mode keeps the value as text (`all`
+/// always, `allowlist` when [`env_value_allowlisted`] says so) or hashes it.
+/// A value that is not valid UTF-8 cannot be JSON text, so it is hashed over
+/// its raw bytes in either case and marked `utf8: false`. The hash is FNV-1a
+/// 64 over the bytes, the same function a replay hashes the current value with.
+#[cfg(unix)]
+fn env_json_value(mode: RecordEnvMode, name: &str, value: std::ffi::OsString) -> EnvJsonValue {
+    use std::os::unix::ffi::OsStrExt as _;
+    let keeps_text = match mode {
+        RecordEnvMode::None => return EnvJsonValue::NameOnly,
+        RecordEnvMode::All => true,
+        RecordEnvMode::Allowlist => env_value_allowlisted(name),
+    };
+    match value.into_string() {
+        Ok(text) if keeps_text => EnvJsonValue::Text(text),
+        Ok(text) => EnvJsonValue::Hash {
+            fnv64: cerulion_core::wire::fnv1a_hash(text.as_bytes()),
+        },
+        Err(raw) => EnvJsonValue::NotUtf8 {
+            fnv64: cerulion_core::wire::fnv1a_hash(raw.as_bytes()),
+            withheld: keeps_text,
+        },
+    }
+}
+
+/// One rendered `env.json`, with the variables the render could not store as
+/// the mode asks.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct EnvJsonRender {
+    /// The attachment bytes: pretty JSON with sorted keys.
+    pub(crate) bytes: Vec<u8>,
+    /// The name of each variable left out because its name is not valid UTF-8
+    /// (a JSON key must be text), sorted by bytes, each name once.
+    pub(crate) left_out_names: Vec<std::ffi::OsString>,
+    /// The name of each variable whose value the mode would have stored as
+    /// text but which is not valid UTF-8, so its hash is stored instead;
+    /// sorted, each name once.
+    pub(crate) withheld_not_utf8: Vec<String>,
+}
+
+/// Render the `env.json` attachment for `mode` over `vars`, each name and
+/// value as the raw bytes the environment holds. Pure (injectable vars), so
+/// every mode's shape is unit-testable without process-env mutation.
+///
+/// Infallible: a variable whose name is not valid UTF-8 is left out and
+/// listed in [`EnvJsonRender::left_out_names`], and each value is stored as
+/// [`env_json_value`] decides. Keys are sorted (`BTreeMap`), so the bytes
+/// depend on the environment alone, never on its order.
+#[cfg(unix)]
+pub(crate) fn render_env_json(
     mode: RecordEnvMode,
-    vars: impl IntoIterator<Item = (String, String)>,
-) -> Vec<u8> {
-    let map: std::collections::BTreeMap<String, serde_json::Value> = vars
-        .into_iter()
-        .map(|(name, value)| {
-            let rendered = match mode {
-                RecordEnvMode::All => serde_json::Value::String(value),
-                RecordEnvMode::None => serde_json::Value::Null,
-                RecordEnvMode::Allowlist => {
-                    if env_value_allowlisted(&name) {
-                        serde_json::Value::String(value)
-                    } else {
-                        serde_json::json!({
-                            "redacted": true,
-                            "fnv64": format!(
-                                "{:016x}",
-                                cerulion_core::wire::fnv1a_hash(value.as_bytes())
-                            ),
-                        })
-                    }
-                }
-            };
-            (name, rendered)
-        })
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> EnvJsonRender {
+    let mut entries: std::collections::BTreeMap<String, EnvJsonValue> =
+        std::collections::BTreeMap::new();
+    let mut left_out_names = Vec::new();
+    for (name, value) in vars {
+        match name.into_string() {
+            Ok(name) => {
+                let entry = env_json_value(mode, &name, value);
+                entries.insert(name, entry);
+            }
+            Err(raw) => left_out_names.push(raw),
+        }
+    }
+    left_out_names.sort();
+    left_out_names.dedup();
+    let withheld_not_utf8 = entries
+        .iter()
+        .filter(|(_, entry)| matches!(entry, EnvJsonValue::NotUtf8 { withheld: true, .. }))
+        .map(|(name, _)| name.clone())
         .collect();
-    serde_json::to_vec_pretty(&map).expect("BTreeMap<String, Value> serializes to JSON infallibly")
+    let map: std::collections::BTreeMap<&str, serde_json::Value> = entries
+        .iter()
+        .map(|(name, entry)| (name.as_str(), entry.to_json()))
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&map)
+        .expect("BTreeMap<&str, Value> serializes to JSON infallibly");
+    EnvJsonRender {
+        bytes,
+        left_out_names,
+        withheld_not_utf8,
+    }
+}
+
+/// Warn once per list that the run directory's `env.json` render left a
+/// variable out or stored a hash in place of the text its mode keeps, or do
+/// nothing when both lists are empty.
+///
+/// `graph_run`, the process that owns the run, calls it once, for the run
+/// directory's render, which every Unix run makes before it records. A
+/// `--record` bag's `env.json` is rendered from the same environment under
+/// the same mode, so it holds the same entries, and that render logs nothing.
+///
+/// The messages are constant. The names ride the `names` field, where each
+/// byte of a name that is not valid UTF-8 prints escaped (`CER_\xFF`). No
+/// value is printed, because a value may be a secret.
+#[cfg(unix)]
+fn warn_run_env_json(render: &EnvJsonRender) {
+    if !render.left_out_names.is_empty() {
+        tracing::warn!(
+            names = ?render.left_out_names,
+            "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
+             compare them"
+        );
+    }
+    if !render.withheld_not_utf8.is_empty() {
+        tracing::warn!(
+            names = ?render.withheld_not_utf8,
+            "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
+             utf8 false; a replay still detects a change"
+        );
+    }
 }
 
 /// Format an epoch-seconds instant as the bag-filename UTC
@@ -17468,12 +17644,37 @@ fn resolve_recording_paths(record_dir: &Path, graph_name: &str, now: Duration) -
 /// file, which is never touched by recording. The round trip is pinned by
 /// `the_effective_graph_yaml_round_trips_through_the_replay_parser`.
 ///
-/// `pub(crate)` because `bag_migrate` re-renders the graph it strips
-/// through THIS renderer, so a migrated bag's `graph.yaml` is byte-for-byte the
-/// shape `graph run --record` writes rather than a second normalization that
-/// could drift from it.
+/// Public because an embedded host serves THIS render as its hosted run's
+/// `graph.yaml`, and `bag_migrate` re-renders the graph it strips through it
+/// too, so a hosted run, a migrated bag and `graph run --record` carry one
+/// normalization rather than several that could drift apart.
+///
+/// # Errors
+///
+/// [`CliError::Validation`] when `serde_yaml` cannot serialize the config.
+///
+/// # Examples
+///
+/// Render `graphs/lobby.yaml` of the workspace at `workspace_dir`, read by
+/// name the way every `cerulion graph` verb reads it:
+///
+/// ```
+/// use cerulion_cli_engine::graph_cmd::{graph_read, render_effective_graph_yaml};
+/// use cerulion_cli_engine::workspace::CerulionWorkspace;
+/// # use cerulion_cli_engine::{graph_cmd::graph_create, workspace::workspace_create};
+/// # let tmp = tempfile::tempdir()?;
+/// # let created = workspace_create(tmp.path(), "lobby_ws")?;
+/// # graph_create(&created.graphs_dir, "lobby", Some("lobby"))?;
+/// # let workspace_dir = created.root;
+///
+/// let workspace = CerulionWorkspace::discover(&workspace_dir)?;
+/// let config = graph_read(&workspace.graphs_dir, "lobby")?;
+/// let graph_yaml = render_effective_graph_yaml(&config)?;
+/// assert_eq!(graph_yaml, "prefix: lobby\nnodes: []\n");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[cfg(unix)]
-pub(crate) fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
+pub fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
     serde_yaml::to_string(config).map_err(|e| {
         CliError::Validation(format!(
             "recording: cannot render the effective graph config for the bag's `graph.yaml` \
@@ -17526,8 +17727,15 @@ fn run_dir_partition_provenance(
 /// Minimal by design (a sacred user-facing format): `arch`, `os`,
 /// `cerulion_version`, `recorded_at_ns` (the recording's start timestamp —
 /// the same `now` that stamps the bag filename; no second clock read), and
-/// three CONTRACT keys a replay applies: `trace_format`, `coordination` and
-/// `node_external`.
+/// four CONTRACT keys a replay applies: `trace_format`, `coordination`,
+/// `node_external` and `node_inputs`, plus one count a replay does not read,
+/// `env_names_left_out`.
+///
+/// `env_names_left_out` is how many variables the same artifact's `env.json`
+/// left out because their name is not valid UTF-8 (`render_env_json`), so a
+/// bag says it is missing them without its log. It is REQUIRED like
+/// `node_external` and written as `0` when none was, so an ABSENT key means a
+/// recorder older than the count.
 ///
 /// `node_external` is each native node's driver flag (`true` where the LOADED
 /// node declares the `external` policy), from
@@ -17538,6 +17746,13 @@ fn run_dir_partition_provenance(
 /// therefore renders AFTER the node libraries load, since the flags come from
 /// the loaded metadata (a source parse would describe the tree, not the build
 /// that runs). The map is a `BTreeMap`, so the key order is the id order.
+///
+/// `node_inputs` is each native node's inputs with the backpressure and depth
+/// the run's topology reads each with, from
+/// [`crate::replay_engine::node_input_queues`]. A replay counts a `block` slot
+/// only where it names the input `block` at the depth the replayed build gives
+/// it. REQUIRED like `node_external`, so an ABSENT key means a recording made
+/// before it.
 ///
 /// `coordination` is stamped EXPLICITLY on every bag this binary
 /// describes — monolith and lockstep routes included — so an ABSENT key means
@@ -17566,6 +17781,8 @@ pub fn render_recorder_json(
     now: Duration,
     coordination: crate::replay_engine::CoordinationMode,
     node_external: &std::collections::BTreeMap<String, bool>,
+    node_inputs: &crate::replay_engine::NodeInputQueues,
+    env_names_left_out: usize,
 ) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "arch": std::env::consts::ARCH,
@@ -17581,8 +17798,13 @@ pub fn render_recorder_json(
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
-        // writers by run, and v9 one in which every multi-frame read whose batch
-        // fits its read stage's window names each frame it consumed, both also
+        // writers by run, v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, v10 one
+        // in which every complete checkpoint part of a stopped node carries
+        // the stopped flag, v11 one in which every read site names its
+        // writer again at every checkpoint window head and the boundary there
+        // carries the reopen flag, and v12 one in which every fire that
+        // stopped its node is followed by a NODE-STOP record, all five also
         // every bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
@@ -17590,29 +17812,23 @@ pub fn render_recorder_json(
         // v1 (back-compat).
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
-            crate::replay_engine::recorder_stream_needs_v4(),
-            crate::replay_engine::recorder_stamps_read_site_roles(),
-            // Whether THIS run folds identical runs, read from the one switch.
-            // `stamp_trace_format` tests the consult term first, so the stamp
-            // is 7 with folding on or off; this term decides the stamp on the
-            // ladder below 7, which is the arm an older recorder's bag took.
-            cerulion_core::read_outcome::fold_enabled(),
-            // Whether THIS binary records every gated consult a replay also
-            // makes: it does, at every consult that found its queue empty but
-            // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
-            // replay never runs, so no replay re-derives those consults), so
-            // every bag it writes stamps at least 7.
-            crate::replay_engine::recorder_stamps_consult_records(),
-            // Whether every edge carries its frames' writers, one annotation per
-            // writer run, and every multi-frame read whose batch fits its read
-            // stage's window names each frame it consumed: it does, so every bag
-            // this binary writes stamps 9.
-            crate::replay_engine::recorder_records_read_identity(),
+            // THIS binary's claims, with whether THIS run folds identical runs
+            // read from the one switch. The node stops, window heads, stops,
+            // identity and consult terms are tested first, so every bag this
+            // binary writes stamps 12 with folding on or off.
+            crate::replay_engine::RecorderClaims::of_this_recorder(
+                cerulion_core::read_outcome::fold_enabled(),
+            ),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
         // Each native node's driver flag, from the loaded metadata.
         "node_external": node_external,
+        // Each native node's inputs, with the backpressure and depth the
+        // run's topology reads each with.
+        "node_inputs": node_inputs,
+        // How many names `env.json` left out for not being valid UTF-8.
+        "env_names_left_out": env_names_left_out,
     }))
     .expect("recorder.json is a static-shape object; serialization cannot fail")
 }
@@ -18065,6 +18281,10 @@ struct RecordingInputSpec<'a> {
     /// ([`crate::replay_engine::node_external_flags`]). Stamped into the bag's
     /// `recorder.json` as `node_external`, the record a replay judges drivers by.
     node_external: &'a std::collections::BTreeMap<String, bool>,
+    /// Each native node's inputs with the backpressure and depth the run reads
+    /// them with ([`crate::replay_engine::node_input_queues`]). Stamped into the
+    /// bag's `recorder.json` as `node_inputs`.
+    node_inputs: &'a crate::replay_engine::NodeInputQueues,
     /// The effective config cloned BEFORE the ros2 split — rendered VERBATIM
     /// as the `graph.yaml` attachment (the bag carries the WHOLE run in
     /// authored node order).
@@ -18082,6 +18302,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         record_env,
         coordination,
         node_external,
+        node_inputs,
         embed_config,
     } = spec;
     // Wall-clock filename is fine at the CLI layer (NOT the deterministic
@@ -18137,8 +18358,11 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     // (see `RecordEnvMode`). Loud about the fidelity
     // trade in the non-default modes (extracted + `#[traced_test]`-pinned).
     warn_record_env_mode(record_env);
-    let env_json = render_env_json(record_env, std::env::vars());
-    std::fs::write(&paths.env_json, &env_json)
+    // The same environment under the same mode as the run directory's
+    // `env.json`, whose render `graph_run` warned about once, so this
+    // render logs nothing.
+    let env_json = render_env_json(record_env, std::env::vars_os());
+    std::fs::write(&paths.env_json, &env_json.bytes)
         .map_err(|e| CliError::Validation(format!("recording: write env.json: {e}")))?;
     // recorder.json: the recording host's arch/os/
     // version + the recording's own stamp (`now` reused — no second clock
@@ -18146,7 +18370,13 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     // multi-process recordings both carry the attachment.
     std::fs::write(
         &paths.recorder_json,
-        render_recorder_json(now, coordination, node_external),
+        render_recorder_json(
+            now,
+            coordination,
+            node_external,
+            node_inputs,
+            env_json.left_out_names.len(),
+        ),
     )
     .map_err(|e| CliError::Validation(format!("recording: write recorder.json: {e}")))?;
     // graph.yaml: the EFFECTIVE config this run executes, rendered to
@@ -20388,11 +20618,19 @@ fn write_run_recorder_best_effort(
     recorded_at: Duration,
     coordination: crate::replay_engine::CoordinationMode,
     node_external: &std::collections::BTreeMap<String, bool>,
+    node_inputs: &crate::replay_engine::NodeInputQueues,
+    env_names_left_out: usize,
 ) {
     let Some(dir) = run_dir else {
         return;
     };
-    let bytes = render_recorder_json(recorded_at, coordination, node_external);
+    let bytes = render_recorder_json(
+        recorded_at,
+        coordination,
+        node_external,
+        node_inputs,
+        env_names_left_out,
+    );
     if let Err(e) = crate::run_dir::write_run_recorder(dir, &bytes) {
         tracing::warn!(
             dir = %dir.display(),
@@ -22301,6 +22539,9 @@ struct SupervisorRecordingStart<'a> {
     /// metadata (`loaded_entry_infos`), the same metadata the bag's schema
     /// hashes come from.
     node_external: &'a std::collections::BTreeMap<String, bool>,
+    /// Each native node's inputs with the backpressure and depth the run reads
+    /// them with, from the same metadata.
+    node_inputs: &'a crate::replay_engine::NodeInputQueues,
 }
 
 /// Bring the multi-process recording session up, BETWEEN
@@ -22348,6 +22589,7 @@ fn start_supervisor_recording(
         trace_plane,
         execution_mode,
         node_external,
+        node_inputs,
     } = start;
 
     // (1) the shared input prep (bag path, ready sentinel, topics-json,
@@ -22378,6 +22620,7 @@ fn start_supervisor_recording(
         // the run opted out with `CERULION_EXECUTION_MODE=lockstep`.
         coordination: resolve_run_coordination(execution_mode),
         node_external,
+        node_inputs,
     })?;
 
     // (2) bagd's iceoryx2 Config file (the DEFAULT `iox2_` data-plane
@@ -22528,6 +22771,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // Each node's driver flag for the bag's `recorder.json`, from the same
     // loaded metadata the runtime is built with.
     let node_external = crate::replay_engine::node_external_flags(&entry_infos);
+    // Each native node's inputs with the backpressure and depth the run reads
+    // them with, for the same `recorder.json`.
+    let node_inputs = crate::replay_engine::node_input_queues(&config, &entry_infos);
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
     let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
@@ -22596,6 +22842,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
             mw_policy,
             Some(&recorded_set),
         )?;
+    // This single process owns the recorded run: it reports what its one build
+    // left out of the nodes' environment.
+    runtime.node_env_left_out().warn();
     configure_recording_runtime(&mut runtime, trace_limit)?;
 
     // CREATE and ARM this run's capture plane HERE,
@@ -22730,6 +22979,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         // From the metadata this run's runtime was built with (`entry_infos`,
         // harvested before the build consumed the factories).
         node_external: &node_external,
+        node_inputs: &node_inputs,
     })?;
     let RecordingPaths {
         out: out_path,
@@ -27548,6 +27798,28 @@ process_groups:
     // The env.json policy (`--record-env`).
     // =======================================================================
 
+    /// The `env.json` bytes for an environment of UTF-8 pairs, which leaves no
+    /// name out and stores every value as its mode asks.
+    #[cfg(unix)]
+    fn render_utf8_env_json(mode: RecordEnvMode, vars: Vec<(String, String)>) -> Vec<u8> {
+        let render = render_env_json(
+            mode,
+            vars.into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        assert!(
+            render.left_out_names.is_empty(),
+            "{:?}",
+            render.left_out_names
+        );
+        assert!(
+            render.withheld_not_utf8.is_empty(),
+            "{:?}",
+            render.withheld_not_utf8
+        );
+        render.bytes
+    }
+
     /// Allowlist mode: allowlisted names keep their VALUES; every other value
     /// is `{"redacted": true, "fnv64": "<hex>"}`; the hash CHANGES when the
     /// value changes (divergence-detectable without the secret).
@@ -27560,7 +27832,7 @@ process_groups:
             ("IOX2_LOG_LEVEL".to_string(), "error".to_string()),
             ("AWS_SECRET".to_string(), "hunter2".to_string()),
         ];
-        let bytes = render_env_json(RecordEnvMode::Allowlist, vars);
+        let bytes = render_utf8_env_json(RecordEnvMode::Allowlist, vars);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["CERULION_FOO"], "keepme", "CERULION_* value recorded");
         assert_eq!(v["RUST_LOG"], "debug", "RUST_LOG value recorded");
@@ -27576,7 +27848,7 @@ process_groups:
         // Hash changes when the value changes.
         let vars2 = vec![("AWS_SECRET".to_string(), "hunter3".to_string())];
         let v2: serde_json::Value =
-            serde_json::from_slice(&render_env_json(RecordEnvMode::Allowlist, vars2)).unwrap();
+            serde_json::from_slice(&render_utf8_env_json(RecordEnvMode::Allowlist, vars2)).unwrap();
         assert_ne!(
             v2["AWS_SECRET"]["fnv64"].as_str().unwrap(),
             h1,
@@ -27595,12 +27867,12 @@ process_groups:
             ]
         };
         let all: serde_json::Value =
-            serde_json::from_slice(&render_env_json(RecordEnvMode::All, vars())).unwrap();
+            serde_json::from_slice(&render_utf8_env_json(RecordEnvMode::All, vars())).unwrap();
         assert_eq!(all["SECRET"], "s3cret", "all mode is verbatim");
         assert_eq!(all["CERULION_X"], "1");
 
         let none: serde_json::Value =
-            serde_json::from_slice(&render_env_json(RecordEnvMode::None, vars())).unwrap();
+            serde_json::from_slice(&render_utf8_env_json(RecordEnvMode::None, vars())).unwrap();
         assert!(none["SECRET"].is_null(), "none mode records names only");
         assert!(none["CERULION_X"].is_null());
         assert!(
@@ -27622,8 +27894,8 @@ process_groups:
                 ("ALPHA".to_string(), "3".to_string()),
             ]
         };
-        let a = render_env_json(RecordEnvMode::All, vars());
-        let b = render_env_json(RecordEnvMode::All, vars());
+        let a = render_utf8_env_json(RecordEnvMode::All, vars());
+        let b = render_utf8_env_json(RecordEnvMode::All, vars());
         assert_eq!(a, b, "byte-identical across calls (deterministic)");
         let text = String::from_utf8(a).unwrap();
         let (pa, pm, pz) = (
@@ -27764,7 +28036,7 @@ process_groups:
              },\n  \
              \"RUST_LOG\": \"debug\"\n\
              }";
-        let first = render_env_json(RecordEnvMode::Allowlist, vars());
+        let first = render_utf8_env_json(RecordEnvMode::Allowlist, vars());
         assert_eq!(
             String::from_utf8(first.clone()).unwrap(),
             want,
@@ -27777,13 +28049,13 @@ process_groups:
         // Determinism: a second render and a reversed input order give the
         // same bytes.
         assert_eq!(
-            render_env_json(RecordEnvMode::Allowlist, vars()),
+            render_utf8_env_json(RecordEnvMode::Allowlist, vars()),
             first,
             "two renders are byte-identical"
         );
         let reversed: Vec<_> = vars().into_iter().rev().collect();
         assert_eq!(
-            render_env_json(RecordEnvMode::Allowlist, reversed),
+            render_utf8_env_json(RecordEnvMode::Allowlist, reversed),
             first,
             "input order does not change the bytes"
         );
@@ -27801,15 +28073,282 @@ process_groups:
             )]
         };
         assert_eq!(
-            String::from_utf8(render_env_json(RecordEnvMode::All, vars())).unwrap(),
+            String::from_utf8(render_utf8_env_json(RecordEnvMode::All, vars())).unwrap(),
             "{\n  \"CERULION_RCP_TOKEN\": \"rcp-token-value\"\n}",
             "all mode is verbatim for a secret-named variable"
         );
         assert_eq!(
-            String::from_utf8(render_env_json(RecordEnvMode::None, vars())).unwrap(),
+            String::from_utf8(render_utf8_env_json(RecordEnvMode::None, vars())).unwrap(),
             "{\n  \"CERULION_RCP_TOKEN\": null\n}",
             "none mode records the name only"
         );
+    }
+
+    /// `bytes` as an environment name or value. A name or value built this way
+    /// never enters this process's own environment.
+    #[cfg(unix)]
+    fn os(bytes: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+
+    /// One environment entry from raw bytes.
+    #[cfg(unix)]
+    fn raw_var(name: &[u8], value: &[u8]) -> (std::ffi::OsString, std::ffi::OsString) {
+        (os(name), os(value))
+    }
+
+    /// `\xff\xfe` is never UTF-8. Under `all` and `allowlist` it is stored as
+    /// its FNV-1a 64 hash over the raw bytes, 0a99c807b6f645b0 (computed
+    /// outside the tree), marked `utf8: false`; `none` stores `null`, as for
+    /// any value. Only `all` would have kept the value as text, so only `all`
+    /// lists it as withheld.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_records_a_non_utf8_value_as_its_raw_byte_hash_in_every_value_mode() {
+        let hashed = "{\n  \
+             \"CER_X\": {\n    \
+               \"fnv64\": \"0a99c807b6f645b0\",\n    \
+               \"redacted\": true,\n    \
+               \"utf8\": false\n  \
+             }\n\
+             }";
+        for (mode, want, withheld) in [
+            (RecordEnvMode::All, hashed, vec!["CER_X".to_string()]),
+            (RecordEnvMode::Allowlist, hashed, vec![]),
+            (RecordEnvMode::None, "{\n  \"CER_X\": null\n}", vec![]),
+        ] {
+            let render = render_env_json(mode, [raw_var(b"CER_X", b"\xff\xfe")]);
+            assert_eq!(String::from_utf8(render.bytes).unwrap(), want, "{mode:?}");
+            assert!(render.left_out_names.is_empty(), "{mode:?}");
+            assert_eq!(render.withheld_not_utf8, withheld, "{mode:?}");
+        }
+    }
+
+    /// A secret-named value that is not valid UTF-8 is hashed like any secret:
+    /// FNV-1a 64 of `\xffpw` is f810bc1be32e8897. It would have been hashed
+    /// anyway, so it is not withheld, and the bytes are UTF-8 JSON with no
+    /// replacement character in them.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_hashes_a_secret_named_non_utf8_value() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [raw_var(b"CERULION_DB_PASSWORD", b"\xffpw")],
+        );
+        let text = String::from_utf8(render.bytes).expect("env.json is UTF-8");
+        assert_eq!(
+            text,
+            "{\n  \
+             \"CERULION_DB_PASSWORD\": {\n    \
+               \"fnv64\": \"f810bc1be32e8897\",\n    \
+               \"redacted\": true,\n    \
+               \"utf8\": false\n  \
+             }\n\
+             }"
+        );
+        assert!(!text.contains('\u{fffd}'), "{text}");
+        assert!(render.left_out_names.is_empty());
+        assert!(render.withheld_not_utf8.is_empty());
+    }
+
+    /// A name that is not valid UTF-8 cannot be a JSON key, so in every mode it
+    /// is left out whole (no lossy `CER_\u{fffd}` key) and reported, while its
+    /// UTF-8 neighbour is written as the mode asks.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_leaves_out_a_non_utf8_name_in_every_mode_and_reports_it() {
+        for (mode, want) in [
+            (RecordEnvMode::All, "{\n  \"CERULION_KEPT\": \"kept\"\n}"),
+            (
+                RecordEnvMode::Allowlist,
+                "{\n  \"CERULION_KEPT\": \"kept\"\n}",
+            ),
+            (RecordEnvMode::None, "{\n  \"CERULION_KEPT\": null\n}"),
+        ] {
+            let render = render_env_json(
+                mode,
+                [
+                    raw_var(b"CER_\xff", b"v"),
+                    raw_var(b"CERULION_KEPT", b"kept"),
+                ],
+            );
+            assert_eq!(String::from_utf8(render.bytes).unwrap(), want, "{mode:?}");
+            assert_eq!(render.left_out_names, [os(b"CER_\xff")], "{mode:?}");
+            assert!(render.withheld_not_utf8.is_empty(), "{mode:?}");
+        }
+    }
+
+    /// `caf\xc3\xa9` is "café" in UTF-8 and `caf\xe9` is "café" in Latin-1,
+    /// where `\xe9` starts a three-byte UTF-8 sequence that never finishes. The
+    /// UTF-8 spelling stays text on the allowlist and, off it, is hashed with
+    /// no `utf8` key (48e8823acfa40d89); the Latin-1 spelling is hashed over
+    /// its raw bytes (b538f990e85962dc), marked `utf8: false` and withheld.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_keeps_a_multibyte_utf8_value_and_hashes_its_latin1_spelling() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [
+                raw_var(b"CERULION_LAYOUT", b"caf\xc3\xa9"),
+                raw_var(b"LAYOUT", b"caf\xc3\xa9"),
+                raw_var(b"CERULION_LATIN1", b"caf\xe9"),
+            ],
+        );
+        let want = "{\n  \
+             \"CERULION_LATIN1\": {\n    \
+               \"fnv64\": \"b538f990e85962dc\",\n    \
+               \"redacted\": true,\n    \
+               \"utf8\": false\n  \
+             },\n  \
+             \"CERULION_LAYOUT\": \"caf\u{e9}\",\n  \
+             \"LAYOUT\": {\n    \
+               \"fnv64\": \"48e8823acfa40d89\",\n    \
+               \"redacted\": true\n  \
+             }\n\
+             }";
+        assert_eq!(String::from_utf8(render.bytes).unwrap(), want);
+        assert_eq!(render.withheld_not_utf8, ["CERULION_LATIN1"]);
+    }
+
+    /// A value that is not valid UTF-8 is withheld only where the mode would
+    /// have kept it as text: every name under `all`, and an allowlisted name
+    /// with no secret marker under `allowlist`. A value the mode hashes anyway
+    /// loses nothing and is not listed, and `none` keeps no value at all.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_withholds_only_values_the_mode_would_have_kept() {
+        let withheld = |mode| {
+            render_env_json(
+                mode,
+                [
+                    raw_var(b"CER_X", b"\xff\xfe"),
+                    raw_var(b"CERULION_LATIN1", b"caf\xe9"),
+                    raw_var(b"CERULION_DB_PASSWORD", b"\xffpw"),
+                    raw_var(b"CERULION_KEPT", b"kept"),
+                ],
+            )
+            .withheld_not_utf8
+        };
+        assert_eq!(
+            withheld(RecordEnvMode::All),
+            ["CERULION_DB_PASSWORD", "CERULION_LATIN1", "CER_X"]
+        );
+        assert_eq!(withheld(RecordEnvMode::Allowlist), ["CERULION_LATIN1"]);
+        assert!(withheld(RecordEnvMode::None).is_empty());
+    }
+
+    /// Two renders of one environment and a render of it in reverse order all
+    /// equal one hand-written render: the same bytes, and the left-out names
+    /// in byte order.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_with_non_utf8_entries_is_identical_across_renders_and_input_orders() {
+        let vars = vec![
+            raw_var(b"CER_\xff", b"v"),
+            raw_var(b"CER_X", b"\xff\xfe"),
+            raw_var(b"CER_\xfe", b"v"),
+            raw_var(b"CERULION_KEPT", b"kept"),
+        ];
+        let want = EnvJsonRender {
+            bytes: "{\n  \
+                 \"CERULION_KEPT\": \"kept\",\n  \
+                 \"CER_X\": {\n    \
+                   \"fnv64\": \"0a99c807b6f645b0\",\n    \
+                   \"redacted\": true,\n    \
+                   \"utf8\": false\n  \
+                 }\n\
+                 }"
+            .as_bytes()
+            .to_vec(),
+            left_out_names: vec![os(b"CER_\xfe"), os(b"CER_\xff")],
+            withheld_not_utf8: vec!["CER_X".to_string()],
+        };
+        let reversed: Vec<_> = vars.iter().rev().cloned().collect();
+        for input in [vars.clone(), vars, reversed] {
+            assert_eq!(render_env_json(RecordEnvMode::All, input), want);
+        }
+    }
+
+    /// The two `env.json` warning texts, typed out by hand rather than shared
+    /// with the code.
+    #[cfg(unix)]
+    const ENV_JSON_LEFT_OUT_WARNING: &str = "env.json: variables whose name is not valid UTF-8 \
+                                             are left out; a replay cannot compare them";
+    #[cfg(unix)]
+    const ENV_JSON_WITHHELD_WARNING: &str = "env.json: values that are not valid UTF-8 are \
+                                             recorded as their FNV-1a 64 hash with utf8 false; \
+                                             a replay still detects a change";
+
+    /// One WARN line per list, each naming its variables (a name's invalid
+    /// byte escaped) with no `artifact` field, and no line carrying a value: not the
+    /// plain value of the left-out name, not the withheld value, not the
+    /// secret-named value that is not UTF-8.
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn env_json_render_warns_once_per_list_naming_each_variable_and_no_value() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [
+                raw_var(b"CER_\xff", b"plainvalue"),
+                raw_var(b"CERULION_LATIN1", b"caf\xe9"),
+                raw_var(b"CERULION_DB_PASSWORD", b"\xffpw"),
+                raw_var(b"CERULION_KEPT", b"kept"),
+            ],
+        );
+        warn_run_env_json(&render);
+        logs_assert(|lines: &[&str]| {
+            for (message, names) in [
+                (ENV_JSON_LEFT_OUT_WARNING, r#"names=["CER_\xFF"]"#),
+                (ENV_JSON_WITHHELD_WARNING, r#"names=["CERULION_LATIN1"]"#),
+            ] {
+                match lines
+                    .iter()
+                    .filter(|line| line.contains(message))
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    [line]
+                        if line.contains(" WARN ")
+                            && !line.contains("artifact")
+                            && line.contains(names) => {}
+                    other => {
+                        return Err(format!(
+                            "one WARN line for {message:?} naming {names}: {other:#?}"
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        });
+        for absent in [
+            "plainvalue",
+            "caf",
+            "pw",
+            "CERULION_KEPT",
+            "CERULION_DB_PASSWORD",
+        ] {
+            assert!(!logs_contain(absent), "no warning carries {absent}");
+        }
+    }
+
+    /// The control: a value that is not valid UTF-8 which the mode hashes
+    /// anyway, beside a UTF-8 neighbour, leaves nothing out and withholds
+    /// nothing, so neither line is printed.
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn env_json_render_is_silent_when_it_hashes_only_what_the_mode_hashes_anyway() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [
+                raw_var(b"CER_X", b"\xff\xfe"),
+                raw_var(b"CERULION_KEPT", b"kept"),
+            ],
+        );
+        warn_run_env_json(&render);
+        assert!(!logs_contain("env.json:"));
     }
 
     // =======================================================================
@@ -29677,6 +30216,125 @@ process_groups:
         }
     }
 
+    /// The process that owns a run reports what its graph build left out of
+    /// the nodes' environment, once, and a worker never does.
+    ///
+    /// A build logs nothing about it (`cerulion_core`'s
+    /// `env_snapshot_isolation_test` pins that over real builds), so how often
+    /// the line prints is decided here, by which code path calls
+    /// `NodeEnvLeftOut::warn`: each single-process build of `graph_run` (the
+    /// virtual and the live arm), the single-process recording, `graph
+    /// profile`, and the supervisor after its planning build and before it
+    /// spawns any worker. Hand-written counts over the comment- and
+    /// literal-stripped source: the worker builds and reports nothing, so a
+    /// 3-worker run prints the line once, not four times. The e2e that counts
+    /// the line on a real 3-worker run (`mp_auto_partition_e2e_test`) is
+    /// Linux-only.
+    #[test]
+    fn the_run_owner_reports_the_node_environment_once_and_a_worker_never_does() {
+        const REPORT: &str = ".node_env_left_out().warn()";
+        fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+            fn_body(src, sig).unwrap_or_else(|| panic!("`{sig}` must still exist"))
+        }
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let recording = body(
+            &src,
+            "fn run_graph_recording(run: RecordingRun) -> CliResult<()> {\n    let \
+             RecordingRun {\n        workspace_root,",
+        );
+        for (owner, builds, reports) in [
+            (body(&src, "pub fn graph_run("), 2, 2),
+            (recording, 1, 1),
+            (body(&src, "pub fn graph_profile("), 1, 1),
+            (body(&src, "fn graph_run_supervisor("), 1, 1),
+        ] {
+            assert_eq!(owner.matches("GraphRuntime::build").count(), builds);
+            assert_eq!(
+                owner.matches(REPORT).count(),
+                reports,
+                "one report per build of a process that owns its run"
+            );
+        }
+        let supervisor = body(&src, "fn graph_run_supervisor(");
+        let planning = supervisor
+            .find("BuildPurpose::PlanningOnly")
+            .expect("the supervisor's planning build");
+        let report = supervisor.find(REPORT).expect("the supervisor's report");
+        let spawn = supervisor
+            .find("spawn_order(&plan)")
+            .expect("the supervisor spawns workers in plan order");
+        assert!(
+            planning < report && report < spawn,
+            "the supervisor reports after its planning build and before any worker spawns"
+        );
+        let worker = body(&src, "fn graph_run_worker(");
+        assert_eq!(
+            worker.matches("GraphRuntime::build").count(),
+            3,
+            "the worker's three build paths"
+        );
+        assert_eq!(
+            worker.matches(REPORT).count(),
+            0,
+            "a worker reports nothing"
+        );
+        assert_eq!(
+            src.matches(REPORT).count(),
+            5,
+            "no other path in this file reports"
+        );
+    }
+
+    /// The run's `env.json` warnings print once per run, from `graph_run`,
+    /// the process that owns the run, for the run directory's render. A
+    /// recorded run renders `env.json` again for the bag, in
+    /// `prepare_recording_inputs`, which the single-process and the
+    /// supervisor recording share, and that render logs nothing. Hand-written
+    /// counts over the comment- and literal-stripped source; the e2e that
+    /// counts the lines on a real recording is `graph_record_e2e_test`.
+    #[cfg(unix)]
+    #[test]
+    fn the_run_env_json_warnings_print_once_from_graph_run() {
+        fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+            fn_body(src, sig).unwrap_or_else(|| panic!("`{sig}` must still exist"))
+        }
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let run = body(&src, "pub fn graph_run(");
+        let render = run
+            .find("render_env_json(")
+            .expect("graph_run renders the run directory's env.json");
+        let warn = run
+            .find("warn_run_env_json(")
+            .expect("graph_run warns about it");
+        let describe = run
+            .find("begin_run_descriptor(")
+            .expect("graph_run writes the run directory");
+        assert!(
+            render < warn && warn < describe,
+            "the warning follows the render and precedes the run directory"
+        );
+        assert_eq!(run.matches("render_env_json(").count(), 1);
+        assert_eq!(run.matches("warn_run_env_json(").count(), 1);
+        let bag = body(&src, "fn prepare_recording_inputs(");
+        assert_eq!(
+            bag.matches("render_env_json(").count(),
+            1,
+            "the bag's render"
+        );
+        assert_eq!(bag.matches("warn_run_env_json(").count(), 0, "logs nothing");
+        for path in [
+            "fn graph_run_supervisor(",
+            "fn start_supervisor_recording(",
+            "fn graph_run_worker(",
+        ] {
+            assert_eq!(
+                body(&src, path).matches("warn_run_env_json(").count(),
+                0,
+                "{path}"
+            );
+        }
+    }
+
     /// The checked rank → ring-header-rank conversion.
     /// In-range ranks pass through; `u32::MAX` (the departure-ring
     /// sentinel reservation) and above are rejected LOUDLY, never silently
@@ -29882,6 +30540,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -29975,6 +30634,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -30052,6 +30712,7 @@ process_groups:
                 record_env: RecordEnvMode::None,
                 coordination: crate::replay_engine::CoordinationMode::Lockstep,
                 node_external: &std::collections::BTreeMap::new(),
+                node_inputs: &std::collections::BTreeMap::new(),
             })
             .unwrap();
             assert_eq!(inputs.display_out_path.parent(), Some(directory.as_path()));
@@ -30109,6 +30770,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         });
         assert!(
             matches!(result, Err(CliError::Validation(message)) if message == "recording: output escaped its directory")
@@ -30141,6 +30803,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -30239,6 +30902,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.schema_catalog.clone().expect("built-in bindings");
@@ -30295,6 +30959,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let text = std::fs::read_to_string(&inputs.graph_yaml)
@@ -30461,6 +31126,109 @@ process_groups:
         );
     }
 
+    /// A hosted run serves this render as its `graph.yaml`, so a reader that
+    /// re-parses it with `parse_graph` gets the same graph: its `name:` (the
+    /// identity on a stemless parse), prefix and wiring come back, and a
+    /// second render is identical.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_graph_yaml_round_trips_parse_graph_with_its_name() {
+        let config = cerulion_core::graph::parse_graph(
+            "\
+name: lobby
+prefix: lobby
+nodes:
+  - id: logic
+    type: lobby_logic
+    inputs:
+      - {name: in, source: /lobby/in}
+    outputs:
+      - {name: edge, schema: std_msgs/String}
+      - {name: pulse, schema: std_msgs/String, topic: /lobby/logic/pulse}
+",
+        )
+        .expect("parse");
+        let rendered = render_effective_graph_yaml(&config).expect("render");
+        let back =
+            cerulion_core::graph::parse_graph(&rendered).expect("parse_graph reads the render");
+
+        assert_eq!(back.identity(), "lobby");
+        assert_eq!(back.name.as_deref(), Some("lobby"));
+        assert_eq!(back.prefix, "lobby");
+        assert_eq!(back.nodes.len(), 1);
+        assert_eq!(back.nodes[0].id, "logic");
+        assert_eq!(back.nodes[0].node_type, "lobby_logic");
+        assert_eq!(
+            back.nodes[0]
+                .inputs
+                .iter()
+                .map(|i| (i.name.as_str(), i.source.as_str()))
+                .collect::<Vec<_>>(),
+            [("in", "/lobby/in")]
+        );
+        assert_eq!(
+            back.nodes[0]
+                .outputs
+                .iter()
+                .map(|o| (o.name.as_str(), o.schema.as_str(), o.topic.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("edge", "std_msgs/String", None),
+                ("pulse", "std_msgs/String", Some("/lobby/logic/pulse")),
+            ]
+        );
+        assert_eq!(
+            render_effective_graph_yaml(&back).expect("render again"),
+            rendered
+        );
+    }
+
+    /// AGENTS.md: rustdoc shows a graph only as a workspace `graphs/*.yaml`
+    /// read by name; a graph built in code is for tests only. Rustdoc is
+    /// published, so a reader copies its examples into application code.
+    #[test]
+    fn rustdoc_examples_read_graphs_from_the_workspace_not_from_code() {
+        let mut fence: Option<bool> = None;
+        let mut example_lines = Vec::new();
+        for line in include_str!("graph_cmd.rs").lines() {
+            let trimmed = line.trim_start();
+            let Some(doc) = trimmed
+                .strip_prefix("///")
+                .or_else(|| trimmed.strip_prefix("//!"))
+            else {
+                continue;
+            };
+            let doc = doc.trim();
+            if let Some(info) = doc.strip_prefix("```") {
+                fence = match fence {
+                    Some(_) => None,
+                    None => Some(!matches!(info.trim(), "text" | "yaml" | "json" | "console")),
+                };
+                continue;
+            }
+            if fence == Some(true) {
+                example_lines.push(doc);
+            }
+        }
+
+        assert!(
+            example_lines
+                .iter()
+                .any(|l| l.contains("graph_read(") && !l.starts_with('#')),
+            "the public renderer's example must show reading `graphs/<name>.yaml` by name"
+        );
+        for banned in ["parse_graph", "GraphConfig {", "GraphRuntime"] {
+            let hits: Vec<&&str> = example_lines
+                .iter()
+                .filter(|l| l.contains(banned))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "a rustdoc example builds a graph in code with `{banned}`: {hits:?}"
+            );
+        }
+    }
+
     /// The rendered attachment is SCRATCH: it must be cleaned up like every other
     /// bagd input, never left beside the bag as a stray artifact.
     #[cfg(unix)]
@@ -30479,6 +31247,7 @@ process_groups:
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
             node_external: &std::collections::BTreeMap::new(),
+            node_inputs: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.graph_yaml.clone();
@@ -30547,37 +31316,64 @@ process_groups:
     }
 
     /// `render_recorder_json` carries EXACTLY
-    /// seven fields (a sacred user-facing format: a speculative EIGHTH
+    /// nine fields (a sacred user-facing format: a speculative TENTH
     /// field fails the count pin), with `arch`/`os` from the compile-time consts,
     /// `recorded_at_ns` equal to the filename-stamp `now` (no second clock), and
     /// `trace_format` = the INTENTIONAL scheduler-trace format version this binary
     /// writes. `trace_format` is the fifth field (the discard-bit-
     /// aware v2) so replay refuses a bag from a newer binary instead of mis-
     /// decoding the discard bit; `node_external` is the seventh, each node's
-    /// driver flag exactly as the caller handed it. The exact-count assert stays
-    /// (no speculative extras; each count move is one intentional add).
+    /// driver flag exactly as the caller handed it; `env_names_left_out` is the
+    /// eighth, the count of names `env.json` left out; `node_inputs` is the
+    /// ninth, each node's input queues exactly as the caller handed them. The
+    /// exact-count assert stays (no speculative extras; each count move is one
+    /// intentional add).
     #[cfg(unix)]
     #[test]
-    fn recorder_json_carries_exactly_the_seven_fields() {
-        use crate::replay_engine::CoordinationMode;
+    fn recorder_json_carries_exactly_the_nine_fields() {
+        use crate::replay_engine::{CoordinationMode, InputQueue};
         let now = Duration::from_nanos(1_783_092_278_948_123_456);
         let flags = std::collections::BTreeMap::from([
             ("meter".to_string(), false),
             ("cam".to_string(), true),
         ]);
+        let inputs = std::collections::BTreeMap::from([
+            ("cam".to_string(), std::collections::BTreeMap::new()),
+            (
+                "meter".to_string(),
+                std::collections::BTreeMap::from([(
+                    "x".to_string(),
+                    InputQueue {
+                        backpressure: "block".to_string(),
+                        depth: 4,
+                    },
+                )]),
+            ),
+        ]);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
             now,
             CoordinationMode::Lockstep,
             &flags,
+            &inputs,
+            2,
         ))
         .expect("valid JSON");
         let obj = v.as_object().expect("an object");
         assert_eq!(
             obj.len(),
-            7,
-            "exactly seven fields (arch/os/cerulion_version/recorded_at_ns + the \
-             trace_format + the coordination stamp + the driver flags), no speculative extras"
+            9,
+            "exactly nine fields (arch/os/cerulion_version/recorded_at_ns + the \
+             trace_format + the coordination stamp + the driver flags + the count of \
+             env.json names left out + the input queues), no speculative extras"
         );
+        // The ninth field: each node's input queues, a map of node id to a map
+        // of input name to its backpressure and depth.
+        assert_eq!(
+            v["node_inputs"],
+            serde_json::json!({"cam": {}, "meter": {"x": {"backpressure": "block", "depth": 4}}})
+        );
+        // The eighth field: the count exactly as the caller handed it.
+        assert_eq!(v["env_names_left_out"], 2);
         // The seventh field: each native node's driver flag, as a map of node id
         // to a bool, the key a replay judges drivers by.
         assert_eq!(
@@ -30605,20 +31401,23 @@ process_groups:
             v["trace_format"],
             crate::replay_engine::stamp_trace_format(
                 CoordinationMode::Lockstep,
-                crate::replay_engine::recorder_stream_needs_v4(),
-                crate::replay_engine::recorder_stamps_read_site_roles(),
-                cerulion_core::read_outcome::fold_enabled(),
-                crate::replay_engine::recorder_stamps_consult_records(),
-                crate::replay_engine::recorder_records_read_identity()
+                crate::replay_engine::RecorderClaims::of_this_recorder(
+                    cerulion_core::read_outcome::fold_enabled()
+                )
             )
         );
         assert_eq!(
-            v["trace_format"], 9,
+            v["trace_format"], 12,
             "every bag this binary writes carries read-site roles, folds runs, \
-             records an empty consult a replay also makes AND names the writer and \
+             records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
-             read stage's window: a reader below 9 does not know the per-frame \
-             record, so the stamp makes it refuse the bag"
+             read stage's window, flags every complete checkpoint part of a stopped \
+             node, names every read site's writer at every checkpoint window head \
+             AND records every stop: a reader below 11 never mirrors the reopen, so \
+             an ungated stage near its rim reports a false read_log_diverged, and \
+             never checks the flags word; a reader below 12 refuses a bag that \
+             holds a stop record as an unknown record kind, and the stamp makes it \
+             refuse one that holds none by its format"
         );
     }
 
@@ -30628,28 +31427,34 @@ process_groups:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
-    /// per-frame batch identity to the 9 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8,
+    /// per-frame batch identity to 9, checkpoint stops to 10, checkpoint
+    /// window heads to 11 and node stops to the 12 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
+    fn a_free_run_recorder_json_stamps_free_run_and_the_node_stops_format() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
             now,
             CoordinationMode::FreeRun,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+            0,
         ))
         .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
-        // every consumed frame of a batch is named (`stamp_trace_format`'s
+        // every consumed frame of a batch is named. 10, not 9: every complete
+        // checkpoint part of a stopped node carries the stopped flag. 11, not
+        // 10: every read site names its writer at every checkpoint window head.
+        // 12, not 11: every stop is a NODE-STOP record (`stamp_trace_format`'s
         // hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 9);
+        assert_eq!(v["trace_format"], 12);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -30672,13 +31477,19 @@ process_groups:
         backward.insert("cam".into(), cam);
         let now = Duration::from_nanos(7);
         let render = |infos: &indexmap::IndexMap<String, NodeInfo>| {
-            render_recorder_json(now, CoordinationMode::FreeRun, &node_external_flags(infos))
+            render_recorder_json(
+                now,
+                CoordinationMode::FreeRun,
+                &node_external_flags(infos),
+                &std::collections::BTreeMap::new(),
+                0,
+            )
         };
         let a = render(&forward);
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"node_inputs":{{}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -34105,7 +34916,7 @@ process_groups:
                 crate::multiprocess::ExecutionMode::Lockstep,
             ),
             graph_yaml: render_effective_graph_yaml(&pre.config).expect("render"),
-            env_json: render_env_json(RecordEnvMode::Allowlist, std::env::vars()),
+            env_json: render_env_json(RecordEnvMode::Allowlist, std::env::vars_os()).bytes,
         })
         .expect("run dir");
 
@@ -43908,12 +44719,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// facts, named so a table row reads as a host rather than two bools.
     #[derive(Clone, Copy, Debug)]
     enum MwHost {
-        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64): arm 3. The wake-word fact is run both ways for every row,
+        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// MWAITX, Linux aarch64): arm 3. The wake-word fact is run both ways for every row,
         /// because arm 3 must not read it.
         Primitive,
         /// No primitive, but a consumer can kernel-block on a doorbell wake
-        /// word (Linux without WAITPKG, macOS 14.4 and later): arm 2.
+        /// word (Linux with no CPU monitor-wait primitive, macOS 14.4 and
+        /// later): arm 2.
         WakeWord,
         /// Neither (macOS before 14.4, other targets): arm 2, doorbell inert.
         Neither,

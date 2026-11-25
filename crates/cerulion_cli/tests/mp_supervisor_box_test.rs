@@ -79,7 +79,7 @@
 //! real `/dev/shm` `MAP_SHARED` page (on macOS `MappedBarrier` uses an in-process
 //! registry, so separate processes never rendezvous) and terminal-Ctrl-C
 //! emulation needs POSIX process-group signals. Run on Linux (x86 with
-//! WAITPKG, or aarch64 with WFE):
+//! WAITPKG or MWAITX, or aarch64 with WFE):
 //!
 //! ```bash
 //! cargo test -p cerulion_cli --test mp_supervisor_box_test -- --ignored --nocapture --test-threads=1
@@ -358,6 +358,7 @@ fn reconstruct(flats: &[FlatEntry]) -> Vec<TraceEntry> {
             global_level: f.global_level,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         })
         .collect()
 }

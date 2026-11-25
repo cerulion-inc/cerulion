@@ -15,7 +15,7 @@
 //! `recheck` (~100µs). To wake on DATA the instant it arrives, every
 //! data-trigger topic gets one cache-line-aligned page that producer and consumer
 //! both map: the producer `ring()`s on each publish, and the consumer waits on that
-//! exact line, with `UMONITOR`/`WFE` where the CPU has them and with a kernel block
+//! exact line, with `UMONITOR`/`MONITORX`/`WFE` where the CPU has them and with a kernel block
 //! on the page's wake word where it does not, so a ring wakes the park with no
 //! timer round-trip.
 //!
@@ -102,7 +102,7 @@
 //! - Linux: real POSIX named SHM (`shm_open`/`mmap`/`shm_unlink` via `libc`),
 //!   rung by one `SeqCst` increment of the ring counter and one load of the
 //!   page's `parked` count, heard by the CPU monitor-wait primitive
-//!   (`UMONITOR`/`WFE`) armed on the same line where the CPU carries one. A
+//!   (`UMONITOR`/`MONITORX`/`WFE`) armed on the same line where the CPU carries one. A
 //!   consumer without one claims `parked` and blocks with `FUTEX_WAIT` on the
 //!   page's wake word, bounded by its park slice; only while such a claim is
 //!   held does a ring bump the word and issue one shared `FUTEX_WAKE`.
@@ -504,7 +504,7 @@ mod imp {
         }
 
         /// Ring the doorbell: bump `seq`, which wakes a consumer parked with
-        /// `UMONITOR`/`WFE` on this line, then read `parked`. Only while a
+        /// `UMONITOR`/`MONITORX`/`WFE` on this line, then read `parked`. Only while a
         /// consumer holds a claim on the futex word does the ring bump the word
         /// and issue one shared `FUTEX_WAKE`.
         ///
@@ -609,7 +609,7 @@ mod imp {
             self.shared().seq.load(Ordering::Acquire)
         }
 
-        /// The watched address for `UMONITOR`/`WFE` (the ring counter's location).
+        /// The watched address for `UMONITOR`/`MONITORX`/`WFE` (the ring counter's location).
         pub fn addr(&self) -> *const AtomicU64 {
             &self.shared().seq as *const AtomicU64
         }
@@ -1560,7 +1560,7 @@ fn wake_word_active_from(backend_usable: bool, killed: bool) -> bool {
 /// `true` on Linux and Android, where the page's wake word is a shared futex,
 /// and on macOS with the os_sync family resolved, unlatched and not killed by
 /// [`DOORBELL_OS_SYNC_ENV`]. A park whose slice the CPU monitor-wait primitive
-/// performs (`UMONITOR`/`WFE` on the ring counter) never reaches this rung; a
+/// performs (`UMONITOR`/`MONITORX`/`WFE` on the ring counter) never reaches this rung; a
 /// park without one blocks on the wake word instead of pacing its recheck nap.
 /// Other targets have no wake word.
 pub fn wake_word_block_primitive_available() -> bool {

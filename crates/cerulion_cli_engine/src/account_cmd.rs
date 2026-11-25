@@ -471,9 +471,38 @@ pub fn sync_robot_epoch_to_cache_at(
 /// session is a loud error naming the fix (`cerulion login`). The main dispatch's
 /// login gate normally guarantees a session BEFORE the command runs; this is the
 /// defensive backstop for a direct engine caller.
+///
+/// With a valid session in hand it then renews the cached device certificate
+/// when that is within its renewal window
+/// ([`crate::device_cert_renewal::renew_if_due`]); a renewal failure is logged,
+/// holds the next attempt back for an hour, and never fails this call.
 pub fn require_session() -> CliResult<String> {
-    // Best-effort refresh if the session is stale (never fatal on its own).
-    let _ = login_cmd::refresh_session_if_stale();
+    let session = require_session_unrenewed(None)?;
+    #[cfg(unix)]
+    crate::device_cert_renewal::renew_if_due(&session);
+    Ok(session)
+}
+
+/// [`require_session`] without the device-certificate renewal, for a caller that
+/// schedules the renewal itself; with `stopping`, a stale session is not
+/// refreshed once it is set.
+pub(crate) fn require_session_unrenewed(
+    stopping: Option<&std::sync::atomic::AtomicBool>,
+) -> CliResult<String> {
+    // Best-effort refresh if the session is stale (never fatal on its own),
+    // except that a refresh a stop kept from sending is returned as such.
+    match stopping {
+        Some(stopping) => {
+            if let Err(e) = login_cmd::refresh_session_if_stale_unless_stopping(None, stopping) {
+                if login_cmd::is_stop_refusal(&e) {
+                    return Err(e);
+                }
+            }
+        }
+        None => {
+            let _ = login_cmd::refresh_session_if_stale();
+        }
+    }
     let loaded = crate::auth::load();
     let now = now_ns();
     match loaded.state() {

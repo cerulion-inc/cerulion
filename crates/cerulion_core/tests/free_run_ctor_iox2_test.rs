@@ -1312,23 +1312,32 @@ fn run_live_places_the_armed_epoch_at_the_shared_start_epoch_exactly() {
 }
 
 /// **`run_live` waits for the shared start epoch before its first step.** The
-/// epoch is 40 ms ahead; a flipper ends the run about 10 ms after the epoch.
-/// The 4 ms ticker fires at most `(return - epoch) / 4 + 2` times; with the
-/// wait deleted the loop would step from entry, 40 ms earlier, and fire about
-/// 10 more times. At least one fire proves it stepped.
+/// epoch is 200 ms ahead; a flipper ends the run once 10 ms have passed since
+/// the epoch AND the ticker has fired. The 4 ms ticker fires at most
+/// `(return - epoch) / 4 + 2` times; with the wait deleted the loop would step
+/// from entry, about 200 ms earlier, and fire about 50 more times. At least
+/// one fire proves it stepped.
 #[test]
 fn run_live_takes_no_step_before_the_shared_start_epoch() {
+    /// Guards a hang only: the flipper stops waiting for the first fire here.
+    const FIRST_FIRE_GUARD_NS: u64 = 10_000_000_000;
     let fires = Arc::new(AtomicU64::new(0));
     let (mut rt, _clock) = shared_start_ticker("frc_shared_wait", Arc::clone(&fires));
     rt.set_gating_follows_wall(true)
         .expect("the deterministic free-run build accepts the wall-following clock");
-    let epoch = real_ns() + 40_000_000;
+    let epoch = real_ns() + 200_000_000;
     rt.place_gating_epoch_at_live_anchor().expect("arm");
     rt.start_live_at_shared_epoch(epoch).expect("arm the start");
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let flip = Arc::clone(&running);
+    let first_fire = Arc::clone(&fires);
+    // The stop waits on the ticker's fire count as well as the clock: a live
+    // loop that wakes from the epoch wait late on a loaded host has not
+    // stepped yet, and a stop flipped then would end the run with no step.
     let flipper = std::thread::spawn(move || {
-        while real_ns() < epoch + 10_000_000 {
+        while (real_ns() < epoch + 10_000_000 || first_fire.load(Ordering::SeqCst) == 0)
+            && real_ns() < epoch + FIRST_FIRE_GUARD_NS
+        {
             std::thread::sleep(Duration::from_millis(1));
         }
         flip.store(false, Ordering::SeqCst);
@@ -1339,11 +1348,12 @@ fn run_live_takes_no_step_before_the_shared_start_epoch() {
     let fired = fires.load(Ordering::SeqCst);
     assert!(
         fired >= 1,
-        "the run stepped past the epoch and fired the ticker"
+        "the run never fired the ticker in the {} ms after the shared start epoch",
+        FIRST_FIRE_GUARD_NS / 1_000_000
     );
     // Bounded by the time from the EPOCH to the return, so a flipper that runs
     // late on a loaded machine widens the bound with it; a loop that stepped
-    // from entry would add the 40 ms wait, 10 more fires.
+    // from entry would add the 200 ms wait, about 50 more fires.
     let window_ms = (returned - epoch) / 1_000_000;
     assert!(
         fired <= window_ms / PERIOD_MS + 2,

@@ -117,7 +117,22 @@
 //! block scalar, owe the guard exactly as much as a job with a one-line `if:`.
 //! Whether a guarded job is PR-blocking is a separate question, decided by
 //! `job_is_gated` and pinned by
-//! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+//! `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
+//!
+//! A RUNNER THAT FOLLOWS THE CLASSIFIER. A job whose `runs-on:` reads another
+//! job's output spells exactly `${{ needs.changes.outputs.code == 'true' &&
+//! 'macos-latest' || 'ubuntu-latest' }}`, reads `code` and `pkgs` from a
+//! classifier that produces them, gates EVERY step so that it is false whenever
+//! the classifier selected no package (a top-level `&&` term that is the `code`
+//! gate or a per-package gate), and keeps at least one selection marker that
+//! only prints. When the classifier FAILED the empty output picks Linux, every
+//! `code` gate is false, and a leg reds only where some condition reaches
+//! `fromJSON('')`. A marker's condition carries no leg selector to
+//! short-circuit ahead of it, so with one marker every leg reaches it; without
+//! one, a leg whose per-package gates all sit behind another leg's selector
+//! skips every step and reports green. `routed_job_complaints` is the rule,
+//! pinned on synthetic jobs
+//! by `a_routed_job_is_named_for_an_ungated_step_a_missing_marker_or_another_route`.
 //!
 //! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
 //! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
@@ -158,6 +173,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+mod ci_test_line;
+use ci_test_line::{line_runs_tests_of, logical_lines};
 
 /// Packages that have tests and are deliberately NOT named in a CI test step.
 ///
@@ -295,12 +313,14 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The ONE job-level condition this walk sanctions, spelled whole.
+/// One of the two job-level conditions this walk sanctions, spelled whole;
+/// [`ALWAYS_CALL`] is the other.
 ///
 /// A job-level `if:` normally disqualifies a job outright: it can stop the job
 /// on a pull request, and a package covered only there is covered by nothing.
-/// `!cancelled()` is the exception and it is the exception for the OPPOSITE
-/// reason: it exists so the job runs when a job it `needs:` FAILED. GitHub
+/// `!cancelled()` is the exception, and `always()` beside it (see
+/// [`ALWAYS_CALL`]), and they are the exceptions for the OPPOSITE reason: they
+/// exist so the job runs when a job it `needs:` FAILED. GitHub
 /// skips a dependant of a failed job, a skipped required context counts as
 /// satisfied, and a pull request would then merge with that job's contexts
 /// never run. So a job carrying exactly this condition runs on every pull
@@ -338,7 +358,9 @@ fn job_if_of(block: &str) -> Option<Result<String, String>> {
 fn job_is_gated(block: &str) -> bool {
     match job_if_of(block) {
         None => false,
-        Some(Ok(cond)) => cond.trim() != JOB_IF_NOT_CANCELLED,
+        Some(Ok(cond)) => {
+            cond.trim() != JOB_IF_NOT_CANCELLED && condition_expression(&cond) != ALWAYS_CALL
+        }
         Some(Err(why)) => panic!(
             "{why}\n\nThe walk cannot say whether this JOB runs on a pull \
              request, so it refuses to guess. Spell the job's `if:` as a \
@@ -1326,55 +1348,15 @@ fn pr_blocking_workflow_texts() -> BTreeMap<String, String> {
     out
 }
 
-/// Does ONE command line name `pkg` as a package it runs tests for?
-///
-/// Two forms, and EVERY package on the line counts in both:
-///
-///   * `cargo test … -p a -p b …` — the ordinary one. Reading
-///     only the package after the FIRST `-p` would leave the `b` of
-///     `cargo test -p a -p b` uncovered. Every
-///     `-p` / `--package` occurrence after `cargo test` is read, in every
-///     spelling cargo accepts (`-p x`, `-px`, `--package x`, `--package=x`).
-///   * `ci_test_shard.sh <pkg> …` — the sharded form
-///     (`tools/scripts/ci_test_shard.sh`, used by the `cerulion_core` legs of
-///     `test-linux` / `test-macos`): the script takes the package name as its
-///     first argument precisely so the name stays LITERALLY present in the
-///     workflow and this walk keeps working across the split.
-///
-/// Matching is by WHOLE WHITESPACE TOKEN, which is what keeps `cerulion_viz`
-/// and `cerulion_vizd` apart: a plain `contains` would report `cerulion_viz`
-/// covered by the `cerulion_vizd` step and vice versa.
-fn line_names_package(line: &str, pkg: &str) -> bool {
-    if let Some(pos) = line.find("ci_test_shard.sh ") {
-        let tail = &line[pos + "ci_test_shard.sh ".len()..];
-        if tail.split_whitespace().next() == Some(pkg) {
-            return true;
-        }
-    }
-    let Some(pos) = line.find("cargo test") else {
-        return false;
-    };
-    let mut it = line[pos..].split_whitespace();
-    while let Some(tok) = it.next() {
-        let named = match tok {
-            "-p" | "--package" => it.next() == Some(pkg),
-            _ => tok
-                .strip_prefix("--package=")
-                .or_else(|| tok.strip_prefix("-p"))
-                .is_some_and(|rest| rest == pkg),
-        };
-        if named {
-            return true;
-        }
-    }
-    false
-}
-
 /// The first PR-blocking workflow whose text names `pkg` in a test command.
 fn workflows_name(texts: &BTreeMap<String, String>, pkg: &str) -> Option<String> {
     texts
         .iter()
-        .find(|(_, text)| text.lines().any(|l| line_names_package(l, pkg)))
+        .find(|(_, text)| {
+            logical_lines(text.lines())
+                .iter()
+                .any(|l| line_runs_tests_of(l, pkg))
+        })
         .map(|(file, _)| file.clone())
 }
 
@@ -1796,20 +1778,17 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
 
     // The ONE routing exception must be reported, by name and by shard.
     //
-    // `--check` pins `macro_compile_fail_test` to a fixed shard because it is the
-    // serial trybuild tail: one test that is essentially the whole of whichever
-    // quarter holds it. This comment is
-    // figure-free on purpose — the measurement and its provenance live in exactly
-    // one place, `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. What matters here is
-    // that `.github/workflows/ci.yml`'s package map counts the tail as a FIXED
-    // term of that shard's wall and packs the package steps around it. The
+    // `--check` pins `macro_compile_fail_test` to a fixed shard and holds it out
+    // of the rotation, so every other file keeps the shard
+    // `.github/workflows/ci.yml`'s package map was balanced against; why, in one
+    // place, is `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The
     // assertions above cannot see any of that: a pin that drifted to another
-    // shard, or one whose target file was renamed away so the tail rejoined the
+    // shard, or one whose target file was renamed away so it rejoined the
     // round-robin, both leave the partition perfectly total and disjoint.
     //
     // So this asserts the LINE, which is what makes the pin observable. Without
-    // it the pin's own guard can go inert — silently, and in exactly the
-    // direction that puts the tail back on a runner chosen by an unrelated PR.
+    // it the pin's own guard can go inert, silently, and every file after the
+    // pinned one moves to another shard.
     let expected_pin = "pinned: macro_compile_fail_test -> shard 2";
     assert!(
         stdout.contains(expected_pin),
@@ -1819,6 +1798,700 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
          .github/workflows/ci.yml to match), or its target file was renamed \
          or deleted (see PINNED_TEST in tools/scripts/ci_test_shard.sh).\n\
          got:\n{stdout}"
+    );
+}
+
+/// `--check` finds the pinned file in a listing far longer than a pipe holds.
+///
+/// The pinned name is the listing's FIRST line and the listing runs to several
+/// hundred kilobytes, so a membership test that pipes the listing into `grep -q`
+/// has grep exit on line one while the writer still holds most of the listing:
+/// the writer takes SIGPIPE, and under `pipefail` the file reads as absent. A
+/// tests directory of generated empty files builds that listing on every run,
+/// where the real listing of a few kilobytes loses the race only now and then.
+#[cfg(unix)]
+#[test]
+fn the_shard_check_finds_the_pinned_file_in_a_listing_longer_than_a_pipe_holds() {
+    let script = repo_root().join("tools/scripts/ci_test_shard.sh");
+    let package = tempfile::tempdir().expect("a package directory");
+    let tests = package.path().join("tests");
+    std::fs::create_dir(&tests).expect("the package's tests directory");
+    std::fs::write(tests.join("macro_compile_fail_test.rs"), "").expect("the pinned file");
+    // 4000 names of 207 bytes that all sort after the pinned one: about 830 KB.
+    let pad = "x".repeat(200);
+    for i in 0..4000 {
+        std::fs::write(tests.join(format!("z_{pad}_{i:04}.rs")), "").expect("a test file");
+    }
+
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .args(["--check", "cerulion_core", "4"])
+        .arg(package.path())
+        .current_dir(repo_root())
+        .output()
+        .expect("running tools/scripts/ci_test_shard.sh --check on the generated package");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "--check refused a package whose pinned file is on disk.\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The 4000 others round robin to 1000 a shard, and the pinned file joins shard 2.
+    for line in [
+        "shard 0/4: 1000 test file(s)",
+        "shard 1/4: 1000 test file(s)",
+        "shard 2/4: 1001 test file(s)",
+        "shard 3/4: 1000 test file(s)",
+        "pinned: macro_compile_fail_test -> shard 2/4",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.starts_with(line)),
+            "the --check output lacks a line starting {line:?}; got:\n{stdout}"
+        );
+    }
+}
+
+/// The shells a shard-script test runs under: `bash` from `PATH`, and
+/// `/bin/bash` whenever that file exists. On macOS that is bash 3.2, the oldest
+/// the script's header promises; on Linux it is usually the same bash again.
+#[cfg(unix)]
+fn shard_script_shells() -> Vec<PathBuf> {
+    let mut shells = vec![PathBuf::from("bash")];
+    let system = PathBuf::from("/bin/bash");
+    if system.is_file() {
+        shells.push(system);
+    }
+    shells
+}
+
+/// A synthetic checkout for the shard script's `--with` arms: a copy of the
+/// script and a `crates/` tree whose packages each break one rule.
+#[cfg(unix)]
+fn with_tree() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("a synthetic checkout");
+    let write = |rel: &str, text: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent directory"))
+            .expect("the file's directory");
+        std::fs::write(&path, text).expect("a synthetic file");
+    };
+    let script = std::fs::read_to_string(repo_root().join("tools/scripts/ci_test_shard.sh"))
+        .expect("read tools/scripts/ci_test_shard.sh");
+    write("tools/scripts/ci_test_shard.sh", &script);
+    let manifest = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n");
+    // The shard's package: three files, so shard 1 of 4 holds `b` and shard 3
+    // holds none.
+    write("crates/core/Cargo.toml", &manifest("core"));
+    for t in ["a", "b", "c"] {
+        write(&format!("crates/core/tests/{t}.rs"), "");
+    }
+    // Two clean extras. `ok` carries a binary with `test = false`, a
+    // `#[cfg(test)]` (not a test) and inline code in a doc comment (not a block).
+    write(
+        "crates/fx/ok/Cargo.toml",
+        &format!(
+            "{}\n[[bin]]\nname = \"p\"\npath = \"tests/ui/p.rs\"\ntest = false\n",
+            manifest("ok")
+        ),
+    );
+    write(
+        "crates/fx/ok/src/lib.rs",
+        "//! Inline `code` only.\n#[cfg(test)]\nmod t {}\n",
+    );
+    write("crates/fx/ok/tests/ok_one.rs", "");
+    write("crates/fx/ok/tests/ok_two.rs", "");
+    write("crates/fx/ok/tests/ui/p.rs", "fn main() {}\n");
+    write(
+        "crates/fx/ok2/Cargo.toml",
+        &format!(
+            "{}\n[lib] # the library\npath = './src/lib.rs'\n\n[[bin]]  # a program\nname = \"q\"\npath = \"tests/ui/q.rs\"\ntest = false\n",
+            manifest("ok2")
+        ),
+    );
+    write("crates/fx/ok2/tests/ok2_t.rs", "");
+    // One package per refusal, each with a test file of its own name so the
+    // refusal is the only thing wrong with it.
+    let broken: &[(&str, &str, &str)] = &[
+        ("ut1", "src/lib.rs", "#[test]\nfn t() {}\n"),
+        (
+            "ut2",
+            "src/lib.rs",
+            "#[tokio::test(flavor = \"multi_thread\")]\nasync fn t() {}\n",
+        ),
+        ("ut3", "src/lib.rs", "#[test_log::test]\nfn t() {}\n"),
+        ("ut4", "src/lib.rs", "#[rstest]\nfn t() {}\n"),
+        ("dc1", "src/lib.rs", "//! ```\n//! let x = 1;\n//! ```\n"),
+        (
+            "dc2",
+            "src/lib.rs",
+            "/// ~~~\n/// let x = 1;\n/// ~~~\npub fn f() {}\n",
+        ),
+        ("dc3", "src/lib.rs", "#[doc = \"text\"]\npub fn f() {}\n"),
+        (
+            "dc4",
+            "src/lib.rs",
+            "#![doc = include_str!(\"../README.md\")]\n",
+        ),
+        ("dc5", "src/lib.rs", "/** text */\npub fn f() {}\n"),
+        (
+            "dc6",
+            "src/lib.rs",
+            "/// Example:\n///\n///     let x = 1;\npub fn f() {}\n",
+        ),
+        ("nm", "tests/sub/main.rs", ""),
+        ("col", "tests/b.rs", ""),
+    ];
+    for (name, rel, text) in broken {
+        write(&format!("crates/fx/{name}/Cargo.toml"), &manifest(name));
+        write(&format!("crates/fx/{name}/{rel}"), text);
+        if *name != "col" {
+            write(&format!("crates/fx/{name}/tests/{name}_t.rs"), "");
+        }
+    }
+    write(
+        "crates/fx/tt/Cargo.toml",
+        &format!(
+            "{}\n[[test]]\nname = \"extra\"\npath = \"t/extra.rs\"\n",
+            manifest("tt")
+        ),
+    );
+    write("crates/fx/tt/tests/tt_t.rs", "");
+    write(
+        "crates/fx/bn/Cargo.toml",
+        &format!(
+            "{}\n[[bin]] # a program\nname = \"p\"\npath = \"tests/ui/p.rs\"\n",
+            manifest("bn")
+        ),
+    );
+    write("crates/fx/bn/tests/bn_t.rs", "");
+    for (name, table) in [
+        (
+            "ex",
+            "[[example]]\nname = \"e\"\npath = \"e.rs\"\ntest = true\n",
+        ),
+        (
+            "be",
+            "[[bench]]\nname = \"b\"\npath = \"b.rs\"\ntest = true\n",
+        ),
+        ("lp", "[lib]\npath = \"lib.rs\"\n"),
+    ] {
+        write(
+            &format!("crates/fx/{name}/Cargo.toml"),
+            &format!("{}\n{table}", manifest(name)),
+        );
+        write(&format!("crates/fx/{name}/tests/{name}_t.rs"), "");
+    }
+    write("crates/fx/nt/Cargo.toml", &manifest("nt"));
+    write("crates/fx/et/Cargo.toml", &manifest("et"));
+    std::fs::create_dir_all(root.path().join("crates/fx/et/tests")).expect("an empty tests dir");
+    // Two manifests that claim one name.
+    write("crates/d1/Cargo.toml", &manifest("dup"));
+    write("crates/d1/tests/d.rs", "");
+    write("crates/d2/Cargo.toml", &manifest("dup"));
+    write("crates/d2/tests/d.rs", "");
+    // A stub `cargo` that prints the command it was handed, and a
+    // `cargo-nextest` for the script's install check.
+    write(
+        "stub/cargo",
+        "#!/bin/sh\nprintf 'cargo'; printf ' %s' \"$@\"; printf '\\n'\n",
+    );
+    write("stub/cargo-nextest", "#!/bin/sh\nexit 0\n");
+    for stub in ["stub/cargo", "stub/cargo-nextest"] {
+        let path = root.path().join(stub);
+        let mut perms = std::fs::metadata(&path).expect("the stub").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).expect("make the stub executable");
+    }
+    root
+}
+
+/// Run the synthetic checkout's script: `(exit code, stdout, stderr)`.
+#[cfg(unix)]
+fn run_with_tree(
+    shell: &Path,
+    root: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg(root.join("tools/scripts/ci_test_shard.sh"))
+        .args(args)
+        .current_dir(root)
+        .env_remove("CI_SELECTED_PACKAGES")
+        .env_remove("CI_TEST_SHARD_EXTRA")
+        .env_remove("CI_TEST_SHARD_ARCHIVE")
+        .env_remove("CI_TEST_SHARD_ARCHIVE_RUSTC")
+        .env_remove("CI_TEST_SHARD_ARCHIVE_PROFILE_DEBUG")
+        .env_remove("CI_TEST_SHARD_EXTRACT_DIR")
+        .env_remove("CI_TEST_SHARD_PROFILE")
+        .env_remove("CARGO_PROFILE_DEV_DEBUG")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("stub").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("run the synthetic shard script");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `--with`: each package rides the selection on its own, in command-line
+/// order, the shard's own `-p` only with a target after it, and the archive
+/// filterset joins one clause per riding package. Every vector is written out
+/// by hand.
+#[cfg(unix)]
+#[test]
+fn a_with_package_rides_the_selection_on_its_own() {
+    let tree = with_tree();
+    let root = tree.path();
+    let lines = |v: &[&str]| v.iter().map(|l| format!("{l}\n")).collect::<String>();
+    let core_b = ["-p", "core", "--test", "b"];
+    let ok = ["-p", "ok", "--test", "ok_one", "--test", "ok_two"];
+    let both: Vec<&str> = core_b.iter().chain(ok.iter()).copied().collect();
+    let skip_core = |sel: &str| format!("selection: skipped core shard 1 (selected: {sel})\n");
+    let skip_ok =
+        |sel: &str| format!("selection: skipped ok beside core shard 1 (selected: {sel})\n");
+    let cases: Vec<(Vec<&str>, Option<&str>, String, String)> = vec![
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            None,
+            lines(&both),
+            String::new(),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            Some("[\"core\"]"),
+            lines(&core_b),
+            skip_ok("[\"core\"]"),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            Some("[\"ok\"]"),
+            lines(&ok),
+            skip_core("[\"ok\"]"),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            Some("[]"),
+            String::new(),
+            format!("{}{}", skip_core("[]"), skip_ok("[]")),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok2", "--with", "ok"],
+            Some("[\"ok\", \"ok2\"]"),
+            lines(&[
+                "-p", "ok2", "--test", "ok2_t", "-p", "ok", "--test", "ok_one", "--test", "ok_two",
+            ]),
+            skip_core("[\"ok\", \"ok2\"]"),
+        ),
+        // Shard 3 holds none of core's files: core's `-p` would select every
+        // test it has, so only the extra is named.
+        (
+            vec!["--list", "core", "3", "4", "--with", "ok"],
+            None,
+            lines(&ok),
+            String::new(),
+        ),
+        // The package directory may come before or after `--with`.
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok", "crates/core"],
+            None,
+            lines(&both),
+            String::new(),
+        ),
+    ];
+    for shell in shard_script_shells() {
+        for (args, sel, stdout, stderr) in &cases {
+            let env: Vec<(&str, &str)> = sel
+                .map(|s| ("CI_SELECTED_PACKAGES", s))
+                .into_iter()
+                .collect();
+            let got = run_with_tree(&shell, root, args, &env);
+            assert_eq!(
+                got,
+                (Some(0), stdout.clone(), stderr.clone()),
+                "{} {args:?} under selection {sel:?}",
+                shell.display()
+            );
+        }
+        // The run mode hands that vector to nextest, and says what it runs.
+        let (code, stdout, _) =
+            run_with_tree(&shell, root, &["core", "3", "4", "--with", "ok"], &[]);
+        assert_eq!(code, Some(0), "{}", shell.display());
+        assert!(
+            stdout.contains("shard 3/4 of core holds none of its files")
+                && stdout.contains("shard 3/4 of core, running ok\n")
+                && stdout
+                    .contains("cargo nextest run --profile ci -p ok --test ok_one --test ok_two\n"),
+            "{}: {stdout}",
+            shell.display()
+        );
+        // With no extra riding, an empty shard is still the EMPTY notice.
+        let (code, stdout, _) = run_with_tree(
+            &shell,
+            root,
+            &["core", "3", "4", "--with", "ok"],
+            &[("CI_SELECTED_PACKAGES", "[\"core\"]")],
+        );
+        assert_eq!(code, Some(0));
+        assert!(
+            stdout.contains("is EMPTY") && !stdout.contains("cargo nextest"),
+            "{stdout}"
+        );
+        // The archive mode: one clause per riding package.
+        let archive = root.join("a.tar.zst");
+        std::fs::write(&archive, "").expect("a stand-in archive");
+        let archive = archive.display().to_string();
+        let (code, stdout, _) = run_with_tree(
+            &shell,
+            root,
+            &["--list", "core", "1", "4", "--with", "ok"],
+            &[("CI_TEST_SHARD_ARCHIVE", archive.as_str())],
+        );
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout.lines().last(),
+            Some("(package(core) and (binary(=b))) or (package(ok) and (binary(=ok_one) + binary(=ok_two)))"),
+            "{stdout}"
+        );
+        let (_, stdout, _) = run_with_tree(
+            &shell,
+            root,
+            &["--list", "core", "1", "4", "--with", "ok"],
+            &[
+                ("CI_TEST_SHARD_ARCHIVE", archive.as_str()),
+                ("CI_SELECTED_PACKAGES", "[\"ok\"]"),
+            ],
+        );
+        assert_eq!(
+            stdout.lines().last(),
+            Some("package(ok) and (binary(=ok_one) + binary(=ok_two))"),
+            "{stdout}"
+        );
+    }
+}
+
+/// Every refusal of `--with`, each from a package that breaks only that rule,
+/// with its exit code and message; and `#[cfg(test)]` plus inline doc code
+/// pass (the `ok` package carries both).
+#[cfg(unix)]
+#[test]
+fn every_with_refusal_names_the_package_and_the_rule() {
+    let tree = with_tree();
+    let root = tree.path();
+    let cases: &[(&[&str], &str)] = &[
+        (&["--with"], "--with needs a package name"),
+        (&["--with", "-x"], "--with needs a package name (got '-x')"),
+        (
+            &["--with", "core"],
+            "--with core names the shard's own package",
+        ),
+        (
+            &["--with", "ok", "--with", "ok"],
+            "--with ok is given twice",
+        ),
+        (
+            &["--with", "nosuch"],
+            "--with nosuch: 0 manifests under crates/ name that package",
+        ),
+        (
+            &["--with", "dup"],
+            "--with dup: 2 manifests under crates/ name that package",
+        ),
+        (&["--bogus"], "unknown option '--bogus'"),
+        (
+            &["crates/core", "crates/core"],
+            "a second package directory",
+        ),
+        (
+            &["--with", "ut1"],
+            "--with ut1: crates/fx/ut1/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "ut2"],
+            "--with ut2: crates/fx/ut2/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "ut3"],
+            "--with ut3: crates/fx/ut3/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "ut4"],
+            "--with ut4: crates/fx/ut4/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "dc1"],
+            "--with dc1: crates/fx/dc1/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc2"],
+            "--with dc2: crates/fx/dc2/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc3"],
+            "--with dc3: crates/fx/dc3/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc4"],
+            "--with dc4: crates/fx/dc4/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc5"],
+            "--with dc5: crates/fx/dc5/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc6"],
+            "--with dc6: crates/fx/dc6/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "ex"],
+            "--with ex: in crates/fx/ex/Cargo.toml, a [[example]] has `test = true`",
+        ),
+        (
+            &["--with", "be"],
+            "--with be: in crates/fx/be/Cargo.toml, a [[bench]] has `test = true`",
+        ),
+        (
+            &["--with", "lp"],
+            "--with lp: in crates/fx/lp/Cargo.toml, its [lib] path is outside src/",
+        ),
+        (
+            &["--with", "tt"],
+            "--with tt: crates/fx/tt/Cargo.toml declares a [[test]] target",
+        ),
+        (
+            &["--with", "nm"],
+            "--with nm: crates/fx/nm/tests/sub/main.rs is a test target",
+        ),
+        (
+            &["--with", "bn"],
+            "--with bn: in crates/fx/bn/Cargo.toml, a [[bin]] lacks `test = false`",
+        ),
+        (
+            &["--with", "nt"],
+            "--with nt: crates/fx/nt/tests does not exist",
+        ),
+        (
+            &["--with", "et"],
+            "--with et: crates/fx/et/tests holds no *.rs files",
+        ),
+        (
+            &["--with", "col"],
+            "--with col: tests/b.rs shares its name with crates/core/tests/b.rs",
+        ),
+    ];
+    for shell in shard_script_shells() {
+        for (extra, message) in cases {
+            let args: Vec<&str> = ["--list", "core", "1", "4"]
+                .iter()
+                .chain(extra.iter())
+                .copied()
+                .collect();
+            let (code, stdout, stderr) = run_with_tree(&shell, root, &args, &[]);
+            assert!(
+                code == Some(2) && stdout.is_empty() && stderr.contains(message),
+                "{} {args:?}: expected exit 2 and {message:?}, got {code:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                shell.display()
+            );
+        }
+        // Shard 0 carries `--lib`, which cargo would hand to the extra.
+        let (code, _, stderr) = run_with_tree(
+            &shell,
+            root,
+            &["--list", "core", "0", "4", "--with", "ok"],
+            &[],
+        );
+        assert!(
+            code == Some(2) && stderr.contains("--with on shard 0"),
+            "{}: {code:?} {stderr}",
+            shell.display()
+        );
+    }
+}
+
+/// Each workflow `ci_test_shard.sh` run line that carries `--with`, run with
+/// `--list` on each leg its step's condition selects, names each `--with`
+/// package in order with every one of its `tests/*.rs`, read off the disk, and
+/// adds no `--lib`. The packages each job passes are written out here, so a
+/// line that drops one fails, and so does a job with a second `--with` line.
+#[cfg(unix)]
+#[test]
+fn every_workflow_with_line_brings_every_test_file_of_its_packages() {
+    let members = packages_with_tests();
+    let mut seen: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for text in pr_blocking_workflow_texts().values() {
+        for (job, block) in jobs_of(text) {
+            let Some(legs) = shard_matrices(&block).into_iter().next() else {
+                continue;
+            };
+            for step in step_blocks(&block) {
+                let script = run_script_of(&step).unwrap_or_default();
+                for line in script.lines() {
+                    let Some(at) = line.find("ci_test_shard.sh ") else {
+                        continue;
+                    };
+                    let args = shell_args(&line[at + "ci_test_shard.sh ".len()..]);
+                    if args.len() < 3 || args[0].starts_with('-') {
+                        continue;
+                    }
+                    let extras: Vec<String> = args
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--with")
+                        .map(|pair| pair[1].clone())
+                        .collect();
+                    if extras.is_empty() {
+                        continue;
+                    }
+                    let cond = step_if_of(&step).expect("a readable step condition");
+                    let selected = shard_step_legs(cond.as_deref(), &legs).expect("a leg selector");
+                    assert!(
+                        !selected.is_empty(),
+                        "{job}: a `--with` step runs on no leg"
+                    );
+                    for leg in &selected {
+                        let mut list = vec!["--list".to_string(), args[0].clone(), leg.clone()];
+                        list.extend(args[2..].iter().cloned());
+                        for shell in shard_script_shells() {
+                            let out = std::process::Command::new(&shell)
+                                .arg(repo_root().join("tools/scripts/ci_test_shard.sh"))
+                                .args(&list)
+                                .current_dir(repo_root())
+                                .env_remove("CI_SELECTED_PACKAGES")
+                                .env_remove("CI_TEST_SHARD_ARCHIVE")
+                                .output()
+                                .expect("run tools/scripts/ci_test_shard.sh --list");
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            assert!(
+                                out.status.success(),
+                                "{} {list:?}: {}",
+                                shell.display(),
+                                String::from_utf8_lossy(&out.stderr)
+                            );
+                            let got: Vec<&str> = stdout.lines().collect();
+                            assert!(!got.contains(&"--lib"), "{list:?} carries --lib:\n{stdout}");
+                            let mut after = 0usize;
+                            for package in &extras {
+                                let dir = members
+                                    .get(package)
+                                    .unwrap_or_else(|| {
+                                        panic!("`--with {package}` names no member with tests")
+                                    })
+                                    .join("tests");
+                                let mut files: Vec<String> = std::fs::read_dir(&dir)
+                                    .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                                    .map(|entry| entry.expect("a directory entry").path())
+                                    .filter(|path| {
+                                        path.is_file()
+                                            && path.extension().is_some_and(|ext| ext == "rs")
+                                    })
+                                    .map(|path| {
+                                        path.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .expect("a stem")
+                                            .to_owned()
+                                    })
+                                    .collect();
+                                files.sort();
+                                let at = got
+                                    .windows(2)
+                                    .position(|pair| pair == ["-p", package.as_str()])
+                                    .unwrap_or_else(|| {
+                                        panic!("no `-p {package}` in {list:?}:\n{stdout}")
+                                    });
+                                assert!(at >= after, "`-p {package}` is out of order:\n{stdout}");
+                                let mut named: Vec<String> = got[at + 2..]
+                                    .chunks(2)
+                                    .take_while(|pair| pair[0] == "--test")
+                                    .map(|pair| pair[1].to_owned())
+                                    .collect();
+                                after = at + 2 + 2 * named.len();
+                                named.sort();
+                                assert_eq!(named, files, "{} {list:?} {package}", shell.display());
+                            }
+                            assert_eq!(
+                                after,
+                                got.len(),
+                                "arguments after the last package:\n{stdout}"
+                            );
+                        }
+                    }
+                    assert!(
+                        seen.insert(job.clone(), extras).is_none(),
+                        "{job}: a second `--with` line; each job passes its extras on one step"
+                    );
+                }
+            }
+        }
+    }
+    let expected: BTreeMap<String, Vec<String>> = [
+        (
+            "test-linux",
+            &["node_macro_ui", "test_node_macro_cdylib"][..],
+        ),
+        (
+            "test-macos",
+            &["node_macro_ui", "test_node_macro_cdylib"][..],
+        ),
+    ]
+    .into_iter()
+    .map(|(job, extras)| {
+        (
+            job.to_string(),
+            extras.iter().map(|e| e.to_string()).collect(),
+        )
+    })
+    .collect();
+    assert_eq!(
+        seen, expected,
+        "the `--with` packages each job's shard step passes"
+    );
+}
+
+/// Every `binary_id(=<package>::<binary>)` in `.config/nextest.toml` names a
+/// `tests/<binary>.rs` of a member: a renamed file would leave the override
+/// matching nothing, and nextest would say nothing.
+#[test]
+fn every_nextest_binary_id_names_a_test_file() {
+    let config = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
+        .expect("read .config/nextest.toml");
+    let members = packages_with_tests();
+    let mut checked = 0usize;
+    for line in config.lines() {
+        let code = line.split('#').next().unwrap_or("");
+        let mut rest = code;
+        while let Some(at) = rest.find("binary_id(=") {
+            rest = &rest[at + "binary_id(=".len()..];
+            let end = rest.find(')').expect("a closing parenthesis");
+            let id = &rest[..end];
+            let (package, binary) = id
+                .split_once("::")
+                .unwrap_or_else(|| panic!("`{id}` is not <package>::<binary>"));
+            let dir = members.get(package).unwrap_or_else(|| {
+                panic!("`{id}` names `{package}`, which is no member with tests")
+            });
+            assert!(
+                dir.join("tests").join(format!("{binary}.rs")).is_file(),
+                "`{id}` names {}/tests/{binary}.rs, which does not exist",
+                dir.display()
+            );
+            checked += 1;
+            rest = &rest[end..];
+        }
+    }
+    assert!(
+        checked >= 1,
+        "no binary_id(=...) in .config/nextest.toml was read"
     );
 }
 
@@ -1865,28 +2538,258 @@ fn shell_args(tail: &str) -> Vec<String> {
 fn the_ci_shard_matrix_agrees_with_the_shard_count_argument() {
     let texts = pr_blocking_workflow_texts();
 
-    let mut invocations = 0usize;
+    let mut sharded_jobs: BTreeSet<String> = BTreeSet::new();
     for (file, text) in &texts {
         // PER JOB. File-global collection let ONE job's correct matrix vouch
         // for a sibling job that declared none — and a shard invocation whose
         // job has no matrix runs with an empty `matrix.shard`, i.e. nothing.
         for (job, block) in jobs_of(text) {
-            invocations += check_shard_invocations(file, &job, &block);
+            if check_shard_invocations(file, &job, &block) > 0 {
+                sharded_jobs.insert(job);
+            }
         }
     }
 
     // BOTH sharded jobs: `test-linux` (4) and `test-macos` (3) run on every
     // pull request; each carries the job-level `if: ${{ !cancelled() }}` that
     // `job_is_gated` above treats as no gate, so the walk reaches both and each
-    // one's matrix is checked against its OWN count. The
-    // floor is 2 rather than 1, so losing either job's shard step (which would
-    // leave the other vouching for the pair) fails here instead of passing
-    // quietly.
-    assert!(
-        invocations >= 2,
-        "expected the sharded core step in BOTH `test-linux` and `test-macos`, found \
-         {invocations} shard invocation(s); this gate would be vacuous"
+    // one's matrix is checked against its OWN count. The jobs are named, not
+    // counted: each job runs its shard in more than one step (shard 2 has a
+    // step of its own), so a count of invocations stays high with one job's
+    // steps all gone.
+    let expected: BTreeSet<String> = ["test-linux", "test-macos"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(
+        sharded_jobs, expected,
+        "the jobs that run `ci_test_shard.sh` are not exactly `test-linux` and `test-macos`"
     );
+}
+
+/// The legs of `legs` a step runs on, read from its `if:`: no condition is
+/// every leg, `matrix.shard == K` is leg K and `matrix.shard != K` every leg
+/// but K, the terms joined by `&&`. The `code` gate ([`SELECTION_CODE_IF`]) is
+/// true or false for every leg alike, so it selects no leg and is passed over.
+/// Any other term is unreadable here, and so is a literal no leg carries.
+fn shard_step_legs(cond: Option<&str>, legs: &[String]) -> Result<BTreeSet<String>, String> {
+    let mut out: BTreeSet<String> = legs.iter().cloned().collect();
+    let Some(cond) = cond else {
+        return Ok(out);
+    };
+    let cond = cond.trim();
+    let cond = cond
+        .strip_prefix("${{")
+        .and_then(|c| c.strip_suffix("}}"))
+        .unwrap_or(cond);
+    for term in cond.split("&&") {
+        let term = term.trim();
+        if term == SELECTION_CODE_IF {
+            continue;
+        }
+        let (literal, keep) = if let Some(rest) = term.strip_prefix("matrix.shard ==") {
+            (rest, true)
+        } else if let Some(rest) = term.strip_prefix("matrix.shard !=") {
+            (rest, false)
+        } else {
+            return Err(format!("`{term}` is not a `matrix.shard` leg selector"));
+        };
+        let literal = literal.trim().trim_matches(['\'', '"']);
+        if !legs.iter().any(|leg| leg == literal) {
+            return Err(format!("`{term}` names no leg of {legs:?}"));
+        }
+        out.retain(|leg| (leg == literal) == keep);
+    }
+    Ok(out)
+}
+
+/// Every leg of one sharded job runs each package's shard step exactly once,
+/// and each `--with` package rides exactly one leg: the steps that run
+/// `ci_test_shard.sh <package> ...` are read with the legs their `if:`
+/// selects, a leg that runs a package's shard twice or never is named, and so
+/// is a `--with` package that rides no leg or more than one. Returns the
+/// complaints and how many shard steps were read.
+fn shard_leg_complaints(job: &str, block: &str) -> (Vec<String>, usize) {
+    let mut complaints = Vec::new();
+    let Some(legs) = shard_matrices(block).into_iter().next() else {
+        return (complaints, 0);
+    };
+    let mut runs: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut rides: BTreeMap<String, usize> = BTreeMap::new();
+    let mut steps = 0usize;
+    for step in step_blocks(block) {
+        let script = run_script_of(&step).unwrap_or_default();
+        let mut packages: Vec<String> = Vec::new();
+        let mut extras: Vec<String> = Vec::new();
+        for line in script.lines() {
+            let Some(at) = line.find("ci_test_shard.sh ") else {
+                continue;
+            };
+            let args = shell_args(&line[at + "ci_test_shard.sh ".len()..]);
+            let Some(package) = args.first().filter(|a| !a.starts_with('-')) else {
+                continue;
+            };
+            packages.push(package.clone());
+            extras.extend(
+                args.windows(2)
+                    .filter(|pair| pair[0] == "--with")
+                    .map(|pair| pair[1].clone()),
+            );
+        }
+        if packages.is_empty() {
+            continue;
+        }
+        steps += 1;
+        let cond = match step_if_of(&step) {
+            Ok(cond) => cond,
+            Err(why) => {
+                complaints.push(format!("{job}: {why}"));
+                continue;
+            }
+        };
+        let selected = match shard_step_legs(cond.as_deref(), &legs) {
+            Ok(selected) => selected,
+            Err(why) => {
+                complaints.push(format!("{job}: a shard step's condition: {why}"));
+                continue;
+            }
+        };
+        for package in packages {
+            let per_leg = runs.entry(package).or_default();
+            for leg in &selected {
+                *per_leg.entry(leg.clone()).or_default() += 1;
+            }
+        }
+        for extra in extras {
+            *rides.entry(extra).or_default() += selected.len();
+        }
+    }
+    for (package, per_leg) in &runs {
+        for leg in &legs {
+            let n = per_leg.get(leg).copied().unwrap_or(0);
+            if n != 1 {
+                complaints.push(format!(
+                    "{job}: leg {leg} runs the `{package}` shard {n} time(s), not once"
+                ));
+            }
+        }
+    }
+    for (extra, n) in &rides {
+        if *n != 1 {
+            complaints.push(format!("{job}: `--with {extra}` rides {n} leg(s), not one"));
+        }
+    }
+    (complaints, steps)
+}
+
+/// On every pull request, each sharded job's legs run the `cerulion_core`
+/// shard once each: shard 2 runs it in a step of its own, so the conditions
+/// that split the legs between the steps are what decides it.
+#[test]
+fn every_shard_leg_runs_each_shard_step_once() {
+    let mut complaints = Vec::new();
+    let mut steps = 0usize;
+    for text in pr_blocking_workflow_texts().values() {
+        for (job, block) in jobs_of(text) {
+            let (mut c, n) = shard_leg_complaints(&job, &block);
+            complaints.append(&mut c);
+            steps += n;
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+    assert!(
+        steps >= 4,
+        "read {steps} shard step(s); `test-linux` and `test-macos` run two each"
+    );
+}
+
+/// The leg rule on synthetic jobs: the shipped split reads clean, a typo that
+/// runs one leg twice and another never is named, and so is a deleted step.
+#[test]
+fn a_shard_leg_run_twice_or_never_is_named() {
+    let job = |steps: &str| {
+        format!(
+            "  t:\n    strategy:\n      matrix:\n        shard: [0, 1, 2, 3]\n    steps:\n{steps}"
+        )
+    };
+    let step = |cond: &str, extra: &str| {
+        format!(
+            "      - name: s\n{cond}        run: ./tools/scripts/ci_test_shard.sh core ${{{{ matrix.shard }}}} 4{extra}\n"
+        )
+    };
+    let not2 = step("        if: matrix.shard != 2\n", "");
+    let is2 = step("        if: matrix.shard == 2\n", " --with x");
+    let is3 = step("        if: matrix.shard == 3\n", " --with x");
+    let all = step("", "");
+    let not23 = step("        if: matrix.shard != 2 && matrix.shard != 3\n", "");
+    let is2x = step("        if: ${{ matrix.shard == 2 }}\n", " --with x");
+    let is3q = step("        if: matrix.shard == '3'\n", " --with x");
+    let not3 = step("        if: matrix.shard != 3\n", "");
+    let not2_code = step(
+        &format!("        if: matrix.shard != 2 && {SELECTION_CODE_IF}\n"),
+        "",
+    );
+    let is2_code = step(
+        &format!("        if: matrix.shard == 2 && {SELECTION_CODE_IF}\n"),
+        " --with x",
+    );
+    let rows: &[(String, &[&str])] = &[
+        (job(&format!("{not2}{is2}")), &[]),
+        // The `code` gate beside a leg selector, as `test-macos` spells it,
+        // selects no leg; any other spelling of it is still unreadable.
+        (job(&format!("{not2_code}{is2_code}")), &[]),
+        (
+            job(&step(
+                "        if: matrix.shard != 2 && needs.changes.outputs.code != 'false'\n",
+                "",
+            )),
+            &["t: a shard step's condition: `needs.changes.outputs.code != 'false'` is not a `matrix.shard` leg selector"],
+        ),
+        (job(&all), &[]),
+        (
+            job(&format!("{not2}{is3}")),
+            &[
+                "t: leg 2 runs the `core` shard 0 time(s), not once",
+                "t: leg 3 runs the `core` shard 2 time(s), not once",
+            ],
+        ),
+        (
+            job(&not2),
+            &["t: leg 2 runs the `core` shard 0 time(s), not once"],
+        ),
+        (
+            job(&format!("{all}{is2}")),
+            &["t: leg 2 runs the `core` shard 2 time(s), not once"],
+        ),
+        (
+            job(&step("        if: matrix.shard == 7\n", "")),
+            &["t: a shard step's condition: `matrix.shard == 7` names no leg of [\"0\", \"1\", \"2\", \"3\"]"],
+        ),
+        (
+            job(&step("        if: always()\n", "")),
+            &["t: a shard step's condition: `always()` is not a `matrix.shard` leg selector"],
+        ),
+        // Two leg selectors joined by `&&`, the `${{ }}` form and a quoted
+        // literal read like the bare forms.
+        (job(&format!("{not23}{is2x}{is3q}")), &["t: `--with x` rides 2 leg(s), not one"]),
+        (job(&format!("{not3}{is3q}")), &[]),
+        // A `--with` package on two legs runs its suite twice; on none, never.
+        (
+            job(&format!("{not2}{is2}{is3}")),
+            &[
+                "t: leg 3 runs the `core` shard 2 time(s), not once",
+                "t: `--with x` rides 2 leg(s), not one",
+            ],
+        ),
+        (
+            job(&step("        if: ''\n", "")),
+            &["t: an empty `if:` value: `if: ''` and `if: \"\"` are valid YAML and mean NOTHING at all"],
+        ),
+    ];
+    for (text, want) in rows {
+        let (got, _) = shard_leg_complaints("t", text);
+        assert_eq!(got, *want, "for job:\n{text}");
+    }
 }
 
 /// Check every `ci_test_shard.sh <package> <index> <count>` invocation in ONE
@@ -2036,8 +2939,12 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .map(|(name, _)| name)
         .collect();
     // The cdylib feature is required to compile the node context migration
-    // cases; required Linux and macOS shards run this fixture's lib harness.
-    let allowed = BTreeSet::from(["test_node_macro_cdylib"]);
+    // cases: this fixture's integration test checks the refused shape and runs
+    // the binaries built from the accepted ones. node_macro_ui is the
+    // #[cerulion_node] diagnostics suite (trybuild plus the compile-pass
+    // binaries). Both run in the cerulion_core shard step on shard 2 of the
+    // required Linux and macOS jobs (`ci_test_shard.sh --with`).
+    let allowed = BTreeSet::from(["test_node_macro_cdylib", "node_macro_ui"]);
     let unexpected: Vec<_> = fixtures
         .iter()
         .filter(|name| !allowed.contains(name.as_str()))
@@ -3029,6 +3936,249 @@ fn every_package_named_in_one_step_is_credited() {
     assert!(workflows_name(&build_only, "buildonly").is_none());
 }
 
+/// `cargo nextest run` credits its packages like `cargo test` does, and a
+/// command that runs none of a package's unit or integration tests credits
+/// nothing: `--doc` runs only doctests, `--no-run` runs no test, and `list` /
+/// `archive` are not runs. Each row is `(line, package, credited?)`, written by
+/// hand.
+#[test]
+fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
+    const ROWS: &[(&str, &str, bool)] = &[
+        // nextest, in every package spelling the cargo form takes.
+        (
+            "        run: cargo nextest run --profile ci -p alpha -E 'not kind(lib)'",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "gamma",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "delta",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "epsilon",
+            true,
+        ),
+        // The whole-token rule holds for nextest too.
+        ("        run: cargo nextest run -p alphab", "alpha", false),
+        // nextest subcommands that run nothing.
+        ("        run: cargo nextest list -p alpha", "alpha", false),
+        (
+            "        run: cargo nextest archive -p alpha --archive-file a.tar.zst",
+            "alpha",
+            false,
+        ),
+        // A step's `name:` is a label, not an invocation.
+        ("      - name: cargo nextest run -p alpha", "alpha", false),
+        ("        name: cargo test -p alpha", "alpha", false),
+        // Steps that run none of the package's ordinary tests.
+        ("        run: cargo test -p alpha --doc", "alpha", false),
+        ("        run: cargo test --doc -p alpha", "alpha", false),
+        ("        run: cargo test -p alpha --no-run", "alpha", false),
+        ("        run: cargo nextest run -p alpha --no-run", "alpha", false),
+        // What follows a bare `--` goes to the test binaries, not to cargo.
+        (
+            "        run: cargo test -p alpha -- --exact -p beta",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        ("        run: cargo test -p alpha -- --doc", "alpha", true),
+        // Each shell command is read on its own: a `--doc` command does not
+        // cancel the run beside it, and a `-p` of a build command is not a test.
+        (
+            "        run: cargo test -p alpha --lib && cargo test -p alpha --doc",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc && cargo nextest run -p alpha",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha && cargo build -p beta",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cd examples/x && cargo test -p alpha --lib -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p alpha || cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "alpha",
+            false,
+        ),
+        // A `;` glued to a word still ends the command.
+        (
+            "        run: cargo build -p alpha; cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha; cargo build -p beta",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p x && ./tools/scripts/ci_test_shard.sh alpha 0 4",
+            "alpha",
+            true,
+        ),
+    ];
+    let wrong: Vec<String> = ROWS
+        .iter()
+        .filter(|(line, pkg, credited)| line_runs_tests_of(line, pkg) != *credited)
+        .map(|(line, pkg, credited)| format!("  `{line}` credits `{pkg}`: expected {credited}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the test-line reader disagrees with the hand oracle:\n{}",
+        wrong.join("\n")
+    );
+
+    // End to end through the gate's own lookup: a package whose ONLY step is a
+    // doctest run is uncovered.
+    let doc_only: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "      - run: cargo test -p doconly --doc\n".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&doc_only, "doconly").is_none());
+
+    // A `\` continuation belongs to the command it continues, so a flag on
+    // the next line counts, and so does a package named there.
+    let continued: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "        run: |\n          cargo test -p norun \\\n            --no-run\n          \
+         cargo nextest run --profile ci \\\n            -p later\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&continued, "norun").is_none());
+    assert!(workflows_name(&continued, "later").is_some());
+
+    // A `\` followed by a space escapes the space and continues nothing, and
+    // a comment is never continued.
+    assert_eq!(
+        logical_lines(["cargo test -p a \\ ", "--no-run"]),
+        vec!["cargo test -p a \\ ".to_string(), "--no-run".to_string()]
+    );
+    assert_eq!(
+        logical_lines(["# note \\", "cargo test -p a"]),
+        vec!["# note \\".to_string(), "cargo test -p a".to_string()]
+    );
+}
+
+/// A `ci_test_shard.sh` run credits its own package and each `--with` package,
+/// by whole token, and a line that runs no shard credits neither. Each row is
+/// `(line, package, credited?)`, written by hand.
+#[test]
+fn a_shard_line_credits_its_package_and_each_with_package() {
+    const ROWS: &[(&str, &str, bool)] = &[
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha ${{ matrix.shard }} 4 --with beta",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha ${{ matrix.shard }} 4 --with beta",
+            "beta",
+            true,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 --with beta --with gamma",
+            "gamma",
+            true,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 crates/a --with beta",
+            "beta",
+            true,
+        ),
+        (
+            "            2) python3 -B tools/scripts/ci_built_tests.py phase alpha -- ./tools/scripts/ci_test_shard.sh alpha ${{ matrix.shard }} 4 --with beta ;;",
+            "beta",
+            true,
+        ),
+        // Whole tokens: a longer name does not credit its prefix, and the
+        // script takes `--with <package>` only, never `--with=<package>`.
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 --with betax",
+            "beta",
+            false,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 --with=beta",
+            "beta",
+            false,
+        ),
+        // The package of the shard is the first argument, not any later one.
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 beta",
+            "beta",
+            false,
+        ),
+        // A mode that runs nothing credits nothing.
+        (
+            "        run: args=$(./tools/scripts/ci_test_shard.sh --list alpha 2 4 --with beta)",
+            "beta",
+            false,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh --selected beta",
+            "beta",
+            false,
+        ),
+        // `--with` belongs to the command it is on.
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4; echo --with beta",
+            "beta",
+            false,
+        ),
+        ("      - name: ci_test_shard.sh alpha 2 4 --with beta", "beta", false),
+    ];
+    let wrong: Vec<String> = ROWS
+        .iter()
+        .filter(|(line, pkg, credited)| line_runs_tests_of(line, pkg) != *credited)
+        .map(|(line, pkg, credited)| format!("  `{line}` credits `{pkg}`: expected {credited}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the shard-line reader disagrees with the hand oracle:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// The `shard:` matrix is read in BOTH YAML list forms, and per JOB.
 #[test]
 fn the_shard_matrix_is_read_in_both_yaml_forms_and_per_job() {
@@ -3896,6 +5046,9 @@ fn a_gated_step_without_its_marker_is_a_red_walker() {
 /// own.
 const GUARD_CALL: &str = "!cancelled()";
 const GUARD_CALL_AND: &str = "!cancelled() && ";
+/// The condition that runs a job on every outcome of its dependencies and on a
+/// cancelled run, so it gates no event either.
+const ALWAYS_CALL: &str = "always()";
 
 /// One condition as a single normalised expression: the `${{ }}` wrapper off,
 /// runs of whitespace down to one space.
@@ -3914,12 +5067,13 @@ fn condition_expression(cond: &str) -> String {
 /// Does this job condition keep the job running when a job it `needs:` FAILED?
 ///
 /// Exactly `!cancelled()`, or `!cancelled()` as the FIRST term of an `&&`
-/// chain, which is `deb-smoke`'s shape. Nothing else: `success() &&
-/// !cancelled()` carries the call and still skips on a failed dependency,
-/// which is the whole fault.
+/// chain, which is `deb-smoke`'s shape, or exactly `always()`, which also runs
+/// the job on a cancelled run and is the aggregator `Lint`'s shape. Nothing
+/// else: `success() && !cancelled()` carries the call and still skips on a
+/// failed dependency, which is the whole fault.
 fn condition_survives_a_failed_dependency(cond: &str) -> bool {
     let expr = condition_expression(cond);
-    expr == GUARD_CALL || expr.starts_with(GUARD_CALL_AND)
+    expr == GUARD_CALL || expr == ALWAYS_CALL || expr.starts_with(GUARD_CALL_AND)
 }
 
 /// Every dependant of the classifier that does NOT guard itself against the
@@ -3989,7 +5143,7 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
         complaints.is_empty(),
         "these jobs depend on the `{SELECTION_JOB}` job, or gate a step on the \
          selection, and their job-level `if:` does not open with \
-         `{GUARD_CALL}`:\n{}\n\nGitHub skips a dependant of a FAILED job and a \
+         `{GUARD_CALL}` (or read exactly `{ALWAYS_CALL}`):\n{}\n\nGitHub skips a dependant of a FAILED job and a \
          skipped required context reads as satisfied, so without the guard a \
          classifier failure is a silent green around every context these jobs \
          report. `{JOB_IF_NOT_CANCELLED}` is the shape a job with no gate of its \
@@ -3999,9 +5153,11 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
     );
     assert!(
         guarded >= 6,
-        "only {guarded} job(s) carry the guard: every job that gates steps on \
-         the selection needs it, and so does every dependant reporting a \
-         required context, so either the reader is broken or a guard is gone"
+        "only {guarded} job(s) carry exactly `{JOB_IF_NOT_CANCELLED}`: every job \
+         that gates steps on the selection opens its condition with the guard, \
+         and so does every dependant reporting a required context other than \
+         the `{ALWAYS_CALL}` aggregator, so either the reader is broken or a \
+         guard is gone"
     );
     // The population is not empty, so an emptied reader is not a pass. Five
     // jobs of `ci.yml` need the classifier today.
@@ -4044,7 +5200,7 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     // A condition that OPENS with the call keeps the job running when the
     // classifier failed, so it satisfies THIS rule; whether such a job is
     // PR-blocking is the separate question `job_is_gated` decides, pinned by
-    // `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+    // `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
     assert_eq!(
         jobs_missing_the_not_cancelled_guard(&job(
             "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
@@ -4133,16 +5289,424 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     );
 }
 
-/// A job carrying exactly `!cancelled()` still credits its packages, and one
-/// carrying any other job-level condition still does not.
+/// The one `runs-on:` value that may read the classifier: macOS where `code` is
+/// `true`, Linux on every other value.
+///
+/// Spelled from [`SELECTION_CODE_IF`], so the runner choice and the step gate
+/// compare the same output the same way. The empty string a FAILED classifier
+/// leaves behind is not `'true'`, so it picks the Linux side, where every
+/// `code` gate is false and a marker's `fromJSON('')` reds the leg.
+fn routed_runs_on() -> String {
+    format!("${{{{ {SELECTION_CODE_IF} && 'macos-latest' || 'ubuntu-latest' }}}}")
+}
+
+/// The `runs-on:` value of one job block, read in every scalar form.
+fn job_runs_on_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    runs-on:"))?;
+    let rest = &lines[at]["    runs-on:".len()..];
+    Some(read_scalar_value(
+        "runs-on",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// Is this step condition false whenever the classifier selected no package?
+///
+/// Yes for an `&&` chain with no top-level `||` and one top-level term that is
+/// the `code` gate or a per-package gate: the classifier reports `pkgs=[]`
+/// whenever it reports `code=false`, so either term is false there and so is
+/// the chain. A status call beside it (`always()`, `failure()`) does not change
+/// that. A top-level `||` answers no, and so does a parenthesised disjunction
+/// holding the gate: either one can run the step on a change that reaches no
+/// package.
+fn condition_skips_an_empty_selection(cond: &str) -> bool {
+    let expr = condition_expression(cond);
+    if split_top_level(&expr, "||").len() != 1 {
+        return false;
+    }
+    split_top_level(&expr, "&&").iter().any(|term| {
+        let term = strip_outer_parens(term);
+        term == SELECTION_CODE_IF || selection_condition_package(term).is_some()
+    })
+}
+
+/// Is this step condition exactly a selection marker's, the negated
+/// per-package gate and nothing else?
+fn is_selection_marker_condition(cond: &str) -> bool {
+    marked_candidates(cond)
+        .iter()
+        .any(|package| cond.trim() == selection_marker_condition(package))
+}
+
+/// Does this marker step do nothing but print, so that running it on the Linux
+/// leg of a code-free change runs nothing written for another runner?
+///
+/// No `uses:`, and a `run:` script of exactly one `echo` command once a block
+/// scalar header is set aside: no command separator, pipe or substitution on
+/// that line. The marker rule elsewhere holds the line to its `selection:`
+/// text; this holds the step to that one command.
+fn marker_step_only_prints(step: &[&str]) -> bool {
+    if step_carries_key(step, "uses:") {
+        return false;
+    }
+    let script = run_script_of(step).unwrap_or_default();
+    let lines: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !matches!(*line, "" | "|" | "|-" | "|+" | ">" | ">-" | ">+"))
+        .collect();
+    lines.len() == 1
+        && lines[0].starts_with("echo ")
+        && !lines[0].contains([';', '&', '|', '`'])
+        && !lines[0].contains("$(")
+}
+
+/// Every complaint about a job of `text` whose `runs-on:` reads another job's
+/// output, and how many such jobs `text` carries.
+///
+/// Such a job lands on Linux for a change that reaches no package, so a step
+/// left ungated there runs a step written for macOS on the wrong runner, or a
+/// test against a build that never ran. And when the classifier FAILED, a leg
+/// is red only where some condition reaches `fromJSON('')`: a marker reaches
+/// it on every leg, and without one a leg whose per-package gates all sit
+/// behind another leg's selector skips every step and reports green.
+fn routed_job_complaints(text: &str) -> (usize, Vec<String>) {
+    let jobs = jobs_of(text);
+    let declared = declared_selection_outputs(&jobs);
+    let mut routed = 0usize;
+    let mut out = Vec::new();
+    for (job, block) in &jobs {
+        let runs_on = match job_runs_on_of(block) {
+            None => continue,
+            Some(Ok(value)) => value,
+            Some(Err(why)) => {
+                out.push(format!("{job}: {why}"));
+                continue;
+            }
+        };
+        if !runs_on.contains("needs.") {
+            continue;
+        }
+        routed += 1;
+        if runs_on.trim() != routed_runs_on() {
+            out.push(format!(
+                "{job}: `runs-on: {runs_on}` reads another job's output, and the \
+                 one form this walk reads is `{}`",
+                routed_runs_on()
+            ));
+        }
+        let needs_classifier = job_needs_of(block).iter().any(|n| n == SELECTION_JOB);
+        for output in [SELECTION_CODE_OUTPUT, SELECTION_PKGS_OUTPUT] {
+            if !(needs_classifier && declared.contains(output)) {
+                out.push(format!(
+                    "{job}: routes its runner on the classifier and cannot read \
+                     `needs.{SELECTION_JOB}.outputs.{output}`: it does not need \
+                     `{SELECTION_JOB}`, or that job does not produce it"
+                ));
+            }
+        }
+        let mut markers = 0usize;
+        for step in step_blocks(block) {
+            let name = step_name_of(&step)
+                .or_else(|| step.first().map(|line| line.trim().to_string()))
+                .unwrap_or_default();
+            match step_if_of(&step) {
+                Ok(Some(cond)) if is_selection_marker_condition(&cond) => {
+                    if marker_step_only_prints(&step) {
+                        markers += 1;
+                    } else {
+                        out.push(format!(
+                            "{job} / `{name}`: a selection marker runs on the Linux \
+                             leg of a change that reaches no package, so it may do \
+                             nothing but print its one `echo` line"
+                        ));
+                    }
+                }
+                Ok(Some(cond)) if condition_skips_an_empty_selection(&cond) => {}
+                Ok(Some(cond)) => out.push(format!(
+                    "{job} / `{name}`: `if: {cond}` can run the step on the Linux \
+                     leg of a change that reaches no package; carry \
+                     `{SELECTION_CODE_IF}` as a top-level `&&` term"
+                )),
+                Ok(None) => out.push(format!(
+                    "{job} / `{name}`: carries no `if:`, so it runs on the Linux \
+                     leg of a change that reaches no package"
+                )),
+                Err(why) => out.push(format!("{job} / `{name}`: {why}")),
+            }
+        }
+        if markers == 0 {
+            out.push(format!(
+                "{job}: carries no selection marker, so when the classifier \
+                 FAILED a leg whose per-package gates sit behind another leg's \
+                 selector reaches no `fromJSON('')` and reports green"
+            ));
+        }
+    }
+    (routed, out)
+}
+
+/// The live workflows: every job routed on the classifier holds the rule.
 #[test]
-fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking() {
+fn a_job_routed_on_the_code_class_gates_every_step_and_keeps_a_marker() {
+    let mut complaints = Vec::new();
+    let mut routed = 0usize;
+    for (file, text) in workflow_texts() {
+        let (jobs, found) = routed_job_complaints(&text);
+        routed += jobs;
+        complaints.extend(found.into_iter().map(|c| format!("  {file} / {c}")));
+    }
+    assert!(
+        complaints.is_empty(),
+        "a job whose runner follows the classifier breaks the routing rule:\n{}",
+        complaints.join("\n")
+    );
+    // The rule is satisfied by finding nothing, so the population is floored:
+    // `test-macos` routes on `code`.
+    assert!(
+        routed >= 1,
+        "no job's `runs-on:` reads the classifier, so the routing rule judged \
+         nothing; `test-macos` should carry `{}`",
+        routed_runs_on()
+    );
+}
+
+/// The routing rule, both sides, on synthetic workflows.
+#[test]
+fn a_routed_job_is_named_for_an_ungated_step_a_missing_marker_or_another_route() {
+    let route = "${{ needs.changes.outputs.code == 'true' && 'macos-latest' || 'ubuntu-latest' }}";
+    let classifier = "on:\n  pull_request:\njobs:\n  changes:\n    runs-on: ubuntu-latest\n    \
+                      outputs:\n      code: ${{ steps.c.outputs.code }}\n      \
+                      pkgs: ${{ steps.c.outputs.pkgs }}\n    steps:\n      - id: c\n        \
+                      run: |\n          echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n          \
+                      echo \"pkgs=[]\" >> \"$GITHUB_OUTPUT\"\n";
+    let marker = "      - name: selection marker, beta\n        \
+                  if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'beta') }}\n        \
+                  run: echo \"selection: skipped beta (selected: x)\"\n";
+    let clean_steps = "      - uses: actions/checkout@v4\n        \
+                       if: needs.changes.outputs.code == 'true'\n      \
+                       - name: alpha tests\n        \
+                       if: matrix.shard == 0 && needs.changes.outputs.code == 'true'\n        \
+                       run: cargo test -p alpha\n      \
+                       - name: beta tests\n        \
+                       if: contains(fromJSON(needs.changes.outputs.pkgs), 'beta')\n        \
+                       run: cargo test -p beta\n      \
+                       - name: save\n        if: >-\n          matrix.shard == 0\n          \
+                       && (env.A == 'all' || contains(env.A, 'x'))\n          \
+                       && needs.changes.outputs.code == 'true'\n        run: true\n      \
+                       - name: upload\n        \
+                       if: always() && needs.changes.outputs.code == 'true'\n        run: true\n";
+    let workflow = |needs: &str, runs_on: &str, steps: &str| {
+        format!(
+            "{classifier}  j:\n{needs}    if: ${{{{ !cancelled() }}}}\n    runs-on: {runs_on}\n    \
+             strategy:\n      matrix:\n        shard: [0, 1]\n    steps:\n{steps}"
+        )
+    };
+    let needs = "    needs: [changes]\n";
+    let with_step = |extra: &str| workflow(needs, route, &format!("{clean_steps}{extra}{marker}"));
+
+    let (routed, found) =
+        routed_job_complaints(&workflow(needs, route, &format!("{clean_steps}{marker}")));
+    assert_eq!(routed, 1, "the routed job is judged");
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "a fully gated routed job passes"
+    );
+
+    // A job that does not route is not judged, whatever its steps carry.
+    let stray = "      - name: stray\n        run: true\n";
+    let (routed, found) = routed_job_complaints(&workflow(
+        needs,
+        "macos-latest",
+        &format!("{clean_steps}{stray}"),
+    ));
+    assert_eq!(
+        (routed, found.len()),
+        (0, 0),
+        "a fixed runner owes nothing: {found:?}"
+    );
+
+    // Every step shape that can run on the Linux leg of a code-free change.
+    for (label, extra) in [
+        ("no condition", stray.to_string()),
+        ("a status call alone", "      - name: stray\n        if: ${{ always() }}\n        run: true\n".to_string()),
+        (
+            "the gate behind a top-level `||`",
+            "      - name: stray\n        \
+             if: matrix.shard == 0 || needs.changes.outputs.code == 'true'\n        run: true\n"
+                .to_string(),
+        ),
+        (
+            "a near miss of the gate",
+            "      - name: stray\n        if: needs.changes.outputs.code != 'false'\n        run: true\n"
+                .to_string(),
+        ),
+        (
+            "the gate inside a parenthesised disjunction",
+            "      - name: stray\n        \
+             if: (needs.changes.outputs.code == 'true' || github.event_name == 'push')\n        \
+             run: true\n"
+                .to_string(),
+        ),
+        (
+            "a leg selector alone",
+            "      - name: stray\n        if: matrix.shard == 1\n        run: true\n".to_string(),
+        ),
+        (
+            "the gate ahead of a top-level `||`",
+            "      - name: stray\n        \
+             if: needs.changes.outputs.code == 'true' && matrix.shard == 0 || github.event_name == 'push'\n        \
+             run: true\n"
+                .to_string(),
+        ),
+        (
+            "a marker that also builds",
+            "      - name: stray\n        \
+             if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'gamma') }}\n        \
+             run: |\n          echo \"selection: skipped gamma (selected: x)\"\n          \
+             cargo build --workspace\n"
+                .to_string(),
+        ),
+        (
+            "a marker that is an action",
+            "      - name: stray\n        \
+             if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'gamma') }}\n        \
+             uses: actions/checkout@v4\n"
+                .to_string(),
+        ),
+        (
+            "a marker whose one line chains another command",
+            "      - name: stray\n        \
+             if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'gamma') }}\n        \
+             run: echo \"selection: skipped gamma (selected: x)\"; cargo build --workspace\n"
+                .to_string(),
+        ),
+        (
+            "an unreadable condition",
+            "      - name: stray\n        if: ''\n        run: true\n".to_string(),
+        ),
+    ] {
+        let (routed, found) = routed_job_complaints(&with_step(&extra));
+        assert_eq!(routed, 1, "{label}: the routed job is judged");
+        assert_eq!(found.len(), 1, "{label}: exactly the stray step is named: {found:?}");
+        assert!(found[0].contains("`stray`"), "{label}: the complaint names the step: {found:?}");
+    }
+
+    // No marker. This fixture's own `beta` gate carries no leg selector, so it
+    // would still red every leg; the rule asks for a marker regardless, because
+    // the next gate added behind a leg selector would leave the other legs
+    // with no `fromJSON('')` to reach.
+    let (_, found) = routed_job_complaints(&workflow(needs, route, clean_steps));
+    assert_eq!(
+        found.len(),
+        1,
+        "a routed job without a marker is named: {found:?}"
+    );
+    assert!(found[0].contains("no selection marker"), "{found:?}");
+
+    // Another spelling over the same output. This one routes every value the
+    // same way, and it is still refused: the walk reads one spelling, so a
+    // route it has not been taught fails here rather than passing unread.
+    let inverted =
+        "${{ needs.changes.outputs.code != 'true' && 'ubuntu-latest' || 'macos-latest' }}";
+    let (routed, found) = routed_job_complaints(&workflow(
+        needs,
+        inverted,
+        &format!("{clean_steps}{marker}"),
+    ));
+    assert_eq!(routed, 1, "an inverted route is still a route");
+    assert_eq!(found.len(), 1, "the inverted route is named: {found:?}");
+    assert!(found[0].contains("the one form"), "{found:?}");
+
+    // A route on outputs the job cannot read: no `needs:` on the classifier.
+    let (_, found) = routed_job_complaints(&workflow("", route, &format!("{clean_steps}{marker}")));
+    assert_eq!(
+        found.len(),
+        2,
+        "both unreadable outputs are named: {found:?}"
+    );
+    assert!(found.iter().all(|c| c.contains("cannot read")), "{found:?}");
+
+    // A `runs-on:` the scalar reader cannot read is named, never skipped as a
+    // job that does not route.
+    let (routed, found) =
+        routed_job_complaints(&workflow(needs, "''", &format!("{clean_steps}{marker}")));
+    assert_eq!(routed, 0, "an unread runner is not counted as a route");
+    assert_eq!(found.len(), 1, "the unreadable runner is named: {found:?}");
+    assert!(found[0].contains("runs-on"), "{found:?}");
+}
+
+/// The classifier reports `pkgs=[]` beside `code=false`, which is what lets a
+/// per-package gate stand in for the `code` gate in a routed job.
+///
+/// Run on the code-free changes the routing exists for, written out by hand: a
+/// root markdown file no doc-pin marker names, a guide under `.github/`, and
+/// the empty change. Each one stays below the selector, so no cargo resolve is
+/// involved.
+#[test]
+fn a_code_free_change_selects_no_package() {
+    let script = repo_root().join("tools/scripts/ci_changed_paths.sh");
+    for paths in ["AGENTS.md\n", ".github/CONTRIBUTING.md\n", ""] {
+        let mut child = std::process::Command::new(&script)
+            .current_dir(repo_root())
+            .env("GITHUB_EVENT_NAME", "pull_request")
+            .env("CI_SELECTION", "on")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("running tools/scripts/ci_changed_paths.sh");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("the classifier's stdin is piped")
+                .write_all(paths.as_bytes())
+                .expect("writing the changed paths");
+        }
+        let out = child.wait_with_output().expect("the classifier exits");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the classifier failed on {paths:?}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.contains(&"code=false") && lines.contains(&"pkgs=[]"),
+            "{paths:?} reaches no package, so the classifier must report `code=false` \
+             beside `pkgs=[]`; it reported:\n{stdout}"
+        );
+    }
+}
+
+/// A job carrying exactly `!cancelled()` or `always()` still credits its
+/// packages, and so does a job that needs it; one carrying any other job-level
+/// condition still does not.
+#[test]
+fn the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking() {
     let body = "    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
     let with = format!("  j:\n    if: {JOB_IF_NOT_CANCELLED}\n{body}");
     let without = format!("  j:\n{body}");
+    let always = format!("  j:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n{body}");
+    let after_always = format!(
+        "  agg:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n    steps:\n      - run: true\n  \
+         j:\n    needs: [agg]\n{body}"
+    );
     let other = format!("  j:\n    if: github.event_name == 'push'\n{body}");
 
-    for (name, text) in [("guarded", &with), ("ungated", &without)] {
+    for (name, text) in [
+        ("guarded", &with),
+        ("ungated", &without),
+        ("always", &always),
+        ("needs-an-always", &after_always),
+    ] {
         assert!(
             pr_blocking_jobs(text).contains("cargo test -p alpha"),
             "the {name} job must stay in the PR-blocking view"
@@ -4173,7 +5737,7 @@ const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
 /// keeps its name and its script and stops running on a pull request, which is
 /// the one property the step exists for.
 const SHARD_CHECK_WORKFLOW: &str = "ci.yml";
-const SHARD_CHECK_JOB: &str = "lint";
+const SHARD_CHECK_JOB: &str = "lint-gates";
 
 /// Is this run script the shipped invocation, WHOLE?
 ///
@@ -4282,8 +5846,9 @@ fn shard_check_complaints_in(texts: &BTreeMap<String, String>) -> Vec<String> {
         .collect()
 }
 
-/// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
-/// under a named step, with the invocation the script documents.
+/// The shard check runs on every pull request, in the `lint-gates` job of
+/// `ci.yml` (a part of the required `Lint`), under a named step, with the
+/// invocation the script documents.
 ///
 /// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
 /// proof that the partition is total and disjoint AND the hand table its
@@ -4329,7 +5894,7 @@ fn the_shard_check_rule_reads_the_main_workflow_and_no_other() {
     };
 
     // (a) THE STEP IN ANOTHER WORKFLOW COVERS NOTHING. `release.yml` carries
-    //     it in a job named `lint` with the shipped shape, so a rule that
+    //     it in a job named like the shard-check job, with the shipped shape, so a rule that
     //     searched every file would read it and pass; the file this rule reads
     //     carries no such step, and that is what is said.
     let elsewhere = tree(Some(bare), &carrying);
@@ -4453,7 +6018,7 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
          {complaints:?}"
     );
 
-    // The job id alone is not the rule: `lint` behind an event test is still a
+    // The job id alone is not the rule: the shard-check job behind an event test is still a
     // job the check does not run in on a pull request.
     let gated = format!(
         "jobs:\n  {SHARD_CHECK_JOB}:\n    if: github.event_name != 'pull_request'\n    \
@@ -4972,7 +6537,7 @@ fn events_a_job_skips(block: &str, triggers: &BTreeSet<String>) -> Vec<Skip> {
         ),
     };
     let expr = condition_expression(&cond);
-    let tail = if expr == GUARD_CALL {
+    let tail = if expr == GUARD_CALL || expr == ALWAYS_CALL {
         String::new()
     } else if let Some(tail) = expr.strip_prefix(GUARD_CALL_AND) {
         tail.to_string()
@@ -5180,18 +6745,59 @@ struct RequiredJobWalk {
     dependants: usize,
     /// Which required contexts a job of this workflow reports by name.
     produced: BTreeSet<String>,
+    /// How many jobs are judged because a required job needs them.
+    needed: usize,
+}
+
+/// The ids of the jobs a required context depends on: every job that `needs:`
+/// reaches, transitively, from a job in `required`. A required aggregator such
+/// as `Lint` reports its parts' results under its own name, so a part is held
+/// to the same rules as the job that reports it.
+fn jobs_required_jobs_need(
+    jobs: &[(String, String)],
+    required: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<String> = required.iter().cloned().collect();
+    while let Some(id) = frontier.pop() {
+        let Some((_, block)) = jobs.iter().find(|(name, _)| *name == id) else {
+            continue;
+        };
+        for need in job_needs_of(block) {
+            let exists = jobs.iter().any(|(name, _)| *name == need);
+            if exists && !required.contains(&need) && reached.insert(need.clone()) {
+                frontier.push(need);
+            }
+        }
+    }
+    reached
 }
 
 /// Walk one workflow: pair every job name against the required contexts, then
 /// measure the job's own condition, its steps' conditions and its `needs:` set
-/// against the workflow's triggers.
+/// against the workflow's triggers. A job a required job `needs:` (see
+/// [`jobs_required_jobs_need`]) is measured the same way.
 fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> RequiredJobWalk {
     let triggers = workflow_trigger_events(file, text);
     let mut walk = RequiredJobWalk::default();
-    for (job, block) in jobs_of(text) {
+    let all_jobs = jobs_of(text);
+    let mut required_ids: BTreeSet<String> = BTreeSet::new();
+    for (job, block) in &all_jobs {
+        let name = job_reported_name(job, block);
+        let legs = job_matrix_legs(block);
+        if contexts
+            .iter()
+            .any(|context| name_produces_context(&name, context, &legs).unwrap_or(true))
+        {
+            required_ids.insert(job.clone());
+        }
+    }
+    let needed = jobs_required_jobs_need(&all_jobs, &required_ids);
+    walk.needed = needed.len();
+    for (job, block) in all_jobs {
         let name = job_reported_name(&job, &block);
         let legs = job_matrix_legs(&block);
-        let mut paired = false;
+        let mut paired = needed.contains(&job);
         for context in contexts {
             let produces = name_produces_context(&name, context, &legs).unwrap_or_else(|why| {
                 panic!(
@@ -5264,7 +6870,8 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
             if !guarded {
                 walk.unguarded.push(format!(
                     "  {file} / {job} (\"{name}\") needs {needs:?} and its \
-                     job-level `if:` does not open with `{GUARD_CALL}`"
+                     job-level `if:` does not open with `{GUARD_CALL}` or read \
+                     exactly `{ALWAYS_CALL}`"
                 ));
             }
         }
@@ -5288,6 +6895,402 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
         }
     }
     walk
+}
+
+/// The transitive walk over `needs:`, on a hand-written job list: every job a
+/// required job reaches is returned once, through chains and around a cycle,
+/// a required job is never returned as needed, and a need naming no job adds
+/// nothing.
+#[test]
+fn the_jobs_a_required_job_needs_are_found_through_every_chain() {
+    let text = "jobs:\n  r:\n    needs: [a, r2]\n    steps: []\n  \
+                r2:\n    needs: [b, ghost]\n    steps: []\n  \
+                a:\n    needs: [c]\n    steps: []\n  \
+                b:\n    steps: []\n  \
+                c:\n    needs: [a]\n    steps: []\n  \
+                lone:\n    needs: [r]\n    steps: []\n";
+    let jobs = jobs_of(text);
+    assert_eq!(jobs.len(), 6, "the fixture parses into six jobs: {jobs:?}");
+    let required: BTreeSet<String> = ["r", "r2"].iter().map(|s| s.to_string()).collect();
+    let needed = jobs_required_jobs_need(&jobs, &required);
+    let want: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        needed, want,
+        "`a` and `b` directly, `c` through `a`, the cycle back to `a` once, \
+         `r2` not at all (it is required), `ghost` not at all (no such job), \
+         `lone` not at all (it needs a required job, no required job needs it)"
+    );
+    let none: BTreeSet<String> = BTreeSet::new();
+    assert!(
+        jobs_required_jobs_need(&jobs, &none).is_empty(),
+        "with no required job nothing is needed"
+    );
+}
+
+/// The jobs `Lint` reports: its three parts.
+const LINT_PARTS: &[&str] = &["lint-clippy", "lint-fmt", "lint-gates"];
+
+/// `Lint` is an aggregator: it needs every part, runs when one failed, and its
+/// one step fails unless every part SUCCEEDED. The step hands each part's
+/// result to its script as one environment variable, and the script is run
+/// here with bash alone over each result a part can carry, so a check that
+/// read `skipped` or `cancelled` as passing, ignored a part, or passed a part
+/// missing from `needs` (an empty result) is a red.
+#[cfg(unix)]
+#[test]
+fn the_lint_aggregator_fails_unless_every_part_succeeded() {
+    let texts = workflow_texts();
+    let text = texts.get("ci.yml").expect("ci.yml is readable");
+    let jobs = jobs_of(text);
+    let (_, block) = jobs
+        .iter()
+        .find(|(id, _)| id == "lint")
+        .expect("ci.yml has a `lint` job");
+    assert_eq!(
+        job_reported_name("lint", block),
+        "Lint",
+        "the aggregator must report the required context `Lint`"
+    );
+    let mut needs = job_needs_of(block);
+    needs.sort();
+    assert_eq!(needs, LINT_PARTS, "`Lint` must need exactly its parts");
+    assert!(
+        matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL),
+        "`Lint` must carry `${{{{ {ALWAYS_CALL} }}}}` so a failed part and a cancelled run \
+         still run it"
+    );
+    for part in LINT_PARTS {
+        let (_, part_block) = jobs
+            .iter()
+            .find(|(id, _)| id == part)
+            .unwrap_or_else(|| panic!("ci.yml has no `{part}` job"));
+        assert!(
+            job_if_of(part_block).is_none() && job_needs_of(part_block).is_empty(),
+            "`{part}` must carry no job condition and no needs, so it runs on every event"
+        );
+    }
+    let steps = step_blocks(block);
+    assert_eq!(steps.len(), 1, "`Lint` runs one step, the check");
+    // Each part's result reaches the script as `VAR: ${{ needs.<part>.result }}`
+    // in the step's `env:`, one variable per part and every part once.
+    let mut result_vars: Vec<(String, String)> = Vec::new();
+    for line in &steps[0] {
+        if !line.contains("needs.") || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (var, value) = line
+            .trim()
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("`Lint` reads `needs` outside its `env:`: {line:?}"));
+        let part = value
+            .strip_prefix("${{ needs.")
+            .and_then(|rest| rest.strip_suffix(".result }}"))
+            .unwrap_or_else(|| {
+                panic!("`Lint` must hand a part's result alone to an env var: {line:?}")
+            });
+        result_vars.push((part.to_string(), var.to_string()));
+    }
+    result_vars.sort();
+    let parts_read: Vec<&str> = result_vars.iter().map(|(part, _)| part.as_str()).collect();
+    assert_eq!(
+        parts_read, LINT_PARTS,
+        "`Lint` must read the result of every part, once each"
+    );
+    let script = run_script_of(&steps[0]).expect("the check has a `run:` script");
+    // `run_script_of` keeps the text after `run:` on its first line, which for a
+    // literal block is the `|` indicator, not a command.
+    let script = match script.split_once('\n') {
+        Some((head, body)) if head.trim() == "|" => body.to_string(),
+        _ => script,
+    };
+
+    // Runs the script with every part succeeded except the one `failing` names,
+    // whose variable carries the given result, or is left unset for `None`.
+    let run = |failing: Option<(&str, Option<&str>)>| -> bool {
+        let mut command = std::process::Command::new("bash");
+        command.arg("-c").arg(&script);
+        for (part, var) in &result_vars {
+            match failing {
+                Some((bad_part, bad)) if bad_part == part.as_str() => match bad {
+                    Some(result) => command.env(var, result),
+                    None => command.env_remove(var),
+                },
+                _ => command.env(var, "success"),
+            };
+        }
+        command
+            .output()
+            .expect("bash runs the aggregator's check")
+            .status
+            .success()
+    };
+    assert!(run(None), "three successes pass");
+    // An empty result is what GitHub hands over for a part missing from `needs`.
+    for bad in ["failure", "cancelled", "skipped", ""] {
+        for part in LINT_PARTS {
+            assert!(
+                !run(Some((*part, Some(bad)))),
+                "`{part}` ending `{bad}` must red `Lint`"
+            );
+        }
+    }
+    for part in LINT_PARTS {
+        assert!(
+            !run(Some((*part, None))),
+            "`{part}` with no result variable set must red `Lint`"
+        );
+    }
+}
+
+/// The parts list the merge-queue watchdog reads beside
+/// [`REQUIRED_CONTEXTS_FILE`]: `<part job name>|<required context>` per row.
+const REQUIRED_PARTS_FILE: &str = "tools/ci/required_parts.txt";
+
+/// The rows of one parts text as `(part, context)`, empty and `#` rows
+/// skipped, as the watchdog skips them; or the first row that is not
+/// `<name>|<name>` with bare names, a row carrying a carriage return, or a part
+/// listed twice.
+///
+/// The watchdog matches each name exactly against a job's name, so a name with
+/// a blank at an end, a `\r` a CRLF file leaves, or a second `|` is a row no job
+/// can match, and the watchdog refuses each of them.
+fn required_parts_of(where_from: &str, raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (n, line) in raw.split('\n').enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let row = n + 1;
+        if line.contains('\r') {
+            return Err(format!(
+                "{where_from}:{row}: `{line:?}` carries a carriage return"
+            ));
+        }
+        let (part, context) = line
+            .split_once('|')
+            .ok_or_else(|| format!("{where_from}:{row}: `{line}` carries no `|`"))?;
+        if context.contains('|') {
+            return Err(format!("{where_from}:{row}: `{line}` carries a second `|`"));
+        }
+        for name in [part, context] {
+            if name.is_empty() || name != name.trim() {
+                return Err(format!(
+                    "{where_from}:{row}: `{line}` has an empty name or a name with a blank at an end"
+                ));
+            }
+        }
+        if out.iter().any(|(seen, _)| seen == part) {
+            return Err(format!(
+                "{where_from}:{row}: the part `{part}` is listed twice"
+            ));
+        }
+        out.push((part.to_string(), context.to_string()));
+    }
+    Ok(out)
+}
+
+/// The parts reader takes the committed shape and refuses every row the
+/// watchdog refuses for its form.
+#[test]
+fn a_required_parts_row_is_read_strictly() {
+    assert_eq!(
+        required_parts_of("t", "# a comment\n\nA (x)|A\nA (y)|A\n"),
+        Ok(vec![
+            ("A (x)".to_string(), "A".to_string()),
+            ("A (y)".to_string(), "A".to_string())
+        ])
+    );
+    for (bad, why) in [
+        ("A (x)", "carries no `|`"),
+        ("A (x)|A|A", "carries a second `|`"),
+        ("|A", "an empty name"),
+        ("A (x)|", "an empty name"),
+        ("A (x) |A", "a blank at an end"),
+        ("A (x)| A", "a blank at an end"),
+        ("A (x)|A\nA (x)|B", "is listed twice"),
+        ("   ", "carries no `|`"),
+        ("A (x)|A\r\n", "carries a carriage return"),
+    ] {
+        match required_parts_of("t", bad) {
+            Err(message) => assert!(
+                message.contains(why),
+                "{bad:?} must be refused for {why:?}, not: {message}"
+            ),
+            Ok(rows) => panic!("the parts reader must refuse {bad:?}, read {rows:?}"),
+        }
+    }
+}
+
+/// The parts list is exactly the jobs every required aggregate needs, both
+/// ways.
+///
+/// A `ci.yml` job that reports a required context under a job-level `always()`
+/// is an aggregate, and its check fails unless every job it needs succeeded
+/// (`the_lint_aggregator_fails_unless_every_part_succeeded` runs `Lint`'s over
+/// every shape). The merge-queue watchdog cancels a batch on a failed part
+/// minutes before the aggregate reports, so a part added to `needs` without a
+/// row is a part whose failure waits for the aggregate, and a row naming no
+/// part cancels a batch on a job its context never reads. Only `ci.yml` is
+/// read: the watchdog reads that workflow's run alone.
+#[test]
+fn the_required_parts_list_is_every_need_of_a_required_aggregate() {
+    let texts = workflow_texts();
+    let text = texts.get("ci.yml").expect("ci.yml is readable");
+    let required: BTreeSet<String> = required_contexts().into_iter().collect();
+    let jobs = jobs_of(text);
+    let mut want: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut aggregates = 0usize;
+    for (id, block) in &jobs {
+        let context = job_reported_name(id, block);
+        let aggregate = required.contains(&context)
+            && matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL);
+        if !aggregate {
+            continue;
+        }
+        aggregates += 1;
+        for need in job_needs_of(block) {
+            let (_, need_block) = jobs
+                .iter()
+                .find(|(job, _)| *job == need)
+                .unwrap_or_else(|| panic!("`{id}` needs `{need}`, which ci.yml does not define"));
+            let part = job_reported_name(&need, need_block);
+            assert!(
+                !part.contains("${{")
+                    && !need_block.lines().any(|l| l.starts_with("    strategy:")),
+                "`{need}` is a matrix job or reports a name built from an expression \
+                 ({part}): GitHub renders its name per run, and this walk cannot derive \
+                 the names the parts list would have to carry"
+            );
+            // A part that can skip reds its aggregate (the check reads `skipped`
+            // as a failure), while the watchdog reads a skipped part as no
+            // failure, so its cancel waits for the aggregate to report.
+            assert!(
+                job_if_of(need_block).is_none() && job_needs_of(need_block).is_empty(),
+                "`{need}`, a part of `{context}`, carries a job condition or `needs:`, so \
+                 it can skip and red `{context}` with no part failure, and the cancel \
+                 waits for `{context}` to report"
+            );
+            want.insert((part, context.clone()));
+        }
+    }
+    assert!(
+        aggregates >= 1,
+        "no job of ci.yml reports a required context under a job-level `{ALWAYS_CALL}`: \
+         `Lint` does, so the walk is no longer finding it"
+    );
+    let path = repo_root().join(REQUIRED_PARTS_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let got: BTreeSet<(String, String)> = required_parts_of(&path.display().to_string(), &raw)
+        .unwrap_or_else(|why| panic!("{why}"))
+        .into_iter()
+        .collect();
+    let missing: Vec<_> = want.difference(&got).collect();
+    let extra: Vec<_> = got.difference(&want).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "{REQUIRED_PARTS_FILE} must list exactly the jobs each required aggregate \
+         needs, as `<part job name>|<required context>`: missing {missing:?}, \
+         naming no part {extra:?}"
+    );
+}
+
+/// The longest `timeout-minutes` a job-level `always()` job may carry.
+const ALWAYS_JOB_MAX_MINUTES: u32 = 5;
+
+/// The jobs whose job-level condition is exactly `always()` and that check out
+/// the tree, run cargo, or carry no `timeout-minutes` of at most
+/// [`ALWAYS_JOB_MAX_MINUTES`]. The time limit bounds the runner time however
+/// the work is spelled; the checkout and cargo markers name the usual cause.
+fn always_jobs_that_do_work(text: &str) -> Vec<String> {
+    jobs_of(text)
+        .into_iter()
+        .filter(|(_, block)| {
+            matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL)
+        })
+        .filter(|(_, block)| {
+            let short = block.lines().any(|line| {
+                line.strip_prefix("    timeout-minutes:")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .is_some_and(|minutes| minutes <= ALWAYS_JOB_MAX_MINUTES)
+            });
+            !short
+                || block.contains("actions/checkout@")
+                || step_blocks(block)
+                    .iter()
+                    .any(|step| run_script_of(step).is_some_and(|run| run.contains("cargo ")))
+        })
+        .map(|(job, _)| job)
+        .collect()
+}
+
+/// A job-level `always()` sits only on a short job that checks out and builds
+/// nothing. The guard rules accept `always()`, and GitHub does not cancel a
+/// running job whose condition is `always()`, so a test shard behind it would
+/// keep its runner through every superseded push and every cancel.
+#[test]
+fn a_job_level_always_sits_only_on_a_short_job_that_builds_nothing() {
+    let mut carriers = 0usize;
+    let mut complaints: Vec<String> = Vec::new();
+    for (file, text) in workflow_texts() {
+        carriers += jobs_of(&text)
+            .iter()
+            .filter(|(_, block)| {
+                matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL)
+            })
+            .count();
+        for job in always_jobs_that_do_work(&text) {
+            complaints.push(format!("  {file} / {job}"));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs carry `{ALWAYS_CALL}` and check out the tree, run cargo or \
+         carry no `timeout-minutes` of at most {ALWAYS_JOB_MAX_MINUTES}:\n{}\n\nA \
+         running `{ALWAYS_CALL}` job is not cancelled with its run, so it holds its \
+         runner after every superseded push. Use `{JOB_IF_NOT_CANCELLED}`, which \
+         also runs the job when a dependency failed.",
+        complaints.join("\n")
+    );
+    assert!(
+        carriers >= 1,
+        "no job carries `{ALWAYS_CALL}`: the `Lint` aggregator does, so the reader \
+         is no longer finding it"
+    );
+    let job = |steps: &str| {
+        format!(
+            "jobs:\n  j:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n    timeout-minutes: 5\n    \
+             steps:\n{steps}"
+        )
+    };
+    assert_eq!(
+        always_jobs_that_do_work(&job(
+            "      - uses: actions/checkout@v4\n      - run: echo ok\n"
+        )),
+        vec!["j".to_string()],
+        "a checkout is work"
+    );
+    assert_eq!(
+        always_jobs_that_do_work(&job("      - run: cargo test -p alpha\n")),
+        vec!["j".to_string()],
+        "a cargo step is work"
+    );
+    assert!(
+        always_jobs_that_do_work(&job("      - run: echo ok\n")).is_empty(),
+        "a step that reads results is not"
+    );
+    let unbounded = job("      - run: echo ok\n").replace("    timeout-minutes: 5\n", "");
+    assert_eq!(
+        always_jobs_that_do_work(&unbounded),
+        vec!["j".to_string()],
+        "a job with no time limit is held to the default six hours"
+    );
+    let long = job("      - run: echo ok\n").replace("timeout-minutes: 5", "timeout-minutes: 6");
+    assert_eq!(
+        always_jobs_that_do_work(&long),
+        vec!["j".to_string()],
+        "a limit above {ALWAYS_JOB_MAX_MINUTES} minutes is refused"
+    );
 }
 
 /// No job reporting a required context can skip: not on an event its own
@@ -5323,6 +7326,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
     let mut pull_request_only_steps = 0usize;
     let mut all_pull_request_only_jobs = 0usize;
     let mut dependants = 0usize;
+    let mut needed = 0usize;
     let mut produced: BTreeSet<String> = BTreeSet::new();
     for (file, text) in workflow_texts() {
         let walk = walk_required_context_jobs(&file, &text, &contexts);
@@ -5336,6 +7340,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         pull_request_only_steps += walk.pull_request_only_steps;
         all_pull_request_only_jobs += walk.all_pull_request_only_jobs;
         dependants += walk.dependants;
+        needed += walk.needed;
         produced.extend(walk.produced);
     }
     assert!(
@@ -5376,16 +7381,16 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         triggers.join("\n")
     );
     // The populations are not empty, so a reader that pairs nothing is not a
-    // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names,
-    // all thirteen carry steps, and six of them list a `needs:` set.
+    // pass: eleven jobs of ci.yml and three of leak-guard.yml carry these
+    // names, all fourteen carry steps, and six of them list a `needs:` set.
     assert!(
-        judged >= 13,
-        "only {judged} job(s) carry a name that produces a required context: \
-         the rules above are judging a population the reader is no longer \
-         finding"
+        judged >= 18,
+        "only {judged} job(s) carry a name that produces a required context \
+         or are needed by one: the rules above are judging a population the \
+         reader is no longer finding"
     );
     assert!(
-        step_judged >= 13,
+        step_judged >= 18,
         "only {step_judged} judged job(s) carry steps: the step rule is judging \
          a population the reader is no longer finding"
     );
@@ -5408,6 +7413,17 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         dependants >= 6,
         "only {dependants} judged job(s) list a `needs:` set: the guard rule is \
          judging a population the reader is no longer finding"
+    );
+    // `Lint` reports its three parts' results, and `period-park`, both test
+    // shard jobs, `crate-tests` and `viz-tests` need the path classifier
+    // `changes`, so those four jobs are judged too: the `judged` and
+    // `step_judged` floors above count them beside the fourteen jobs that
+    // carry a required name.
+    assert!(
+        needed >= 4,
+        "only {needed} job(s) are judged because a required job needs them: \
+         the three parts of `Lint` and `changes` are, so the transitive walk \
+         is no longer finding them"
     );
     // And the export is not stale in the other direction: a context no job
     // reports by name is a context nothing can ever red.
@@ -6428,4 +8444,199 @@ fn all_workflow_texts() -> BTreeMap<String, String> {
     }
     assert!(!out.is_empty(), "no workflow files under {}", dir.display());
     out
+}
+
+// ---------------------------------------------------------------------------
+// The harness path rule, per path and per event, and the harness job.
+// ---------------------------------------------------------------------------
+
+/// The job id of the job that checks the `harness/` folder.
+const HARNESS_JOB: &str = "harness";
+
+/// What one classifier run printed: the `selection: reason=` token and every
+/// `<class>=<value>` line, by class name.
+#[cfg(unix)]
+struct ClassifierAnswer {
+    reason: String,
+    classes: BTreeMap<String, String>,
+}
+
+/// `tools/scripts/ci_changed_paths.sh` on `paths`, with the event and the
+/// switch set explicitly, so the job environment of a CI run reaches neither.
+#[cfg(unix)]
+fn run_classifier(event: &str, switch: &str, paths: &[&str]) -> ClassifierAnswer {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let script = repo_root().join("tools/scripts/ci_changed_paths.sh");
+    let mut child = Command::new("bash")
+        .arg(&script)
+        .env("GITHUB_EVENT_NAME", event)
+        .env("CI_SELECTION", switch)
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
+    let input: String = paths.iter().map(|p| format!("{p}\n")).collect();
+    child
+        .stdin
+        .take()
+        .expect("the classifier's stdin is piped")
+        .write_all(input.as_bytes())
+        .unwrap_or_else(|e| panic!("writing the changed paths to the classifier: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("waiting for the classifier: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "[{event} {switch}] {paths:?}: the classifier failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut reason = None;
+    let mut classes = BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some(token) = line.strip_prefix("selection: reason=") {
+            reason = Some(token.to_string());
+        } else if let Some((class, value)) = line.split_once('=') {
+            classes.insert(class.to_string(), value.to_string());
+        }
+    }
+    ClassifierAnswer {
+        reason: reason.unwrap_or_else(|| {
+            panic!("[{event} {switch}] {paths:?}: no `selection: reason=` line in\n{stdout}")
+        }),
+        classes,
+    }
+}
+
+/// The harness path rule, evaluated per path and per event against
+/// hand-written answers.
+///
+/// A harness-only change selects no package on a pull request AND on a merge
+/// group; a harness path beside any other path selects every package; a
+/// `push` or a dispatch selects every package whatever it touched; and the
+/// switch stops the rule on both events it applies to.
+///
+/// Each row is `<event>|<switch>|<paths>|<code>|<pkgs>|<reason>`,
+/// `,` separating paths. `<pkgs>` is `[]`, `every` for the array a `push` run
+/// prints, or a package name: neither of those, and holding that package.
+#[cfg(unix)]
+#[test]
+fn the_harness_path_rule_is_evaluated_per_path_and_per_event() {
+    const ROWS: &[&str] = &[
+        "pull_request|on|harness/install.sh|false|[]|harness",
+        "pull_request|on|harness/install.sh,harness/tests/test_pins.py|false|[]|harness",
+        "pull_request|on|harness/README.md|false|[]|docs:md,harness",
+        "pull_request|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|harness-mixed",
+        "pull_request|on|harness/install.sh,README.md|true|every|harness-mixed",
+        "pull_request|on|harness/Cargo.toml|true|every|workspace-input:Cargo.toml",
+        "pull_request|on|harnessx/install.sh|true|every|unknown-path",
+        "pull_request|on|crates/cerulion_viz/bin/cerulion_vizd/src/harness/mod.rs\
+         |true|cerulion_vizd|crates:cerulion_vizd",
+        "pull_request|on||false|[]|none",
+        "pull_request|off|harness/install.sh|true|every|switch:off",
+        "merge_group|on|harness/install.sh|false|[]|harness",
+        "merge_group|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|event:merge_group",
+        "merge_group|on|crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|event:merge_group",
+        "merge_group|on||true|every|event:merge_group",
+        "merge_group|off|harness/install.sh|true|every|switch:off",
+        "push|on|harness/install.sh|true|every|event:push",
+        "workflow_dispatch|on|harness/install.sh|true|every|event:workflow_dispatch",
+    ];
+
+    // The whole-workspace array, read once off a run every rule answers with
+    // everything, and floored so an empty listing cannot stand in for it.
+    let every = run_classifier("push", "on", &["Cargo.lock"])
+        .classes
+        .get("pkgs")
+        .cloned()
+        .expect("a push run prints `pkgs=`");
+    assert!(
+        every.starts_with('[')
+            && every.matches('"').count() >= 40
+            && every.contains("\"cerulion_core\""),
+        "the every-member array reads `{every}`: the listing is not reaching the workspace"
+    );
+
+    let mut complaints = Vec::new();
+    for row in ROWS {
+        let fields: Vec<&str> = row.split('|').collect();
+        let [event, switch, paths, code, pkgs, reason] = fields[..] else {
+            panic!("the row `{row}` does not carry six fields");
+        };
+        let paths: Vec<&str> = paths.split(',').filter(|p| !p.is_empty()).collect();
+        let got = run_classifier(event, switch, &paths);
+        let class = |name: &str| got.classes.get(name).cloned().unwrap_or_default();
+        let got_pkgs = class("pkgs");
+        let pkgs_ok = match pkgs {
+            "[]" => got_pkgs == "[]",
+            "every" => got_pkgs == every,
+            package => {
+                got_pkgs != "[]"
+                    && got_pkgs != every
+                    && got_pkgs.contains(&format!("\"{package}\""))
+            }
+        };
+        if class("code") != code || !pkgs_ok || got.reason != reason {
+            complaints.push(format!(
+                "  [{event} {switch}] {paths:?}: code={} reason={} pkgs={got_pkgs}; \
+                 wanted code={code} reason={reason} pkgs {pkgs}",
+                class("code"),
+                got.reason
+            ));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "the classifier disagrees with the hand-written rows:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The `harness` job runs its checks on every event: no `needs:`, no job
+/// condition, no matrix and no step condition, so nothing the classifier
+/// answers can skip a check of the folder.
+#[test]
+fn the_harness_job_runs_its_checks_on_every_event() {
+    let texts = workflow_texts();
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+    let job = jobs_of(ci)
+        .into_iter()
+        .find(|(name, _)| name == HARNESS_JOB)
+        .map(|(_, block)| block)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{HARNESS_JOB}` job"));
+
+    assert!(
+        job_if_of(&job).is_none(),
+        "the `{HARNESS_JOB}` job carries a job condition, which can skip it"
+    );
+    assert!(
+        job_needs_of(&job).is_empty(),
+        "the `{HARNESS_JOB}` job lists `needs:`: a failed dependency skips it"
+    );
+    assert!(
+        !job.lines().any(|l| l.trim() == "strategy:"),
+        "the `{HARNESS_JOB}` job carries a matrix: a matrix job reports per-leg names"
+    );
+    let steps = step_blocks(&job);
+    assert!(
+        steps.len() >= 2,
+        "the `{HARNESS_JOB}` job has no check after its checkout"
+    );
+    for step in &steps {
+        assert_eq!(
+            step_if_of(step),
+            Ok(None),
+            "`{}` carries a step condition, which can skip a check",
+            step_name_of(step).unwrap_or_else(|| "<unnamed>".to_string())
+        );
+    }
 }

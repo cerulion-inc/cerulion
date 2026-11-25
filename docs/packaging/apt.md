@@ -1,7 +1,8 @@
 # Cerulion Debian and APT distribution
 
 The Debian package is named `cerulion` and installs the CLI, the three daemon
-binaries, the ROS 2 Jazzy rmw and the heap hook into `/usr/bin`:
+binaries, the ROS 2 Jazzy rmw, the heap hook and the agent harness tree into
+`/usr/bin`:
 
 * `cerulion`
 * `cerulion-netd`
@@ -9,9 +10,11 @@ binaries, the ROS 2 Jazzy rmw and the heap hook into `/usr/bin`:
 * `cerulion-remoted`
 * `librmw_cerulion.so`
 * `libcerulion_heaphook.so`
+* `harness/`, from 2.1.0
 
 Keeping the files together is required because the CLI resolves its siblings
-by its own directory: `cerulion connect` finds `cerulion-connectd` there, and
+by its own directory: `cerulion connect` finds `cerulion-connectd` there, the
+agent harness is read from `harness/` there, and
 `cerulion ros2 run` and `cerulion ros2 launch` find `librmw_cerulion.so` there
 and stage a minimal ament prefix that links it, so ROS 2's rmw discovery never
 sees `/usr/bin` in a path. The same verbs prepend `libcerulion_heaphook.so` to
@@ -79,7 +82,13 @@ missing any of the four rather than producing a package without it.
 
 The production APT repository is served from `apt.cerulion.com`.
 
-Install the signing key and repository:
+The recipe needs `ca-certificates`, `curl` and `gnupg`. Install them first if the machine lacks them:
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
+```
+
+Then install the signing key and repository:
 
 ```bash
 (
@@ -118,15 +127,18 @@ sudo apt-get update && sudo apt-get install cerulion
 )
 ```
 
-The install recipe in the README compares the downloaded keyring against the
-same expected set in the same `printf` form. Both lists change in one commit,
-so a reader of either page installs from the keyring the archive serves.
+Each step runs only if the one before it succeeded: the subshell runs under
+`set -euo pipefail`, and the download, the key inspection and the fingerprint
+check each print an error that names the failed step. The recipe compares
+the keyring's primary key fingerprints with the pinned set before it installs
+the keyring. The README links this recipe for Debian and Ubuntu, so this
+`printf` list is the one expected set a reader installs from.
 
 When a key rotation starts, add the new primary fingerprint as another line
-in the `expected_fingerprints` `printf` list above, and in the README recipe's
-`printf` list, before publishing the overlap keyring. Keep both fingerprints in
-both lists throughout the overlap; remove the outgoing fingerprint from both
-again after the final new-key-only keyring is published.
+in the `expected_fingerprints` `printf` list above before publishing the
+overlap keyring. Keep both fingerprints in the list throughout the overlap;
+remove the outgoing fingerprint again after the final new-key-only keyring is
+published.
 
 This is an apt-native update path: `apt upgrade` brings in new Cerulion
 versions. A machine that installed a bare `.deb` does not receive updates from
@@ -408,9 +420,8 @@ Publish the transition in four stages:
    keyring. Direct A-to-B replacement is refused, so widen from A to A+B first.
    Keep the old fingerprint first in `APT_KEYRING_KEYS` during this stage.
    Before publishing the overlap, add the new fingerprint as a second line
-   in the `expected_fingerprints` list in this document's bootstrap snippet
-   and in the README recipe's `printf` list. Keep both expected fingerprints
-   through the overlap.
+   in the `expected_fingerprints` list in this document's bootstrap snippet.
+   Keep both expected fingerprints through the overlap.
 2. **Inventory only: no publication.** Before removing the old key, perform a mandatory inventory check: verify
    that every client, including clients with `APT::Install-Recommends "false"`,
    has installed the overlap `cerulion-archive-keyring` containing both
@@ -433,8 +444,7 @@ Publish the transition in four stages:
    for `dists/*` invalidation after publishing new-key-signed metadata, then
    publishes and invalidates the narrowed keyring. Remove the outgoing
    fingerprint from the `expected_fingerprints` list in this document's
-   bootstrap snippet, and from the README recipe's `printf` list, after that
-   final publish.
+   bootstrap snippet after that final publish.
 
 Dropping the old key from signing before clients have installed the two-key
 keyring breaks those clients: they cannot use APT to obtain the replacement

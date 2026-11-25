@@ -664,7 +664,7 @@ fn gen_wrapper(
     // instead of inline bounds reported a syntax error it did not contain.
     // (Pre-existing, and independent of the state forwards below: reproduced
     // with those removed. Pinned by the `WhereClauseNode` half of
-    // `tests/ui/pass/generic_node_state_bounds_pass.rs`.)
+    // `crates/test_fixtures/node_macro_ui/tests/ui/pass/generic_node_state_bounds_pass.rs`.)
     let default_where_clause = {
         let existing = where_clause.map(|w| {
             let preds = &w.predicates;
@@ -916,6 +916,15 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 ctx.drain_trigger_input(input_name)
             } else {
                 (0, ::core::option::Option::None)
+            }
+        }
+
+        // Lets the fire tap attribute each tick's commits to its outputs. An
+        // entry without a context (before `init`, after `shutdown`) cannot.
+        fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+            match self.context.as_ref() {
+                ::core::option::Option::Some(ctx) => ctx.output_commit_counts(out),
+                ::core::option::Option::None => false,
             }
         }
 

@@ -34,6 +34,7 @@ use cerulion_core::transport::cerulion_q::{
 use cerulion_core::transport::demand_authorizer::{
     AllowAllAuthorizer, DemandAuthorizer, DemandDecision, DemandSubject,
 };
+use cerulion_core::transport::TeardownWait;
 use cerulion_core::{TransportConfig, TransportManager, WireHeader};
 use cerulion_link::{
     accept_frame_stream, read_frame, write_frame, Connection, DEFAULT_MAX_FRAME_LEN,
@@ -88,15 +89,21 @@ fn local_source(topic: &str, marker: Result<bool, String>) -> Result<(), SourceR
 }
 
 /// Only a local source may be exported under this robot's authorization.
-pub(crate) fn wire_servable(manager: &TransportManager, topic: &str) -> Result<(), SourceRefusal> {
+/// `wait` says whether a mirror or policy marker being torn down is waited
+/// out: a request for one topic waits, a listing filter does not.
+pub(crate) fn wire_servable(
+    manager: &TransportManager,
+    topic: &str,
+    wait: TeardownWait,
+) -> Result<(), SourceRefusal> {
     local_source(
         topic,
         manager
-            .is_network_mirror(topic)
+            .is_network_mirror(topic, wait)
             .map_err(|error| error.to_string()),
     )?;
     if !manager
-        .remote_topic_allowed(topic)
+        .remote_topic_allowed(topic, wait)
         .map_err(|error| SourceRefusal::Excluded(error.to_string()))?
     {
         return Err(SourceRefusal::Excluded(cerulion_core::TransportError::EgressScope {
@@ -883,7 +890,7 @@ async fn handle_request(
                     }
                 }
             };
-            if let Err(refusal) = wire_servable(&manager, &topic) {
+            if let Err(refusal) = wire_servable(&manager, &topic, TeardownWait::Bounded) {
                 let message = refusal.message(&topic);
                 return WireResponse::Error {
                     topic: Some(topic),
@@ -934,7 +941,8 @@ async fn handle_request(
                 .manager()
                 .map_err(|error| error.to_string())
                 .and_then(|manager| {
-                    wire_servable(&manager, &topic).map_err(|refusal| refusal.message(&topic))
+                    wire_servable(&manager, &topic, TeardownWait::Bounded)
+                        .map_err(|refusal| refusal.message(&topic))
                 });
             if let Err(message) = source {
                 return WireResponse::Error {
@@ -954,7 +962,7 @@ async fn handle_request(
                         .manager()
                         .map_err(|error| error.to_string())
                         .and_then(|manager| {
-                            wire_servable(&manager, &topic)
+                            wire_servable(&manager, &topic, TeardownWait::Bounded)
                                 .map_err(|refusal| refusal.message(&topic))
                         }) {
                         Ok(()) => WireResponse::Schema(reply),
@@ -1064,7 +1072,8 @@ async fn build_catalog(
         let per_topic = crate::tap::catalog_peek_budget();
         let rows: Vec<(String, Option<u64>, Option<u32>)> = topics
             .into_iter()
-            .filter(|topic| wire_servable(&manager, topic).is_ok())
+            // A listing filter never waits for a marker being torn down.
+            .filter(|topic| wire_servable(&manager, topic, TeardownWait::Never).is_ok())
             .map(|topic| {
                 let hash = match known.get(&topic) {
                     Some(h) => Some(*h),
@@ -1162,13 +1171,19 @@ mod tests {
         )
         .unwrap();
         for topic in ["/__cerulion", "/__cerulion/observers/x/y"] {
-            assert_eq!(wire_servable(&manager, topic), Err(SourceRefusal::Reserved));
+            assert_eq!(
+                wire_servable(&manager, topic, TeardownWait::Never),
+                Err(SourceRefusal::Reserved)
+            );
             assert_eq!(
                 SourceRefusal::Reserved.message(topic),
                 format!("'{topic}' is in Cerulion's reserved control-plane namespace")
             );
         }
-        assert_eq!(wire_servable(&manager, "/__cerulionx"), Ok(()));
+        assert_eq!(
+            wire_servable(&manager, "/__cerulionx", TeardownWait::Never),
+            Ok(())
+        );
     }
 
     #[test]

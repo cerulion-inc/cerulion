@@ -19,7 +19,8 @@
 //! refusal: `--adopt-take` is refused by both verbs (exit 69,
 //! nothing exec'd) because the `ros2` Python CLI spawns the node as a
 //! grandchild with `close_fds=True`, so the descriptor-bound heap hook
-//! cannot reach it.
+//! cannot reach it. A fourth pins bytes that are not valid UTF-8 reaching
+//! `ros2` as given, in a forwarded argument and in a delivery-log path.
 
 #![cfg(unix)]
 
@@ -45,6 +46,7 @@ const FAKE_ROS2: &str = r#"#!/bin/sh
   echo "ament=$AMENT_PREFIX_PATH"
   echo "ldlp=$LD_LIBRARY_PATH"
   echo "preload=${LD_PRELOAD:-<unset>}"
+  echo "delivery=${CERULION_RMW_DELIVERY_LOG:-<unset>}"
 } > "$CER_TEST_REPORT"
 exit "${CER_TEST_EXIT:-0}"
 "#;
@@ -94,6 +96,10 @@ impl Sandbox {
             // asserted below.
             .env("CERULION_LOGIN_GATE", "off")
             .env_remove("LD_PRELOAD")
+            // An ambient delivery-log variable would refuse or redirect a
+            // `--record-deliveries` arm.
+            .env_remove("CERULION_RMW_DELIVERY_LOG")
+            .env_remove("CERULION_RMW_REPLAY")
             .env_remove("LD_LIBRARY_PATH")
             .env_remove("AMENT_PREFIX_PATH")
             .env_remove("RUST_LOG");
@@ -209,6 +215,40 @@ fn leading_hyphenated_tokens_are_forwarded_verbatim() {
     assert_eq!(
         line(&sb.report_lines(), "argv"),
         "launch -s pkg demo.launch.py"
+    );
+}
+
+/// Bytes that are not valid UTF-8 reach `ros2` as given: a forwarded argument
+/// byte for byte, and a `--record-deliveries` directory in the child's
+/// `CERULION_RMW_DELIVERY_LOG`. Nothing panics.
+#[test]
+fn bytes_that_are_not_utf8_reach_ros2_as_given() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let sb = Sandbox::new();
+    let dir = sb.root.path().join(std::ffi::OsStr::from_bytes(b"caf\xE9"));
+    let out = sb
+        .command(&["ros2", "run", "--record-deliveries"])
+        .arg(&dir)
+        .args(["demo_nodes_cpp", "talker"])
+        .arg(std::ffi::OsStr::from_bytes(b"x\xFF"))
+        .output()
+        .expect("spawn cerulion");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let report = std::fs::read(&sb.report).expect("the fake ros2 must have written its report");
+    let lines: Vec<&[u8]> = report.split(|&b| b == b'\n').collect();
+    assert!(
+        lines.contains(&&b"argv=run demo_nodes_cpp talker x\xFF"[..]),
+        "{:?}",
+        String::from_utf8_lossy(&report)
+    );
+    let mut delivery = b"delivery=".to_vec();
+    delivery.extend_from_slice(dir.as_os_str().as_bytes());
+    assert!(
+        lines.contains(&delivery.as_slice()),
+        "{:?}",
+        String::from_utf8_lossy(&report)
     );
 }
 
