@@ -1,6 +1,6 @@
 # cerulion_cli_engine
 
-Clap delegates; tests never spawn. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: reentrant UNIX flock with wsd; others wait (one warn); no-op elsewhere.
+Clap delegates; bound helper tests. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: reentrant UNIX flock with wsd; others wait (one warn); no-op elsewhere.
 Reads: `acquire_read` creates nothing, refuses same-thread re-entry; all
 refuse symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
 tracked `.gitignore` when creating `.cerulion/`; polls use

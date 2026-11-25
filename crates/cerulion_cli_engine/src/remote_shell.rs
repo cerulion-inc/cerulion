@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Pure argument planning and network refusals for paired remote sessions.
+//! Paired remote-session planning, account selection, and helper invocation.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::connect_cmd::ConnectPlan;
+#[cfg(unix)]
+use crate::connect_cmd::{self, ConnectArgs};
 use crate::error::{CliError, CliResult};
 use crate::graph_cmd::{query_network_kill, query_network_kill_from, QueryNetworkKill};
+#[cfg(unix)]
+use crate::{account_robot_access, account_robots, auth, peer_cache};
 
 /// Exit code when the network kill switch refuses a remote shell operation.
 pub const EXIT_NETWORK_REFUSED: u8 = crate::message_text::EXIT_USAGE;
@@ -139,6 +147,204 @@ fn network_refusal_with(operation: &Operation, kill: QueryNetworkKill) -> Option
         "cerulion {verb} reaches the robot over the network, which {reason} disables; {} to {action}",
         kill.unset_remedy()
     ))
+}
+
+#[cfg(unix)]
+struct AccountSession {
+    directory: account_robots::AccountRobotDirectory,
+    robot: account_robots::AccountRobot,
+}
+
+#[cfg(unix)]
+struct PreparedSession {
+    plan: ConnectPlan,
+    account: Option<AccountSession>,
+}
+
+#[cfg(unix)]
+impl PreparedSession {
+    fn spawn(self, running: Arc<AtomicBool>) -> CliResult<i32> {
+        // Cancel before epoch HTTP as well as before spawning the helper.
+        if !running.load(Ordering::SeqCst) {
+            return Ok(130);
+        }
+        if let Some(account) = &self.account {
+            account.directory.validate_current_login()?;
+            if let Err(error) = account
+                .directory
+                .sync_robot_epoch(&account.robot, account_robot_access::EPOCH_SYNC_BUDGET)
+            {
+                tracing::warn!(
+                    robot = %cerulion_netd::account_access::robot_route(&account.robot.robot_id.0),
+                    error = %crate::topic_cmd::sanitize_refusal_reason(&error.to_string()),
+                    "remote shell revocation refresh did not complete"
+                );
+            }
+            // HTTP uses the saved session; re-read identity after every result.
+            account.directory.validate_current_login()?;
+        }
+        if !running.load(Ordering::SeqCst) {
+            return Ok(130);
+        }
+        connect_cmd::spawn_and_wait(&self.plan, running)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct SelectedAccountRobot {
+    robot: account_robots::AccountRobot,
+    eid: String,
+}
+
+#[cfg(unix)]
+fn set_account_epoch_route(
+    connection: &mut ConnectPlan,
+    robot: &account_robots::AccountRobot,
+) -> CliResult<()> {
+    let route = cerulion_netd::account_access::robot_route(&robot.robot_id.0);
+    if let Some(index) = connection.argv.iter().position(|arg| arg == "--robot-name") {
+        let value = connection.argv.get_mut(index + 1).ok_or_else(|| {
+            CliError::Validation("the connection plan has no value for its robot name".into())
+        })?;
+        *value = route;
+    } else {
+        connection.argv.extend(["--robot-name".into(), route]);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn local_selector(robot: &str) -> CliResult<bool> {
+    if connect_cmd::is_hex_eid(robot) {
+        return Ok(true);
+    }
+    if robot.starts_with("account:") {
+        return Ok(false);
+    }
+    let Some(path) = connect_cmd::robots_toml_path() else {
+        return Ok(false);
+    };
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(connect_cmd::parse_robots_toml(&text).contains_key(robot)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn account_endpoint(
+    robots: &[account_robots::AccountRobot],
+    robot: &str,
+    cached_names: &std::collections::BTreeSet<String>,
+) -> CliResult<SelectedAccountRobot> {
+    let selected = account_robot_access::select_account_robot(robots, robot, cached_names)?
+        .ok_or_else(|| {
+            CliError::Validation(format!(
+                "robot '{}' is neither a pinned alias nor an owned account robot; use a paired alias, endpoint ID, or account:<robot-id>",
+                crate::topic_cmd::sanitize_display(robot)
+            ))
+        })?;
+    match &selected.endpoint {
+        account_robots::RobotEndpoint::Known(key) => Ok(SelectedAccountRobot {
+            robot: selected.clone(),
+            eid: hex::encode(key.0),
+        }),
+        account_robots::RobotEndpoint::Unknown { reason } => Err(CliError::Validation(format!(
+            "cannot open the selected account robot: {reason}"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn prepare(robot: &str, operation: &Operation, json: bool) -> CliResult<PreparedSession> {
+    require_network(operation)?;
+    let config = auth::cerulion_config_dir().ok_or_else(|| {
+        CliError::Validation("cannot resolve the Cerulion directory for recording witnesses".into())
+    })?;
+    let (connection, account) = if local_selector(robot)? {
+        // Raw endpoint IDs and explicit pins never need the account service.
+        (
+            connect_cmd::plan(&ConnectArgs {
+                robot: Some(robot.to_owned()),
+                ..ConnectArgs::default()
+            })?,
+            None,
+        )
+    } else {
+        let directory = account_robots::fetch()?;
+        let names = peer_cache::default_cache_path()
+            .map(|path| peer_cache::load_peers(&path, peer_cache::current_unix_secs()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|peer| peer.robot)
+            .collect();
+        let selected = account_endpoint(&directory.robots, robot, &names)?;
+        let mut connection = connect_cmd::plan(&ConnectArgs {
+            eid: Some(selected.eid),
+            ..ConnectArgs::default()
+        })?;
+        // Replace reverse-pin names before session_plan appends the command tail.
+        set_account_epoch_route(&mut connection, &selected.robot)?;
+        let auth_path = auth::auth_json_path().ok_or_else(|| {
+            CliError::Validation("cannot resolve the current account store".into())
+        })?;
+        connection.argv.extend([
+            "--owner-account".into(),
+            hex::encode(directory.account_id.0),
+            "--owner-desk-key".into(),
+            hex::encode(directory.desk_key.0),
+            "--owner-config-dir".into(),
+            context_path(&config)?,
+            "--owner-store-lock".into(),
+            context_path(&auth::store_lock_path(&auth_path))?,
+        ]);
+        (
+            connection,
+            Some(AccountSession {
+                directory,
+                robot: selected.robot,
+            }),
+        )
+    };
+    Ok(PreparedSession {
+        plan: session_plan(connection, operation, json, &config.join("shell-witnesses"))?,
+        account,
+    })
+}
+
+#[cfg(unix)]
+fn context_path(path: &Path) -> CliResult<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| CliError::Validation("the account directory path is not valid UTF-8".into()))
+}
+
+/// Resolve a pinned or account-owned robot, start connectd, and preserve its exit status.
+///
+/// Explicit pins and endpoint IDs skip account lookup. Account selections retain
+/// their login and desk-key identity, rechecked around the bounded epoch-refresh
+/// wait. The helper receives public account context, never a session token.
+#[cfg(unix)]
+pub fn run(
+    robot: String,
+    operation: Operation,
+    json: bool,
+    running: Arc<AtomicBool>,
+) -> CliResult<i32> {
+    prepare(&robot, &operation, json)?.spawn(running)
+}
+
+/// Refuse unsupported platforms before account lookup or helper creation.
+#[cfg(not(unix))]
+pub fn run(
+    _robot: String,
+    operation: Operation,
+    _json: bool,
+    _running: Arc<AtomicBool>,
+) -> CliResult<i32> {
+    require_network(&operation)?;
+    Err(CliError::Validation("remote shell requires Unix".into()))
 }
 
 #[cfg(test)]
@@ -395,3 +601,6 @@ mod tests {
         assert_eq!(inspect.argv.len(), 7);
     }
 }
+
+#[cfg(test)]
+mod account_tests;
