@@ -1172,10 +1172,10 @@ the bag's `cerulion_version` in parentheses when it is a plain version token
 `MAJOR.MINOR.PATCH` is above this build's, names the format
 or the stamp and this Cerulion's version, and ends
 `Upgrade Cerulion to replay it.` The recording is sound, and an upgraded
-Cerulion replays it. On 2.0.0 and 2.1.0 the same refusal names the newer
-scheduler-trace format, or the unknown `coordination` stamp, and then calls the
-recording corrupt or hand-edited and says to re-record it. That recording is
-sound too: upgrade Cerulion to replay it.
+Cerulion replays it. On 2.1.0 or an earlier release the same refusal names the
+newer scheduler-trace format, or the unknown `coordination` stamp, and then
+calls the recording corrupt or hand-edited and says to re-record it. That
+recording is sound too: upgrade Cerulion to replay it.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
