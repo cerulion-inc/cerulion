@@ -12,8 +12,8 @@
 //! `ceiling - 1` zero-copy loans are held, each further take receives into the
 //! reserved borrow, copies the message into private memory, releases the
 //! borrow at once and hands out the copy. Both shapes are pinned: a FIXED type
-//! (the fixed section copied into aligned heap words) and a FORGED type (an
-//! unpooled shadow filled by the copying decode).
+//! past the copy limit (the fixed section copied into aligned heap words) and
+//! a FORGED type (an unpooled shadow filled by the copying decode).
 //!
 //! The copies ride their own `FailureRegimeLatch` through
 //! `loan_refusal_latch`. Hand oracles, every predicate matching the LEVEL
@@ -119,16 +119,25 @@ fn c_ts(
     }))
 }
 
-/// FIXED: the transport-budget arm.
+/// The `f64` words of [`CPoint`]'s zeroed tail: enough to take the struct past
+/// the copy limit whatever the limit's value.
+const POINT_PAD: usize = (rmw_cerulion::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES - 24) / 8 + 1;
+
+/// FIXED and past the copy limit, its loan the shared-memory struct: the
+/// transport-budget arm. Three doubles and a zeroed tail.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct CPoint {
     x: f64,
     y: f64,
     z: f64,
+    pad: [f64; POINT_PAD],
 }
 
 fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    let mut pad = c_member("pad", ROS_TYPE_DOUBLE, 24);
+    pad.is_array_ = true;
+    pad.array_size_ = POINT_PAD;
     c_ts(
         unique,
         std::mem::size_of::<CPoint>(),
@@ -136,6 +145,7 @@ fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
             c_member("x", ROS_TYPE_DOUBLE, 0),
             c_member("y", ROS_TYPE_DOUBLE, 8),
             c_member("z", ROS_TYPE_DOUBLE, 16),
+            pad,
         ],
         None,
         None,
@@ -640,56 +650,66 @@ fn forged_takes_past_the_reserve_are_served_by_copy_loud_once_re_announced_and_r
 }
 
 /// The points published in order, written out by hand.
-const POINT_ORACLE: [CPoint; 10] = [
+static POINT_ORACLE: [CPoint; 10] = [
     CPoint {
         x: 0.0,
         y: -1.5,
         z: 100.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 1.0,
         y: -2.5,
         z: 101.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 2.0,
         y: -3.5,
         z: 102.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 3.0,
         y: -4.5,
         z: 103.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 4.0,
         y: -5.5,
         z: 104.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 5.0,
         y: -6.5,
         z: 105.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 6.0,
         y: -7.5,
         z: 106.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 7.0,
         y: -8.5,
         z: 107.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 8.0,
         y: -9.5,
         z: 108.0,
+        pad: [0.0; POINT_PAD],
     },
     CPoint {
         x: 9.0,
         y: -10.5,
         z: 109.0,
+        pad: [0.0; POINT_PAD],
     },
 ];
 
