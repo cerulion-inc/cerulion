@@ -493,14 +493,16 @@ in prepare_pass_verification
 # the recorder version a refusal may print (`NewerRecorderVersion::newer_than`,
 # its `Display`, and `release_number`, which reads a version's leading
 # `MAJOR.MINOR.PATCH`), the ` (<version>)` it renders after "a newer
-# Cerulion" (`RecordedBy`'s `Display`) and the ASCII-only printing of an
-# unknown `coordination` stamp (`PrintableJson`'s `Display`). The rest of the
-# file reads the bag, which the mutation rule does not cover; the gate that
-# calls the picker is pinned by tests/replay_gates_test.rs.
+# Cerulion" (`RecordedBy`'s `Display`) and the ASCII-only printing of bag
+# text in the `recorder.json` refusals (`PrintableAscii`'s `Display`, and
+# `printable_ids` in src/replay_engine.rs, which prints the driver stamp's node
+# ids through it). The rest of the two files reads the bag, which the mutation
+# rule does not cover; the gate that calls the picker is pinned by
+# tests/replay_gates_test.rs.
 #
 # Run:     cargo mutants -p cerulion_cli_engine \
 #            -f crates/cerulion_cli_engine/src/replay_cmd.rs \
-#            --re 'NewerRecorderVersion|release_number|PrintableJson|RecordedBy|newer_recording_refusal' \
+#            --re 'NewerRecorderVersion|release_number|PrintableAscii|RecordedBy|newer_recording_refusal' \
 #            --exclude-re 'tests::' --cap-lints true --in-place \
 #            --timeout 600 -- --lib -- replay_cmd::
 #          (the unmutated baseline passed)
@@ -519,6 +521,17 @@ in prepare_pass_verification
 #          `ReplayError` have no default.
 #          (The first run of this scope, over the version token alone before
 #          it compared releases, gave 11 mutants: 9 caught, 2 unviable.)
+#          Re-run once the printer was renamed `PrintableAscii` and printed
+#          the other `recorder.json` refusals' bag text: with
+#          `--re 'PrintableAscii'` and the command above, 1 mutant, 1 caught
+#          (its `Display` replaced with `Ok(())`); and over
+#          src/replay_engine.rs with `--re 'printable_ids'` and the test
+#          command `-- --test replay_gates_test`, 4 mutants, 2 caught (its
+#          body replaced with `String::new()` and with "xyzzy"). The other 2
+#          are field deletions the tool generates outside the `--re` list,
+#          in `prepare_pass_verification` and `InjectionWindow::cross_rank`:
+#          the fourth scope lists the first as equivalent and catches the
+#          second with the lib tests, which this command does not run.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
