@@ -10353,11 +10353,13 @@ fn creditable_split_block_edges(
 
 /// PURE: the split `block` edges ([`creditable_split_block_edges`]) the pass
 /// over `members` feeds from the bag, as its build's replay wiring names them
-/// ([`cerulion_core::replay_feed::BagFedBlockEdges`]): each edge one of whose
-/// producers the pass holds. The build marks each such producer as held by
-/// the edge, so it accepts a trailing refill the recording holds on it below
-/// the burst cap. A pass that holds none of an edge's producers gets no entry
-/// for it.
+/// ([`cerulion_core::replay_feed::BagFedBlockEdges`]): each edge whose
+/// consumer, or one of whose producers, the pass holds. The build accepts a
+/// consumer end's `block` input with no in-graph producer and installs no
+/// backpressure probe on it, since no credit word counts it, and marks each
+/// producer it holds as held by the edge, so it accepts a trailing refill the
+/// recording holds on it below the burst cap. A pass that holds neither end
+/// of an edge gets no entry for it.
 fn pass_fed_block_edges(
     edges: &[crate::multiprocess::CreditEdgePlan],
     members: &[String],
@@ -10365,7 +10367,10 @@ fn pass_fed_block_edges(
     cerulion_core::replay_feed::BagFedBlockEdges::new(
         edges
             .iter()
-            .filter(|e| e.producer_nodes.iter().any(|p| members.contains(p)))
+            .filter(|e| {
+                members.contains(&e.consumer_node)
+                    || e.producer_nodes.iter().any(|p| members.contains(p))
+            })
             .map(|e| cerulion_core::replay_feed::BagFedBlockEdge {
                 topic: e.topic.clone(),
                 consumer_node: e.consumer_node.clone(),
@@ -18124,6 +18129,9 @@ fn run_rank_pass(
     // labels. Minted before the step loop, reported with the rest.
     rederivation_notes.append(&mut verification.notes);
     if !lockstep {
+        // A split `block` edge the replay feeds from the bag has no credit
+        // word in this runtime, so it has no entry here; the re-derived check
+        // after the pass judges it, or stands it down by name.
         for credit in runtime.block_credits() {
             if credit.conservation_broken() {
                 // Reported as well as warned — the SYMMETRY the re-derived twin
@@ -43052,11 +43060,11 @@ mod fed_block_edge_tests {
             .collect()
     }
 
-    /// A pass that holds an edge's producer feeds that edge, a pass that
-    /// holds neither of its ends feeds nothing, and the set comes out in its
-    /// own order whatever order the classification gave.
+    /// A pass that holds an edge's producer or its consumer feeds that
+    /// edge, a pass that holds neither of its ends feeds nothing, and the set
+    /// comes out in its own order whatever order the classification gave.
     #[test]
-    fn a_pass_feeds_the_split_edges_whose_producer_it_holds() {
+    fn a_pass_feeds_the_split_edges_it_holds_an_end_of() {
         let edges = vec![
             edge("/t/b", "sink_b", "src_b"),
             edge("/t/a", "sink_a", "src_a"),
@@ -43077,7 +43085,12 @@ mod fed_block_edge_tests {
         let one = pass_fed_block_edges(&edges, &members(&["src_b"]));
         assert_eq!(named(&one), vec![("/t/b", "sink_b", vec!["src_b"])]);
         assert!(pass_fed_block_edges(&edges, &members(&["mid"])).is_empty());
-        assert!(pass_fed_block_edges(&edges, &members(&["sink_a", "sink_b"])).is_empty());
+        let back = pass_fed_block_edges(&edges, &members(&["sink_b", "sink_a"]));
+        assert_eq!(back, front, "the consumer ends name the same edges");
+        let mixed = pass_fed_block_edges(&edges, &members(&["src_a", "sink_b"]));
+        assert_eq!(back, mixed, "one producer end and one consumer end");
+        let consumer = pass_fed_block_edges(&edges, &members(&["sink_a"]));
+        assert_eq!(named(&consumer), vec![("/t/a", "sink_a", vec!["src_a"])]);
         assert!(pass_fed_block_edges(&[], &members(&["src_a"])).is_empty());
     }
 }
