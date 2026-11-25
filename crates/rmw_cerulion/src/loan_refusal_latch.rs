@@ -2,27 +2,33 @@
 //! The flood-suppression reporters of the forged loaned
 //! take — the take-side siblings of [`crate::decode_failure_latch`] and
 //! [`crate::publish_reject_latch`], built on `cerulion_core`'s one shared
-//! `FailureRegimeLatch` (never a hand-rolled fifth copy). Two CONDITIONS,
-//! two latches, because their remedies differ:
+//! `FailureRegimeLatch` (never a hand-rolled fifth copy). Three CONDITIONS,
+//! three latches, because their remedies differ:
 //!
 //! # A REFUSED loaned take (`report_loan_refused`)
 //!
 //! `rmw_take_loaned_message` holds an iceoryx2 sample across the C ABI for
-//! every loan the consumer has not yet returned, and (for a forged type) one
-//! rmw-owned shadow message per outstanding loan. Both are BUDGETED — the
+//! every zero-copy loan the consumer has not yet returned, and (for a forged
+//! type) one rmw-owned shadow message per such loan. Both are BUDGETED: the
 //! service's `subscriber_max_borrowed_samples` (provisioned at
 //! `RMW_TAKE_LOAN_BORROW_BUDGET`) and the shadow pool sized to the same
-//! number — and a consumer that RETAINS loans past that budget is refused on
-//! every following take until it returns one. A BARE `error!` per
-//! attempt would flood: rclcpp's executor retries the take at the arrival
-//! rate, so on a 30 Hz camera topic a stuck consumer is 30 lines/s forever —
-//! the disk-fill class `FailureRegimeLatch` exists for. Every refusal kind
-//! ([`LoanRefusal`]) shares the ONE regime (they are all "the take was
-//! refused, no frame consumed") but carries its OWN headline and remedy: a
-//! pool exhausted by retained loans is cured by returning one, a failed heap
-//! allocation is memory pressure with NOTHING to return, and a transport
-//! receive failure carries the transport's own reason (`ExceedsMaxBorrows`
-//! is the budget; anything else is not).
+//! number. The take keeps zero-copy loans one below the borrow ceiling and
+//! serves every take past them by copy (below), so loans a consumer retains
+//! are never refused. A take is refused only when it cannot get a borrow or a
+//! shadow at all: the transport refuses the receive (`ExceedsMaxBorrows` when
+//! ADOPTED messages of the same subscription hold the reserved borrow, or a
+//! condition of the transport's own) or a shadow allocation fails. A BARE
+//! `error!` per attempt would flood: rclcpp's executor retries the take at
+//! the arrival rate, so on a 30 Hz camera topic a stuck consumer is 30
+//! lines/s forever, the disk-fill class `FailureRegimeLatch` exists for.
+//! Every refusal kind ([`LoanRefusal`]) shares the ONE regime (they are all
+//! "the take was refused, no frame consumed") but carries its OWN headline
+//! and remedy: a pool exhausted by retained loans is cured by returning one
+//! (the reserve keeps the pool from running dry, so this kind is the bound,
+//! not a path retention reaches), a failed heap allocation is memory pressure
+//! with NOTHING to return, and a transport receive failure carries the
+//! transport's own reason (`ExceedsMaxBorrows` is the budget; anything else
+//! is not).
 //!
 //! The ADOPT path's budget refusal has its own reporter
 //! (`report_adopt_borrow_refused`) on the SAME latch and regime, because an
@@ -43,6 +49,21 @@
 //! rule forbids. Loud once per regime (`warn!` — a degrade, not a loss), a
 //! recovery line when a clean frame follows, an unconditional total.
 //!
+//! # A take SERVED BY COPY past the borrow ceiling (`report_loan_copied`)
+//!
+//! The loaned take keeps one borrow of the subscription's ceiling in reserve:
+//! once a consumer holds every other one as a zero-copy loan, each further
+//! take receives into the reserved borrow, copies the message into private
+//! memory and releases the borrow before it returns, so the consumer keeps
+//! receiving instead of being refused. The take succeeded, so this is a
+//! degrade line (`warn!` once per regime, `debug!` repeats, decade
+//! re-announcement) on its OWN latch, with an unconditional total; the
+//! regime closes, with one recovery line (`report_loan_served_zero_copy`), on
+//! the first take served zero-copy while no copy is outstanding, so a
+//! consumer that keeps the newest N messages stays in one regime instead of
+//! flapping. A service that allows a single borrow copies every take and has
+//! its own headline: the remedy is the service's borrow limit, not a return.
+//!
 //! # The policy, as every latch consumer applies it
 //!
 //! Loud head (full context + the remedy), `debug!` repeats carrying the
@@ -56,7 +77,8 @@
 //! head, repeat, re-announcement and recovery alike, exactly as the sibling
 //! reporters do — so a regime that never reaches a decade still exposes its
 //! running count. Keys are the repo's: `topic=`, `total_failures=`,
-//! `suppressed_count=`, and `kind=` names which budget bound.
+//! `suppressed_count=`, and `kind=` names which budget bound; the copy lines
+//! carry `held_loans=` and `ceiling=` in its place.
 
 use std::sync::Mutex;
 
@@ -68,18 +90,22 @@ use cerulion_core::transport::failure_regime_latch::{
 /// selector for the headline + remedy the line carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoanRefusal {
-    /// Every shadow in the subscription's pool is loaned out — the consumer
-    /// is RETAINING loans (forged types only; checked BEFORE the receive, so
-    /// no frame is consumed). Remedy: return one.
+    /// Every shadow in the subscription's pool is loaned out (forged types
+    /// only; checked BEFORE the receive, so no frame is consumed). The loaned
+    /// take keeps zero-copy loans one below the borrow ceiling, which is below
+    /// the pool's capacity, so retained loans cannot reach this kind: it is
+    /// the pool's bound. Remedy: return a loan.
     ShadowPoolExhausted,
     /// The pool was under capacity but the shadow could not be built: the
     /// heap allocation failed. Memory pressure or a bug — NOT a retained
     /// loan; there is nothing to return. Also refused before the receive.
     ShadowAllocationFailed,
     /// The transport refused the receive; its reason rides `error=`
-    /// verbatim. iceoryx2's `ExceedsMaxBorrows` is the borrow budget (the
-    /// subscription holds it whole — return a loan); any other reason is the
-    /// transport's own condition, not a loan the consumer can return.
+    /// verbatim. iceoryx2's `ExceedsMaxBorrows` means every borrow of the
+    /// subscription is held, which the reserve leaves to adopted messages
+    /// beside the loans, and the line's `remedy=` names the holders
+    /// (`receive_refusal_remedy`); any other reason is the transport's own
+    /// condition, with nothing the consumer can return.
     ReceiveFailed,
 }
 
@@ -94,17 +120,19 @@ impl LoanRefusal {
     }
 }
 
-/// WHO is holding the service's borrow budget when an
-/// adopted take's receive is refused with `ExceedsMaxBorrows`.
+/// WHO is holding the service's borrow budget when a take's receive (an
+/// adopted take, or a loaned take past the reserve) is refused with
+/// `ExceedsMaxBorrows`.
 ///
-/// The refusal itself is always correct — the port really has no borrow
-/// left — but its REMEDY is not one thing. An adopt-armed type is always
+/// The refusal itself is always correct (the port really has no borrow
+/// left) but its REMEDY is not one thing. An adopt-armed type is always
 /// `can_loan_take` too, so `rmw_take_loaned_message`'s outstanding loans
 /// (`pending_takes`) consume the SAME `subscriber_max_borrowed_samples`
-/// budget as adopted samples do. Without this classification the arm would always
-/// say "free adopted messages", advice that does exactly nothing for a
-/// consumer whose borrows are all LOANS — and would leave an operator grepping
-/// `kind=adopted_budget_exhausted` on a line that is not about adoption.
+/// budget as adopted samples do. The loaned take keeps one borrow in
+/// reserve, so loans alone never hold the whole budget: adopted messages
+/// alone, or adopted messages beside loans, do, and the line must say which,
+/// so an operator grepping `kind=adopted_budget_exhausted` reads a line that
+/// is about adoption.
 ///
 /// One CONDITION, so one regime and one latch (the take was refused and no
 /// frame was consumed); what varies is the noun and the remedy, which is
@@ -115,8 +143,11 @@ pub enum BorrowHolders {
     /// subscription has no outstanding loan. SELF-HEALS when the app frees
     /// any adopted message (its `fini`/destructor releases the sample).
     AdoptedOnly,
-    /// Outstanding LOANED takes hold the budget and no adopted sample does.
-    /// Freeing adopted messages cannot help — there are none.
+    /// The counters show loans and no adopted message. Loans alone cannot
+    /// hold the whole budget (the loaned take keeps one borrow in reserve),
+    /// so this reading means an adopted message's release landed between the
+    /// refused receive and the read (its counter drops before its borrow
+    /// does), a condition that heals by itself: the next take should succeed.
     LoanedOnly,
     /// Both paths hold borrows. Either kind of return releases a unit, so
     /// the line names both rather than guessing which the operator meant.
@@ -175,9 +206,10 @@ impl BorrowHolders {
                  widen an already-existing smaller service"
             }
             Self::LoanedOnly => {
-                "return outstanding loaned messages via \
-                 rmw_return_loaned_message_from_subscription; this subscription holds NO \
-                 adopted message, so freeing adopted messages cannot release anything"
+                "an adopted message's release raced this reading (its counter drops before \
+                 its borrow does): loaned takes keep one borrow in reserve, so loans alone \
+                 never hold the whole budget, and the next take should succeed; if it \
+                 persists, the bound is the SERVICE's own capacity (budget=)"
             }
             Self::Both => {
                 "both paths hold borrows on this subscription — return outstanding loaned \
@@ -280,6 +312,26 @@ fn observe_success(latch: &Mutex<FailureRegimeLatch>) -> (Option<u64>, u64) {
     (recovered, latch.total_failures())
 }
 
+/// The remedy a loaned take's refused RECEIVE carries: the PURE decision.
+///
+/// `ExceedsMaxBorrows` means every borrow of the subscription is held, and
+/// the loaned take keeps its own loans one short of the ceiling, so the
+/// holders are named by the same classification the adopted path uses
+/// ([`BorrowHolders`]): usually adopted messages beside the loans. Any other
+/// reason is the transport's own condition, with nothing to return.
+pub(crate) fn receive_refusal_remedy(
+    error: &str,
+    adopted_outstanding: usize,
+    loaned_outstanding: usize,
+) -> &'static str {
+    if error.contains("ExceedsMaxBorrows") {
+        BorrowHolders::classify(adopted_outstanding, loaned_outstanding).remedy()
+    } else {
+        "none: the transport refused the receive for a reason of its own (see error=), so \
+         nothing this consumer holds can be returned to recover it"
+    }
+}
+
 /// Record one refused loaned take and log it per the regime policy, with
 /// the headline and remedy that are TRUE for `kind`.
 ///
@@ -287,15 +339,22 @@ fn observe_success(latch: &Mutex<FailureRegimeLatch>) -> (Option<u64>, u64) {
 /// to see the shape (how many are held vs. how many may be); `error` is the
 /// transport's own reason for a [`LoanRefusal::ReceiveFailed`] (empty for
 /// the shadow-side kinds, which have no transport error to carry).
+/// `adopted_outstanding` is how many ADOPTED messages of the same
+/// subscription hold borrows (0 when adopt-take is not armed): a receive
+/// refusal's remedy depends on who holds them ([`receive_refusal_remedy`]).
 pub(crate) fn report_loan_refused(
     latch: &Mutex<FailureRegimeLatch>,
     topic: &str,
     kind: LoanRefusal,
     outstanding_loans: usize,
+    adopted_outstanding: usize,
     budget: usize,
     error: &str,
 ) {
     let (decision, total) = observe_failure(latch);
+    // Derived here from the counts the line prints, so the remedy and the
+    // numbers beside it cannot disagree.
+    let remedy = receive_refusal_remedy(error, adopted_outstanding, outstanding_loans);
     match decision {
         RegimeDecision::Loud => match kind {
             LoanRefusal::ShadowPoolExhausted => tracing::error!(
@@ -324,13 +383,13 @@ pub(crate) fn report_loan_refused(
                 topic = %topic,
                 kind = %kind.as_str(),
                 outstanding_loans,
+                adopted_outstanding,
                 budget,
                 error = %error,
                 total_failures = total,
-                "loaned take refused — the transport refused the receive (see error=): \
-                 ExceedsMaxBorrows means the subscription holds its whole borrow budget, \
-                 return outstanding loans via rmw_return_loaned_message_from_subscription; \
-                 any other reason is the transport's own condition; the queued frame is not \
+                remedy = %remedy,
+                "loaned take refused: the transport refused the receive (see error=); the \
+                 release that recovers it, if any, is in remedy=; the queued frame is not \
                  consumed (repeats are logged at debug until a take succeeds)"
             ),
         },
@@ -360,26 +419,42 @@ pub(crate) fn report_loan_refused(
                 topic = %topic,
                 kind = %kind.as_str(),
                 outstanding_loans,
+                adopted_outstanding,
                 budget,
                 error = %error,
                 total_failures = total,
                 suppressed_count = suppressed,
-                "loaned take STILL refused — the regime is open and every attempt is refused \
-                 (the transport keeps refusing the receive, see error=; ExceedsMaxBorrows ⇒ \
-                 return outstanding loans via rmw_return_loaned_message_from_subscription)"
+                remedy = %remedy,
+                "loaned take STILL refused: the regime is open and the transport keeps \
+                 refusing the receive (see error=); the release that recovers it, if any, is \
+                 in remedy="
             ),
         },
         RegimeDecision::Suppressed { suppressed } => match kind {
-            LoanRefusal::ShadowPoolExhausted
-            | LoanRefusal::ShadowAllocationFailed
-            | LoanRefusal::ReceiveFailed => tracing::debug!(
+            LoanRefusal::ShadowPoolExhausted | LoanRefusal::ShadowAllocationFailed => {
+                tracing::debug!(
+                    topic = %topic,
+                    kind = %kind.as_str(),
+                    outstanding_loans,
+                    budget,
+                    error = %error,
+                    total_failures = total,
+                    suppressed_count = suppressed,
+                    "loaned take refused (suppressed repeat)"
+                )
+            }
+            // The repeat carries the holders' counts and the remedy the head
+            // carries: an operator tailing at debug is reading this line.
+            LoanRefusal::ReceiveFailed => tracing::debug!(
                 topic = %topic,
                 kind = %kind.as_str(),
                 outstanding_loans,
+                adopted_outstanding,
                 budget,
                 error = %error,
                 total_failures = total,
                 suppressed_count = suppressed,
+                remedy = %remedy,
                 "loaned take refused (suppressed repeat)"
             ),
         },
@@ -394,10 +469,10 @@ pub(crate) fn report_loan_refused(
 /// point of the reporter rather than a detail of it.
 ///
 /// Two reasons, both load-bearing. (1) WORDING: routing it through
-/// [`LoanRefusal::ReceiveFailed`] would bound the log volume and then tell an
-/// operator "loaned take refused — return outstanding loans", on a call that
-/// took no loan and returns `RMW_RET_ERROR`. A remedy the reader cannot
-/// perform is the same defect [`BorrowHolders`] exists to remove. (2) And
+/// [`LoanRefusal::ReceiveFailed`] would bound the log volume and then print a
+/// "loaned take refused" headline on a call that took no loan and returns
+/// `RMW_RET_ERROR`; a line that names the wrong operation sends the reader to
+/// the wrong API, the same defect [`BorrowHolders`] exists to remove. (2) And
 /// the one that actually matters: `FailureRegimeLatch` is kind-AGNOSTIC and
 /// is closed only by a SUCCESS. A consumer retaining adopted messages
 /// refuses on every take and returns `RMW_RET_OK`, so the borrow regime
@@ -700,6 +775,102 @@ pub(crate) fn report_forge_clean(latch: &Mutex<FailureRegimeLatch>, topic: &str)
     }
 }
 
+/// Record a loaned take served by COPY: the subscription already held
+/// `held_loans` zero-copy loans, one below its borrow `ceiling`, so the take
+/// received into the reserved borrow, copied the message into private memory
+/// and released the borrow. The take succeeded with the published contents;
+/// what the operator learns is that this consumer retains loans and is paying
+/// a copy for every take past them.
+#[cold]
+pub(crate) fn report_loan_copied(
+    latch: &Mutex<FailureRegimeLatch>,
+    topic: &str,
+    held_loans: usize,
+    ceiling: usize,
+) {
+    let (decision, total) = observe_failure(latch);
+    // A service that allows one borrow has none to lend: every take needs it
+    // to receive, so every take is copied whatever the consumer returns, and
+    // the remedy is on the service, not the consumer.
+    let single_borrow = ceiling <= 1;
+    match decision {
+        RegimeDecision::Loud if single_borrow => tracing::warn!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            "loaned take served by COPY: the topic's service allows this subscription at most \
+             ONE borrow (ceiling=), which every take needs to receive, so no message can be \
+             held zero-copy and every loaned take is copied into private memory; the \
+             subscription keeps receiving, and zero-copy takes need the topic's service \
+             recreated with a larger subscriber_max_borrowed_samples (whichever process \
+             creates the topic first sets it; an rmw endpoint creates it with enough for \
+             zero-copy takes) (repeats are logged at debug)"
+        ),
+        RegimeDecision::Loud => tracing::warn!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            "loaned take served by COPY: the consumer holds held_loans= zero-copy loans and the \
+             last of the subscription's ceiling= borrows stays in reserve, so this message was \
+             copied into private memory and its borrow released at once; the subscription \
+             keeps receiving, each take past the reserve pays a copy, and to return to \
+             zero-copy takes return loans via rmw_return_loaned_message_from_subscription \
+             (repeats are logged at debug until a take is served zero-copy with no copy \
+             outstanding)"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } if single_borrow => tracing::warn!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            suppressed_count = suppressed,
+            "loaned takes STILL served by COPY: the topic's service allows one borrow, so every \
+             loaned take is copied"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            suppressed_count = suppressed,
+            "loaned takes STILL served by COPY: the consumer keeps holding its zero-copy loans, \
+             so every take past the reserve is copied"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            topic = %topic,
+            held_loans,
+            ceiling,
+            total_failures = total,
+            suppressed_count = suppressed,
+            "loaned take served by COPY (suppressed repeat)"
+        ),
+    }
+}
+
+/// Record a loaned take served ZERO-COPY while NO copy is outstanding:
+/// closes an open served-by-copy regime (one recovery line if anything was
+/// suppressed) and re-arms. The caller calls it only while a regime is open
+/// and no copy is held. Copies held keep the regime open because a consumer
+/// that keeps the newest N messages alternates zero-copy takes and copies for
+/// as long as it runs, and closing on each zero-copy take would print a loud
+/// head and a recovery line every few messages.
+#[cold]
+pub(crate) fn report_loan_served_zero_copy(latch: &Mutex<FailureRegimeLatch>, topic: &str) {
+    let (recovered, total) = observe_success(latch);
+    if let Some(suppressed) = recovered {
+        tracing::info!(
+            topic = %topic,
+            suppressed_count = suppressed,
+            total_failures = total,
+            "loaned take served zero-copy again with no copy outstanding: the consumer returned \
+             its copies and loans below the reserve; suppressed_count counts the repeats logged \
+             at debug while the regime was open (total_failures counts every copy)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,13 +897,14 @@ mod tests {
                 0,
                 1,
                 BorrowHolders::LoanedOnly,
-                "one outstanding loan and no adopted message",
+                "one outstanding loan and no adopted message: a release raced the read",
             ),
             (
                 0,
-                4,
+                3,
                 BorrowHolders::LoanedOnly,
-                "the whole loan budget outstanding",
+                "every zero-copy loan the reserve allows, no adopted message: a release raced \
+                 the read",
             ),
             (
                 1,
@@ -797,11 +969,16 @@ mod tests {
         assert!(adopted_advice(BorrowHolders::AdoptedOnly));
         assert!(!loaned_advice(BorrowHolders::AdoptedOnly));
 
-        assert!(loaned_advice(BorrowHolders::LoanedOnly));
+        // Loans alone never hold the whole budget (the loaned take keeps a
+        // borrow in reserve), so this reading is a release racing the read:
+        // it prescribes neither release, and says the next take should succeed.
         assert!(
-            !adopted_advice(BorrowHolders::LoanedOnly),
-            "a consumer whose borrows are ALL loans must not be told to free adopted messages \
-             — that was the defect: {}",
+            !adopted_advice(BorrowHolders::LoanedOnly)
+                && !loaned_advice(BorrowHolders::LoanedOnly)
+                && BorrowHolders::LoanedOnly
+                    .remedy()
+                    .contains("the next take should succeed"),
+            "a loans-only reading is a release race, with nothing to return: {}",
             BorrowHolders::LoanedOnly.remedy()
         );
 
@@ -819,13 +996,15 @@ mod tests {
         // counter read — a condition that heals by itself — so telling an
         // operator to stop a process over it is the same defect in a
         // different direction.
-        for forbidden in ["restart", "stop the earlier creator"] {
-            assert!(
-                !BorrowHolders::Unaccounted.remedy().contains(forbidden),
-                "the unaccounted remedy must not prescribe `{forbidden}` for what is \
-                 usually a transient release race: {}",
-                BorrowHolders::Unaccounted.remedy()
-            );
+        for holder in [BorrowHolders::Unaccounted, BorrowHolders::LoanedOnly] {
+            for forbidden in ["restart", "stop the earlier creator"] {
+                assert!(
+                    !holder.remedy().contains(forbidden),
+                    "the {holder:?} remedy must not prescribe `{forbidden}` for what is \
+                     usually a transient release race: {}",
+                    holder.remedy()
+                );
+            }
         }
     }
 
@@ -992,5 +1171,119 @@ mod tests {
                 "{h:?}'s remedy must be one flat line for the log: {remedy}"
             );
         }
+    }
+
+    /// The receive refusal's remedy against a hand-written table: a borrow
+    /// refusal names whoever holds the borrows, any other transport reason
+    /// prescribes nothing to return.
+    #[test]
+    fn the_receive_refusal_remedy_matches_its_oracle_table() {
+        let both = BorrowHolders::Both.remedy();
+        let adopted = BorrowHolders::AdoptedOnly.remedy();
+        let loaned = BorrowHolders::LoanedOnly.remedy();
+        let nobody = BorrowHolders::Unaccounted.remedy();
+        let oracle: &[(&str, usize, usize, &str, &str)] = &[
+            (
+                "ExceedsMaxBorrows",
+                1,
+                3,
+                both,
+                "three loans beside one adopted message",
+            ),
+            ("ExceedsMaxBorrows", 4, 0, adopted, "adopted messages alone"),
+            (
+                "ExceedsMaxBorrows",
+                0,
+                3,
+                loaned,
+                "loans alone: an adopted release raced the read, the next take should succeed",
+            ),
+            ("ExceedsMaxBorrows", 0, 0, nobody, "nobody by the counters"),
+            (
+                "receive failed: ExceedsMaxBorrows",
+                1,
+                3,
+                both,
+                "the token inside a longer reason",
+            ),
+        ];
+        for &(error, adopted_n, loaned_n, want, why) in oracle {
+            assert_eq!(
+                receive_refusal_remedy(error, adopted_n, loaned_n),
+                want,
+                "error={error} adopted={adopted_n} loaned={loaned_n}: {why}"
+            );
+        }
+        for error in ["", "ConnectionCorrupted", "exceedsmaxborrows"] {
+            let remedy = receive_refusal_remedy(error, 1, 3);
+            assert!(
+                remedy.starts_with("none:") && !remedy.contains("rmw_return_loaned_message"),
+                "a reason that is not the borrow refusal prescribes no return ({error:?}): {remedy}"
+            );
+        }
+    }
+
+    /// `kind=shadow_pool_exhausted` is the pool's bound, which retention
+    /// cannot reach through the take, so its lines are pinned here directly:
+    /// two refusals give ONE `ERROR` head carrying the kind, the shape and
+    /// the pool's own headline and remedy, and one `DEBUG` repeat of the
+    /// same kind; the counter counts both.
+    #[test]
+    #[tracing_test::traced_test]
+    fn the_shadow_pool_exhausted_refusal_names_its_kind_and_remedy() {
+        use cerulion_core::testing::{debug_lines_expected, line_level, never_loud};
+        const TOPIC: &str = "probe/pool";
+        const REPEAT: &str = "loaned take refused (suppressed repeat)";
+        let latch = Mutex::new(FailureRegimeLatch::new());
+        for _ in 0..2 {
+            report_loan_refused(&latch, TOPIC, LoanRefusal::ShadowPoolExhausted, 3, 0, 4, "");
+        }
+        assert_eq!(lock_regime_latch(&latch).total_failures(), 2);
+        logs_assert(|lines: &[&str]| {
+            let token = |line: &str, key: &str, value: &str| {
+                let needle = format!("{key}={value}");
+                line.split_whitespace().any(|t| t == needle)
+            };
+            let heads: Vec<&&str> = lines
+                .iter()
+                .filter(|l| line_level(l) == Some("ERROR") && l.contains("loaned take refused"))
+                .collect();
+            let [head] = heads.as_slice() else {
+                return Err(format!("expected exactly one ERROR head, got {heads:?}"));
+            };
+            for (key, value) in [
+                ("kind", "shadow_pool_exhausted"),
+                ("topic", TOPIC),
+                ("outstanding_loans", "3"),
+                ("budget", "4"),
+                ("total_failures", "1"),
+            ] {
+                if !token(head, key, value) {
+                    return Err(format!("the head must carry {key}={value}: {head}"));
+                }
+            }
+            if !head.contains("every shadow in the pool is loaned out")
+                || !head.contains("rmw_return_loaned_message_from_subscription")
+            {
+                return Err(format!(
+                    "the head must carry the pool's headline and remedy: {head}"
+                ));
+            }
+            // The repeat must never be loud (the half that holds where debug!
+            // is compiled out), and counts once where it is compiled in.
+            never_loud(lines, REPEAT)?;
+            let repeats = lines
+                .iter()
+                .filter(|l| {
+                    line_level(l) == Some("DEBUG")
+                        && l.contains(REPEAT)
+                        && token(l, "kind", "shadow_pool_exhausted")
+                })
+                .count();
+            if repeats != debug_lines_expected(1) {
+                return Err(format!("expected one DEBUG repeat, got {repeats}"));
+            }
+            Ok(())
+        });
     }
 }

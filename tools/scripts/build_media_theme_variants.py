@@ -23,7 +23,11 @@ import re
 import sys
 
 MEDIA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "docs", "media")
-SOURCES = ["cerulion-logo.svg", "development-loop.svg", "architecture-flow.svg"]
+# The drawings are hand-written sources; the charts are written by their generators under
+# docs/media/charts/ (build_harness_charts.py and build_benchmark_plots.py): rerun the generator,
+# then this script.
+SOURCES = ["cerulion-logo.svg", "development-loop.svg", "architecture-flow.svg", "harness-results.svg",
+           "harness-success-rate.svg", "harness-cost-per-success.svg", "native-rtt.svg", "platform-rtt.svg"]
 
 # Every colour-scheme rule in a source must be a dark block holding exactly one
 # `:root{...}` rule (a source may carry several: the architecture figure has one

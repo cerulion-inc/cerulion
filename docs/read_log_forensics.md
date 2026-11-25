@@ -94,8 +94,15 @@ the slots. All little-endian.
 | 16..24 | `duration_ns` | Packed aux: low 32 bits = `popped`, high 32 bits = the FOLD RUN COUNT (`0` and `1` both mean one occurrence; see "Folded runs"). Through `trace_format` 5 the high half is structurally zero. **Exception:** on a `producer` annotation the whole 64 bits are the producer token, so it has no high half to read |
 | 24..28 | `node_idx` | The CONSUMER node, indexing that rank's manifest `node_ids` |
 | 28..32 | `global_level` | Packed `(input_idx:16 << 16) \| outcome_kind:16` |
-| 32..36 | `record_type` | `6` for every record in this doc (`1` = fire, `2` = departure, `3` = step boundary) |
+| 32..36 | `record_type` | `6` for every record in this doc (`1` = fire, `2` = departure, `3` = step boundary, `7` = node stop) |
 | 36..40 | `reserved` | The owning worker RANK, stamped by `bagd` at bag-write time |
+
+A step boundary record (`record_type` 3) uses the same `global_level` slot for
+flags from `trace_format` 11 on: bit 0 (`STEP_BOUNDARY_FLAG_RUNS_REOPENED`)
+says the recorder reopened every read site's writer run right before this
+step, at a checkpoint, so each site's first read that serves a frame from this
+step on carries a `producer` annotation. A bag stamped 11 or later whose
+boundary sets any other bit is refused.
 
 ### The outcome kinds
 
@@ -121,8 +128,10 @@ all; a reader that predates them decodes every field to the value the writer
 meant and renders the kind as `unknown(6)` / `unknown(7)`. (They are defined
 from format 3 on. A bag stamps 5 for the read-site role, 6 for folded runs and 7
 for the every-consult record, each a WIRE change rather than a diagnostic, and
-8 for read identity and 9 for batch frames, so a bag recorded with the
-defaults carries these annotations under a 9, folding on or off:
+8 for read identity, 9 for batch frames and 11 for window heads (10 states
+checkpoint stops in the state records, and 12 adds a NODE-STOP record, record
+kind 7, after every fire that stopped its node), so a bag recorded with the
+defaults carries these annotations under a 12, folding on or off:
 `CERULION_READ_LOG_FOLD=off` moves no stamp, because the every-consult record,
 the annotations and the batch frames are written either way.)
 
@@ -145,7 +154,9 @@ a WRITER RUN: it names the writer (the token) of the read right after it and of
 every later read of the same read stage and read site up to the next
 annotation. A read site is the node body (`body`), or the scheduler (`drain`
 and `peek` together). A single-writer edge therefore shows one annotation per
-read site in the whole log. With the wire sequence
+read site per checkpoint window: the recording's first, and from
+`trace_format` 11 each window after a checkpoint, whose first step boundary
+sets bit 0. With the wire sequence
 on every read record, the log names the writer and the sequence of every frame
 a read served. That is what lets `bag play --resim all --verify` feed each read
 its recorded frames (see "Read identity" in [`docs/bag.md`](bag.md)). Below
@@ -702,7 +713,7 @@ log finding is never exit 1:
 |---|---|
 | 0 | every gated stage admitted the frames the recording popped, at the steps it popped them, and the redundant per-edge verifier retained nothing outside the read-log quarantine's scope (a quarantined finding stays in `read_log_divergence` and reaches no verdict, so an exit-0 run can still list the class). `read_log_enforcement.status` says which stages those were: `enforced` gates every stage of every produced-and-consumed edge that CAN be gated, while `not_gateable`, `not_enforced` and the `stages_not_gateable` count beside an `enforced` status each name stages that were not, and exit 0 says nothing about their intra-step arrival. A stage the wiring DOES gate is never left out of that count quietly: a replay that would report `enforced` over a stage it did not arm is refused instead |
 | 1 | frame CONTENT diverged. No read-log condition reaches this code |
-| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_stage_set_skew`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage on the per-stage arms or the topics or the rank on the whole-topic and whole-rank ones, and the remedy. Eight of the nine are minted at prepare, before the first step of the rank they refuse; `read_log_verdict_incomplete` is minted after the step loop, when the gate's bounded per-stage violation list overflowed and no verdict would name every finding |
+| 2 | the recording's read log cannot be enforced on a gated edge, so the run is refused rather than gated on a claim it cannot trust. The message names the cause token (`read_log_no_coverage`, `read_log_record_dropped`, `read_log_edge_not_gateable`, `read_log_unenforceable_record`, `read_log_input_name_unresolved`, `read_log_input_name_duplicated`, `read_log_stage_set_skew`, `read_log_budget_declined`, `read_log_verdict_incomplete`), the stage on the per-stage arms or the topics or the rank on the whole-topic and whole-rank ones, and the remedy. Over a budget (`verifier_declined_read_log_budget` or `verifier_declined_frame_index_budget` in the message) it names how many reads or recorded frames the rank holds and the budget, and the remedy is a shorter recording. Eight of the nine are minted at prepare, before the first step of the rank they refuse; `read_log_verdict_incomplete` is minted after the step loop, when the gate's bounded per-stage violation list overflowed and no verdict would name every finding |
 | 6 | a recorded EDGE READ the re-execution did not reproduce: a frame due at a step that never arrived, a surviving sequence that does not match, or a divergence the per-edge verifier retained outside the read-log quarantine's scope. On a `trace_format` 7 recording the reverse direction lands here too: a CONSULT the recording holds no read for (`unplanned_consult`), which on formats 1 to 6 is the `unplanned_consults` count instead. `resim_exit_code` returns 6 for it and for the fire comparator alike: both say the re-executed SCHEDULE is not the recorded one |
 
 The terminal block for the last of those is headed `EDGE-READ DIVERGENCE` and

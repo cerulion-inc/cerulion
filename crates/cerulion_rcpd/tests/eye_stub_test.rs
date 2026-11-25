@@ -22,7 +22,7 @@ use cerulion_rcpd::eye::limits::jpeg_header_for_test;
 use cerulion_rcpd::eye::switch::write_switch;
 use cerulion_rcpd::eye::verdict::{BoxEdge, EyeAnswer, Look, Outcome};
 use cerulion_rcpd::manifest::RcpManifest;
-use eye_common::{eyes_yaml, good_body, key_file, Reply, Stub, ANSWERED_MODEL, TEST_KEY};
+use eye_common::{eyes_yaml, good_body, key_file, Reply, Stub, ANSWERED_MODEL, EYE_WAIT, TEST_KEY};
 use serde_json::{json, Value};
 
 /// The eye's rules for a manifest routed to `base_url`, with a key on file.
@@ -246,14 +246,16 @@ async fn a_late_answer_is_dropped_and_the_gate_sees_a_timeout() {
     assert_eq!(answer.request_sha256, late.request_sha256);
 }
 
-/// The next report on `rx`, waiting at most 10 s.
+/// The next report on `rx`, waiting at most [`EYE_WAIT`]. The channel is
+/// read once more after the deadline has passed.
 async fn next(rx: &mpsc::Receiver<Completed>) -> Completed {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + EYE_WAIT;
     loop {
+        let last = Instant::now() >= deadline;
         if let Ok(done) = rx.try_recv() {
             return done;
         }
-        assert!(Instant::now() < deadline, "no report within 10 s");
+        assert!(!last, "no report within {EYE_WAIT:?}");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }

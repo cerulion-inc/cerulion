@@ -444,12 +444,12 @@ pub(crate) fn split_edge_timeout_refusal_in_groups(
 /// `consumer_node.consumer_input` of `topic`, or `None` when `topo` gives
 /// that input no `block_timeout_ms`.
 ///
-/// The one check behind [`refuse_split_edge_timeouts`] and
-/// [`split_edge_timeout_refusal_in_groups`]: both read the key off `topo`'s
-/// consumer edge and render [`cerulion_core::graph::topology::split_edge_timeout_refusal`]
-/// with the topic's in-graph producers. `places` returns where the consumer
-/// and then the producer run, and is called only for an edge that sets the
-/// key.
+/// [`refuse_split_edge_timeouts`] and [`split_edge_timeout_refusal_in_groups`]
+/// both render [`cerulion_core::graph::topology::split_edge_timeout_refusal`]
+/// with the topic's in-graph producers here, for an edge
+/// [`split_edge_timeout_producers`] finds the key on. `places` returns where
+/// the consumer and then the producer run, and is called only for an edge
+/// that sets the key.
 fn split_edge_timeout_verdict(
     topo: &cerulion_core::graph::GraphTopology,
     topic: &str,
@@ -457,6 +457,38 @@ fn split_edge_timeout_verdict(
     consumer_input: &str,
     places: impl FnOnce() -> (String, String),
 ) -> Option<String> {
+    let producers = split_edge_timeout_producers(topo, topic, consumer_node, consumer_input)?;
+    let (consumer_place, producer_place) = places();
+    Some(cerulion_core::graph::topology::split_edge_timeout_refusal(
+        topic,
+        consumer_node,
+        consumer_input,
+        producers,
+        &consumer_place,
+        &producer_place,
+    ))
+}
+
+/// The in-graph producers of `topic` when `topo` gives its consumer input
+/// `consumer_node.consumer_input` a `block_timeout_ms`, or `None` when the
+/// input sets none (or `topo` has no such edge).
+///
+/// The key check the supervisor's refusal ([`split_edge_timeout_verdict`]) and
+/// a several-rank replay's split check
+/// ([`crate::replay_rank::classify_split_block_edges`]) share, each wording the
+/// refusal for its own surface. A worker's own build refuses the key on the
+/// edges its credit bindings name instead
+/// (`GraphTopology::validate_with_credit_edges`). The
+/// `block_split_timeout_refusal_off` oracle mutant turns this check off, and
+/// with it the supervisor's, `graph levels`', `graph partition`'s and the
+/// replay's refusal of the key; it also turns off the worker's
+/// (`GraphTopology::validate_with_credit_edges`).
+pub(crate) fn split_edge_timeout_producers<'t>(
+    topo: &'t cerulion_core::graph::GraphTopology,
+    topic: &str,
+    consumer_node: &str,
+    consumer_input: &str,
+) -> Option<&'t [String]> {
     if cerulion_core::oracle_mutant::active("block_split_timeout_refusal_off") {
         return None;
     }
@@ -465,15 +497,7 @@ fn split_edge_timeout_verdict(
         .iter()
         .find(|c| c.node_id == consumer_node && c.input == consumer_input)?
         .block_timeout_ms?;
-    let (consumer_place, producer_place) = places();
-    Some(cerulion_core::graph::topology::split_edge_timeout_refusal(
-        topic,
-        consumer_node,
-        consumer_input,
-        &flow.producers,
-        &consumer_place,
-        &producer_place,
-    ))
+    Some(&flow.producers)
 }
 
 /// The slot `dead_rank` occupies on `edge`, or `None` if it is not

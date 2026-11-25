@@ -127,7 +127,12 @@ fn cached_private_topic_diagnostics_stay_hidden_after_the_producer_exits() {
         .any(|entry| entry.topic == private_topic));
     drop(private);
     drop(scope);
-    assert!(mgr.remote_topic_allowed(&private_topic).unwrap());
+    assert!(mgr
+        .remote_topic_allowed(
+            &private_topic,
+            cerulion_core::transport::TeardownWait::Bounded
+        )
+        .unwrap());
     for _ in 0..2 {
         let remote = feed.remote_snapshot().unwrap();
         let topics: Vec<_> = remote

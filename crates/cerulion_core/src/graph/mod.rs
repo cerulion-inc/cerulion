@@ -38,6 +38,11 @@ pub mod node_plugin_abi;
 pub mod param_resume;
 pub mod params;
 pub mod partition;
+// The live loop's opt-in kernel sleep between expected events
+// (`CERULION_PERIOD_PARK=1`).
+pub(crate) mod period_park;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use period_park::PeriodParkStats;
 pub mod run_topology;
 pub mod runtime;
 // The two sibling topic sets a split worker is told about, one type per
@@ -103,8 +108,8 @@ pub use run_topology::{
 pub use runtime::{
     build_trigger_edges, check_declared_outputs_listed, compute_gateway_plan,
     resolve_ingress_schema_hash, validate_network_ingress, BuildPurpose, CreditBinding, CreditRole,
-    CrossProcessWiring, GraphRuntime, NodeTickPanicRecords, BARRIER_BOUNDARY_TIMEOUT,
-    EXTERNAL_TOPIC_SILENCE_GRACE_MS,
+    CrossProcessWiring, GraphRuntime, NodeEnvLeftOut, NodeTickPanicRecords,
+    BARRIER_BOUNDARY_TIMEOUT, EXTERNAL_TOPIC_SILENCE_GRACE_MS,
 };
 pub use sibling_topics::{SiblingConsumedTopics, SiblingProducedTopics};
 pub use topology::{

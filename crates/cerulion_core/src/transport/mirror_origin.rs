@@ -8,25 +8,34 @@
 //! identity gets [`TransportError::MirrorIdentity`], a local observer that
 //! cannot hold its source gets [`TransportError::LocalObservationLease`], and a
 //! reserved marker another process left in an unreadable shape gets
-//! [`TransportError::MalformedMirrorMarker`], which names the remedy.
+//! [`TransportError::MalformedMirrorMarker`], which names the remedy. A marker
+//! whose last holder is dropping it is not malformed: the identity check opens
+//! it again within the `marker_teardown` budget and, if it is still being torn
+//! down, refuses with [`TransportError::MirrorIdentity`] naming that budget.
 
 use iceoryx2::node::Node;
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::notifier::Notifier;
 use iceoryx2::prelude::*;
 use iceoryx2::service::attribute::AttributeVerifier;
+use iceoryx2::service::builder::event::{EventOpenError, EventOpenOrCreateError};
 
+use super::marker_teardown::{MarkerOpenError, MarkerTeardown, TeardownWait};
 use super::CerService;
 use crate::error::{TransportError, TransportResult};
 
 const PREFIX: &str = "/__cerulion/mirror_origin/";
 const TOPIC_ATTRIBUTE: &str = "topic";
 
+/// The marker a refusal names while it is still being torn down.
+const MIRROR_MARKER: &str = "its network mirror marker";
+
 /// Native event listener quota per marker, the ceiling on simultaneous
 /// explicitly local observers of one topic when the configuration is untouched.
 const DEFAULT_LOCAL_OBSERVER_QUOTA: usize = 16;
 
 type MarkerService = iceoryx2::service::port_factory::event::PortFactory<CerService>;
+type MarkerBuilder = iceoryx2::service::builder::event::Builder<CerService>;
 
 /// Characters that are not `char::is_control` yet still steer a terminal
 /// invisibly: the whole Unicode `Format` (Cf) general category (soft hyphen,
@@ -209,7 +218,26 @@ fn open_marker(
         // Omit max_listeners: retain configured creation capacity (default 16)
         // and the existing open behavior, which imposes no minimum quota.
         .open_or_create_with_attributes(&verifier(topic, err)?)
-        .map_err(|e| err(topic, e.to_string()))
+        .map_err(|e| {
+            err(
+                topic,
+                open_marker_reason(e, node.config().global.creation_timeout),
+            )
+        })
+}
+
+/// The reason a failed open-or-create of a marker refuses with. iceoryx2's
+/// open-or-create waits out a marker marked for destruction itself, until the
+/// node's creation window (`window`) ends, and then returns that state: it is
+/// named, and every other error is quoted as iceoryx2 returned it.
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn open_marker_reason(e: EventOpenOrCreateError, window: std::time::Duration) -> String {
+    match e {
+        EventOpenOrCreateError::EventOpenError(EventOpenError::IsMarkedForDestruction) => {
+            super::marker_teardown::outlasted_creation_window(MIRROR_MARKER, window)
+        }
+        e => e.to_string(),
+    }
 }
 
 impl MirrorOrigin {
@@ -235,31 +263,63 @@ impl MirrorOrigin {
 }
 
 /// Open-only identity check. A malformed/incompatible marker fails closed and
-/// names the marker service plus the remedy.
+/// names the marker service plus the remedy. A marker still being torn down is
+/// opened again as `wait` allows and refuses, naming that wait, only once it
+/// outlasts it.
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
-pub(crate) fn is_network_mirror(node: &Node<CerService>, topic: &str) -> TransportResult<bool> {
-    use iceoryx2::service::builder::event::EventOpenError;
+pub(crate) fn is_network_mirror(
+    node: &Node<CerService>,
+    topic: &str,
+    wait: TeardownWait,
+) -> TransportResult<bool> {
+    is_network_mirror_with(node, topic, wait.budget(), &mut |builder, verifier| {
+        builder.open_with_attributes(verifier)
+    })
+}
+
+/// [`is_network_mirror`] with its teardown budget and its open of an existing
+/// marker supplied.
+// hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
+fn is_network_mirror_with(
+    node: &Node<CerService>,
+    topic: &str,
+    teardown: MarkerTeardown,
+    open: &mut dyn FnMut(
+        MarkerBuilder,
+        &AttributeVerifier,
+    ) -> Result<MarkerService, EventOpenError>,
+) -> TransportResult<bool> {
     let name = service_name(topic, &identity_error)?;
-    match node
-        .service_builder(&name)
-        .event()
-        // On an open the ceiling is a requirement the existing service must
-        // meet; see `CERULION_MAX_EVENT_ID`.
-        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
-        .open_with_attributes(&verifier(topic, &identity_error)?)
-    {
+    let verifier = verifier(topic, &identity_error)?;
+    let opened = teardown.open(
+        || {
+            open(
+                node.service_builder(&name)
+                    .event()
+                    // On an open the ceiling is a requirement the existing
+                    // service must meet; see `CERULION_MAX_EVENT_ID`.
+                    .event_id_max_value(super::CERULION_MAX_EVENT_ID),
+                &verifier,
+            )
+        },
+        |e| matches!(e, EventOpenError::IsMarkedForDestruction),
+    );
+    match opened {
         Ok(service) => Ok(service.dynamic_config().number_of_notifiers() > 0),
-        Err(EventOpenError::DoesNotExist) => Ok(false),
-        Err(e) => Err(malformed_error(
+        Err(MarkerOpenError::Open(EventOpenError::DoesNotExist)) => Ok(false),
+        Err(MarkerOpenError::Open(e)) => Err(malformed_error(
             name.as_str(),
             format!("opening it as the marker of topic '{topic}' failed with {e}"),
         )),
+        Err(MarkerOpenError::TornDown(budget)) => {
+            Err(identity_error(topic, budget.outlasted(MIRROR_MARKER)))
+        }
     }
 }
 
 /// Enumerate marker identities on this manager's namespace, without a gather wait.
 // hot-path-alloc-ok-fn: one-shot topic listing, never frame delivery.
-pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
+pub(crate) fn topics(node: &Node<CerService>, wait: TeardownWait) -> TransportResult<Vec<String>> {
     let mut candidates: Vec<String> = Vec::new();
     let mut malformed: Option<(String, &'static str)> = None;
     <CerService as iceoryx2::service::Service>::list(
@@ -301,7 +361,7 @@ pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
     }
     let mut topics = Vec::new();
     for topic in candidates {
-        if is_network_mirror(node, &topic)? {
+        if is_network_mirror(node, &topic, wait)? {
             topics.push(topic);
         }
     }
@@ -420,5 +480,133 @@ mod tests {
         }
         // Printable non-ASCII letters and symbols still pass through.
         assert_eq!(terminal_safe("go2-α/日本/€"), "go2-α/日本/€");
+    }
+
+    fn node() -> Node<CerService> {
+        NodeBuilder::new()
+            .config(&crate::testing::iceoryx_test_config())
+            .create::<CerService>()
+            .unwrap()
+    }
+
+    /// A budget of `opens` with no pause between them.
+    fn opens(opens: u32) -> MarkerTeardown {
+        MarkerTeardown::new(
+            std::num::NonZeroU32::new(opens).unwrap(),
+            std::time::Duration::ZERO,
+        )
+    }
+
+    /// [`is_network_mirror_with`] whose first `torn` opens report the marker
+    /// as marked for destruction and whose later opens are the real open.
+    /// Returns the answer and the number of opens.
+    fn mirror_after(
+        node: &Node<CerService>,
+        topic: &str,
+        torn: usize,
+        teardown: MarkerTeardown,
+    ) -> (TransportResult<bool>, usize) {
+        let mut calls = 0usize;
+        let answer = is_network_mirror_with(node, topic, teardown, &mut |builder, verifier| {
+            calls += 1;
+            if calls <= torn {
+                Err(EventOpenError::IsMarkedForDestruction)
+            } else {
+                builder.open_with_attributes(verifier)
+            }
+        });
+        (answer, calls)
+    }
+
+    #[test]
+    fn a_mirror_marker_being_torn_down_is_waited_out_and_then_read() {
+        let node = node();
+        // No marker once the teardown ends: a local source.
+        let (answer, calls) = mirror_after(&node, "/teardown/local", 3, opens(20));
+        assert_eq!((answer.unwrap(), calls), (false, 4));
+        // A live network mirror is read on the budget's last open.
+        let _mirror = MirrorOrigin::open(&node, "/teardown/mirror").unwrap();
+        let (answer, calls) = mirror_after(&node, "/teardown/mirror", 19, opens(20));
+        assert_eq!((answer.unwrap(), calls), (true, 20));
+        // A local observer's lease holds no mirror notifier: a local source.
+        let _lease = LocalObservationLease::open(&node, "/teardown/observed").unwrap();
+        let (answer, calls) = mirror_after(&node, "/teardown/observed", 1, opens(20));
+        assert_eq!((answer.unwrap(), calls), (false, 2));
+    }
+
+    #[test]
+    fn a_mirror_marker_that_outlasts_the_budget_is_not_called_malformed() {
+        let node = node();
+        let (answer, calls) =
+            mirror_after(&node, "/teardown/stuck", usize::MAX, MarkerTeardown::BUDGET);
+        assert_eq!(calls, 20);
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            "Network mirror identity for topic '/teardown/stuck' could not be established: its \
+             network mirror marker was still being torn down after 20 opens 25 ms apart; retry \
+             the request"
+        );
+        let (answer, calls) = mirror_after(&node, "/teardown/stuck", 20, opens(20));
+        assert_eq!(calls, 20);
+        assert!(answer.is_err());
+    }
+
+    #[test]
+    fn a_mirror_check_that_never_waits_opens_once_and_refuses_at_once() {
+        let node = node();
+        let (answer, calls) = mirror_after(
+            &node,
+            "/teardown/callback",
+            usize::MAX,
+            TeardownWait::Never.budget(),
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            "Network mirror identity for topic '/teardown/callback' could not be established: \
+             its network mirror marker was being torn down, and this check does not wait for \
+             it; retry the request"
+        );
+    }
+
+    #[test]
+    fn any_other_mirror_open_error_still_names_the_malformed_marker() {
+        let node = node();
+        let topic = "/teardown/foreign";
+        let mut calls = 0usize;
+        let answer = is_network_mirror_with(&node, topic, opens(20), &mut |_, _| {
+            calls += 1;
+            Err(EventOpenError::IncompatibleAttributes)
+        });
+        assert_eq!(calls, 1);
+        // `terminal_safe` escapes the reason's quotes, so they cannot close the
+        // span the refusal quotes the marker name in.
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            format!(
+                "Reserved network mirror marker '{}' is malformed: opening it as the marker of \
+                 topic \\'{topic}\\' failed with EventOpenError::IncompatibleAttributes. A process \
+                 on this machine created it with an incompatible marker scheme: stop or upgrade \
+                 that process, or run `cerulion clean` once it has exited, then retry",
+                marker_service_name(topic)
+            )
+        );
+    }
+
+    #[test]
+    fn an_open_or_create_that_ends_in_a_teardown_names_the_creation_window() {
+        let window = std::time::Duration::from_millis(500);
+        assert_eq!(
+            open_marker_reason(
+                EventOpenOrCreateError::EventOpenError(EventOpenError::IsMarkedForDestruction),
+                window,
+            ),
+            "its network mirror marker was still being torn down when the 500 ms shared-memory \
+             creation window ended; retry the request"
+        );
+        assert_eq!(
+            open_marker_reason(EventOpenOrCreateError::SystemInFlux, window),
+            "EventOpenOrCreateError::SystemInFlux"
+        );
     }
 }

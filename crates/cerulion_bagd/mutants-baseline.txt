@@ -1,0 +1,17 @@
+# Mutation baseline for cerulion_bagd: the capture walk's consumed frame
+# decision.
+#
+# Scope: `name_consumed_frame` in trace_window.rs, the pure fold that decides
+# which kept read-outcome record consumed a frame and which writer that frame
+# is named under. The rest of the crate is outside this baseline's scope.
+#
+# Run:     cargo mutants -p cerulion_bagd --in-place --cap-lints true \
+#            -f crates/cerulion_bagd/src/trace_window.rs \
+#            --re "name_consumed_frame" -- --lib -- --test-threads=1
+# Result:  12 mutants: 12 caught, 0 missed.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)

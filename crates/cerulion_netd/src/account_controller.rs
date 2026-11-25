@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -70,6 +71,21 @@ struct Pin {
 }
 
 const RESTORATION_BUDGET: Duration = Duration::from_secs(5);
+/// How long a serving start waits for a controller state held by another
+/// operation before it cancels its live WAN pins. It covers the short holders
+/// (demand admission, a release, an identity refresh apply) and stops well short
+/// of the metadata I/O that holds the state for seconds, so the new child is
+/// supervised promptly either way.
+const RESTORATION_LOCK_GRACE: Duration = Duration::from_millis(250);
+/// The first pause between attempts on a held state; each later pause doubles up
+/// to [`RESTORATION_LOCK_MAX_PAUSE`], so a short holder is met within about a
+/// millisecond and a holder that outlasts the grace costs a few wakes.
+const RESTORATION_LOCK_FIRST_PAUSE: Duration = Duration::from_millis(1);
+const RESTORATION_LOCK_MAX_PAUSE: Duration = Duration::from_millis(64);
+const _: () = assert!(
+    RESTORATION_LOCK_GRACE.as_millis() < RESTORATION_BUDGET.as_millis(),
+    "the wait for the state is spent from the restoration budget"
+);
 
 fn restoration_time_left(deadline: Instant, now: Instant) -> Option<Duration> {
     deadline
@@ -83,6 +99,10 @@ struct State {
     plane: Option<IrohMirrorPlane>,
     account_mode: bool,
     identity: Option<IdentitySnapshot>,
+    /// Advances on every write of `identity`, so a load taken with the state
+    /// unlocked can tell that the installed identity was replaced meanwhile,
+    /// even when it was replaced back to the same content.
+    identity_generation: u64,
     snapshot: Option<AccountSnapshot>,
     catalogs: HashMap<[u8; 32], CatalogReply>,
     pending_all: bool,
@@ -102,6 +122,8 @@ pub struct AccountWanController {
     paired: Mutex<HashMap<String, WanRobot>>,
     pins: Mutex<BTreeMap<TopicKey, Pin>>,
     state: Mutex<State>,
+    restoration_contentions: AtomicU64,
+    restoration_busy_cancellations: AtomicU64,
 }
 
 impl AccountWanController {
@@ -140,6 +162,7 @@ impl AccountWanController {
                 plane: None,
                 account_mode: false,
                 identity: None,
+                identity_generation: 0,
                 snapshot: None,
                 catalogs: HashMap::new(),
                 pending_all: false,
@@ -148,7 +171,22 @@ impl AccountWanController {
                 handover: None,
                 busy_since: None,
             }),
+            restoration_contentions: AtomicU64::new(0),
+            restoration_busy_cancellations: AtomicU64::new(0),
         })
+    }
+
+    /// Observable state (Principle #3): serving starts that found the controller
+    /// state held by another operation when they came to restore outbound readers.
+    pub fn restoration_contentions(&self) -> u64 {
+        self.restoration_contentions.load(Ordering::Relaxed)
+    }
+
+    /// Observable state (Principle #3): serving starts that cancelled their live
+    /// outbound WAN pins, and returned an error naming the first, because the
+    /// controller state stayed held by another operation.
+    pub fn restoration_busy_cancellations(&self) -> u64 {
+        self.restoration_busy_cancellations.load(Ordering::Relaxed)
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, String> {
@@ -239,7 +277,7 @@ impl AccountWanController {
         state.pending_robots.clear();
         state.pending_restores.clear();
         state.handover = None;
-        state.identity = None;
+        Self::set_identity(state, None);
         state.snapshot = None;
         state.catalogs.clear();
         match state.plane.take() {
@@ -335,7 +373,18 @@ impl AccountWanController {
         if !state.account_mode {
             return Ok(());
         }
-        let current = match self.read_identity() {
+        let current = self.read_identity();
+        Self::apply_identity(state, current)
+    }
+
+    /// Compare a loaded identity with the installed one and apply it: a changed
+    /// account or device key invalidates, a renewed proof replaces the owner
+    /// certificate, and an unchanged stamp is a no-op.
+    fn apply_identity(
+        state: &mut State,
+        current: Result<IdentitySnapshot, SnapshotError>,
+    ) -> Result<(), String> {
+        let current = match current {
             Ok(current) => current,
             Err(SnapshotError::Busy) => return Err(IDENTITY_BUSY.into()),
             Err(_) => {
@@ -354,10 +403,16 @@ impl AccountWanController {
             state
                 .registry
                 .replace_owner_certificate(current.owner_chain().cloned().map(Arc::new))?;
-            state.identity = Some(current);
+            Self::set_identity(state, Some(current));
             state.catalogs.clear();
         }
         Ok(())
+    }
+
+    /// Write the installed identity and advance its generation.
+    fn set_identity(state: &mut State, identity: Option<IdentitySnapshot>) {
+        state.identity = identity;
+        state.identity_generation = state.identity_generation.wrapping_add(1);
     }
 
     fn fence_reply(
@@ -483,7 +538,7 @@ impl AccountWanController {
                 .replace_owner_certificate(identity.owner_chain().cloned().map(Arc::new))?;
         }
         state.account_mode = true;
-        state.identity = Some(identity);
+        Self::set_identity(&mut state, Some(identity));
         state.snapshot = Some(snapshot.clone());
         state.catalogs.clear();
         state.busy_since = None;
@@ -493,16 +548,50 @@ impl AccountWanController {
         self.fence_reply(&mut state, &stamp)
     }
 
+    /// The periodic identity check. The identity files are read and decoded with
+    /// the state unlocked; the state is held only to retire pending keys and to
+    /// compare and apply the loaded identity.
     fn refresh(&self, registry: &mut DemandRegistry) -> Result<(), String> {
+        let Some(loaded_at) = self.refresh_start(registry)? else {
+            return Ok(());
+        };
+        let current = self.read_identity();
+        self.refresh_apply(registry, loaded_at, current)
+    }
+
+    /// Retire pending keys and return the installed identity's generation, or
+    /// `None` outside account mode.
+    fn refresh_start(&self, registry: &mut DemandRegistry) -> Result<Option<u64>, String> {
         let mut state = self.state()?;
         self.retire_pending(&mut state, registry)?;
         if !state.account_mode {
-            return Ok(());
+            return Ok(None);
         }
         if state.identity.is_none() {
             return Err(NEED_INSTALL.into());
         }
-        match self.read_identity() {
+        Ok(Some(state.identity_generation))
+    }
+
+    /// Apply an identity loaded at generation `loaded_at`. An identity written
+    /// during the load (an install, a renewed proof or a clear) supersedes it, so
+    /// this older load is dropped and the next refresh reads again; a cleared
+    /// identity still reports that it needs an install.
+    fn refresh_apply(
+        &self,
+        registry: &mut DemandRegistry,
+        loaded_at: u64,
+        current: Result<IdentitySnapshot, SnapshotError>,
+    ) -> Result<(), String> {
+        let mut state = self.state()?;
+        if state.identity_generation != loaded_at {
+            self.retire_pending(&mut state, registry)?;
+            if state.identity.is_none() {
+                return Err(NEED_INSTALL.into());
+            }
+            return Ok(());
+        }
+        match current {
             Err(SnapshotError::Busy) => {
                 let now = Instant::now();
                 let since = *state.busy_since.get_or_insert(now);
@@ -512,9 +601,9 @@ impl AccountWanController {
                 }
                 Err(IDENTITY_BUSY.into())
             }
-            _ => {
+            current => {
                 state.busy_since = None;
-                let result = self.sync_identity(&mut state);
+                let result = Self::apply_identity(&mut state, current);
                 self.retire_pending(&mut state, registry)?;
                 result
             }

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The single-process scheduler → trace-ring hook.
 //!
-//! These pin the [`Scheduler::set_trace_ring_producer`] hook END-TO-END over a
-//! REAL POSIX-SHM [`TraceRingOwner`]/producer/consumer (no iceoryx2 — the trace
-//! ring is a standalone SPSC POSIX-SHM ring), against HAND oracles (never a
-//! two-run self-compare):
+//! The scheduler-hook arms pin the [`Scheduler::set_trace_ring_producer`] hook
+//! END-TO-END over a REAL POSIX-SHM [`TraceRingOwner`]/producer/consumer, with
+//! no iceoryx2 (the trace ring is a standalone SPSC POSIX-SHM ring); the
+//! reopen-flag arm, last in the list, runs a `GraphRuntime`. Every arm checks
+//! against HAND oracles (never a two-run self-compare):
 //!
 //! - `completeness`: with an in-memory `--trace-limit` SMALLER than the total
 //!   fire count, the ring receives ALL fire records while the in-memory trace
@@ -18,6 +19,12 @@
 //!   in-memory trace is BYTE-IDENTICAL whether or not a ring is installed (the
 //!   ring is a pure side-effect that never perturbs what fires), AND both equal
 //!   a hand oracle (so it is not a pure two-run tautology).
+//! - `the_boundary_after_a_due_step_carries_the_reopen_flag`: the one shape that
+//!   writes a nonzero boundary flags word, a `GraphRuntime` with a checkpoint
+//!   arm AND a trace ring installed, puts
+//!   `STEP_BOUNDARY_FLAG_RUNS_REOPENED` on exactly the boundary after each due
+//!   step, against hand-written records and hand-written bytes; the same graph
+//!   with no arm flags no boundary.
 //!
 //! # SHM-touching — run in the shared-memory test window
 //!
@@ -26,6 +33,10 @@
 //! file is parallel-safe, even on a machine whose POSIX SHM namespace is
 //! shared with other test runs. `#[serial]` is
 //! kept as belt-and-suspenders for any future in-binary sibling.
+//!
+//! The reopen-flag arm also builds a `GraphRuntime` over iceoryx2
+//! (`build_for_test`, a per-test SHM root) and maps a checkpoint arm word named
+//! from the same pid-scoped tag, which its owner unlinks on drop.
 
 #![cfg(unix)]
 
@@ -33,10 +44,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cerulion_core::clock::VirtualClock;
+use cerulion_core::graph::config::{GraphConfig, NodeDef, OutputDef};
+use cerulion_core::graph::node::NodeEntry;
+use cerulion_core::graph::GraphRuntime;
+use cerulion_core::prelude::*;
 use cerulion_core::scheduler::{NodeConfig, Scheduler, TraceEntry, TriggerPolicy};
+use cerulion_core::state_arm::MappedStateArm;
 use cerulion_core::trace_ring::{
-    TraceRingConsumer, TraceRingOwner, TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY,
+    step_boundary_flags, TraceRingConsumer, TraceRingOwner, TraceRingRecord, RECORD_TYPE_FIRE,
+    RECORD_TYPE_STEP_BOUNDARY, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
 };
+use indexmap::IndexMap;
+use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
 
 /// A `Period` policy with unlimited catch-up (all interval boundaries fire).
@@ -150,6 +169,7 @@ fn ring_receives_all_fires_when_in_memory_trace_is_capped() {
             global_level: 0,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         })
         .collect();
     assert_eq!(
@@ -357,6 +377,7 @@ fn recording_on_vs_off_trace_is_byte_identical() {
         global_level: 0,
         duration_ns: 0,
         discarded: false,
+        stop: None,
     };
     let trace_oracle = vec![
         oracle("src", 0, 10_000_000),
@@ -805,4 +826,178 @@ fn no_discard_signal_leaves_every_fire_unmarked() {
     );
 
     drop(ring_owner);
+}
+
+// ---------------------------------------------------------------------------
+// (g) The runs-reopened flag: a `GraphRuntime` with a checkpoint arm AND a
+//     trace ring, the one shape whose boundary flags word is not 0.
+// ---------------------------------------------------------------------------
+
+/// A `Period(10)` source: the boundary stream is the subject here, so the node
+/// only has to give the graph a step to run.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct HookTick {
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl HookTick {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = 1.0;
+        Ok(())
+    }
+}
+
+/// [`boundary_record`] with `flags` in its `global_level` word.
+fn flagged_boundary_record(step: u64, advanced_ns: u64, flags: u32) -> TraceRingRecord {
+    TraceRingRecord {
+        global_level: flags,
+        ..boundary_record(step, advanced_ns)
+    }
+}
+
+/// Build the one-node graph over iceoryx2, install a trace ring before step 0
+/// and, for `Some(cadence)`, attach a checkpoint arm armed from step 0 every
+/// `cadence` steps, as a recorder arms it; step `steps` times by 10 ms and
+/// return the ring's STEP_BOUNDARY records in push order.
+///
+/// No state ring is installed, so each due step's anchor walk returns at its
+/// ring check, and the reopen and its boundary flag are the due step's whole
+/// effect on the trace.
+fn reopen_flag_boundaries(label: &str, cadence: Option<u64>, steps: u64) -> Vec<TraceRingRecord> {
+    let tag = ring_tag(label);
+    let node_ids = vec!["tick".to_string()];
+    let mut ring_owner = TraceRingOwner::create(&tag, 256, 0, &["tick"]).expect("create ring");
+    let ring_name = ring_owner.name().to_string();
+    let producer = ring_owner.producer().expect("mint producer");
+
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "trace_ring_hook".to_string(),
+        prefix: format!("hk_{label}"),
+        nodes: vec![NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: "tick".to_string(),
+            node_type: "hook_tick".to_string(),
+            inputs: vec![],
+            outputs: vec![OutputDef {
+                name: "out".to_string(),
+                schema: "Vector3".to_string(),
+                max_slice_len: None,
+                history_size: 0,
+                topic: None,
+            }],
+        }],
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("tick".to_string(), Box::new(HookTickEntry::new()));
+    let mut runtime =
+        GraphRuntime::build_for_test(config, factories, Arc::new(VirtualClock::new()), 8)
+            .expect("the graph builds");
+    runtime.set_trace_ring_producer(producer, &node_ids);
+    // Held until the run ends: dropping the owning handle unlinks the word.
+    let arm = cadence.map(|cadence| {
+        let word = Arc::new(MappedStateArm::create_owned(&format!("{tag}_arm")).expect("arm word"));
+        word.arm(cadence, 0);
+        runtime.attach_state_arm(Arc::clone(&word));
+        word
+    });
+
+    for _ in 0..steps {
+        runtime.step(Duration::from_millis(10));
+    }
+
+    let records = drain_ring(&ring_name);
+    runtime.shutdown();
+    drop(arm);
+    drop(ring_owner);
+    records
+        .into_iter()
+        .filter(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY)
+        .collect()
+}
+
+/// A `GraphRuntime` armed from step 0 every 3 steps is due at 0, 3, 6 and 9.
+/// The live step reopens every stage's writer runs at the end of each due step
+/// and marks the NEXT boundary, so over 10 steps the boundaries of steps 1, 4
+/// and 7 carry `STEP_BOUNDARY_FLAG_RUNS_REOPENED` and no other does: step 0's
+/// boundary is pushed before the first due check, and step 9's next boundary
+/// (step 10) is never pushed. Hand oracle, record by record, plus the hand
+/// 40 bytes of the first flagged one.
+///
+/// CONTROL: the same graph with no arm attached flags no boundary, so the flag
+/// is the arm's and not the ring's. DETERMINISM: a second armed run pushes the
+/// same records.
+#[test]
+#[serial]
+fn the_boundary_after_a_due_step_carries_the_reopen_flag() {
+    const STEPS: u64 = 10;
+    /// One boundary per step at `(k + 1) * 10 ms`, the `flagged` steps' with
+    /// the reopen flag and every other one's with 0.
+    fn oracle(flagged: &[u64]) -> Vec<TraceRingRecord> {
+        (0..STEPS)
+            .map(|k| {
+                let flags = if flagged.contains(&k) {
+                    STEP_BOUNDARY_FLAG_RUNS_REOPENED
+                } else {
+                    0
+                };
+                flagged_boundary_record(k, (k + 1) * 10_000_000, flags)
+            })
+            .collect()
+    }
+
+    let armed = reopen_flag_boundaries("reopen_a", Some(3), STEPS);
+    assert_eq!(
+        armed,
+        oracle(&[1, 4, 7]),
+        "exactly the boundary after each due step carries the flag, step 0's never"
+    );
+    // The flagged boundary of step 1, at 20 ms, byte by byte.
+    #[rustfmt::skip]
+    let step_one: [u8; 40] = [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // step 1
+        0x00, 0x2D, 0x31, 0x01, 0x00, 0x00, 0x00, 0x00, // fire_time_ns 20_000_000
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // duration_ns 0
+        0x00, 0x00, 0x00, 0x00,                         // node_idx 0
+        0x01, 0x00, 0x00, 0x00,                         // global_level: the flag
+        0x03, 0x00, 0x00, 0x00,                         // record_type STEP_BOUNDARY
+        0x00, 0x00, 0x00, 0x00,                         // reserved 0 on the ring
+    ];
+    assert_eq!(armed[1].as_bytes(), step_one);
+    let decoded: Vec<bool> = armed
+        .iter()
+        .map(|r| {
+            step_boundary_flags(r.global_level)
+                .expect("a recorder writes only defined bits")
+                .runs_reopened()
+        })
+        .collect();
+    assert_eq!(
+        decoded,
+        vec![false, true, false, false, true, false, false, true, false, false],
+        "the decoder reads the flag back on the same three boundaries"
+    );
+
+    let detached = reopen_flag_boundaries("reopen_off", None, STEPS);
+    assert_eq!(
+        detached,
+        oracle(&[]),
+        "CONTROL: with no arm attached no step is due and no boundary is flagged"
+    );
+
+    let again = reopen_flag_boundaries("reopen_b", Some(3), STEPS);
+    assert_eq!(
+        again, armed,
+        "DETERMINISM: a second armed run pushes the same records"
+    );
 }
