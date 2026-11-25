@@ -5867,10 +5867,14 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // edge no credit word can count exactly (two or more in-graph producers,
     // or `block_timeout_ms`) refuses the replay before rank 0 has run a step,
     // when the whole graph builds (and, for `block_timeout_ms`, validates).
-    // One plan holds every node, so it splits nothing.
-    if plans.len() > 1 {
-        refuse_uncreditable_split_block_edges(&config, &plans, &factories)?;
-    }
+    // Every other split `block` edge is one a live run counts on a
+    // cross-process credit word, and each pass feeds it from the bag. One
+    // plan holds every node, so it splits nothing.
+    let split_block_edges = if plans.len() > 1 {
+        creditable_split_block_edges(&config, &plans, &factories)?
+    } else {
+        Vec::new()
+    };
     // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
     //        the first pass ────────────────────────────────────────────────
     //
@@ -5962,6 +5966,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 node_infos: &node_infos,
                 bag_side: &bag_side,
                 node_info_notes,
+                split_block_edges: &split_block_edges,
                 config: &config,
                 driver_nodes: &classes.driver_nodes,
                 recorded_queues: recorder.as_ref().and_then(|r| r.input_queues.as_ref()),
@@ -6000,7 +6005,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                     None
                 },
                 publisher_slots: publisher_slots.clone(),
-                bag_fed_block_edges: cerulion_core::replay_feed::BagFedBlockEdges::default(),
+                bag_fed_block_edges: pass_fed_block_edges(&split_block_edges, plan.members()),
             };
             let mut runtime = match build_pass_runtime(
                 plan,
@@ -10245,10 +10250,21 @@ fn refuse_unlisted_macro_output_in_every_pass(
         .try_for_each(|plan| refuse_unlisted_macro_output(plan.subgraph(), entries))
 }
 
+/// The warning [`creditable_split_block_edges`] gives once per split edge
+/// whose `block` the graph the bag embeds does not set, so the build's own
+/// declaration of the consumer input decides it.
+const SPLIT_BLOCK_FROM_DECLARATION_WARNING: &str = "replay: a split `block` edge takes its \
+     `block` from the consumer's declaration in the build you replay, not from the graph the \
+     bag embeds; the replay feeds the edge from the recording and stands its producer down, \
+     which matches the recorded run only if the recorded build of the consumer also declared \
+     `block` on this input";
+
 /// Refuse a replay of more than one rank whose manifests split a `block` edge
 /// no cross-process credit word can count exactly (two or more in-graph
 /// producers, or `block_timeout_ms`)
-/// ([`replay_rank::classify_split_block_edges`]).
+/// ([`replay_rank::classify_split_block_edges`]), and otherwise return the
+/// split `block` edges a live run counts on a cross-process credit word, in
+/// the classifier's order.
 ///
 /// The classifier reads the WHOLE graph the bag embeds and each node's
 /// declaration in this build, before any pass takes its entry; a node whose
@@ -10271,14 +10287,15 @@ fn refuse_unlisted_macro_output_in_every_pass(
 /// The replay keeps the exit, the order and the partial report it gave such a
 /// bag before: a refusal made before the first pass and an earlier rank's
 /// failure still come first. An engine bug the classifier reports is
-/// [`ReplayError::Internal`] (exit 5). The creditable split edges the
-/// classifier returns are not read here: a pass build refuses a `block` input
-/// whose producer runs in another rank.
-fn refuse_uncreditable_split_block_edges(
+/// [`ReplayError::Internal`] (exit 5). Such a fault returns no edge, so no
+/// pass feeds a split edge from the bag and its consumer's rank build refuses
+/// it as above. Every edge returned is fed from the bag by each pass that
+/// holds one of its ends ([`pass_fed_block_edges`]).
+fn creditable_split_block_edges(
     config: &GraphConfig,
     plans: &[RankPlan],
     entries: &IndexMap<String, Box<dyn NodeEntry>>,
-) -> Result<(), ReplayError> {
+) -> Result<Vec<crate::multiprocess::CreditEdgePlan>, ReplayError> {
     let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = config
         .nodes
         .iter()
@@ -10289,14 +10306,31 @@ fn refuse_uncreditable_split_block_edges(
         .collect();
     let node_rank = replay_rank::plan_node_ranks(plans);
     match replay_rank::classify_split_block_edges(config, &infos, &node_rank) {
-        Ok(_) => Ok(()),
+        Ok(edges) => {
+            // The classification reads `block` off this build's declarations
+            // where the bag's graph sets no key, so a recording made with a
+            // build that declared otherwise is fed and judged as this one.
+            for edge in edges.iter().filter(|e| {
+                replay_rank::block_declared_by(config, &e.consumer_node, &e.consumer_input)
+                    == replay_rank::BlockDeclaredBy::Node
+            }) {
+                tracing::warn!(
+                    topic = %edge.topic,
+                    consumer_node = %edge.consumer_node,
+                    consumer_input = %edge.consumer_input,
+                    producer = %edge.producer_nodes.join(", "),
+                    "{SPLIT_BLOCK_FROM_DECLARATION_WARNING}"
+                );
+            }
+            Ok(edges)
+        }
         Err(replay_rank::SplitBlockEdgeError::Topology { reason }) => {
             tracing::debug!(
                 error = %reason,
                 "replay: the whole graph does not build or validate with this build's \
                  declarations, so its remaining split `block` edges are left to each rank's build"
             );
-            Ok(())
+            Ok(Vec::new())
         }
         Err(e @ replay_rank::SplitBlockEdgeError::EngineBug { .. }) => Err(ReplayError::Internal {
             reason: e.to_string(),
@@ -10308,6 +10342,30 @@ fn refuse_uncreditable_split_block_edges(
             Err(ReplayError::SplitBlockEdgeTimeout { edge })
         }
     }
+}
+
+/// PURE: the split `block` edges ([`creditable_split_block_edges`]) the pass
+/// over `members` feeds from the bag, as its build's replay wiring names them
+/// ([`cerulion_core::replay_feed::BagFedBlockEdges`]): each edge one of whose
+/// producers the pass holds. The build marks each such producer as held by
+/// the edge, so it accepts a trailing refill the recording holds on it below
+/// the burst cap. A pass that holds none of an edge's producers gets no entry
+/// for it.
+fn pass_fed_block_edges(
+    edges: &[crate::multiprocess::CreditEdgePlan],
+    members: &[String],
+) -> cerulion_core::replay_feed::BagFedBlockEdges {
+    cerulion_core::replay_feed::BagFedBlockEdges::new(
+        edges
+            .iter()
+            .filter(|e| e.producer_nodes.iter().any(|p| members.contains(p)))
+            .map(|e| cerulion_core::replay_feed::BagFedBlockEdge {
+                topic: e.topic.clone(),
+                consumer_node: e.consumer_node.clone(),
+                consumer_input: e.consumer_input.clone(),
+                producer_nodes: e.producer_nodes.clone(),
+            }),
+    )
 }
 
 /// Refuse a graph in which a `#[cerulion_node]` node declares an output that
@@ -10526,6 +10584,10 @@ struct PassInputs<'a> {
     /// one per member whose declared metadata could not be read, so the
     /// verifier's clean claim never covers a node nobody looked at.
     node_info_notes: Vec<RederivationNote>,
+    /// The `block` edges the run's rank manifests split that a live run
+    /// counts on a cross-process credit word
+    /// ([`creditable_split_block_edges`]), the whole run's.
+    split_block_edges: &'a [crate::multiprocess::CreditEdgePlan],
     /// The whole-graph config — `multi_publisher_topics` is a graph-level
     /// declaration, not a subgraph one.
     config: &'a GraphConfig,
@@ -11338,9 +11400,12 @@ fn derive_trailing_refills(
 /// `sample(N)` declaration settles it) plans nothing, a node with no refill
 /// hook in this replay (`has_refill`) plans nothing, and a `drop_oldest` node
 /// on a bag with no stage set (`FifoDrain::Unrecorded`) is planned on the
-/// rule it is judged on, which allows for no hold. A node whose reads
-/// a pop count cannot be taken over (a node a cross-rank `block` edge gates, a
-/// truncated or decimated stream, a declined verification) carries nothing.
+/// rule it is judged on, which allows for no hold. A node a `block` edge
+/// across ranks holds (`replay_rederive::NodeDecl::held_across_ranks`) can be
+/// deferred at every step, since the edge's credit word is in another process,
+/// so its burst can end on a trailing refill at any step. A node whose reads
+/// a pop count cannot be taken over (a truncated or decimated stream, a
+/// declined verification) carries nothing.
 /// A step no carry explains (a stopped node, a fire on a re-offered head that
 /// no pop recorded, a signal clamp) carries nothing and is left to the
 /// re-derivation verdict.
@@ -11382,13 +11447,6 @@ fn fifo_trailing_refills(
             replay_rederive::FifoDrain::Unified | replay_rederive::FifoDrain::Unrecorded => {}
         }
         if !has_refill(&decl.node_id) {
-            continue;
-        }
-        if verification
-            .block_edges
-            .iter()
-            .any(|e| e.producer_node == decl.node_id)
-        {
             continue;
         }
         let carry = carries
@@ -13036,7 +13094,8 @@ struct PassVerification {
     reads_by_step: BTreeMap<u64, Vec<replay_rederive::RecordedRead>>,
     /// This rank's declarations, in graph order.
     decls: Vec<replay_rederive::NodeDecl>,
-    /// The rank's cross-rank `block` consumer edges.
+    /// The split `block` edges whose consumer this rank holds
+    /// ([`creditable_split_block_edges`]).
     block_edges: Vec<replay_rederive::BlockEdgeObservation>,
     /// `Some(cause)` when this pass DECLINED the two additive gates, carrying
     /// WHICH of the five prepare-time causes fired.
@@ -15313,7 +15372,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// SIXTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// SEVENTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -15357,6 +15416,9 @@ fn prepare_pass_verification(
     recorded_queues: Option<&RecordedInputQueues>,
     // Does the bag's trace hold every node stop (`trace_format` 12 or later)?
     stops_recorded: bool,
+    // The run's split `block` edges a live run counts on a cross-process
+    // credit word ([`creditable_split_block_edges`]).
+    split_block_edges: &[crate::multiprocess::CreditEdgePlan],
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -16303,6 +16365,11 @@ fn prepare_pass_verification(
                 may_be_held_by: replay_rederive::BlockHoldEdges::new(
                     block_holds.remove(id.as_str()).unwrap_or_default(),
                 ),
+                // A split edge's producer and consumer are in different
+                // ranks by its classification, so its consumer is never here.
+                held_across_ranks: split_block_edges
+                    .iter()
+                    .any(|e| e.producer_nodes.contains(id)),
                 has_non_trigger_inputs: node_has_non_trigger_inputs(info, wired),
                 trigger_input_capacities: trigger_input_capacities(
                     info,
@@ -16315,66 +16382,21 @@ fn prepare_pass_verification(
         })
         .collect();
 
-    let cross: std::collections::HashMap<(String, String), &replay_rank::CrossRankEdge> = plan
-        .cross_rank_consumed()
+    // The split `block` edges whose consumer this rank holds, judged here for
+    // their credit conservation on the consumer's recorded drains.
+    let block_edges = split_block_edges
         .iter()
-        .map(|e| ((e.consumer_node.clone(), e.consumer_input.clone()), e))
-        .collect();
-    // MEASURED, see
-    // `a_crafted_cross_rank_block_edge_is_refused_at_the_rank_build_never_verified`:
-    // this loop is UNREACHABLE with a non-empty result on any bag the engine
-    // will build. A cross-rank `block` edge is refused TWICE before it could
-    // reach here: `validate_partition` refuses a split at record time,
-    // and `build_pass_runtime` builds THIS rank's subgraph, whose
-    // `GraphTopology::validate` refuses a `block` input with no in-graph
-    // producer (exit 5) strictly before the pass that reads `block_edges`
-    // runs. So no pass ever judges a non-empty list, and the `verify_conservation`
-    // plane it feeds is held by its pure oracles alone. It stays because
-    // deleting it is a design call over that plane (`Decider::BlockCredit`,
-    // three stand-down reasons, eight oracles), not a local tidy-up.
-    let mut block_edges = Vec::new();
-    for (topic, node, input) in &consumed {
-        let Some(edge) = cross.get(&(node.clone(), input.clone())) else {
-            continue; // an intra-rank block edge is decided inside one runtime.
-        };
-        let Some(info) = node_infos.get(node.as_str()) else {
-            continue;
-        };
-        let Some(meta) = info.input_meta().iter().find(|m| m.name == *input) else {
-            continue;
-        };
-        if meta.backpressure != cerulion_core::graph::node::BackpressurePolicy::Block {
-            continue;
-        }
-        // A `BlockEdgeObservation` models ONE producer/consumer
-        // pair, and a split multi-publisher topic has no single producer to put
-        // in the producer slot. Picking the first in graph order would attribute
-        // the whole published-frame count to a writer that produced part of it,
-        // so the observation is DECLINED instead — the rederive plane simply
-        // sees no block edge here, which is what it already sees for every
-        // intra-rank one.
-        let Some(producer) = edge.sole_producer() else {
-            tracing::debug!(
-                topic = %topic,
-                consumer_node = %node,
-                consumer_input = %input,
-                producers = edge.producers.len(),
-                "replay: a cross-rank `block` edge on a multi-producer topic has no single \
-                 producer to observe — its block-credit observation is declined"
-            );
-            continue;
-        };
-        block_edges.push(replay_rederive::BlockEdgeObservation {
-            topic: topic.clone(),
-            producer_node: producer.node.clone(),
-            consumer_node: node.clone(),
-            consumer_input: input.clone(),
-            depth: meta.depth as u32,
+        .filter(|e| plan.members().contains(&e.consumer_node))
+        .map(|e| replay_rederive::BlockEdgeObservation {
+            topic: e.topic.clone(),
+            consumer_node: e.consumer_node.clone(),
+            consumer_input: e.consumer_input.clone(),
+            depth: e.depth,
             // The FRAMES, never the producer's fires (an output the
             // tick never writes never publishes).
-            published_frames: recorded_messages.frame_count(topic) as u64,
-        });
-    }
+            published_frames: recorded_messages.frame_count(&e.topic) as u64,
+        })
+        .collect();
 
     Ok(PassVerification {
         steered,
@@ -16821,6 +16843,7 @@ fn plan_pass_verification(
         pass.record_health,
         pass.recorded_queues,
         pass.stops_recorded,
+        pass.split_block_edges,
     )?;
     Ok(verification)
 }
@@ -22925,6 +22948,7 @@ mod node_trigger_decl_tests {
             trigger,
             throttle_ns: None,
             may_be_held_by: BlockHoldEdges::none(),
+            held_across_ranks: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: Default::default(),
         };
@@ -23077,6 +23101,7 @@ mod node_trigger_decl_tests {
             ),
             throttle_ns: None,
             may_be_held_by: BlockHoldEdges::none(),
+            held_across_ranks: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: Default::default(),
         };
@@ -42084,6 +42109,7 @@ mod trigger_input_capacity_tests {
                 },
                 throttle_ns: None,
                 may_be_held_by: BlockHoldEdges::new(holds.remove("relay").unwrap_or_default()),
+                held_across_ranks: false,
                 has_non_trigger_inputs: false,
                 trigger_input_capacities: Default::default(),
             }
@@ -42677,6 +42703,71 @@ mod enforcement_decode_tests {
 }
 
 #[cfg(test)]
+mod fed_block_edge_tests {
+    use super::*;
+    use crate::multiprocess::CreditEdgePlan;
+
+    /// The split edge `topic` -> `consumer.inp`, which `producer` alone writes.
+    fn edge(topic: &str, consumer: &str, producer: &str) -> CreditEdgePlan {
+        CreditEdgePlan {
+            topic: topic.to_string(),
+            consumer_node: consumer.to_string(),
+            consumer_input: "inp".to_string(),
+            depth: 3,
+            producer_ranks: vec![0],
+            consumer_rank: 1,
+            producer_nodes: vec![producer.to_string()],
+        }
+    }
+
+    fn members(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// Each entry as `(topic, consumer, producers)`, in the set's order.
+    fn named(set: &cerulion_core::replay_feed::BagFedBlockEdges) -> Vec<(&str, &str, Vec<&str>)> {
+        set.iter()
+            .map(|e| {
+                (
+                    e.topic.as_str(),
+                    e.consumer_node.as_str(),
+                    e.producer_nodes.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A pass that holds an edge's producer feeds that edge, a pass that
+    /// holds neither of its ends feeds nothing, and the set comes out in its
+    /// own order whatever order the classification gave.
+    #[test]
+    fn a_pass_feeds_the_split_edges_whose_producer_it_holds() {
+        let edges = vec![
+            edge("/t/b", "sink_b", "src_b"),
+            edge("/t/a", "sink_a", "src_a"),
+        ];
+        let front = pass_fed_block_edges(&edges, &members(&["src_a", "src_b", "mid"]));
+        assert_eq!(
+            named(&front),
+            vec![
+                ("/t/a", "sink_a", vec!["src_a"]),
+                ("/t/b", "sink_b", vec!["src_b"]),
+            ]
+        );
+        let reversed: Vec<CreditEdgePlan> = edges.iter().rev().cloned().collect();
+        assert_eq!(
+            pass_fed_block_edges(&reversed, &members(&["src_a", "src_b", "mid"])),
+            front
+        );
+        let one = pass_fed_block_edges(&edges, &members(&["src_b"]));
+        assert_eq!(named(&one), vec![("/t/b", "sink_b", vec!["src_b"])]);
+        assert!(pass_fed_block_edges(&edges, &members(&["mid"])).is_empty());
+        assert!(pass_fed_block_edges(&edges, &members(&["sink_a", "sink_b"])).is_empty());
+        assert!(pass_fed_block_edges(&[], &members(&["src_a"])).is_empty());
+    }
+}
+
+#[cfg(test)]
 mod trailing_refill_tests {
     use super::*;
     use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
@@ -42707,6 +42798,7 @@ mod trailing_refill_tests {
             },
             throttle_ns,
             may_be_held_by: holds,
+            held_across_ranks: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
         }
@@ -42853,25 +42945,12 @@ mod trailing_refill_tests {
         assert_eq!(got, vec![(0, vec!["n".to_string()]), (1, vec![])]);
     }
 
-    /// No refill hook, a block-gated node, or a declined verification: nothing.
+    /// No refill hook, or a declined verification: nothing.
     #[test]
     fn a_node_that_cannot_carry_marks_nothing() {
         let rows: Vec<Row> = vec![(0, 0, vec![("n", CAP + 1, CAP, 0)])];
         let v = verification(vec![unified("n")], &rows);
         assert_eq!(derive(&v, &rows, STAMPED, false, false), vec![(0, vec![])]);
-        let mut blocked = verification(vec![unified("n")], &rows);
-        blocked.block_edges = vec![replay_rederive::BlockEdgeObservation {
-            topic: "/t".to_string(),
-            producer_node: "n".to_string(),
-            consumer_node: "c".to_string(),
-            consumer_input: "inp".to_string(),
-            depth: 1,
-            published_frames: 0,
-        }];
-        assert_eq!(
-            derive(&blocked, &rows, STAMPED, false, true),
-            vec![(0, vec![])]
-        );
         let mut declined = verification(vec![unified("n")], &rows);
         declined.declined = Some(VerifierDecline::ReadLogBudget(ReadLogOverrun {
             reads: 2,
@@ -42882,6 +42961,40 @@ mod trailing_refill_tests {
         assert_eq!(
             derive(&declined, &rows, STAMPED, false, true),
             vec![(0, vec![])]
+        );
+    }
+
+    /// A node a `block` edge across ranks holds can be deferred at every
+    /// step, whatever its drain, so a step below the cap that fires and pops
+    /// one frame more than it fires marks a trailing refill: the held relay's
+    /// shape, a step that pops a frame and fires nothing (step 0, no refill
+    /// to mark), a step that fires the frozen frame while its refill pops the
+    /// next (step 1), and one that fires that frame (step 2). The same node
+    /// held by nothing marks nothing, since no cap explains a step.
+    #[test]
+    fn a_node_a_block_edge_across_ranks_holds_marks_its_trailing_refills() {
+        let rows: Vec<Row> = vec![
+            (0, 0, vec![("n", 1, 0, 0)]),
+            (1, 5_000, vec![("n", 1, 1, 0)]),
+            (2, 10_000, vec![("n", 0, 1, 0)]),
+        ];
+        for drain in [
+            replay_rederive::FifoDrain::Unified,
+            replay_rederive::FifoDrain::Unrecorded,
+        ] {
+            let mut held = decl("n", drain, None, replay_rederive::BlockHoldEdges::none());
+            held.held_across_ranks = true;
+            let v = verification(vec![held], &rows);
+            assert_eq!(
+                marked(derive(&v, &rows, STAMPED, false, true)),
+                vec![1],
+                "{drain:?}"
+            );
+        }
+        let v = verification(vec![unified("n")], &rows);
+        assert_eq!(
+            marked(derive(&v, &rows, STAMPED, false, true)),
+            Vec::<u64>::new()
         );
     }
 

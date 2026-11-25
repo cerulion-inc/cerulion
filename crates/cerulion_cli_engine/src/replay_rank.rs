@@ -202,8 +202,8 @@ pub struct RemoteProducer {
 /// frames foreign and the rest local, but it is still ONE read stream on ONE
 /// `(topic, consumer_node, consumer_input)` key — that key is the read log's
 /// own, and emitting a second entry under it would make every consumer keyed on
-/// it (the block-edge join, the injected-topic set) see a topic twice. So the
-/// edge stays single and its blame anchor carries every foreign producer.
+/// it (the injected-topic set, the enforced-topic set) see a topic twice. So
+/// the edge stays single and its blame anchor carries every foreign producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossRankEdge {
     /// The resolved ABSOLUTE topic name.
@@ -223,24 +223,6 @@ pub struct CrossRankEdge {
     /// This rank's OWN producers are deliberately absent: the edge exists to
     /// name what must be INJECTED, and a local producer publishes live.
     pub producers: Vec<RemoteProducer>,
-}
-
-impl CrossRankEdge {
-    /// The edge's SINGLE foreign producer, or `None` when the topic has more
-    /// than one.
-    ///
-    /// For the consumers that model a producer/consumer PAIR (the rederive
-    /// plane's block-edge observation): a shared bus has no single producer to
-    /// stand in the pair's producer slot, and picking the first in graph order
-    /// would be a guess — so they decline the observation rather than model
-    /// half of it.
-    #[must_use]
-    pub fn sole_producer(&self) -> Option<&RemoteProducer> {
-        match self.producers.as_slice() {
-            [only] => Some(only),
-            _ => None,
-        }
-    }
 }
 
 /// The per-rank replay plan: everything the sequential executor needs to stand
@@ -640,12 +622,8 @@ pub fn plan_ranks(
     // reason. A node may write ONE declared multi-publisher topic through TWO
     // outputs (`validate_graph`'s duplicate-output-topic check exempts a listed
     // topic, and the topology's double-producer check exempts it too), so an
-    // output-keyed list would name that node twice. Downstream that is not
-    // cosmetic: `CrossRankEdge::sole_producer` answers "has this edge ONE
-    // producer to model a pair with", and a doubled name makes a
-    // single-writer-to-this-rank edge look like a shared bus — silently
-    // declining the block-credit observation the rederive plane would otherwise
-    // make.
+    // output-keyed list would name that node twice, and a cross-rank edge's
+    // `producers` would list one writer as two, reading as a shared bus.
     let mut produced_by: BTreeMap<String, Vec<(u32, &str)>> = BTreeMap::new();
     for n in &config.nodes {
         let rank = rank_of[n.id.as_str()];
@@ -1077,7 +1055,7 @@ pub fn classify_split_block_edges(
 
 /// Whether `node.input`'s `block` is the graph's `backpressure: block` key or
 /// the node's own declaration (the key is absent, so the declaration stands).
-fn block_declared_by(config: &GraphConfig, node: &str, input: &str) -> BlockDeclaredBy {
+pub(crate) fn block_declared_by(config: &GraphConfig, node: &str, input: &str) -> BlockDeclaredBy {
     let graph_key = config
         .nodes
         .iter()
