@@ -5,8 +5,9 @@
 # does not state, the verifier budget's pure decision functions, the
 # decisions a replay makes about checkpoint window heads, those it makes about
 # a recorded node stop, how a replay judges and re-executes a FIFO node that a
-# `block` input in its own rank holds, and how it judges a `period_ms` or Sync
-# node that such an input holds.
+# `block` input in its own rank holds, how it judges a `period_ms` or Sync
+# node that such an input holds, and how it replays a `block` edge its rank
+# manifests split.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -574,6 +575,44 @@ in prepare_pass_verification
 #          2 unviable, none missed. The unviable replace
 #          `PendingExcuse::voided` and `FifoCarry::voided_at` with
 #          `Some(Default::default())`, a default `VoidedExcuse` does not have.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Ninth scope: a `block` edge the rank manifests split across ranks.
+#
+# Scope: the pure decision functions on the lines the split edge change added
+# or changed. In src/replay_engine.rs: the edges a pass feeds from the bag
+# (`pass_fed_block_edges`), why a split edge's credit conservation cannot be
+# judged before its consumer's pass runs (`split_edge_unjudgeable`), the code
+# and the sentence of each cause (`ConservationStandDown::code`,
+# `ConservationStandDown::detail`) and the block-event note
+# (`block_event_note`). In src/replay_rederive.rs: the step after which a stop
+# released a node's slots (`StopPoint::slots_released_at`,
+# `StopPoint::slots_released_after`, `PassStops::slots_released_at`), the FIFO
+# carry that takes a node held across ranks as deferrable at every step
+# (`FifoCarry::step`) and the pass entry that stands such a node down
+# (`verify`). The change's other lines in the two files thread the
+# classification through a pass, build the wiring, or log and push notes,
+# which the mutation rule does not cover; the replay engine's integration
+# arms pin those.
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place \
+#            --in-diff <the change's diff of the two files> \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --re 'pass_fed_block_edges|split_edge_unjudgeable|ConservationStandDown::|block_event_note|slots_released_at|slots_released_after|FifoCarry::step|\bverify\b' \
+#            --exclude-re 'tests::' --timeout 600 --cap-lints true \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (the unmutated baseline passed)
+# Result:  28 mutants: 25 caught, 3 unviable, none missed. The unviable ones
+#          replace `block_event_note` and `FifoCarry::step` with
+#          `Default::default()` and `split_edge_unjudgeable` with
+#          `Some(Default::default())`, defaults `RederivationNote`,
+#          `FifoStep` and `ConservationStandDown` do not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

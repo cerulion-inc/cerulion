@@ -2047,8 +2047,9 @@ pub enum RederivationNoteKind {
 /// [`replay_rederive::RederivationReport::is_clean`] ignores by design), and the
 /// EVIDENCE kinds: a read-site census, a producer-label fault, the
 /// carried-heads disclosure, the queue a `consume = latest` input was
-/// judged with before its node's first fire, and the hold a `period_ms` or
-/// Sync node was judged with. See [`RederivationNoteKind`].
+/// judged with before its node's first fire, the hold a `period_ms` or Sync
+/// node was judged with, and the block events a split `block` input's
+/// consumer is not delivered. See [`RederivationNoteKind`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RederivationNote {
     /// The rank whose pass produced it.
@@ -10334,11 +10335,11 @@ const SPLIT_BLOCK_FROM_DECLARATION_WARNING: &str = "replay: a split `block` edge
 /// one input or one node, which that node's rank build sees.
 /// The replay keeps the exit, the order and the partial report it gave such a
 /// bag before: a refusal made before the first pass and an earlier rank's
-/// failure still come first. An engine bug the classifier reports is
-/// [`ReplayError::Internal`] (exit 5). Such a fault returns no edge, so no
-/// pass feeds a split edge from the bag and its consumer's rank build refuses
-/// it as above. Every edge returned is fed from the bag by each pass that
-/// holds one of its ends ([`pass_fed_block_edges`]).
+/// failure still come first. A whole-graph build or validation fault returns
+/// no edge, so no pass feeds a split edge from the bag and its consumer's rank
+/// build refuses it as above. An engine bug the classifier reports is
+/// [`ReplayError::Internal`] (exit 5). Every edge returned is fed from the bag
+/// by each pass that holds one of its ends ([`pass_fed_block_edges`]).
 fn creditable_split_block_edges(
     config: &GraphConfig,
     plans: &[RankPlan],
@@ -14257,7 +14258,8 @@ enum ConservationStandDown {
         step: u64,
     },
     /// `rank`, which holds the `end` named, begins at `step`, past step 0,
-    /// so the frames published and drained before it are not in the bag.
+    /// so the bag's trace holds none of that rank's reads or fires before it,
+    /// and no edge's outstanding count at it.
     CreditUnknownAtAnchor {
         /// The rank that begins late.
         rank: u32,
@@ -18191,7 +18193,8 @@ fn run_rank_pass(
     if !lockstep {
         // A split `block` edge the replay feeds from the bag has no credit
         // word in this runtime, so it has no entry here; the re-derived check
-        // after the pass judges it, or stands it down by name.
+        // after the pass judges it or stands it down by name, and where the
+        // rank's verifier declines, the rank's decline note covers it.
         for credit in runtime.block_credits() {
             if credit.conservation_broken() {
                 // Reported as well as warned — the SYMMETRY the re-derived twin

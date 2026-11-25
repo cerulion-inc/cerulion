@@ -12,13 +12,13 @@
 //! attribute: the `block` policy on its trigger input.
 //!
 //! Its purpose is the auto-partition default. `block` defers the
-//! producer's tick through a mirror the consumer's subscriber decrements, and
-//! that mirror is a PROCESS-LOCAL `Arc<AtomicU64>` — so a partition that puts
-//! the producer in another worker does not degrade the policy, it refuses to
-//! build (`GraphTopology::validate` sees a `Block` consumer on a topic whose
-//! producer was filtered out of this worker's subgraph). Staged as the `sink`
-//! of the D5 chain, this node is what makes that failure — and the
-//! co-location that fixes it — observable over the real binary.
+//! producer's tick through a credit word the consumer's subscriber
+//! decrements: a process-local word for a co-located edge, and a mapped page
+//! the supervisor mints when a hand-written `process_groups:` puts the
+//! producer in another worker, which it does only for an edge with one
+//! in-graph producer and no `block_timeout_ms`. The derived partition
+//! co-locates the flow instead. Staged as the `sink` of the D5 chain, this
+//! node makes that co-location observable over the real binary.
 //!
 //! `depth = 4` is deliberately shallow: it keeps the defer reachable at the
 //! e2e's tick rate rather than needing a long run to fill a default queue.
