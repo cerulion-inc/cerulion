@@ -376,20 +376,25 @@ impl StopPoint {
     /// consecutive-panic breaker releases none, in the re-execution as in the
     /// recording.
     fn slots_released_after(self, step: u64) -> bool {
+        self.slots_released_at().is_some_and(|stop| step > stop)
+    }
+
+    /// The step after which the stop released the node's `block` slots: the
+    /// checkpoint's step for a stop at the checkpoint, the stopping step for
+    /// a fatal error or a poisoned entry, and `None` for the
+    /// consecutive-panic breaker, which releases none.
+    fn slots_released_at(self) -> Option<u64> {
         match self {
-            Self::AtAnchor { anchor_step } => step > anchor_step,
+            Self::AtAnchor { anchor_step } => Some(anchor_step),
             Self::InPass {
                 step: stop, cause, ..
             }
             | Self::Recorded {
                 step: stop, cause, ..
-            } => {
-                let releases = match cause {
-                    NodeStopCause::FatalError | NodeStopCause::EntryPoisoned => true,
-                    NodeStopCause::DisabledAfterPanics => false,
-                };
-                releases && step > stop
-            }
+            } => match cause {
+                NodeStopCause::FatalError | NodeStopCause::EntryPoisoned => Some(stop),
+                NodeStopCause::DisabledAfterPanics => None,
+            },
         }
     }
 
@@ -463,6 +468,12 @@ impl PassStops {
     /// Where `node_id` was stopped, if it was.
     fn stop_point(&self, node_id: &str) -> Option<StopPoint> {
         self.stopped_at.get(node_id).copied()
+    }
+
+    /// The step after which `node_id`'s stop released its `block` slots, if
+    /// a stop did ([`StopPoint::slots_released_at`]).
+    pub(crate) fn slots_released_at(&self, node_id: &str) -> Option<u64> {
+        self.stop_point(node_id)?.slots_released_at()
     }
 }
 
@@ -8912,6 +8923,37 @@ mod tests {
                 ),
                 (1, Ok(0), None),
             ]
+        );
+    }
+
+    /// The step after which a node's stop released its `block` slots: the
+    /// stopping step for a fatal error, a poisoned entry and a recorded fatal
+    /// stop, the checkpoint's step for a stop the checkpoint states, and none
+    /// for the consecutive-panic breaker or a node that never stopped.
+    #[test]
+    fn a_stop_releases_its_slots_after_its_step_unless_the_breaker_made_it() {
+        let mut stops = PassStops::at_anchor(ANCHOR_STEP, ["anchored"]);
+        stops.note("fatal", 4, 1, NodeStopCause::FatalError);
+        stops.note("poisoned", 5, 2, NodeStopCause::EntryPoisoned);
+        stops.note("breaker", 6, 1, NodeStopCause::DisabledAfterPanics);
+        stops.note_recorded(
+            7,
+            &StepStop {
+                node_id: "recorded".to_string(),
+                rank: 0,
+                fires: NonZeroU32::new(1).unwrap(),
+                cause: NodeStopCause::FatalError,
+            },
+        );
+        let released: Vec<Option<u64>> = [
+            "anchored", "fatal", "poisoned", "breaker", "recorded", "running",
+        ]
+        .iter()
+        .map(|node| stops.slots_released_at(node))
+        .collect();
+        assert_eq!(
+            released,
+            vec![Some(ANCHOR_STEP), Some(4), Some(5), None, Some(7), None]
         );
     }
 
