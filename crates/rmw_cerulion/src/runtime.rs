@@ -1025,12 +1025,26 @@ pub(crate) enum TakeCopy {
 /// the heap words the caller's pointer aims at.
 pub struct PooledCopy {
     buffer: CopyBuffer,
+    /// The sample the copy was made from, held until the copy is returned so
+    /// its release runs on the return instead of inside the take; `None` when
+    /// the take released it at once to keep the borrow reserve free.
+    sample: Option<cerulion_core::transport::subscriber::OwnedInboundSample>,
 }
 
 impl PooledCopy {
-    /// Track `buffer`, which already holds the copied struct.
-    pub(crate) fn new(buffer: CopyBuffer) -> Self {
-        Self { buffer }
+    /// Track `buffer`, which already holds the copied struct, with the sample
+    /// it was copied from when the take holds it until the return.
+    pub(crate) fn new(
+        buffer: CopyBuffer,
+        sample: Option<cerulion_core::transport::subscriber::OwnedInboundSample>,
+    ) -> Self {
+        Self { buffer, sample }
+    }
+
+    /// Whether this copy still holds its shared-memory sample, and so one of
+    /// the subscription's borrows.
+    pub fn holds_sample(&self) -> bool {
+        self.sample.is_some()
     }
 
     /// The pointer handed to the caller: the copy's address, mutable because
@@ -1044,8 +1058,10 @@ impl PooledCopy {
         self.buffer.words.as_ptr() as usize
     }
 
-    /// The buffer, for [`FixedCopyPool::release`].
+    /// The buffer, for [`FixedCopyPool::release`]; the held sample, if any,
+    /// is released here.
     pub(crate) fn into_buffer(self) -> CopyBuffer {
+        drop(self.sample);
         self.buffer
     }
 }

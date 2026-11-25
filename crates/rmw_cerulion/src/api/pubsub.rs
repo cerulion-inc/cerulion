@@ -4280,10 +4280,12 @@ fn takes_private_copy(bridge: &crate::bridge::AnyBridge) -> bool {
 }
 
 /// A small FIXED type's take ([`takes_private_copy`]): the fixed section into a buffer from the subscription's
-/// copy pool, then the sample is released before the take returns, so the
-/// copy aliases nothing in shared memory (an rclcpp `std::shared_ptr<MsgT>`
-/// callback receives this loan itself and may write it) and holds no borrow
-/// while outstanding. The buffer is whole `u64` words, so the struct is
+/// copy pool. The copy aliases nothing in shared memory (an rclcpp
+/// `std::shared_ptr<MsgT>` callback receives this loan itself and may write
+/// it). With `keep_sample` the sample stays with the copy and is released on
+/// its return, as a zero-copy loan's is, so the release runs off the take;
+/// without it (the take would hold the last borrow the reserve keeps free) it
+/// is released before the take returns. The buffer is whole `u64` words, so the struct is
 /// 8-aligned (`fixed_align <= 8`). With every pooled buffer loaned out, the
 /// take is served by copy into fresh memory through [`serve_fixed_copy`]
 /// instead. Returns the pointer handed out and whether it is that unpooled
@@ -4295,13 +4297,19 @@ unsafe fn serve_private_copy(
     inner: &mut SubscriptionInner,
     owned: cerulion_core::transport::subscriber::OwnedInboundSample,
     fixed_size: usize,
+    keep_sample: bool,
 ) -> (*mut c_void, bool) {
     let Some(mut buffer) = inner.copy_pool.acquire() else {
         return (serve_fixed_copy(inner, owned, fixed_size), true);
     };
     buffer.fill(&owned.payload()[WireHeader::SIZE..]);
-    drop(owned);
-    let mut take = runtime::PooledCopy::new(buffer);
+    let sample = if keep_sample {
+        Some(owned)
+    } else {
+        drop(owned);
+        None
+    };
+    let mut take = runtime::PooledCopy::new(buffer, sample);
     let ptr = take.loaned_ptr();
     // Never grows: reserved at create to the pool's capacity, and every entry
     // holds one of the pool's buffers.
@@ -4346,11 +4354,12 @@ fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_v
 ///   byte-for-byte (pinned by `layout_equivalence_test` over all 254 vendored
 ///   types). Above `take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES` the SHM payload
 ///   pointer itself is handed out, read-only. At or below it the struct is
-///   copied into a buffer from the subscription's `copy_pool` and the sample
-///   is released before the take returns: the copy's address is the loaned
-///   pointer, writable (an rclcpp `std::shared_ptr<MsgT>` callback receives
-///   the loan itself and may write it), tracked in `pooled_copies`, and the
-///   return gives the buffer back;
+///   copied into a buffer from the subscription's `copy_pool`: the copy's
+///   address is the loaned pointer, writable (an rclcpp `std::shared_ptr<MsgT>`
+///   callback receives the loan itself and may write it), tracked in
+///   `pooled_copies` with its sample (released on the return, or at once when
+///   holding it would take the reserve's borrow), and the return gives the
+///   buffer back;
 /// - a type carrying at least one FORGEABLE primitive
 ///   sequence (`Image.data`, `LaserScan.ranges`, …): an rmw-owned SHADOW
 ///   message from the subscription's pool receives the small copied
@@ -4373,8 +4382,9 @@ fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_v
 /// `copied_takes` and returned through the same call as a loan. Loud once
 /// per regime on its own latch (`loan_refusal_latch::report_loan_copied`),
 /// recovered by the first take served zero-copy with no copy outstanding. A
-/// small fixed type's pooled copy holds no borrow, so the reserve does not
-/// apply to it: a take that finds every pooled buffer loaned out is served by
+/// small fixed type's pooled copy holds its sample's borrow only while the
+/// reserve stays free, so it never takes the reserve: a take that finds every
+/// pooled buffer loaned out is served by
 /// copy into fresh memory the same way, counted on the same latch with no
 /// line, and the first take served from the pool with no such copy
 /// outstanding closes that regime. A take that cannot get a
@@ -4425,7 +4435,7 @@ unsafe fn take_loaned_impl(
     // `.max(1)` is pure defense against a zero from a degenerate layout.
     let fixed_align = data.bridge.layout().fixed_align.max(1);
     // A small fixed type is served as a private copy from the pool, never as a
-    // zero-copy loan, so the reserve does not apply to it.
+    // zero-copy loan; its sample is held only while the reserve stays free.
     let private_copy = takes_private_copy(&data.bridge);
 
     // Receive + validate + register under the ONE subscription lock (the
@@ -4443,6 +4453,14 @@ unsafe fn take_loaned_impl(
     let held_loans = inner.pending_takes.len();
     let mut by_copy =
         !private_copy && crate::take_gate::loaned_take_serves_copy(held_loans, ceiling);
+    // A private copy holds its sample until the return, as a zero-copy loan
+    // does, so the release runs off the take; the samples such copies hold
+    // count toward the reserve, and a take that would hold the last borrow
+    // releases its sample at once.
+    let keep_sample = private_copy && {
+        let held_by_copies = inner.pooled_copies.iter().filter(|c| c.holds_sample()).count();
+        !crate::take_gate::loaned_take_serves_copy(held_loans + held_by_copies, ceiling)
+    };
     // A forged take needs its shadow BEFORE the receive: a refusal here
     // consumes NO frame, so the queued frame is served by a later take. A
     // zero-copy take recycles one from the pool; a take served by copy builds
@@ -4684,7 +4702,7 @@ unsafe fn take_loaned_impl(
             return RMW_RET_OK;
         }
         if private_copy {
-            let (ptr, unpooled) = serve_private_copy(&mut inner, owned, fixed_size);
+            let (ptr, unpooled) = serve_private_copy(&mut inner, owned, fixed_size, keep_sample);
             by_copy = unpooled;
             ptr
         } else if by_copy {
@@ -4909,8 +4927,8 @@ pub unsafe extern "C" fn rmw_return_loaned_message_from_subscription(
             drop(sample);
             return RMW_RET_OK;
         }
-        // A small fixed type's pooled copy holds no sample: its buffer goes
-        // back to the pool.
+        // A small fixed type's pooled copy: its held sample, if any, is
+        // released and its buffer goes back to the pool.
         if let Some(pos) = inner.pooled_copies.iter().position(|c| c.key() == key) {
             let buffer = inner.pooled_copies.swap_remove(pos).into_buffer();
             inner.copy_pool.release(buffer);
