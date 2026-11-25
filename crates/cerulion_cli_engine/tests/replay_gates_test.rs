@@ -2041,22 +2041,51 @@ fn an_unknown_coordination_value_on_a_supported_format_is_refused_by_name() {
     assert_eq!(err.exit_code(), 2);
 }
 
-/// Bag text reaches the terminal escaped or not at all: an unknown
-/// `coordination` value holding an escape byte is quoted as JSON text, so the
-/// byte arrives as `\u001b`, and a `cerulion_version` stamp that is not a plain
+/// Bag text reaches the terminal escaped or not at all. An unknown
+/// `coordination` value is printed as the reader's JSON text with every char
+/// outside printable ASCII (0x20 to 0x7E) as a JSON `\uXXXX` escape: ESC
+/// (which the reader escapes already), DEL, the C1 control U+009B, the bidi
+/// control U+202E and a non-ASCII letter each arrive escaped, and the sentence
+/// holds printable ASCII only. A `cerulion_version` stamp that is not a plain
 /// version token is left out of both refusals.
 #[test]
 fn a_refusal_prints_bag_text_escaped_or_not_at_all() {
     let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
-    for (name, trace_format, want) in [
+    for (name, trace_format, coordination, want) in [
         (
-            "coordination",
+            "esc",
             supported,
+            "\u{1b}[2Jbarrier",
             coordination_unknown_sentence("", "\"\\u001b[2Jbarrier\""),
+        ),
+        (
+            "del",
+            supported,
+            "\u{7f}barrier",
+            coordination_unknown_sentence("", "\"\\u007fbarrier\""),
+        ),
+        (
+            "c1",
+            supported,
+            "\u{9b}2Jbarrier",
+            coordination_unknown_sentence("", "\"\\u009b2Jbarrier\""),
+        ),
+        (
+            "bidi",
+            supported,
+            "\u{202e}barrier",
+            coordination_unknown_sentence("", "\"\\u202ebarrier\""),
+        ),
+        (
+            "letter",
+            supported,
+            "barri\u{e8}re",
+            coordination_unknown_sentence("", "\"barri\\u00e8re\""),
         ),
         (
             "format",
             supported + 1,
+            "\u{1b}[2Jbarrier",
             format_too_new_sentence("", supported + 1),
         ),
     ] {
@@ -2069,14 +2098,17 @@ fn a_refusal_prints_bag_text_escaped_or_not_at_all() {
                 "cerulion_version": "99.0.0-\u{1b}[2J",
                 "recorded_at_ns": 42u64,
                 "trace_format": trace_format,
-                "coordination": "\u{1b}[2Jbarrier",
+                "coordination": coordination,
             }))
             .unwrap(),
         ));
         write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
         let err = gate(&path);
         assert_eq!(err.to_string(), want, "{name}");
-        assert!(!err.to_string().contains('\u{1b}'), "{name}: {err}");
+        assert!(
+            err.to_string().chars().all(|c| (' '..='~').contains(&c)),
+            "{name}: {err}"
+        );
         assert_eq!(err.exit_code(), 2, "{name}");
     }
 }

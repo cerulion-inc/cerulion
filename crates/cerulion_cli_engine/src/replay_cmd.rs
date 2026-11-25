@@ -720,14 +720,19 @@ pub enum ReplayError {
     /// lockstep contract would refuse a sound recording or mis-anchor it
     /// silently. `newer_recording_refusal` picks it.
     #[error(
-        "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is {value}, \
+        "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is {shown}, \
          which this Cerulion ({ours}) does not know. Upgrade Cerulion to replay it.",
         by = RecordedBy(recorded_by.as_ref()),
+        shown = PrintableJson(value),
         ours = CERULION_VERSION
     )]
     CoordinationUnknown {
         /// The stamp as JSON text, as the reader carries it out: a string
-        /// keeps its quotes, and a control byte in it is escaped.
+        /// keeps its quotes, and the reader escapes a C0 control byte in it.
+        /// The refusal then prints every char outside printable ASCII (0x20
+        /// to 0x7E) as a JSON `\uXXXX` escape, a char above U+FFFF as its
+        /// surrogate pair, so DEL, a C1 control and a bidi control never
+        /// reach the terminal raw.
         value: String,
         /// The bag's `cerulion_version` stamp, when it names a release above
         /// this build's.
@@ -1006,6 +1011,29 @@ impl std::fmt::Display for RecordedBy<'_> {
             Some(version) => write!(f, " ({version})"),
             None => Ok(()),
         }
+    }
+}
+
+/// JSON text as a refusal prints it: every char outside printable ASCII (0x20
+/// to 0x7E) is written as a JSON `\uXXXX` escape in lowercase hex, and a char
+/// above U+FFFF as its surrogate pair. Such a char can sit only inside a JSON
+/// string, where the escape stands for the same char, so the output is JSON
+/// text for the same value, and DEL, C1 controls and bidi controls in bag text
+/// never reach the terminal raw.
+struct PrintableJson<'a>(&'a str);
+
+impl std::fmt::Display for PrintableJson<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for c in self.0.chars() {
+            if (' '..='~').contains(&c) {
+                write!(f, "{c}")?;
+            } else {
+                for unit in c.encode_utf16(&mut [0u16; 2]) {
+                    write!(f, "\\u{unit:04x}")?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3520,6 +3548,24 @@ mod tests {
             ("18446744073709551616.0.0", "2.1.0"),
         ] {
             assert_eq!(held(stamp, ours), None, "{stamp} vs {ours}");
+        }
+    }
+
+    /// JSON text is printed ASCII-only: printable ASCII as is, from the space
+    /// to `~`, and every other char as a `\uXXXX` escape, a char above U+FFFF
+    /// as its surrogate pair.
+    #[test]
+    fn json_text_is_printed_with_every_char_outside_printable_ascii_escaped() {
+        for (text, printed) in [
+            (" \"a~\\\"", " \"a~\\\""),
+            ("\"\u{7f}\"", "\"\\u007f\""),
+            ("\"\u{9b}2J\"", "\"\\u009b2J\""),
+            ("\"\u{202e}x\"", "\"\\u202ex\""),
+            ("\"caf\u{e9}\"", "\"caf\\u00e9\""),
+            ("\"\u{1f600}\"", "\"\\ud83d\\ude00\""),
+            ("\"\u{1f}\"", "\"\\u001f\""),
+        ] {
+            assert_eq!(PrintableJson(text).to_string(), printed, "{text:?}");
         }
     }
 
