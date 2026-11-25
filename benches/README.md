@@ -20,6 +20,8 @@ Start here:
   catalog of the RMW + operational pitfalls that produce wrong or missing
   numbers.
 
+For a first run of Cerulion itself, use the [README quickstart](../README.md#quickstart); these commands run the benchmark suites.
+
 Quickstart (see `latency/README.md` for the full matrix):
 
 ```bash

@@ -4,7 +4,7 @@
 use super::*;
 use cerulion_core::transport::demand_authorizer::AllowAllAuthorizer;
 use cerulion_netd::account_access::{
-    AccountAccessReply, AccountAccessRequest, PairedRobot, RobotPresence,
+    AccountAccessReply, AccountAccessRequest, PairedRobot, RobotPath, RobotPresence,
 };
 use cerulion_netd::account_controller::{AccountControllerConfig, AccountWanController};
 use cerulion_netd::registry::DemandRegistry;
@@ -190,11 +190,47 @@ fn shared_endpoint_serving_discovery_lists_two_online_and_one_offline_without_lo
         let pb = spawn_producer(b.manager.clone(), "/shared/discover/b".into(), stop.clone());
         let key = TopicKey::observed("a", "/shared/discover/a");
         controller.ensure_mirror(&key, ORACLE_SCHEMA_HASH).unwrap();
-        let AccountAccessReply::Discovery { robots } = controller
-            .account_access(&AccountAccessRequest::Discover { budget_ms: 3900 })
-            .unwrap()
-        else {
-            panic!("missing discovery reply");
+        // A row's path is the connection's selected path when its catalog arrives,
+        // and a path iroh has not selected yet reads Unknown. Every discovery dials
+        // again, so it is repeated while an online robot's path is Unknown. Each
+        // read must still list both robots online with an error-free catalog and the offline
+        // one not reached, and no path may be Relayed: the relay is disabled.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let robots = loop {
+            let AccountAccessReply::Discovery { robots } = controller
+                .account_access(&AccountAccessRequest::Discover { budget_ms: 3900 })
+                .unwrap()
+            else {
+                panic!("missing discovery reply");
+            };
+            let mut paths = Vec::new();
+            for name in ["a", "b"] {
+                let row = robots.iter().find(|row| row.route == name).unwrap();
+                assert_eq!(row.presence, RobotPresence::Online, "{name}");
+                assert_eq!(row.catalog.as_ref().unwrap().error, None, "{name}");
+                assert!(
+                    matches!(row.path, RobotPath::Direct | RobotPath::Unknown),
+                    "{name} reported {:?} with the relay disabled",
+                    row.path
+                );
+                paths.push((name, row.path));
+            }
+            assert!(matches!(
+                robots
+                    .iter()
+                    .find(|row| row.route == "offline")
+                    .unwrap()
+                    .presence,
+                RobotPresence::NotReached { .. }
+            ));
+            if paths.iter().all(|(_, path)| *path == RobotPath::Direct) {
+                break robots;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the online robots never both reported a Direct path; last seen {paths:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
         };
         assert_eq!(robots.len(), 3);
         let mut rows = Vec::new();

@@ -172,6 +172,69 @@ impl NodeDeathCause {
     }
 }
 
+/// WHY the scheduler stopped a node at one fire, as the trace records it: the
+/// three [`NodeDeathCause`]s that end a node's execution at a fire the
+/// scheduler performed.
+///
+/// [`NodeDeathCause::CdylibPanicked`] has no variant here: the node library
+/// returns the panic as a tick error, the host's entry stays usable and the
+/// scheduler keeps firing the node, so no fire stops it.
+///
+/// The wire code ([`Self::code`]) is the `duration_ns` word of a
+/// `trace_ring::RECORD_TYPE_NODE_STOP` record (named in backticks: that module
+/// is unix only), and the tick callback's stop signal holds the same code
+/// (`0` = no stop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NodeStopCause {
+    /// The tick returned `NodeError::Fatal`, and the scheduler disabled the
+    /// node after this fire.
+    FatalError,
+    /// The tick panicked inside the runtime's tick callback, or the callback
+    /// found the node's entry already poisoned. The scheduler keeps firing the
+    /// node and every later fire skips its tick.
+    EntryPoisoned,
+    /// This fire was the node's `MAX_CONSECUTIVE_PANICS`th consecutive panic,
+    /// and the scheduler disabled it.
+    DisabledAfterPanics,
+}
+
+impl NodeStopCause {
+    /// The wire code: `1`, `2` or `3`. `0` is never a cause.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::FatalError => 1,
+            Self::EntryPoisoned => 2,
+            Self::DisabledAfterPanics => 3,
+        }
+    }
+
+    /// The cause a wire code names, or `None` for a code no cause has.
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::FatalError),
+            2 => Some(Self::EntryPoisoned),
+            3 => Some(Self::DisabledAfterPanics),
+            _ => None,
+        }
+    }
+
+    /// Does the scheduler fire the node again after this stop? Only a
+    /// poisoned entry keeps firing, with its tick skipped.
+    pub const fn fires_again(self) -> bool {
+        matches!(self, Self::EntryPoisoned)
+    }
+
+    /// The node-death cause this stop is, whose [`NodeDeathCause::as_wire`]
+    /// is its one spelling.
+    pub const fn death_cause(self) -> NodeDeathCause {
+        match self {
+            Self::FatalError => NodeDeathCause::FatalError,
+            Self::EntryPoisoned => NodeDeathCause::EntryPoisoned,
+            Self::DisabledAfterPanics => NodeDeathCause::DisabledAfterPanics,
+        }
+    }
+}
+
 /// One recorded death.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDeath {

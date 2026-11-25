@@ -275,10 +275,11 @@ pub struct CerulionPublisher {
     ///
     /// This is the ASK. What the publisher actually got is
     /// [`Self::provisioned_history_size`] — on an OPEN of a deeper existing
-    /// service the two differ, and the difference is observable to a late
-    /// joiner.
+    /// service without a history floor (or with one, under an iceoryx2 without
+    /// a per-publisher history size) the two differ, and the difference is
+    /// observable to a late joiner.
     history_size: usize,
-    /// The history depth the opened SERVICE really provides — see
+    /// The number of sent frames this publisher's port retains; see
     /// [`CerulionPublisherConfig::provisioned_history_size`] for why this is
     /// not always [`Self::history_size`] and how it is measured.
     provisioned_history_size: usize,
@@ -650,21 +651,21 @@ pub(crate) struct CerulionPublisherConfig {
     /// (0 = VOLATILE / no late-joiner history). Mirrored onto the
     /// publisher to back [`CerulionPublisher::has_history`].
     pub history_size: usize,
-    /// The history depth the OPENED SERVICE actually provides — which is
-    /// not always [`Self::history_size`], and the difference is observable.
+    /// The number of sent frames the publisher PORT retains, which is not
+    /// always [`Self::history_size`], and the difference is observable.
     ///
     /// iceoryx2's open-time verification on `.history_size(N)` is AT-LEAST
     /// (existing < required fails), so a request of 5 attaches to a service
-    /// already created at 16 — and the port iceoryx2 hands back is sized
-    /// from the SERVICE's static config, not from the request
-    /// (`iceoryx2-0.9.1/src/port/publisher.rs`:
-    /// `Queue::new(static_config.history_size)`). Such a publisher really
-    /// retains 16; a late joiner takes up to its own history request from
-    /// that ring.
+    /// already created at 16. On a service created with a history floor the
+    /// port is bounded to the request (`retain_own_history` in `mod.rs`), so
+    /// it retains 5. On any other such service, and under an iceoryx2 without a
+    /// per-publisher history size (the released 0.10.0, or a fork revision
+    /// before it), the port is sized
+    /// from the SERVICE's static config and really retains 16; a late joiner
+    /// takes up to its own history request from that ring.
     ///
-    /// Read back from `static_config()` at construction, so it is right for
-    /// a CREATE (where it equals the request) and for an OPEN (where it may
-    /// exceed it) alike.
+    /// Read back from the created port (`retained_history` in `mod.rs`), so
+    /// it is right for a CREATE and for an OPEN alike.
     pub provisioned_history_size: usize,
     /// The topic's EVENT-service factory (the same one the
     /// `notifier`/`listener` were minted from), retained on the publisher so
@@ -1245,15 +1246,17 @@ impl CerulionPublisher {
         self.block_send_hook = Some(hook);
     }
 
-    /// The history depth this publisher's service ACTUALLY
-    /// provides: the number of past frames this publisher's port retains.
-    /// A late joiner receives at most that many, and fewer when its own
-    /// history request is smaller.
+    /// The number of past frames this publisher's port ACTUALLY retains. A
+    /// late joiner receives at most that many, and fewer when its own history
+    /// request is smaller.
     ///
-    /// Not the same as the request whenever the publisher OPENED a service
-    /// someone else created deeper: iceoryx2's open verification is
-    /// at-least, and the port it returns is sized from the service's static
-    /// config.
+    /// Equal to the request on a service this publisher created, and on a
+    /// service created with a history floor (`cerulion.history_floor`), where
+    /// the port retains its own request. Not the same as the request when the
+    /// publisher OPENED a service someone else created deeper without a
+    /// floor, or built against an iceoryx2 without per-publisher history:
+    /// iceoryx2's open verification is at-least, and that port retains the
+    /// service's whole history.
     ///
     /// [`Self::has_history`] deliberately still keys on the REQUEST: it
     /// gates the SentHistory wake, and changing what that gate means is a

@@ -386,7 +386,7 @@ fn node_attr_span(attrs: &[syn::Attribute]) -> Option<proc_macro2::Span> {
 ///
 /// So the second signal is not a name at all, it is SHAPE. A
 /// `#[cerulion_node]` must declare at least one `#[input]`/`#[output]` field
-/// (`tests/ui/no_input_or_output_attrs_rejected.rs` pins that), and in this
+/// (`crates/test_fixtures/node_macro_ui/tests/ui/no_input_or_output_attrs_rejected.rs` pins that), and in this
 /// order those attributes are still on the struct, because the attribute macro
 /// that strips them has not run yet. A struct being derived that declares a
 /// PORT is therefore a node whatever its attribute is called — and the same

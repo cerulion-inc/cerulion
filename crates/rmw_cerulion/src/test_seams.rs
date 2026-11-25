@@ -286,8 +286,10 @@ pub const LOANED_SERVE_REPORT_PANIC_MSG: &str =
     "test-seam: injected panic inside the loaned take's serve report";
 
 /// RAII arm of the LOANED serve-report seam: while held,
-/// `rmw_take_loaned_message` panics at `report_loan_served` — after the loan
-/// has been pushed into `pending_takes` but before `*loaned_message` and
+/// `rmw_take_loaned_message` panics after the take's last report (the copy
+/// latch's report for a copy or for the take that closes a copy regime,
+/// `report_loan_served` otherwise): after the loan has been pushed into
+/// `pending_takes` or `copied_takes` but before `*loaned_message` and
 /// `*taken` are written.
 ///
 /// That is the window the ADOPTED path's rollback closes and this seam's

@@ -295,10 +295,10 @@ fn decode_and_verify(bytes: &[u8], mac_key: &[u8], path: &str) -> Result<OnDisk,
 /// HMAC-SHA256 over `data` with `mac_key` (mirrors `cerulion_pairing::crypto`,
 /// which is crate-private there — we compose the same vetted primitives here).
 fn hmac_sha256(mac_key: &[u8], data: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(mac_key).expect("HMAC accepts a key of any length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(mac_key)
+        .expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
@@ -949,6 +949,15 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "no temporary file is left: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_test_case_2() {
+        let tag = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            hex::encode(tag),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
     }
 }
