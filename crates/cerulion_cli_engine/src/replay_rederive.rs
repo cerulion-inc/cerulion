@@ -948,7 +948,10 @@ pub enum FifoDrain {
     /// throttle can leave a frame unfired below the cap, at any step: a
     /// `block` hold is not allowed for, so a held node can be convicted, and
     /// a short step at which its slot was full by the bag's own record says so
-    /// ([`FindingCaveat::DrainUnrecordedHold`]).
+    /// ([`FindingCaveat::DrainUnrecordedHold`]). A node a `block` input in
+    /// another rank holds ([`NodeDecl::held_across_ranks`]) is the exception:
+    /// its rule stands down, and the refill plan takes it as deferrable at
+    /// every step, as on any drain.
     Unrecorded,
 }
 
@@ -1989,6 +1992,33 @@ impl fmt::Display for StandDownReason {
         f.write_str(self.label())
     }
 }
+
+/// Every [`StandDownReason`], for the oracles that walk the closed set: its
+/// own token test, and the engine's check that no other token on a
+/// `stand_down` note collides with one of these.
+#[cfg(test)]
+pub(crate) const EVERY_STAND_DOWN_REASON: [StandDownReason; 20] = [
+    StandDownReason::BlockGated,
+    StandDownReason::NoPhaseAnchor,
+    StandDownReason::ZeroInterval,
+    StandDownReason::TruncatedReadLog,
+    StandDownReason::DecimatedRead,
+    StandDownReason::MissingWireStamp,
+    StandDownReason::SuppressibleFire,
+    StandDownReason::QueueExceedsVerifierRoom,
+    StandDownReason::AmbiguousReadSite,
+    StandDownReason::ImpossibleReadShape,
+    StandDownReason::UnattributableCredit,
+    StandDownReason::SyncHeadStampRegressed,
+    StandDownReason::CaptureTimeSync,
+    StandDownReason::LatestDrainUnrecorded,
+    StandDownReason::LatestWritersUncapped,
+    StandDownReason::LatestWritersUnnamed,
+    StandDownReason::LatestBlockHeld,
+    StandDownReason::LatestUnfiredSinceAnchor,
+    StandDownReason::FifoUnfiredSinceAnchor,
+    StandDownReason::SyncUnfiredSinceAnchor,
+];
 
 /// A decider declined to judge, and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16066,28 +16096,7 @@ mod tests {
     /// repo has already paid for once (`total_failures=` vs four spellings).
     #[test]
     fn every_stand_down_reason_has_its_own_machine_token() {
-        let all = [
-            StandDownReason::BlockGated,
-            StandDownReason::NoPhaseAnchor,
-            StandDownReason::ZeroInterval,
-            StandDownReason::TruncatedReadLog,
-            StandDownReason::DecimatedRead,
-            StandDownReason::MissingWireStamp,
-            StandDownReason::SuppressibleFire,
-            StandDownReason::QueueExceedsVerifierRoom,
-            StandDownReason::AmbiguousReadSite,
-            StandDownReason::ImpossibleReadShape,
-            StandDownReason::UnattributableCredit,
-            StandDownReason::SyncHeadStampRegressed,
-            StandDownReason::CaptureTimeSync,
-            StandDownReason::LatestDrainUnrecorded,
-            StandDownReason::LatestWritersUncapped,
-            StandDownReason::LatestWritersUnnamed,
-            StandDownReason::LatestBlockHeld,
-            StandDownReason::LatestUnfiredSinceAnchor,
-            StandDownReason::FifoUnfiredSinceAnchor,
-            StandDownReason::SyncUnfiredSinceAnchor,
-        ];
+        let all = EVERY_STAND_DOWN_REASON;
         let codes: std::collections::BTreeSet<&str> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len(), "every reason's token is distinct");
         for r in &all {

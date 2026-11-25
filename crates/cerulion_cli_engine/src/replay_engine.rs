@@ -1039,8 +1039,12 @@ pub struct ReplayOutcome {
     /// ignores), and the evidence notes: a read-site census, a producer-label
     /// fault, a carried-heads note, the queue a `consume = latest` input
     /// was judged with before its node's first fire
-    /// (`latest_before_first_fire`), and the hold a `period_ms` or Sync node
-    /// was judged with (`hold_allowed_for`). [`RederivationNoteKind`] is the
+    /// (`latest_before_first_fire`), the hold a `period_ms` or Sync node
+    /// was judged with (`hold_allowed_for`), and the block events a split
+    /// `block` input's consumer is not delivered
+    /// (`block_event_not_reproduced`). A stand-down names a node as its
+    /// subject, or a topic where it is a `block` edge's conservation
+    /// ([`RederivationNote::subject`]). [`RederivationNoteKind`] is the
     /// closed set of kinds. Additive + skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rederivation_notes: Vec<RederivationNote>,
@@ -11456,7 +11460,8 @@ fn derive_trailing_refills(
 /// `sample(N)` declaration settles it) plans nothing, a node with no refill
 /// hook in this replay (`has_refill`) plans nothing, and a `drop_oldest` node
 /// on a bag with no stage set (`FifoDrain::Unrecorded`) is planned on the
-/// rule it is judged on, which allows for no hold. A node a `block` edge
+/// rule it is judged on, which allows for no hold, except a node a `block`
+/// edge across ranks holds, below. A node a `block` edge
 /// across ranks holds (`replay_rederive::NodeDecl::held_across_ranks`) can be
 /// deferred at every step, since the edge's credit word is in another process,
 /// so its burst can end on a trailing refill at any step. A node whose reads
@@ -14312,11 +14317,19 @@ impl ConservationStandDown {
                 )
             }
         };
-        format!(
-            "the rank-local re-derivation verifier makes NO credit-conservation claim about \
-             '{topic}' -> {node}.{input}: {why}"
-        )
+        format!("{}{why}", no_conservation_claim(topic, node, input))
     }
+}
+
+/// The start of every note in which the re-derivation verifier makes no
+/// credit-conservation claim about the `block` edge `topic` ->
+/// `node.input`: a cause's ([`ConservationStandDown::detail`]) and the
+/// `--duration` bound's.
+fn no_conservation_claim(topic: &str, node: &str, input: &str) -> String {
+    format!(
+        "the rank-local re-derivation verifier makes NO credit-conservation claim about \
+         '{topic}' -> {node}.{input}: "
+    )
 }
 
 /// PURE: why the re-derivation verifier cannot judge a split `block` edge's
@@ -18876,11 +18889,10 @@ fn run_rank_pass(
             if bounded_out {
                 for e in &judged_edges {
                     let detail = format!(
-                        "the rank-local re-derivation verifier makes NO credit-conservation \
-                         claim about '{}' -> {}.{}: the `--duration` bound stopped this pass \
-                         short, so the drains it observed cover part of the recording while the \
-                         publish count it would compare them against covers all of it",
-                        e.topic, e.consumer_node, e.consumer_input
+                        "{}the `--duration` bound stopped this pass short, so the drains it \
+                         observed cover part of the recording while the publish count it would \
+                         compare them against covers all of it",
+                        no_conservation_claim(&e.topic, &e.consumer_node, &e.consumer_input)
                     );
                     tracing::warn!(
                         rank = plan.rank(),
@@ -43099,6 +43111,29 @@ mod conservation_stand_down_tests {
         }
         let tokens: BTreeSet<&str> = rows.iter().map(|(cause, ..)| cause.code()).collect();
         assert_eq!(tokens.len(), 4, "one token per cause: {tokens:?}");
+    }
+
+    /// A cause's token and a node's stand-down reason both fill a
+    /// `stand_down` note's code, so no cause shares a token with a reason.
+    #[test]
+    fn no_conservation_cause_shares_a_token_with_a_stand_down_reason() {
+        let reasons: BTreeSet<&str> = replay_rederive::EVERY_STAND_DOWN_REASON
+            .iter()
+            .map(replay_rederive::StandDownReason::code)
+            .collect();
+        assert_eq!(reasons.len(), 20, "{reasons:?}");
+        for cause in [
+            OutsideWriterCounted,
+            FramesLostAtRecord,
+            ConsumerStopped { step: 1 },
+            CreditUnknownAtAnchor {
+                rank: 1,
+                end: Produces,
+                step: 1,
+            },
+        ] {
+            assert!(!reasons.contains(cause.code()), "{cause:?}");
+        }
     }
 }
 

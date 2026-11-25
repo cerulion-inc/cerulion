@@ -622,8 +622,8 @@ pub fn plan_ranks(
     // reason. A node may write ONE declared multi-publisher topic through TWO
     // outputs (`validate_graph`'s duplicate-output-topic check exempts a listed
     // topic, and the topology's double-producer check exempts it too), so an
-    // output-keyed list would name that node twice, and a cross-rank edge's
-    // `producers` would list one writer as two, reading as a shared bus.
+    // output-keyed list would name that node twice. The list, and each
+    // cross-rank edge's `producers` built from it, names each writer once.
     let mut produced_by: BTreeMap<String, Vec<(u32, &str)>> = BTreeMap::new();
     for n in &config.nodes {
         let rank = rank_of[n.id.as_str()];
