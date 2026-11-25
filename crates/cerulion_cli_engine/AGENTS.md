@@ -1,13 +1,14 @@
 # cerulion_cli_engine
 
-Clap delegates here; tests never spawn processes. Writers hold `workspace_lock::WorkspaceLock` at `<root>/.cerulion/workspace.lock` through check/write: UNIX flock shared with wsd, reentrant, others wait (one warn); elsewhere no-op.
-Reads: `acquire_read` (creates nothing; refuses same-thread re-entry); all
-refuse a symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
-tracked `.gitignore` when creating `.cerulion/`; migrate polls with
-`acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
+Clap delegates; tests never spawn. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: reentrant UNIX flock with wsd; others wait (one warn); no-op elsewhere.
+Reads: `acquire_read` creates nothing, refuses same-thread re-entry; all
+refuse symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
+tracked `.gitignore` when creating `.cerulion/`; polls use
+`acquire_interruptibly(root, interrupted)` -> `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
 Ports: `graph_cmd::stage_declared_node`.
 ## Rules
 - Engine enforces invariants; CLI checks are UX.
+- Sessions: literal argv; network refusal before lookup/spawn.
 - Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll/renew<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
 - Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
 - Paired graph producers need serving_authority; canonical ingress before GO retains pinned demands; refuse schema/QoS/writer mismatches.
@@ -25,11 +26,10 @@ Ports: `graph_cmd::stage_declared_node`.
 - iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
 - Interrupted waits check running; retry<=MAX_CONSECUTIVE_WAIT_ERRORS, never sleep-retry errors. Foreign SIGINT: child_signals (exec inherits ignore/blocks), self_exe excepted.
-- After `templates.rs` changes, regenerate its fixture at repo root:
+- For `templates.rs` changes, regenerate at repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
 ## Dependencies
-Deps follow binary: checkout/exact registry pins.
-Checks: cli dossier §11.
+Binary deps: checkout/exact registry pins; checks: cli dossier §11.
 ## Tests: lib env `test_env::env_lock`
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
