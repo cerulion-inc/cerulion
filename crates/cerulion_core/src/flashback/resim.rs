@@ -1180,8 +1180,7 @@ impl ResimGap {
                 format!(
                     "this capture's `__cerulion/recorder.json` {stated}, and `cerulion bag play \
                      --resim` refuses a recording whose contract it cannot read before it \
-                     re-executes anything. The frames, the state and the trace are in the bag \
-                     and readable"
+                     re-executes anything"
                 )
             }
             Self::RankWithoutCompleteStep { ranks } => format!(
@@ -3776,8 +3775,7 @@ mod tests {
         let at_zero = by_rank(&[(0, 0)]);
         let mixed = by_rank(&[(0, 0), (1, 6)]);
         let refusal = "`cerulion bag play --resim` refuses a recording whose contract it cannot \
-                       read before it re-executes anything. The frames, the state and the trace \
-                       are in the bag and readable";
+                       read before it re-executes anything";
         for (why, stated) in [
             (
                 UnreadableCoordination::NotJson,
