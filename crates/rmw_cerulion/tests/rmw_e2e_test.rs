@@ -2372,7 +2372,7 @@ fn expected_bytes(seed: u8, n: usize) -> Vec<u8> {
 /// HOLD a zero-copy loaned take (a fixed type one byte past the copy limit,
 /// whose loan IS the shared-memory struct) across further publishes: the
 /// held payload is byte-UNCHANGED (iceoryx2 borrow accounting pins the slot
-/// until the loan returns — the no-reclaim-while-held pin), then the
+/// until the loan returns, the no-reclaim-while-held pin), then the
 /// remaining frames drain IN ORDER.
 #[test]
 #[serial]
