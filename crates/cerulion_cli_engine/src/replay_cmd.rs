@@ -960,6 +960,10 @@ const CERULION_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// text, so a refusal prints it only through this type. A stamp that holds any
 /// other byte, whose leading part is not three integers, or whose release is
 /// not above this build's reads as absent, and the refusal names no version.
+///
+/// Only this crate builds one, from this build's own version, so every value
+/// a caller outside it sees names a release above that version. Read it
+/// through its `Display`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewerRecorderVersion(String);
 
@@ -970,7 +974,7 @@ impl NewerRecorderVersion {
     /// `stamp` when it is a plain version token whose release is above the
     /// release of `ours`, this build's version; `None` otherwise, and when
     /// `ours` has no `MAJOR.MINOR.PATCH` either.
-    pub fn newer_than(stamp: &str, ours: &str) -> Option<Self> {
+    pub(crate) fn newer_than(stamp: &str, ours: &str) -> Option<Self> {
         let plain = (1..=Self::MAX_LEN).contains(&stamp.len())
             && stamp
                 .bytes()
