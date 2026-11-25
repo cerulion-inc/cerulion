@@ -2,30 +2,32 @@
 // The crate root is `#![cfg(unix)]`, so on a non-unix target this test
 // file must compile to NOTHING or its `use rmw_cerulion::…` items vanish.
 #![cfg(unix)]
-//! The loaned-take REFUSAL flood latch at the production
-//! `rmw_take_loaned_message` site — both budget arms.
+//! The loaned take PAST the zero-copy loans its borrow ceiling allows, and the
+//! take-side flood latches, at the production `rmw_take_loaned_message` site.
 //!
-//! A consumer that RETAINS loans past the budget is refused on every
-//! following take, and rclcpp's executor retries at the topic's arrival
-//! rate: on a 30 Hz camera topic that is 30 lines/s forever under a
-//! bare `error!`. The site rides `cerulion_core`'s shared
-//! `FailureRegimeLatch` through `loan_refusal_latch`. Two arms, ONE latch:
+//! A consumer that RETAINS loans (a `message_filters` cache, a latest-N
+//! buffer) must keep receiving. The take keeps one borrow of the
+//! subscription's ceiling (`min(RMW_TAKE_LOAN_BORROW_BUDGET, the service's
+//! max_borrowed_samples)`, 4 on a service this crate creates) in reserve: once
+//! `ceiling - 1` zero-copy loans are held, each further take receives into the
+//! reserved borrow, copies the message into private memory, releases the
+//! borrow at once and hands out the copy. Both shapes are pinned: a FIXED type
+//! past the copy limit (the fixed section copied into aligned heap words) and
+//! a FORGED type (an unpooled shadow filled by the copying decode).
 //!
-//! - `kind=shadow_pool_exhausted` — a FORGED type whose four shadows are all
-//!   loaned out; refused BEFORE the receive (no frame consumed);
-//! - `kind=receive_failed` — a FIXED type at the transport's borrow budget
-//!   (iceoryx2's `ExceedsMaxBorrows`), the arm that originally shipped unlatched.
-//!
-//! Hand oracles, every predicate matching the LEVEL TOKEN as well as the
-//! message (a text-only filter passes a variant that emits the suppressed
-//! arm at `error!`, so suppression does nothing while message and
-//! counter stay intact): N refusals ⇒ exactly 1 `ERROR` head + N-1 `DEBUG`
-//! repeats (+ the `ERROR` decade re-announcement when N crosses 10, which is
-//! NOT counted as suppressed) + an UNCONDITIONAL counter of N; a return +
-//! served take ⇒ exactly ONE `INFO` recovery carrying `suppressed_count=`
-//! the suppressed number (not the total); the counter is never reset; a
-//! fresh refusal is loud again. Field keys are pinned as whole tokens:
-//! `topic=`, `kind=`, `total_failures=`, `suppressed_count=`.
+//! The copies ride their own `FailureRegimeLatch` through
+//! `loan_refusal_latch`. Hand oracles, every predicate matching the LEVEL
+//! TOKEN as well as the message (a text-only filter passes a variant that
+//! emits the suppressed arm loudly, so suppression does nothing while message
+//! and counter stay intact): N copies give exactly 1 `WARN` head + N-1
+//! `DEBUG` repeats (+ the `WARN` decade re-announcement when N crosses 10,
+//! which is NOT counted as suppressed) + an UNCONDITIONAL counter of N; a
+//! take served zero-copy again once no copy is outstanding gives exactly ONE
+//! `INFO` recovery carrying `suppressed_count=` the suppressed number (not the
+//! total), so a latest-N ring stays in one regime; the counter is never reset;
+//! a fresh copy is loud again. The refusal latch
+//! counts zero throughout. Field keys are pinned as whole tokens: `topic=`,
+//! `held_loans=`, `ceiling=`, `total_failures=`, `suppressed_count=`.
 //!
 //! Its OWN binary: `#[traced_test]` installs the process-global subscriber
 //! and `runtime()` installs its own with `try_init` — a non-traced test
@@ -44,7 +46,7 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rmw_cerulion::ffi::{self, RMW_RET_ERROR, RMW_RET_OK};
+use rmw_cerulion::ffi::{self, RMW_RET_OK};
 use rmw_cerulion::runtime::SubscriptionData;
 use rmw_cerulion::*;
 use tracing_test::traced_test;
@@ -117,16 +119,25 @@ fn c_ts(
     }))
 }
 
-/// FIXED: the transport-budget arm.
+/// The `f64` words of [`CPoint`]'s zeroed tail: enough to take the struct past
+/// the copy limit whatever the limit's value.
+const POINT_PAD: usize = (rmw_cerulion::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES - 24) / 8 + 1;
+
+/// FIXED and past the copy limit, its loan the shared-memory struct: the
+/// transport-budget arm. Three doubles and a zeroed tail.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct CPoint {
     x: f64,
     y: f64,
     z: f64,
+    pad: [f64; POINT_PAD],
 }
 
 fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    let mut pad = c_member("pad", ROS_TYPE_DOUBLE, 24);
+    pad.is_array_ = true;
+    pad.array_size_ = POINT_PAD;
     c_ts(
         unique,
         std::mem::size_of::<CPoint>(),
@@ -134,6 +145,7 @@ fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
             c_member("x", ROS_TYPE_DOUBLE, 0),
             c_member("y", ROS_TYPE_DOUBLE, 8),
             c_member("z", ROS_TYPE_DOUBLE, 16),
+            pad,
         ],
         None,
         None,
@@ -164,7 +176,13 @@ unsafe extern "C" fn blob_init(
 ) {
 }
 
+/// Every `fini` the rmw runs over a blob: a copy's return runs it once (the
+/// copy is destroyed), a zero-copy loan's return runs none (its shadow is
+/// recycled).
+static BLOB_FINIS: AtomicU64 = AtomicU64::new(0);
+
 unsafe extern "C" fn blob_fini(msg: *mut c_void) {
+    BLOB_FINIS.fetch_add(1, Ordering::Relaxed);
     let m = &mut *(msg as *mut CBlob);
     if !m.data.data.is_null() {
         free(m.data.data as *mut c_void);
@@ -284,16 +302,65 @@ unsafe fn refusal_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     (*((*subscription).data as *const SubscriptionData)).loan_refusal_count()
 }
 
+unsafe fn copy_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
+    (*((*subscription).data as *const SubscriptionData)).loan_copy_count()
+}
+
+/// The zero-copy loans the subscription holds (each pins one SHM borrow).
+unsafe fn zero_copy_held(subscription: *const ffi::rmw_subscription_t) -> usize {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_takes
+        .len()
+}
+
+/// Whether the subscription's served-by-copy regime is open.
+unsafe fn copy_regime_open(subscription: *const ffi::rmw_subscription_t) -> bool {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .copy_regime_open
+}
+
+/// True when `loaned` is a zero-copy loan: one of the held SHM samples is
+/// keyed by it. A copy is keyed by private heap memory and holds no sample.
+unsafe fn is_zero_copy(subscription: *const ffi::rmw_subscription_t, loaned: *mut c_void) -> bool {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending_takes
+        .iter()
+        .any(|t| t.key == loaned as usize)
+}
+
+/// True when `ptr` lies inside the payload of a held SHM sample.
+unsafe fn inside_a_held_sample(
+    subscription: *const ffi::rmw_subscription_t,
+    ptr: *const u8,
+) -> bool {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.pending_takes.iter().any(|t| {
+        let payload = t.sample.payload();
+        let start = payload.as_ptr() as usize;
+        (start..start + payload.len()).contains(&(ptr as usize))
+    })
+}
+
 // =====================================================================
 // Log helpers (the repo's level-token discipline — see
 // rmw_publish_reject_test.rs for why a text-only filter is not enough)
 // =====================================================================
 
-/// Markers chosen so no one is a substring of another: every loud head opens
-/// with the refusal + an em dash (each `kind=` then carries its OWN headline
-/// and remedy, asserted per arm), the repeat names itself, the decade line
-/// says STILL.
-const LOUD: &str = "loaned take refused —";
+/// Refusal markers, used here only to prove a line was NOT logged: every
+/// refusal line opens with `loaned take refused` (the head, whatever its
+/// `kind=`, and the repeat), the repeat names itself, the decade line says
+/// STILL.
+const LOUD: &str = "loaned take refused";
 const SUPPRESSED: &str = "(suppressed repeat)";
 const STILL: &str = "loaned take STILL refused";
 const RECOVERY: &str = "loaned take recovered";
@@ -326,18 +393,77 @@ fn has_field(line: &str, key: &str, value: &str) -> bool {
 // Tests
 // =====================================================================
 
-/// The shadow-pool arm, driven PAST the decade: a forged type with all four
-/// shadows loaned out is refused 10× ⇒ 1 loud head + 8 suppressed repeats
-/// + the 10th refusal re-announced loudly (`total_failures=10`,
-/// `suppressed_count=8`); nothing was consumed (all 10 queued frames are
-/// still there); one return + served take ⇒ ONE recovery carrying
-/// `suppressed_count=8`; the counter is never reset; a fresh refusal is loud
-/// again.
+/// Markers of the served-by-copy latch, none a substring of another: the head
+/// names the copy and a colon, the repeat names itself, the decade line says
+/// STILL, the recovery says zero-copy again.
+const COPY_LOUD: &str = "loaned take served by COPY:";
+const COPY_SUPPRESSED: &str = "loaned take served by COPY (suppressed repeat)";
+const COPY_STILL: &str = "loaned takes STILL served by COPY";
+const COPY_RECOVERY: &str = "loaned take served zero-copy again";
+
+/// The bytes `publish_blob(_, x, 4)` writes for `x` in `0..=14`, written out by
+/// hand (`data[i] = i ^ x`).
+const BLOB_ORACLE: [[u8; 4]; 15] = [
+    [0, 1, 2, 3],
+    [1, 0, 3, 2],
+    [2, 3, 0, 1],
+    [3, 2, 1, 0],
+    [4, 5, 6, 7],
+    [5, 4, 7, 6],
+    [6, 7, 4, 5],
+    [7, 6, 5, 4],
+    [8, 9, 10, 11],
+    [9, 8, 11, 10],
+    [10, 11, 8, 9],
+    [11, 10, 9, 8],
+    [12, 13, 14, 15],
+    [13, 12, 15, 14],
+    [14, 15, 12, 13],
+];
+
+/// Publish blob `x` and take it as a loan: served, taken, `x` and its four
+/// bytes exactly the oracle's. Returns the loaned pointer.
+unsafe fn publish_and_take_blob(
+    publisher: *const ffi::rmw_publisher_t,
+    subscription: *const ffi::rmw_subscription_t,
+    x: u32,
+) -> *mut c_void {
+    publish_blob(publisher, x, 4);
+    let (ret, taken, p) = take_loaned(subscription);
+    assert_eq!(
+        ret, RMW_RET_OK,
+        "take of blob {x} is served whatever the consumer holds"
+    );
+    assert!(taken, "blob {x} is taken");
+    assert!(!p.is_null(), "blob {x} hands out a pointer");
+    let b = &*(p as *const CBlob);
+    assert_eq!(b.x, x, "FIFO");
+    assert_eq!(b.data.size, 4, "blob {x}");
+    assert_eq!(
+        std::slice::from_raw_parts(b.data.data, 4),
+        &BLOB_ORACLE[x as usize],
+        "blob {x}'s bytes"
+    );
+    p
+}
+
+/// A FORGED type whose consumer keeps every message keeps receiving. The
+/// ceiling is 4, so the first three takes are zero-copy loans (`data()` inside
+/// a held sample) and every take after them, the 4th and the 5th included, is
+/// served by COPY: RMW_RET_OK, taken, the published contents, `data()` in
+/// private memory, no borrow held for it. Ten copies give 1 WARN head + 8 DEBUG
+/// repeats + the 10th re-announced at WARN (`total_failures=10`,
+/// `suppressed_count=8`) and a counter of 10. Returning a copy runs the
+/// typesupport's `fini` once and untracks it; once every copy and one
+/// zero-copy loan are back the next take is zero-copy again, with ONE INFO
+/// recovery carrying `suppressed_count=8`; the counter is never reset and a
+/// fresh copy is loud again. Nothing is refused.
 #[test]
 #[serial]
 #[traced_test]
-fn shadow_pool_refusals_are_loud_once_re_announced_at_the_decade_and_recover() {
-    const REFUSALS: usize = 10;
+fn forged_takes_past_the_reserve_are_served_by_copy_loud_once_re_announced_and_recover() {
+    const ZERO_COPY: u32 = 3;
+    const COPIES: u32 = 10;
     unsafe {
         let suffix = unique_suffix();
         let ts = blob_ts(&format!("BlobR{suffix}"));
@@ -346,80 +472,124 @@ fn shadow_pool_refusals_are_loud_once_re_announced_at_the_decade_and_recover() {
             (*subscription).can_loan_messages,
             "the blob type is take-loanable"
         );
-        assert_eq!(refusal_count(subscription), 0);
+        assert_eq!(copy_count(subscription), 0);
 
-        for i in 0..8u32 {
-            publish_blob(publisher, i, 64);
-        }
         let mut held = Vec::new();
-        for i in 0..4u32 {
-            let (ret, taken, p) = take_loaned(subscription);
-            assert_eq!(ret, RMW_RET_OK, "take {i} inside the budget");
-            assert!(taken);
-            assert_eq!((*(p as *const CBlob)).x, i, "FIFO");
+        for x in 0..ZERO_COPY + COPIES {
+            let p = publish_and_take_blob(publisher, subscription, x);
+            let data_ptr = (*(p as *const CBlob)).data.data as *const u8;
+            if x < ZERO_COPY {
+                assert!(
+                    is_zero_copy(subscription, p),
+                    "blob {x} is a zero-copy loan"
+                );
+                assert!(
+                    inside_a_held_sample(subscription, data_ptr),
+                    "a zero-copy loan's data() aims into its held sample (blob {x})"
+                );
+            } else {
+                assert!(
+                    !is_zero_copy(subscription, p),
+                    "blob {x} is served by copy: the consumer already holds {ZERO_COPY} \
+                     zero-copy loans"
+                );
+                assert!(
+                    !inside_a_held_sample(subscription, data_ptr),
+                    "a copy's data() is private memory, never a held sample (blob {x})"
+                );
+            }
             held.push(p);
         }
-        for _ in 0..REFUSALS {
-            let (ret, taken, p) = take_loaned(subscription);
-            assert_eq!(ret, RMW_RET_ERROR);
-            assert!(!taken);
-            assert!(p.is_null());
-        }
         assert_eq!(
-            refusal_count(subscription),
-            REFUSALS as u64,
-            "the counter is UNCONDITIONAL — it counts the debug-suppressed repeats too"
+            held.len(),
+            13,
+            "a fifth held loan, and every one after it, still receives"
+        );
+        assert_eq!(
+            zero_copy_held(subscription),
+            3,
+            "zero-copy loans stop one below the ceiling of 4"
+        );
+        assert_eq!(
+            copy_count(subscription),
+            u64::from(COPIES),
+            "the counter is UNCONDITIONAL: it counts the debug-suppressed repeats too"
+        );
+        assert_eq!(refusal_count(subscription), 0, "nothing was refused");
+
+        // A returned copy is destroyed through the typesupport's fini and is
+        // no longer outstanding.
+        let last_copy = held.pop().expect("held");
+        let finis = BLOB_FINIS.load(Ordering::Relaxed);
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, last_copy),
+            RMW_RET_OK
+        );
+        assert_eq!(
+            BLOB_FINIS.load(Ordering::Relaxed) - finis,
+            1,
+            "returning a copy runs the typesupport's fini exactly once"
+        );
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, last_copy),
+            ffi::RMW_RET_INVALID_ARGUMENT,
+            "a returned copy is no longer an outstanding loan"
         );
 
-        // Recovery: return one, the next take serves frame 4 (nothing was
-        // consumed by the refusals).
+        // Recovery: every copy and one zero-copy loan back, and the next take
+        // is zero-copy with no copy outstanding.
+        for copy in held.split_off(ZERO_COPY as usize) {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, copy),
+                RMW_RET_OK
+            );
+        }
         assert_eq!(
             rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
             RMW_RET_OK
         );
-        let (ret, taken, p) = take_loaned(subscription);
-        assert_eq!(ret, RMW_RET_OK);
-        assert!(taken);
-        assert_eq!(
-            (*(p as *const CBlob)).x,
-            4,
-            "the refused takes consumed no frame"
+        let p = publish_and_take_blob(publisher, subscription, 13);
+        assert!(
+            is_zero_copy(subscription, p),
+            "below the reserve again, the take is zero-copy"
         );
         held.push(p);
         assert_eq!(
-            refusal_count(subscription),
-            REFUSALS as u64,
+            copy_count(subscription),
+            u64::from(COPIES),
             "recovery never resets"
         );
 
-        // Re-armed: with four held again, a fresh refusal is loud again.
-        let (ret, taken, _) = take_loaned(subscription);
-        assert_eq!(ret, RMW_RET_ERROR);
-        assert!(!taken);
-        assert_eq!(refusal_count(subscription), REFUSALS as u64 + 1);
+        // Re-armed: three zero-copy loans held again, a fresh copy is loud.
+        let p = publish_and_take_blob(publisher, subscription, 14);
+        assert!(!is_zero_copy(subscription, p), "past the reserve again");
+        held.push(p);
+        assert_eq!(copy_count(subscription), u64::from(COPIES) + 1);
+        assert_eq!(refusal_count(subscription), 0);
 
         logs_assert(|lines: &[&str]| {
-            let heads = count_at_exclusively(lines, "ERROR", &[LOUD])?;
-            never_loud(lines, SUPPRESSED)?;
-            let repeats = count_at_exclusively(lines, "DEBUG", &[SUPPRESSED])?;
-            let stills = count_at_exclusively(lines, "ERROR", &[STILL])?;
-            let recoveries = count_at_exclusively(lines, "INFO", &[RECOVERY])?;
+            let heads = count_at_exclusively(lines, "WARN", &[COPY_LOUD])?;
+            never_loud(lines, COPY_SUPPRESSED)?;
+            let repeats = count_at_exclusively(lines, "DEBUG", &[COPY_SUPPRESSED])?;
+            let stills = count_at_exclusively(lines, "WARN", &[COPY_STILL])?;
+            let recoveries = count_at_exclusively(lines, "INFO", &[COPY_RECOVERY])?;
             if heads != 2 {
                 return Err(format!(
-                    "expected exactly 2 ERROR loud heads (the regime, then the re-armed one) \
-                     — a per-take error! would give {}; got {heads}",
-                    REFUSALS + 1
+                    "expected exactly 2 WARN heads (the regime, then the re-armed one); a \
+                     per-take warn! would give {}; got {heads}",
+                    COPIES + 1
                 ));
             }
-            let want_repeats = debug_lines_expected(REFUSALS - 2);
+            let want_repeats = debug_lines_expected((COPIES - 2) as usize);
             if repeats != want_repeats {
                 return Err(format!(
-                    "expected {want_repeats} DEBUG suppressed repeats (10 refusals − head − decade), got {repeats}"
+                    "expected {want_repeats} DEBUG suppressed repeats (10 copies less the head \
+                     and the decade line), got {repeats}"
                 ));
             }
             if stills != 1 {
                 return Err(format!(
-                    "expected exactly 1 ERROR decade re-announcement, got {stills}"
+                    "expected exactly 1 WARN decade re-announcement, got {stills}"
                 ));
             }
             if recoveries != 1 {
@@ -427,49 +597,43 @@ fn shadow_pool_refusals_are_loud_once_re_announced_at_the_decade_and_recover() {
                     "expected exactly 1 INFO recovery, got {recoveries}"
                 ));
             }
-            if count_at(lines, "ERROR", SUPPRESSED) != 0 {
-                return Err("the suppressed arm must be DEBUG, found it at ERROR".into());
-            }
-            let heads = lines_at(lines, "ERROR", LOUD);
-            if heads.is_empty() {
-                return Err("no loud head".into());
-            }
-            for head in heads {
+            for head in lines_at(lines, "WARN", COPY_LOUD) {
                 if !has_field(head, "topic", &topic)
-                    || !has_field(head, "kind", "shadow_pool_exhausted")
+                    || !has_field(head, "held_loans", "3")
+                    || !has_field(head, "ceiling", "4")
                 {
                     return Err(format!(
-                        "head must carry topic= and kind=shadow_pool_exhausted: {head}"
+                        "head must carry topic=, held_loans=3 and ceiling=4: {head}"
                     ));
                 }
-                if !head.contains("every shadow in the pool is loaned out")
-                    || !head.contains("return outstanding loans")
-                {
-                    return Err(format!(
-                        "the pool-exhausted head must name ITS condition and ITS remedy: {head}"
-                    ));
-                }
-                if !has_field(head, "outstanding_loans", "4") || !has_field(head, "budget", "4") {
-                    return Err(format!("head must name the shape (4 held of 4): {head}"));
+                if !head.contains("return loans") {
+                    return Err(format!("head must name the remedy: {head}"));
                 }
             }
-            let still = find_at(lines, "ERROR", STILL).ok_or("no decade line")?;
+            let still = find_at(lines, "WARN", COPY_STILL).ok_or("no decade line")?;
             if !has_field(still, "total_failures", "10")
                 || !has_field(still, "suppressed_count", "8")
+                || !has_field(still, "topic", &topic)
             {
                 return Err(format!(
-                    "decade line must carry total_failures=10 suppressed_count=8: {still}"
+                    "decade line must carry topic=, total_failures=10 and suppressed_count=8: \
+                     {still}"
                 ));
             }
-            if !has_field(still, "topic", &topic) {
-                return Err(format!("decade line must carry topic=: {still}"));
-            }
-            let rec = find_at(lines, "INFO", RECOVERY).ok_or("no INFO recovery")?;
+            let rec = find_at(lines, "INFO", COPY_RECOVERY).ok_or("no INFO recovery")?;
             if !has_field(rec, "suppressed_count", "8") || !has_field(rec, "topic", &topic) {
                 return Err(format!(
                     "recovery must report the 8 SUPPRESSED (not the 10 total) with topic=: {rec}"
                 ));
             }
+            if lines
+                .iter()
+                .any(|l| l.contains(LOUD) || l.contains(STILL) || l.contains(RECOVERY))
+            {
+                return Err(
+                    "a take served by copy must never log through the REFUSAL latch".into(),
+                );
+            }
             Ok(())
         });
 
@@ -485,116 +649,216 @@ fn shadow_pool_refusals_are_loud_once_re_announced_at_the_decade_and_recover() {
     }
 }
 
-/// The transport-budget arm (a FIXED type at iceoryx2's borrow budget —
-/// `ExceedsMaxBorrows`), the arm that shipped as a bare per-take `error!`:
-/// 6 refusals ⇒ 1 loud head (`kind=receive_failed`, the transport's reason
-/// on `error=`) + 5 suppressed + counter 6; return + served take ⇒ one
-/// recovery with `suppressed_count=5`; the queued 5th frame survives.
+/// The points published in order, written out by hand.
+static POINT_ORACLE: [CPoint; 10] = [
+    CPoint {
+        x: 0.0,
+        y: -1.5,
+        z: 100.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 1.0,
+        y: -2.5,
+        z: 101.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 2.0,
+        y: -3.5,
+        z: 102.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 3.0,
+        y: -4.5,
+        z: 103.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 4.0,
+        y: -5.5,
+        z: 104.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 5.0,
+        y: -6.5,
+        z: 105.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 6.0,
+        y: -7.5,
+        z: 106.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 7.0,
+        y: -8.5,
+        z: 107.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 8.0,
+        y: -9.5,
+        z: 108.0,
+        pad: [0.0; POINT_PAD],
+    },
+    CPoint {
+        x: 9.0,
+        y: -10.5,
+        z: 109.0,
+        pad: [0.0; POINT_PAD],
+    },
+];
+
+/// Publish point `i` of the oracle and take it as a loan: served, taken, the
+/// struct exactly the oracle's, the pointer 8-aligned. Returns the pointer.
+unsafe fn publish_and_take_point(
+    publisher: *const ffi::rmw_publisher_t,
+    subscription: *const ffi::rmw_subscription_t,
+    i: usize,
+) -> *mut c_void {
+    let msg = POINT_ORACLE[i];
+    assert_eq!(
+        rmw_publish(
+            publisher,
+            &msg as *const _ as *const c_void,
+            std::ptr::null_mut()
+        ),
+        RMW_RET_OK
+    );
+    let (ret, taken, p) = take_loaned(subscription);
+    assert_eq!(
+        ret, RMW_RET_OK,
+        "take of point {i} is served whatever the consumer holds"
+    );
+    assert!(taken, "point {i} is taken");
+    assert!(!p.is_null(), "point {i} hands out a pointer");
+    assert_eq!(p as usize % 8, 0, "point {i}'s loaned pointer is 8-aligned");
+    assert_eq!(*(p as *const CPoint), POINT_ORACLE[i], "point {i}");
+    p
+}
+
+/// A FIXED type at its borrow ceiling keeps receiving: three zero-copy loans
+/// held, the 4th, the 5th and every take after them are served by COPY (the
+/// fixed section in private, 8-aligned memory, the borrow released at once),
+/// never `ExceedsMaxBorrows`. Six copies give 1 WARN head + 5 DEBUG repeats and
+/// a counter of 6; a returned copy is untracked; with every copy and one
+/// zero-copy loan back the next take is zero-copy again with ONE INFO recovery
+/// carrying `suppressed_count=5`.
 #[test]
 #[serial]
 #[traced_test]
-fn transport_budget_refusals_are_loud_once_counted_always_and_recover() {
-    const REFUSALS: usize = 6;
+fn fixed_takes_past_the_reserve_are_served_by_copy_counted_always_and_recover() {
+    const ZERO_COPY: usize = 3;
+    const COPIES: usize = 6;
     unsafe {
         let suffix = unique_suffix();
         let ts = point_ts(&format!("PtR{suffix}"));
         let (node, publisher, subscription, topic) = setup_pair(ts, "pt", suffix);
-        for i in 0..5u32 {
-            let msg = CPoint {
-                x: f64::from(i),
-                y: 0.0,
-                z: 0.0,
-            };
+        let mut held = Vec::new();
+        for i in 0..ZERO_COPY + COPIES {
+            let p = publish_and_take_point(publisher, subscription, i);
             assert_eq!(
-                rmw_publish(
-                    publisher,
-                    &msg as *const _ as *const c_void,
-                    std::ptr::null_mut()
-                ),
+                is_zero_copy(subscription, p),
+                i < ZERO_COPY,
+                "point {i}: the first {ZERO_COPY} takes are zero-copy, the rest copies"
+            );
+            if i >= ZERO_COPY {
+                assert!(
+                    !inside_a_held_sample(subscription, p as *const u8),
+                    "a copy is private memory, never a held sample (point {i})"
+                );
+            }
+            held.push(p);
+        }
+        assert_eq!(
+            zero_copy_held(subscription),
+            3,
+            "the fourth borrow stays in reserve"
+        );
+        assert_eq!(copy_count(subscription), COPIES as u64);
+        assert_eq!(refusal_count(subscription), 0, "nothing was refused");
+
+        // A returned copy is untracked; its bytes were the oracle's to the end.
+        let copy = held.pop().expect("held");
+        assert_eq!(*(copy as *const CPoint), POINT_ORACLE[8]);
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, copy),
+            RMW_RET_OK
+        );
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, copy),
+            ffi::RMW_RET_INVALID_ARGUMENT,
+            "a returned copy is no longer an outstanding loan"
+        );
+
+        for copy in held.split_off(ZERO_COPY) {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, copy),
                 RMW_RET_OK
             );
         }
-        let mut held = Vec::new();
-        for _ in 0..4 {
-            let (ret, taken, p) = take_loaned(subscription);
-            assert_eq!(ret, RMW_RET_OK);
-            assert!(taken);
-            held.push(p);
-        }
-        for _ in 0..REFUSALS {
-            let (ret, taken, p) = take_loaned(subscription);
-            assert_eq!(
-                ret, RMW_RET_ERROR,
-                "the 5th concurrent loan exceeds the borrow budget"
-            );
-            assert!(!taken);
-            assert!(p.is_null());
-        }
-        assert_eq!(refusal_count(subscription), REFUSALS as u64);
-
         assert_eq!(
             rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
             RMW_RET_OK
         );
-        let (ret, taken, p) = take_loaned(subscription);
-        assert_eq!(ret, RMW_RET_OK, "returning one loan recovers");
-        assert!(taken);
-        assert_eq!(
-            (*(p as *const CPoint)).x,
-            4.0,
-            "the frame behind the refusals survived"
+        let p = publish_and_take_point(publisher, subscription, 9);
+        assert!(
+            is_zero_copy(subscription, p),
+            "below the reserve again, the take is zero-copy"
         );
         held.push(p);
-        assert_eq!(refusal_count(subscription), REFUSALS as u64);
+        assert_eq!(
+            copy_count(subscription),
+            COPIES as u64,
+            "recovery never resets"
+        );
 
         logs_assert(|lines: &[&str]| {
-            let heads = count_at_exclusively(lines, "ERROR", &[LOUD])?;
-            never_loud(lines, SUPPRESSED)?;
-            let repeats = count_at_exclusively(lines, "DEBUG", &[SUPPRESSED])?;
-            let recoveries = count_at_exclusively(lines, "INFO", &[RECOVERY])?;
+            let heads = count_at_exclusively(lines, "WARN", &[COPY_LOUD])?;
+            never_loud(lines, COPY_SUPPRESSED)?;
+            let repeats = count_at_exclusively(lines, "DEBUG", &[COPY_SUPPRESSED])?;
+            let recoveries = count_at_exclusively(lines, "INFO", &[COPY_RECOVERY])?;
             if heads != 1 {
-                return Err(format!("expected exactly 1 ERROR loud head, got {heads}"));
+                return Err(format!("expected exactly 1 WARN loud head, got {heads}"));
             }
-            let want_repeats = debug_lines_expected(REFUSALS - 1);
+            let want_repeats = debug_lines_expected(COPIES - 1);
             if repeats != want_repeats {
                 return Err(format!(
                     "expected {want_repeats} DEBUG suppressed repeats, got {repeats}"
                 ));
+            }
+            if count_at(lines, "WARN", COPY_STILL) != 0 {
+                return Err("six copies never reach the decade line".into());
             }
             if recoveries != 1 {
                 return Err(format!(
                     "expected exactly 1 INFO recovery, got {recoveries}"
                 ));
             }
-            if count_at(lines, "ERROR", SUPPRESSED) != 0 {
-                return Err("the suppressed arm must be DEBUG, found it at ERROR".into());
+            let head = find_at(lines, "WARN", COPY_LOUD).ok_or("no loud head")?;
+            if !has_field(head, "topic", &topic)
+                || !has_field(head, "held_loans", "3")
+                || !has_field(head, "ceiling", "4")
+                || !has_field(head, "total_failures", "1")
+            {
+                return Err(format!(
+                    "head must carry topic=, held_loans=3, ceiling=4 and total_failures=1: {head}"
+                ));
             }
-            let heads = lines_at(lines, "ERROR", LOUD);
-            if heads.is_empty() {
-                return Err("no loud head".into());
+            let rec = find_at(lines, "INFO", COPY_RECOVERY).ok_or("no INFO recovery")?;
+            if !has_field(rec, "suppressed_count", &(COPIES - 1).to_string())
+                || !has_field(rec, "total_failures", &COPIES.to_string())
+            {
+                return Err(format!(
+                    "recovery must report the suppressed count and the running total: {rec}"
+                ));
             }
-            for head in heads {
-                if !has_field(head, "kind", "receive_failed") || !has_field(head, "topic", &topic) {
-                    return Err(format!(
-                        "head must carry kind=receive_failed and topic=: {head}"
-                    ));
-                }
-                if !head.contains("ExceedsMaxBorrows") {
-                    return Err(format!(
-                        "head must carry the transport's own reason (ExceedsMaxBorrows): {head}"
-                    ));
-                }
-                if !head.contains("the transport refused the receive")
-                    || head.contains("every shadow in the pool")
-                {
-                    return Err(format!(
-                        "the receive-failed head must carry ITS headline, not the pool's: {head}"
-                    ));
-                }
-            }
-            let rec = find_at(lines, "INFO", RECOVERY).ok_or("no INFO recovery")?;
-            if !has_field(rec, "suppressed_count", &(REFUSALS - 1).to_string()) {
-                return Err(format!("recovery must report the suppressed count: {rec}"));
+            if lines.iter().any(|l| l.contains("ExceedsMaxBorrows")) {
+                return Err("no take may reach the transport's borrow refusal".into());
             }
             Ok(())
         });
@@ -611,9 +875,484 @@ fn transport_budget_refusals_are_loud_once_counted_always_and_recover() {
     }
 }
 
-/// Anti-tautology control: a consumer that never retains past the budget
-/// logs NONE of the refusal vocabulary and counts zero — the "exactly N"
-/// arms above would also pass a reporter that fired on served takes.
+/// One served take of the determinism sequence: `x`, whether it was zero-copy,
+/// and its four bytes.
+type ServedBlob = (u32, bool, [u8; 4]);
+
+/// The copy regime closes and opens again. Regime 1: three zero-copy loans
+/// held, then two copies (one WARN head, one suppressed repeat); both copies
+/// and a loan returned, the next take is zero-copy and closes it (one INFO
+/// recovery, which prints because a repeat was suppressed). Regime 2 repeats
+/// the same shape: a second WARN head (the recovery re-armed the latch) and a
+/// second recovery. The regime flag reads open after each copy and closed after
+/// each closing take, and stays closed on a zero-copy take while none is open.
+#[test]
+#[serial]
+#[traced_test]
+fn the_copy_regime_closes_and_opens_again_with_one_head_and_one_recovery_each() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtRe{suffix}"));
+        let (node, publisher, subscription, _topic) = setup_pair(ts, "pt_reopen", suffix);
+        let mut held = Vec::new();
+        let mut next = 0;
+        let mut take = |want_zero_copy: bool, held: &mut Vec<*mut c_void>| {
+            let p = publish_and_take_point(publisher, subscription, next);
+            assert_eq!(
+                is_zero_copy(subscription, p),
+                want_zero_copy,
+                "point {next}: zero-copy {want_zero_copy}"
+            );
+            next += 1;
+            held.push(p);
+        };
+        let give_back = |held: &mut Vec<*mut c_void>, index: usize| {
+            let p = held.remove(index);
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        };
+        for _ in 0..3 {
+            take(true, &mut held);
+            assert!(!copy_regime_open(subscription), "no regime before any copy");
+        }
+        for _regime in 0..2 {
+            take(false, &mut held);
+            assert!(copy_regime_open(subscription), "a copy opens the regime");
+            take(false, &mut held);
+            assert!(
+                copy_regime_open(subscription),
+                "a second copy keeps it open"
+            );
+            // The two copies sit last; give them back, then the oldest loan.
+            let last = held.len() - 1;
+            give_back(&mut held, last);
+            let last = held.len() - 1;
+            give_back(&mut held, last);
+            give_back(&mut held, 0);
+            // Below the reserve with no copy outstanding: zero-copy, closing it.
+            take(true, &mut held);
+            assert!(
+                !copy_regime_open(subscription),
+                "the zero-copy take closes it"
+            );
+        }
+        give_back(&mut held, 0);
+        take(true, &mut held);
+        assert!(
+            !copy_regime_open(subscription),
+            "no regime opens on a zero-copy take"
+        );
+        assert_eq!(copy_count(subscription), 4, "two copies in each regime");
+
+        logs_assert(|lines: &[&str]| {
+            let heads = count_at_exclusively(lines, "WARN", &[COPY_LOUD])?;
+            let recoveries = count_at_exclusively(lines, "INFO", &[COPY_RECOVERY])?;
+            if heads != 2 {
+                return Err(format!(
+                    "expected 2 WARN heads (one per regime), got {heads}"
+                ));
+            }
+            if recoveries != 2 {
+                return Err(format!(
+                    "expected 2 INFO recoveries (one per regime), got {recoveries}"
+                ));
+            }
+            Ok(())
+        });
+
+        for p in held {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// Run the fixed sequence on a fresh topic: six takes held, a copy and a
+/// zero-copy loan returned, two takes more. Returns what was served and the
+/// final copy and refusal counts.
+unsafe fn run_retention_sequence(tag: &str) -> (Vec<ServedBlob>, u64, u64) {
+    let suffix = unique_suffix();
+    let ts = blob_ts(&format!("BlobD{tag}{suffix}"));
+    let (node, publisher, subscription, _) = setup_pair(ts, tag, suffix);
+    let mut served = Vec::new();
+    let mut held = Vec::new();
+    let mut take = |x: u32, held: &mut Vec<*mut c_void>| {
+        let p = publish_and_take_blob(publisher, subscription, x);
+        let b = &*(p as *const CBlob);
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(std::slice::from_raw_parts(b.data.data, 4));
+        served.push((b.x, is_zero_copy(subscription, p), bytes));
+        held.push(p);
+    };
+    for x in 0..6 {
+        take(x, &mut held);
+    }
+    // Return the last copy and the first zero-copy loan.
+    for p in [held.remove(5), held.remove(0)] {
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, p),
+            RMW_RET_OK
+        );
+    }
+    take(6, &mut held);
+    take(7, &mut held);
+    let counts = (copy_count(subscription), refusal_count(subscription));
+    for p in held {
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, p),
+            RMW_RET_OK
+        );
+    }
+    assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+    assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    (served, counts.0, counts.1)
+}
+
+/// Determinism: the same retention sequence run twice serves the same
+/// messages the same way (which takes are zero-copy, which are copies, the
+/// bytes) with the same counts, and both runs equal the hand-written oracle.
+#[test]
+#[serial]
+#[traced_test]
+fn the_same_retention_sequence_serves_the_same_takes_twice() {
+    const ZC: bool = true;
+    const COPY: bool = false;
+    let oracle: Vec<ServedBlob> = vec![
+        (0, ZC, [0, 1, 2, 3]),
+        (1, ZC, [1, 0, 3, 2]),
+        (2, ZC, [2, 3, 0, 1]),
+        (3, COPY, [3, 2, 1, 0]),
+        (4, COPY, [4, 5, 6, 7]),
+        (5, COPY, [5, 4, 7, 6]),
+        // One zero-copy loan returned: the next take is zero-copy again...
+        (6, ZC, [6, 7, 4, 5]),
+        // ...and the one after it is past the reserve once more.
+        (7, COPY, [7, 6, 5, 4]),
+    ];
+    unsafe {
+        let first = run_retention_sequence("detA");
+        let second = run_retention_sequence("detB");
+        assert_eq!(first, second, "two runs of one sequence must agree");
+        assert_eq!(first.0, oracle, "served takes");
+        assert_eq!(first.1, 4, "four takes were served by copy");
+        assert_eq!(first.2, 0, "none was refused");
+    }
+}
+
+/// The copies the subscription holds (each private memory, no borrow).
+unsafe fn copies_held(subscription: *const ffi::rmw_subscription_t) -> usize {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .copied_takes
+        .len()
+}
+
+/// A consumer that keeps the newest four messages and returns the oldest as
+/// each new one arrives (a latest-N ring) alternates zero-copy takes and
+/// copies for as long as it runs, and stays in ONE served-by-copy regime: the
+/// regime closes only on a zero-copy take with no copy outstanding, which the
+/// ring never makes. Fifty messages give twenty copies, in the hand-written
+/// order below, and exactly 1 WARN head, the decade line at the 10th copy, 18
+/// DEBUG repeats and no recovery; once the ring is emptied the next take is
+/// zero-copy and logs the one recovery, `suppressed_count=18`.
+#[test]
+#[serial]
+#[traced_test]
+fn a_latest_four_ring_stays_in_one_copy_regime() {
+    // One letter per take: z = zero-copy loan, c = copy.
+    const RING: &str = "zzzcczzzcczzzcczzzcczzzcczzzcczzzcczzzcczzzcczzzcc";
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = blob_ts(&format!("BlobRing{suffix}"));
+        let (node, publisher, subscription, topic) = setup_pair(ts, "blobring", suffix);
+        let mut ring: std::collections::VecDeque<*mut c_void> = std::collections::VecDeque::new();
+        for (i, kind) in RING.chars().enumerate() {
+            let x = i as u32;
+            publish_blob(publisher, x, 4);
+            let (ret, taken, p) = take_loaned(subscription);
+            assert_eq!(ret, RMW_RET_OK, "take {i}");
+            assert!(taken, "take {i}");
+            let b = &*(p as *const CBlob);
+            assert_eq!((b.x, b.data.size), (x, 4), "take {i}");
+            assert_eq!(*b.data.data, x as u8, "take {i}: data[0] is 0 ^ x");
+            assert_eq!(
+                is_zero_copy(subscription, p),
+                kind == 'z',
+                "take {i} is {kind}"
+            );
+            ring.push_back(p);
+            if ring.len() > 4 {
+                let oldest = ring.pop_front().expect("ring");
+                assert_eq!(
+                    rmw_return_loaned_message_from_subscription(subscription, oldest),
+                    RMW_RET_OK
+                );
+            }
+        }
+        assert_eq!(copy_count(subscription), 20);
+        assert_eq!(refusal_count(subscription), 0);
+
+        for p in ring.drain(..) {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        publish_blob(publisher, 50, 4);
+        let (ret, taken, p) = take_loaned(subscription);
+        assert!(ret == RMW_RET_OK && taken && is_zero_copy(subscription, p));
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, p),
+            RMW_RET_OK
+        );
+
+        logs_assert(|lines: &[&str]| {
+            let heads = count_at_exclusively(lines, "WARN", &[COPY_LOUD, &topic])?;
+            let stills = count_at_exclusively(lines, "WARN", &[COPY_STILL, &topic])?;
+            never_loud(lines, COPY_SUPPRESSED)?;
+            let repeats = count_at_exclusively(lines, "DEBUG", &[COPY_SUPPRESSED, &topic])?;
+            let recoveries = count_at_exclusively(lines, "INFO", &[COPY_RECOVERY, &topic])?;
+            if (heads, stills, recoveries) != (1, 1, 1) {
+                return Err(format!(
+                    "a ring must not flap: expected 1 head, 1 decade line and 1 recovery, got \
+                     {heads}, {stills} and {recoveries}"
+                ));
+            }
+            let want_repeats = debug_lines_expected(18);
+            if repeats != want_repeats {
+                return Err(format!(
+                    "expected {want_repeats} DEBUG repeats, got {repeats}"
+                ));
+            }
+            let rec = find_at(lines, "INFO", COPY_RECOVERY).ok_or("no recovery")?;
+            if !has_field(rec, "suppressed_count", "18") || !has_field(rec, "total_failures", "20")
+            {
+                return Err(format!(
+                    "recovery must carry suppressed_count=18 total_failures=20: {rec}"
+                ));
+            }
+            Ok(())
+        });
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// A forged take past the reserve whose frame the copying decode refuses (its
+/// `data` entry points past the payload): the frame is consumed and counted
+/// on the decode latch, nothing is handed out, the copy's shadow is destroyed
+/// through `fini` once, no copy is held or counted, and the next take serves
+/// the frame after it.
+#[test]
+#[serial]
+#[traced_test]
+fn a_forged_copy_whose_decode_fails_consumes_the_frame_and_frees_the_shadow() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = blob_ts(&format!("BlobBad{suffix}"));
+        let (node, publisher, subscription, _) = setup_pair(ts, "blobbad", suffix);
+        let data = &*((*subscription).data as *const SubscriptionData);
+        let mut held = Vec::new();
+        for x in 0..3 {
+            held.push(publish_and_take_blob(publisher, subscription, x));
+        }
+        let decode_failures = data.decode_failures.read().total_failures();
+        publish_serialized_blob_entry(publisher, ts, 60, Some((0x7fff_0000, 4)));
+        let finis = BLOB_FINIS.load(Ordering::Relaxed);
+        let (ret, taken, p) = take_loaned(subscription);
+        assert_eq!(
+            ret, RMW_RET_OK,
+            "an undecodable frame is dropped, not an error"
+        );
+        assert!(!taken && p.is_null(), "nothing is handed out");
+        assert_eq!(
+            data.decode_failures.read().total_failures(),
+            decode_failures + 1,
+            "counted on the decode latch"
+        );
+        assert_eq!(
+            BLOB_FINIS.load(Ordering::Relaxed) - finis,
+            1,
+            "the copy's shadow is destroyed through fini once"
+        );
+        assert_eq!(copies_held(subscription), 0, "no copy is held");
+        assert_eq!(copy_count(subscription), 0, "and none is counted as served");
+
+        let p = publish_and_take_blob(publisher, subscription, 4);
+        assert!(
+            !is_zero_copy(subscription, p),
+            "the undecodable frame was consumed: the next take serves blob 4, by copy"
+        );
+        held.push(p);
+        for p in held {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// A blob pair on a topic whose service ANOTHER creator minted first with a
+/// borrow ceiling of `ceiling` (the rmw create floor applies only when it
+/// creates the service). Returns the pin that holds that service open.
+unsafe fn setup_pair_on_ceiling(
+    ts: *const ffi::rosidl_message_type_support_t,
+    tag: &str,
+    suffix: u64,
+    ceiling: usize,
+) -> (
+    *mut ffi::rmw_node_t,
+    *mut ffi::rmw_publisher_t,
+    *mut ffi::rmw_subscription_t,
+    String,
+    cerulion_core::transport::subscriber::CerulionSubscriber,
+) {
+    // The node first: it brings up the runtime whose transport mints the
+    // foreign service.
+    let node = setup_node(&format!("{tag}_node_{suffix}"));
+    let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+    let ros_topic = format!("/rmw_refusal/{tag}/{suffix}");
+    let mut cfg = rt.transport.default_topic_config();
+    cfg.publisher_provisioning = cerulion_core::transport::PublisherProvisioning::External;
+    cfg.subscriber_max_borrowed_samples = Some(ceiling);
+    let depth = cfg.subscriber_max_buffer_size;
+    let pin = rt
+        .transport
+        .create_subscriber_with_buffers(&ros_topic, cfg, depth)
+        .expect("the foreign service is creatable");
+    assert_eq!(
+        pin.max_borrowed_samples(),
+        ceiling,
+        "PREMISE: the foreign service is minted at the ceiling under test"
+    );
+    let topic = CString::new(ros_topic.clone()).expect("topic");
+    let qos = default_qos();
+    let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+    let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+    let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+    assert!(
+        !subscription.is_null(),
+        "the subscription opens the smaller service"
+    );
+    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+    assert!(!publisher.is_null());
+    (node, publisher, subscription, ros_topic, pin)
+}
+
+/// The reserve follows the LIVE service ceiling, not the create floor: on a
+/// service minted at 2 borrows, one zero-copy loan is held and the 2nd and 3rd
+/// held takes are already copies (`held_loans=1 ceiling=2`). Against the floor
+/// of 4 the 2nd would be zero-copy and the 3rd refused by the transport.
+#[test]
+#[serial]
+#[traced_test]
+fn on_a_two_borrow_service_the_second_held_take_is_a_copy() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = blob_ts(&format!("BlobC2{suffix}"));
+        let (node, publisher, subscription, topic, pin) =
+            setup_pair_on_ceiling(ts, "blobc2", suffix, 2);
+        let mut held = Vec::new();
+        for (x, zero_copy) in [(0, true), (1, false), (2, false)] {
+            let p = publish_and_take_blob(publisher, subscription, x);
+            assert_eq!(is_zero_copy(subscription, p), zero_copy, "blob {x}");
+            held.push(p);
+        }
+        assert_eq!(zero_copy_held(subscription), 1);
+        assert_eq!(copy_count(subscription), 2);
+        assert_eq!(refusal_count(subscription), 0);
+        logs_assert(|lines: &[&str]| {
+            let head = find_at(lines, "WARN", COPY_LOUD).ok_or("no copy head")?;
+            if !has_field(head, "topic", &topic)
+                || !has_field(head, "held_loans", "1")
+                || !has_field(head, "ceiling", "2")
+            {
+                return Err(format!("head must carry held_loans=1 ceiling=2: {head}"));
+            }
+            Ok(())
+        });
+        for p in held {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        drop(pin);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// On a service that allows ONE borrow every take needs it to receive, so
+/// every loaned take is served by copy (`held_loans=0 ceiling=1`) whatever
+/// the consumer returns, and the head names the service's borrow limit as
+/// the remedy, never a return of loans the consumer does not hold.
+#[test]
+#[serial]
+#[traced_test]
+fn on_a_one_borrow_service_every_take_is_a_copy_and_the_head_names_the_service() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = blob_ts(&format!("BlobC1{suffix}"));
+        let (node, publisher, subscription, topic, pin) =
+            setup_pair_on_ceiling(ts, "blobc1", suffix, 1);
+        for x in 0..3 {
+            let p = publish_and_take_blob(publisher, subscription, x);
+            assert!(!is_zero_copy(subscription, p), "blob {x} is a copy");
+            assert_eq!(zero_copy_held(subscription), 0);
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(copy_count(subscription), 3);
+        assert_eq!(refusal_count(subscription), 0);
+        logs_assert(|lines: &[&str]| {
+            let heads = count_at_exclusively(lines, "WARN", &[COPY_LOUD, &topic])?;
+            if heads != 1 {
+                return Err(format!("expected 1 WARN head, got {heads}"));
+            }
+            let head = find_at(lines, "WARN", COPY_LOUD).ok_or("no copy head")?;
+            if !has_field(head, "held_loans", "0") || !has_field(head, "ceiling", "1") {
+                return Err(format!("head must carry held_loans=0 ceiling=1: {head}"));
+            }
+            if !head.contains("at most ONE borrow")
+                || !head.contains("subscriber_max_borrowed_samples")
+                || head.contains("return loans")
+            {
+                return Err(format!(
+                    "the one-borrow head must name the service's limit, not a return: {head}"
+                ));
+            }
+            Ok(())
+        });
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        drop(pin);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// Anti-tautology control: a consumer that holds no more than the three
+/// zero-copy loans the ceiling of 4 allows logs NONE of the refusal or copy
+/// vocabulary and counts zero on both latches; the "exactly N" arms above would
+/// also pass a reporter that fired on every served take.
 #[test]
 #[serial]
 #[traced_test]
@@ -623,14 +1362,18 @@ fn a_consumer_inside_the_budget_logs_nothing_and_counts_zero() {
         let ts = blob_ts(&format!("BlobQ{suffix}"));
         let (node, publisher, subscription, _) = setup_pair(ts, "blobq", suffix);
         for round in 0..3u32 {
-            for i in 0..4u32 {
-                publish_blob(publisher, round * 4 + i, 32);
+            for i in 0..3u32 {
+                publish_blob(publisher, round * 3 + i, 32);
             }
             let mut held = Vec::new();
-            for _ in 0..4 {
+            for _ in 0..3 {
                 let (ret, taken, p) = take_loaned(subscription);
                 assert_eq!(ret, RMW_RET_OK);
                 assert!(taken);
+                assert!(
+                    is_zero_copy(subscription, p),
+                    "inside the budget, zero-copy"
+                );
                 held.push(p);
             }
             for p in held {
@@ -640,6 +1383,7 @@ fn a_consumer_inside_the_budget_logs_nothing_and_counts_zero() {
                 );
             }
         }
+        assert_eq!(copy_count(subscription), 0);
         assert_eq!(refusal_count(subscription), 0);
         logs_assert(|lines: &[&str]| {
             // The offenders themselves, so a failure names WHICH marker leaked
@@ -647,14 +1391,22 @@ fn a_consumer_inside_the_budget_logs_nothing_and_counts_zero() {
             let noisy: Vec<&&str> = lines
                 .iter()
                 .filter(|l| {
-                    [LOUD, SUPPRESSED, STILL, RECOVERY]
-                        .iter()
-                        .any(|m| l.contains(m))
+                    [
+                        LOUD,
+                        SUPPRESSED,
+                        STILL,
+                        RECOVERY,
+                        COPY_LOUD,
+                        COPY_STILL,
+                        COPY_RECOVERY,
+                    ]
+                    .iter()
+                    .any(|m| l.contains(m))
                 })
                 .collect();
             if !noisy.is_empty() {
                 return Err(format!(
-                    "healthy consumer logged {} loan-refusal line(s): {noisy:?}",
+                    "healthy consumer logged {} loan-refusal or copy line(s): {noisy:?}",
                     noisy.len()
                 ));
             }
@@ -714,6 +1466,17 @@ unsafe fn publish_serialized_blob(
     x: u32,
     below_floor: bool,
 ) {
+    publish_serialized_blob_entry(publisher, ts, x, below_floor.then_some((0, 4)));
+}
+
+/// Publish one blob through `rmw_publish_serialized_message`, its `data`
+/// offset-table entry rewritten to `(offset, length)` when `entry` is set.
+unsafe fn publish_serialized_blob_entry(
+    publisher: *const ffi::rmw_publisher_t,
+    ts: *const ffi::rosidl_message_type_support_t,
+    x: u32,
+    entry: Option<(u32, u32)>,
+) {
     let buf = calloc(4, 1) as *mut u8;
     for i in 0..4 {
         *buf.add(i) = (i as u32 ^ x) as u8;
@@ -736,11 +1499,11 @@ unsafe fn publish_serialized_blob(
         rmw_serialize(&msg as *const _ as *const c_void, ts, &mut ser),
         RMW_RET_OK
     );
-    if below_floor {
+    if let Some((offset, length)) = entry {
         let bytes = std::slice::from_raw_parts_mut(ser.buffer, ser.buffer_length);
-        let entry = cerulion_core::wire::WireHeader::SIZE + 4; // fixed = x (4 bytes); data = entry 0
-        bytes[entry..entry + 4].copy_from_slice(&0u32.to_le_bytes());
-        bytes[entry + 4..entry + 8].copy_from_slice(&4u32.to_le_bytes());
+        let at = cerulion_core::wire::WireHeader::SIZE + 4; // fixed = x (4 bytes); data = entry 0
+        bytes[at..at + 4].copy_from_slice(&offset.to_le_bytes());
+        bytes[at + 4..at + 8].copy_from_slice(&length.to_le_bytes());
     }
     assert_eq!(
         rmw_publish_serialized_message(publisher, &ser, std::ptr::null_mut()),

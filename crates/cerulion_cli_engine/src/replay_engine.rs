@@ -1038,10 +1038,11 @@ pub struct ReplayOutcome {
     /// looked at), a conservation breach (evidence about the RECORDING's
     /// credit accounting, which `RederivationReport::is_clean` deliberately
     /// ignores), and the evidence notes: a read-site census, a producer-label
-    /// fault, a carried-heads note, and the queue a `consume = latest` input
+    /// fault, a carried-heads note, the queue a `consume = latest` input
     /// was judged with before its node's first fire
-    /// (`latest_before_first_fire`). [`RederivationNoteKind`] is the closed set
-    /// of kinds. Additive + skipped when empty.
+    /// (`latest_before_first_fire`), and the hold a `period_ms` or Sync node
+    /// was judged with (`hold_allowed_for`). [`RederivationNoteKind`] is the
+    /// closed set of kinds. Additive + skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rederivation_notes: Vec<RederivationNote>,
     /// Every node whose trace-driven burst was UNDER-FED by the
@@ -1940,8 +1941,8 @@ pub struct ReplayInputShortfall {
 
 /// What a [`RederivationNote`] can be — a CLOSED set, so no producer can emit
 /// a spelling by typo and no reader has to guess which arm an unknown one
-/// belongs in. SIX variants; the count is pinned by the exhaustive `match`
-/// in `rederivation_note_serde_spelling_is_pinned` (a seventh is a
+/// belongs in. SEVEN variants; the count is pinned by the exhaustive `match`
+/// in `rederivation_note_serde_spelling_is_pinned` (an eighth is a
 /// compile error there), not by an ordinal claim here — each variant's own
 /// doc says what it adds and why it is additive on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -2012,6 +2013,18 @@ pub enum RederivationNoteKind {
     /// array, names why not. See [`replay_rederive::LatestBeforeFirstFireNote`].
     /// Additive on the wire, as the third to fifth variants are.
     LatestBeforeFirstFire,
+    /// A `period_ms` or Sync node that a `block` input in its own rank can
+    /// hold was judged with that hold allowed for, at the steps where the bag
+    /// shows the slot full. The subject is the node, and the code says which
+    /// rule: `period_block_held` or `sync_block_held`.
+    ///
+    /// NOT a [`RederivationNoteKind::StandDown`], for the reason
+    /// [`RederivationNoteKind::CarriedHeads`] is not: the rule judged the node,
+    /// on an allowance that can only drop a finding, so a `stand_down` would
+    /// tell a reader the node went unjudged. See
+    /// [`replay_rederive::HoldAllowedForNote`]. Additive on the wire, as the
+    /// third to sixth variants are.
+    HoldAllowedFor,
 }
 
 /// One thing the rank-local re-derivation verifier said that is
@@ -2023,8 +2036,9 @@ pub enum RederivationNoteKind {
 /// breach (evidence about the recording's credit accounting, which
 /// [`replay_rederive::RederivationReport::is_clean`] ignores by design), and the
 /// EVIDENCE kinds: a read-site census, a producer-label fault, the
-/// carried-heads disclosure, and the queue a `consume = latest` input was
-/// judged with before its node's first fire. See [`RederivationNoteKind`].
+/// carried-heads disclosure, the queue a `consume = latest` input was
+/// judged with before its node's first fire, and the hold a `period_ms` or
+/// Sync node was judged with. See [`RederivationNoteKind`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RederivationNote {
     /// The rank whose pass produced it.
@@ -2038,8 +2052,8 @@ pub struct RederivationNote {
     /// undeclared value by typo.
     pub kind: RederivationNoteKind,
     /// What it is about: the node id for a stand-down, a read-site census, a
-    /// carried-heads note or a before-first-fire note; the topic for a
-    /// conservation breach or a producer-label note.
+    /// carried-heads note, a before-first-fire note or a hold-allowed-for
+    /// note; the topic for a conservation breach or a producer-label note.
     pub subject: String,
     /// The rendered sentence, from the pure module's own `Display`.
     pub detail: String,
@@ -2059,6 +2073,9 @@ pub struct RederivationNote {
     /// `StandDownReason` is exactly a closed enum — and without the token
     /// a CI job asking "did any bag report an impossible read shape this
     /// week?" has to substring-match a REWORDABLE sentence out of `detail`.
+    /// **And for a `hold_allowed_for` note**, from
+    /// [`replay_rederive::HeldRule::code`], a closed set too:
+    /// `period_block_held` or `sync_block_held`.
     ///
     /// Still `None` for a conservation breach, a read-site census, a
     /// carried-heads note and a `latest_before_first_fire` note: those are
@@ -2070,6 +2087,23 @@ pub struct RederivationNote {
     /// report carrying neither is byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+/// The `--report` note for one node judged with a hold by a `block` input in
+/// its rank allowed for: kind [`RederivationNoteKind::HoldAllowedFor`], the
+/// node as its subject, the note's own sentence as its detail, and the rule's
+/// code.
+fn hold_allowed_for_note(
+    rank: u32,
+    note: &replay_rederive::HoldAllowedForNote,
+) -> RederivationNote {
+    RederivationNote {
+        rank,
+        kind: RederivationNoteKind::HoldAllowedFor,
+        subject: note.node_id.clone(),
+        detail: note.to_string(),
+        code: Some(note.rule.code().to_string()),
+    }
 }
 
 /// The `--report` note for one input judged with one queue excused before its
@@ -11302,7 +11336,7 @@ fn derive_trailing_refills(
 /// REFILL (`replay_rederive::fifo_step_carry`): the read log holds one pop more
 /// than fires, the burst fired at least once, and the cap or a pre-fire check
 /// that could defer the node at this step (its throttle window, or a `block`
-/// slot full by the bag's own record: `replay_rederive::FifoDeferral`) left the
+/// slot full by the bag's own record: `replay_rederive::PreFireDeferral`) left the
 /// last popped frame unfired for the next step's first fire. Derived only
 /// from the recording, on the ONE carry walk the verdict takes
 /// (`replay_rederive::FifoCarry`), which `carries` threads across steps; the
@@ -13701,36 +13735,52 @@ fn recorded_fire_levels(
     Ok(levels)
 }
 
-/// The instants of each node's FIRE records on `rank` in the bag's trace,
-/// ascending. A node the trace holds no fire of is absent.
+/// The clock each node's FIRE records on `rank` in the bag's trace ran at,
+/// ascending: the gating clock of the fire's step, which the step's
+/// STEP_BOUNDARY record carries ([`StepBoundary::target_ns`]) and which every
+/// frame the fire sends is stamped with. A Data, Sync or external fire records
+/// that clock as its instant; a `period_ms` fire records its deadline, which
+/// can be below it. A fire of a step the rank holds no
+/// boundary of gives its own instant. A node the trace holds no fire of is
+/// absent.
 ///
 /// # Errors
 ///
 /// A trace the walk cannot read.
-fn recorded_fire_instants(
+fn recorded_fire_clocks(
     trace: &RecordedTrace,
     rank_tables: &[Vec<Arc<str>>],
     rank: u32,
 ) -> Result<BTreeMap<String, Vec<u64>>, ReplayError> {
-    let mut instants: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut clocks: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     let Some(table) = rank_tables.get(rank as usize) else {
-        return Ok(instants);
+        return Ok(clocks);
     };
+    let mut step_clocks: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut fires: Vec<(&Arc<str>, u64, u64)> = Vec::new();
     trace.for_each(|rec| {
-        if rec.record_type == RECORD_TYPE_FIRE && rec.rank() == rank {
-            if let Some(node) = table.get(rec.node_idx as usize) {
-                instants
-                    .entry(node.to_string())
-                    .or_default()
-                    .push(rec.fire_time_ns);
+        if rec.rank() == rank {
+            if rec.record_type == RECORD_TYPE_STEP_BOUNDARY {
+                let boundary = StepBoundary::from_record(rec);
+                step_clocks.insert(boundary.step, boundary.target_ns);
+            } else if rec.record_type == RECORD_TYPE_FIRE {
+                if let Some(node) = table.get(rec.node_idx as usize) {
+                    fires.push((node, rec.step, rec.fire_time_ns));
+                }
             }
         }
         Ok(())
     })?;
-    for list in instants.values_mut() {
+    for (node, step, instant) in fires {
+        clocks
+            .entry(node.to_string())
+            .or_default()
+            .push(step_clocks.get(&step).copied().unwrap_or(instant));
+    }
+    for list in clocks.values_mut() {
         list.sort_unstable();
     }
-    Ok(instants)
+    Ok(clocks)
 }
 
 /// The frames of a `block` producer that its rank's trace can judge against
@@ -13825,15 +13875,15 @@ fn judged_frames(
 }
 
 /// PURE: does the bag record more frames of a topic at one wire stamp
-/// (`frame_stamps`, ascending) than its producer fired at that instant
-/// (`fire_instants`, ascending), at any stamp from `from_ns` (the rank's first
-/// recorded fire) on that the rank's trace can judge (`judged`,
-/// [`judged_frames`]), or, where it judges no frame
-/// ([`JudgedFrames::Nothing`]), does the bag record any frame of the topic? A fire stamps every frame it sends with its step's
-/// gating clock, which is also its FIRE record's instant, so more frames than
-/// fires at a stamp shows a fire that sent several frames, or a frame no
-/// recorded fire sent. Equal totals do not say which fire sent which frame:
-/// two fires at one stamp, the first sending nothing and the second two
+/// (`frame_stamps`, ascending) than its producer fired at that clock
+/// (`fire_clocks`, ascending, [`recorded_fire_clocks`]), at any stamp from
+/// `from_ns` (the clock of the rank's first recorded fire) on that the rank's
+/// trace can judge (`judged`, [`judged_frames`]), or, where it judges no frame
+/// ([`JudgedFrames::Nothing`]), does the bag record any frame of the topic? A
+/// fire stamps every frame it sends with its step's gating clock, so more
+/// frames than fires at a stamp shows a fire that sent several frames, or a
+/// frame no recorded fire sent. Equal totals do not say which fire sent which
+/// frame: two fires at one stamp, the first sending nothing and the second two
 /// frames, match two frames. [`local_block_holds`] reads the answer only for a
 /// producer that sends at most one frame per fire ([`producer_sends_per_fire`]),
 /// for which more frames than fires at a stamp is a frame no fire sent, or a
@@ -13845,7 +13895,7 @@ fn judged_frames(
 /// counted.
 fn writes_past_fires(
     frame_stamps: &[u64],
-    fire_instants: &[u64],
+    fire_clocks: &[u64],
     from_ns: u64,
     judged: JudgedFrames,
 ) -> bool {
@@ -13863,8 +13913,8 @@ fn writes_past_fires(
     while at < frames.len() {
         let stamp = frames[at];
         let sent = frames[at..].iter().take_while(|&&s| s == stamp).count();
-        let lo = fire_instants.partition_point(|&f| f < stamp);
-        let fired = fire_instants[lo..]
+        let lo = fire_clocks.partition_point(|&f| f < stamp);
+        let fired = fire_clocks[lo..]
             .iter()
             .take_while(|&&f| f == stamp)
             .count();
@@ -16183,18 +16233,18 @@ fn prepare_pass_verification(
     let hold_flows = block_hold_flows(plan.subgraph(), node_infos, recorded_queues, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
-    let (fire_levels, fire_instants, last_kept) = if hold_flows.is_empty() {
+    let (fire_levels, fire_clocks, last_kept) = if hold_flows.is_empty() {
         (BTreeMap::new(), BTreeMap::new(), None)
     } else {
         (
             recorded_fire_levels(trace, rank_tables, plan.rank())?,
-            recorded_fire_instants(trace, rank_tables, plan.rank())?,
+            recorded_fire_clocks(trace, rank_tables, plan.rank())?,
             last_kept_step(trace, plan.rank())?,
         )
     };
-    let first_fire_ns = fire_instants
+    let first_fire_ns = fire_clocks
         .values()
-        .filter_map(|instants| instants.first())
+        .filter_map(|clocks| clocks.first())
         .min()
         .copied()
         .unwrap_or(u64::MAX);
@@ -16216,7 +16266,7 @@ fn prepare_pass_verification(
                     };
                     writes_past_fires(
                         stamps,
-                        fire_instants.get(producer).unwrap_or(&no_fires),
+                        fire_clocks.get(producer).unwrap_or(&no_fires),
                         first_fire_ns,
                         judged_frames(
                             last_kept.map(|step| step.target_ns),
@@ -18520,6 +18570,19 @@ fn run_rank_pass(
                      before its first fire (report-only; see `detail`)"
                 );
                 rederivation_notes.push(latest_before_first_fire_note(plan.rank(), e));
+            }
+            // A hold a judged rule allowed for is a judged note too: `debug!`,
+            // and the note carries it into the `--report` with its rule's code.
+            for h in &report.holds_allowed_for {
+                tracing::debug!(
+                    rank = plan.rank(),
+                    node_id = %h.node_id,
+                    code = h.rule.code(),
+                    detail = %h,
+                    "replay: this node was judged with a hold by a block input in its rank \
+                     allowed for (report-only; see `detail`)"
+                );
+                rederivation_notes.push(hold_allowed_for_note(plan.rank(), h));
             }
             // Conservation is LOUD and NEVER a verdict (the pure module's own
             // rule — `is_clean` ignores it): a breach is evidence about the
@@ -23090,6 +23153,34 @@ mod node_trigger_decl_tests {
         let json = serde_json::to_value(&notes[0]).expect("a note serializes");
         assert_eq!(json["kind"], "latest_before_first_fire");
         assert!(json.get("code").is_none(), "{json}");
+    }
+
+    /// A node judged with a hold allowed for reaches the `--report` as one
+    /// `hold_allowed_for` note about the node, with its rule's code and the
+    /// note's own sentence as its detail.
+    #[test]
+    fn a_hold_allowed_for_reaches_the_report_as_a_judged_note_with_its_rules_code() {
+        use super::replay_rederive::{HeldRule, HoldAllowedForNote};
+        use super::{hold_allowed_for_note, RederivationNoteKind};
+        for (rule, code) in [
+            (HeldRule::Period, "period_block_held"),
+            (HeldRule::Sync, "sync_block_held"),
+        ] {
+            let held = HoldAllowedForNote {
+                node_id: "src".to_string(),
+                rule,
+            };
+            let note = hold_allowed_for_note(3, &held);
+            assert_eq!(note.rank, 3);
+            assert_eq!(note.kind, RederivationNoteKind::HoldAllowedFor);
+            assert_eq!(note.subject, "src");
+            assert_eq!(note.code.as_deref(), Some(code));
+            assert_eq!(note.detail, held.to_string());
+            let json = serde_json::to_value(&note).expect("a note serializes");
+            assert_eq!(json["kind"], "hold_allowed_for");
+            assert_eq!(json["code"], code);
+            assert_eq!(json["subject"], "src");
+        }
     }
 
     /// The recording's stage set names a latest input's drain discipline: a
@@ -41471,7 +41562,7 @@ mod trigger_input_capacity_tests {
     }
 
     /// A producer writes past its fires where the bag records more frames at
-    /// one stamp than it fired at that instant, from the rank's first fire on:
+    /// one stamp than it fired at that clock, from the rank's first fire on:
     /// hand table.
     #[test]
     fn a_producer_writes_past_its_fires_where_a_stamp_holds_more_frames_than_fires() {

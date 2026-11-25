@@ -52,18 +52,24 @@ use serial_test::serial;
 
 /// The time each of the producer's ticks takes.
 const TICK_WORK: Duration = Duration::from_micros(300);
-/// Fires the run collects before it judges.
+/// The fewest fires judged from the warm-up mark.
 const FIRES: usize = 1_000;
-/// Fires discarded first. The node's first deadline is set when the graph is
-/// built, so the first live step finds it several periods behind and catches
-/// up with a burst (each tick costing `TICK_WORK`); delivery is judged after.
+/// The fewest fires the warm-up discards. The node's first deadline is one
+/// period after the graph adds it, and the rest of the build runs after that:
+/// when the rest takes longer than a period, the first live step finds the
+/// node behind and fires it once for each period missed, in one burst. Each
+/// fire costs `TICK_WORK`, so the next step finds it behind again, by less,
+/// until a step fires it once. The warm-up mark is the first step that ends
+/// with this many fires or more and fires the node at most once: the node was
+/// less than one period behind there, so the lag the build left is gone, and
+/// delivery is judged from it.
 const WARMUP: usize = 100;
 /// The producer's period, in ns.
 const PERIOD_NS: u64 = 1_000_000;
 /// The longest the run may take; a stalled loop fails instead of hanging.
 const BUDGET: Duration = Duration::from_secs(6);
-/// The longest the consumer may take to empty its queue, at the warm-up and at
-/// the end; a consumer that never catches up fails instead of hanging.
+/// The longest the consumer may take to empty its queue, at the warm-up mark
+/// and at the end; a consumer that never catches up fails instead of hanging.
 const SETTLE_BUDGET: Duration = Duration::from_secs(2);
 
 #[cerulion_node(period_ms = 1)]
@@ -260,18 +266,23 @@ fn every_frame_a_slow_one_kilohertz_node_publishes_is_received_or_counted_evicte
     .expect("build the live graph");
 
     let started = Instant::now();
-    // The account once the warm-up has run and the consumer has emptied its
-    // queue: the burst the warm-up catches up with can overrun that queue, and
-    // the eviction counter starts counting only at the first frame it sees, so
-    // delivery is judged from here on.
-    let mut at_warmup = None;
-    while ticks.lock().expect("tick log").len() < WARMUP + FIRES && started.elapsed() < BUDGET {
+    // The account at the warm-up mark (see `WARMUP`), once the consumer has
+    // emptied its queue: the catch-up bursts before the mark can overrun that
+    // queue, and the eviction counter starts counting only at the first frame
+    // it sees, so delivery is judged over at least `FIRES` fires from here.
+    let mut at_warmup: Option<Account> = None;
+    while started.elapsed() < BUDGET {
+        let before = fire_count(&rt);
+        if at_warmup.is_some_and(|mark| before >= mark.fires + FIRES as u64) {
+            break;
+        }
         let timeout = rt.live_timeout_for_test();
         rt.run_live_step_once_for_test(timeout);
-        if at_warmup.is_none() && ticks.lock().expect("tick log").len() >= WARMUP {
+        let after = fire_count(&rt);
+        if at_warmup.is_none() && after >= WARMUP as u64 && after - before <= 1 {
             at_warmup = Some(
                 settle(&mut rt, &received, &last)
-                    .expect("the consumer emptied its queue after the warm-up"),
+                    .expect("the consumer emptied its queue at the warm-up mark"),
             );
         }
     }
@@ -284,21 +295,25 @@ fn every_frame_a_slow_one_kilohertz_node_publishes_is_received_or_counted_evicte
         )
     });
 
-    let all = ticks.lock().expect("tick log").clone();
-    assert!(
-        all.len() >= WARMUP + FIRES,
-        "the live loop ran {} fires in {BUDGET:?}; expected {}",
-        all.len(),
-        WARMUP + FIRES
-    );
-
     assert_eq!(
         at_end.fires as usize,
-        all.len(),
+        ticks.lock().expect("tick log").len(),
         "every fire logged its tick"
     );
-    let at_warmup = at_warmup.expect("the run passed its warm-up");
+    let at_warmup = at_warmup.unwrap_or_else(|| {
+        panic!(
+            "the live loop ran {} fires in {BUDGET:?} and no step at {WARMUP} fires or more \
+             fired the node at most once",
+            at_end.fires
+        )
+    });
     let published = at_end.fires - at_warmup.fires;
+    assert!(
+        published >= FIRES as u64,
+        "the live loop ran {published} fires from the warm-up mark at {} fires within \
+         {BUDGET:?}; expected at least {FIRES}",
+        at_warmup.fires
+    );
     let delivered = at_end.received - at_warmup.received;
     let evicted = at_end.evicted - at_warmup.evicted;
     assert_eq!(
@@ -307,12 +322,14 @@ fn every_frame_a_slow_one_kilohertz_node_publishes_is_received_or_counted_evicte
         "every frame published after the warm-up is received or counted as evicted by the \
          consumer's queue: {delivered} received, {evicted} evicted, {published} published"
     );
-    // The Linux park wakes promptly enough that the producer never falls far
-    // enough behind to overrun the consumer's queue, so every frame arrives.
+    // After the warm-up mark the Linux park wakes promptly enough that the
+    // producer never falls far enough behind to overrun the consumer's queue,
+    // so every frame arrives.
     #[cfg(target_os = "linux")]
     assert_eq!(
         delivered, published,
-        "the consumer received every frame the producer published after the warm-up"
+        "the consumer received every frame the producer published after the warm-up: \
+         {evicted} evicted; the account at the warm-up mark {at_warmup:?}, at the end {at_end:?}"
     );
 }
 
