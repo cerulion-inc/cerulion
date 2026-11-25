@@ -30,6 +30,10 @@ timeout does not cancel its request worker, which may later replace the epoch
 cache atomically. A changed login or key refuses the operation.
 Only public account/key context and locked-store paths enter the helper arguments.
 The helper owns proof handling and returns its actual exit status to the caller.
+Account-session tests forward real loopback account responses, observe requests
+before mutating identity or cancellation, and assert helper refusal and unchanged
+cache bytes after a real HTTP refusal. Both network switches are tested before
+lookup, with a successful request through the same observer after re-enabling.
 
 ---
 
