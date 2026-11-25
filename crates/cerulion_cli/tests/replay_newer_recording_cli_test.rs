@@ -36,9 +36,9 @@ fn fire(step: u64) -> TraceRingRecord {
     }
 }
 
-/// A finalized bag that clears every gate before `recorder.json`'s: one user
-/// frame, two FIRE records of the one manifest node, a graph that parses and
-/// validates, and `recorder_json` as its recorder stamp.
+/// A finalized bag that is otherwise replay-grade (one user frame, two FIRE
+/// records of the one manifest node, a graph that parses and validates), so
+/// only `recorder_json`, its recorder stamp, can refuse it.
 fn write_bag(path: &Path, recorder_json: &[u8]) {
     let graph =
         b"name: replaytest\nprefix: replaytest\nnodes:\n  - id: pub1\n    type: test_pub\n    \

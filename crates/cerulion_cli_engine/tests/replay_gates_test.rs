@@ -1028,7 +1028,7 @@ fn a_stop_cause_unknown_at_the_supported_format_is_a_corrupt_bag_exit_2() {
 
 /// One format past what this build reads, the same bag is refused by its
 /// format before any record is read, so its unknown stop cause is never
-/// reached: the format refusal, string 1 with the bag's 99.0.0 stamp (exit 2).
+/// reached: the format refusal, naming the bag's 99.0.0 stamp (exit 2).
 #[test]
 fn the_format_refusal_wins_over_an_unknown_stop_cause_in_a_bag_stamped_past_the_supported_format() {
     let past = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT + 1;
@@ -1725,7 +1725,8 @@ fn legitimately_marked_fire_passes_the_rank_gate() {
 
 /// The sentence the format refusal renders, written out: `by` is the
 /// ` (<stamp>)` after "a newer Cerulion", or empty for a bag whose recorder
-/// stamp is absent or not a plain version token.
+/// stamp is absent, not a plain version token, or not a release above this
+/// build's.
 fn format_too_new_sentence(by: &str, recorded: u32) -> String {
     format!(
         "this bag was recorded by a newer Cerulion{by}: its scheduler-trace format is version \

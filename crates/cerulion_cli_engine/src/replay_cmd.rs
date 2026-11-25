@@ -1652,9 +1652,10 @@ pub struct ReplayOptions {
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
 ///
-/// First the replay-grade **entry gates** in order (open, completeness,
-/// scheduler-trace presence, graph attachment, trace manifest, env.json) — any
-/// failure is a typed [`ReplayError`] (exit 2–5). Then the gated artifacts are
+/// First the replay-grade **entry gates** in order (open, completeness, the
+/// `recorder.json` contract (format, then coordination), scheduler-trace
+/// presence, graph attachment, trace manifest, env.json); any failure is a
+/// typed [`ReplayError`] (exit 2 to 5). Then the gated artifacts are
 /// handed to [`crate::replay_engine::run_engine`], which loads the CURRENT
 /// workspace's node cdylibs (a missing type → [`ReplayError::NodeLoad`], exit
 /// 3), re-executes the graph on the recorded-clock re-advance, injects recorded
@@ -2103,13 +2104,13 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
     };
 
     // 6b. The driver stamp (`node_external`, read at 2b): refused when
-    //        unreadable, and checked against the embedded graph (its ros2
-    //        entries were taken out above) when present, so it is admitted
-    //        here, after the graph parse. Below the version gate for the same
-    //        reason as the unknown-coordination refusal: a bag from a newer
-    //        Cerulion is named as such first. A validated stamp is what the
-    //        engine classifies drivers by; an absent one leaves the build
-    //        replayed to declare them.
+    //     unreadable, and checked against the embedded graph (its ros2
+    //     entries were taken out above) when present, so it is admitted
+    //     here, after the graph parse. Below the version gate for the same
+    //     reason as the unknown-coordination refusal: a bag from a newer
+    //     Cerulion is named as such first. A validated stamp is what the
+    //     engine classifies drivers by; an absent one leaves the build
+    //     replayed to declare them.
     if let Some(info) = recorder.as_mut() {
         info.driver_stamp = replay_engine::DriverStamp::admit(driver_stamp, &config)?;
     }
@@ -3437,9 +3438,9 @@ mod tests {
 
     /// The recorder stamp is printed only when it is a plain version token
     /// (ASCII letters, digits, `.`, `-`, `+`; 1 to 64 bytes). Each stamp below
-    /// names release 99.0.0, above this build's, so only the token rule leaves
-    /// it out: the offending byte sits in the suffix, and the sentence is the
-    /// unstamped one.
+    /// but the empty one names release 99.0.0, above this build's, so only the
+    /// token rule leaves it out: the offending byte, or the 65th, sits in the
+    /// suffix, and the sentence is the unstamped one.
     #[test]
     fn a_recorder_stamp_is_printed_only_as_a_plain_version_token() {
         let ours = env!("CARGO_PKG_VERSION");

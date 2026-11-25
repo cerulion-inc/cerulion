@@ -688,10 +688,12 @@ pub enum TraceRecordFault {
     },
     /// A NODE-STOP record whose cause code names no
     /// [`NodeStopCause`](crate::scheduler::NodeStopCause) this build defines:
-    /// a cause a newer or foreign writer added, or a corrupt record. The
-    /// record walk runs before the version gate, so a newer writer's cause can
-    /// reach this check first. [`Self::detail`] and the replay's refusal both
-    /// word it from the bag's stamp through [`unknown_stop_cause_origin`].
+    /// a cause a newer or foreign writer added, or a corrupt record.
+    /// `cerulion bag play --resim` refuses a bag stamped past the formats it
+    /// reads before its record walk, so the replay meets this only at or below
+    /// them; the stamp-worded newer-writer branch serves the capture judge and
+    /// the engine's direct callers. [`Self::detail`] and the replay's refusal
+    /// both word it from the bag's stamp through [`unknown_stop_cause_origin`].
     UnknownStopCause {
         /// The record's rank.
         rank: u32,
