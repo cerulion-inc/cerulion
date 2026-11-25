@@ -2963,10 +2963,10 @@ pub fn replay_stages_batch_frames(
 /// trace; format-2 bags, which carry no kind 6, stay fully replayable); bumped
 /// to 4 by free-run recording support (a bag may be stamped `coordination: free_run`, whose
 /// per-rank boundary streams do not share a timeline). A bag stamped with a
-/// `trace_format` GREATER than this is refused at the `recorder.json` gate
-/// (exit 2) with a message that says to upgrade Cerulion to replay it, which
-/// is how an OLDER binary refuses a format-3 bag (its own SUPPORTED is 2, and
-/// its record-type gate, which runs first, also refuses kind 6 as reserved).
+/// `trace_format` GREATER than this that clears the gates before the
+/// `recorder.json` one is refused there (exit 2) as
+/// `replay_cmd::ReplayError::TraceFormatTooNew`, which says a newer Cerulion
+/// recorded it and to upgrade Cerulion to replay it.
 ///
 /// Bumped to 5 by read-site roles (a kind-6 record's `global_level` word carries
 /// the READ-SITE ROLE in bits 14..16 — see

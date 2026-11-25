@@ -809,7 +809,7 @@ pub enum ResimGap {
     },
     /// The capture's `__cerulion/recorder.json` states no coordination
     /// contract this build can read: resim refuses such a bag when it reads
-    /// that attachment (`BagInvalidAttachment`, or `RecordingInconsistent` for
+    /// that attachment (`BagInvalidAttachment`, or `CoordinationUnknown` for
     /// an unknown stamp).
     CoordinationUnreadable(UnreadableCoordination),
     /// The trace carries records but no step boundary — resim's

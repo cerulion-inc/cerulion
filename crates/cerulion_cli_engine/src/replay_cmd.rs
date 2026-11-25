@@ -2049,14 +2049,15 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
 
     // 6b'. Trace-format version gate: a bag stamped with a `trace_format`
     //      GREATER than this binary supports carries a scheduler-trace layout
-    //      this Cerulion cannot decode (e.g. a future `reserved`-bit assignment).
-    //      It is refused here as `ReplayError::TraceFormatTooNew` (exit 2, not
-    //      replay-grade), naming the newer recording and saying to upgrade,
-    //      rather than mis-replayed. The gate runs after the graph parse (step 4)
-    //      and the trace-record walk (step 5): a newer bag whose `graph.yaml`
-    //      this build cannot parse, or whose trace holds a record kind this
-    //      build does not define, is refused there first, by that step's own
-    //      message. ABSENT `trace_format` decodes to version 1 (full
+    //      this Cerulion cannot decode. It is refused here as
+    //      `ReplayError::TraceFormatTooNew` (exit 2, not replay-grade), naming
+    //      the newer recording and saying to upgrade, rather than mis-replayed.
+    //      The gate runs after the graph parse (step 4) and the trace-record
+    //      walk (step 5): a newer bag whose `graph.yaml` this build cannot
+    //      parse, whose trace holds a record kind this build does not define,
+    //      or whose records set a `reserved` bit this build reads as part of
+    //      the rank (a rank with no manifest), is refused there first, by that
+    //      step's own message. ABSENT `trace_format` decodes to version 1 (full
     //      back-compat: every unstamped bag). A recorder.json this binary cannot
     //      read AT ALL never reaches here: an unparseable CONTRACT CARRIER is a
     //      refusal inside `read_recorder_info` rather than a silent

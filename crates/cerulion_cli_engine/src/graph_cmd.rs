@@ -17807,9 +17807,8 @@ pub fn render_recorder_json(
         // stopped its node is followed by a NODE-STOP record, all five also
         // every bag this binary writes.
         // A replaying binary that supports a LOWER version
-        // refuses this bag (exit 2), saying a newer Cerulion recorded it and
-        // to upgrade, rather than mis-decoding it. An absent field =
-        // v1 (back-compat).
+        // refuses this bag (exit 2) rather than mis-decoding it. An absent
+        // field = v1 (back-compat).
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
             // THIS binary's claims, with whether THIS run folds identical runs
