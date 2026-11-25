@@ -723,7 +723,7 @@ pub enum ReplayError {
         "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is {shown}, \
          which this Cerulion ({ours}) does not know. Upgrade Cerulion to replay it.",
         by = RecordedBy(recorded_by.as_ref()),
-        shown = PrintableJson(value),
+        shown = PrintableAscii(value),
         ours = CERULION_VERSION
     )]
     CoordinationUnknown {
@@ -1014,15 +1014,15 @@ impl std::fmt::Display for RecordedBy<'_> {
     }
 }
 
-/// JSON text as a refusal prints it: every char outside printable ASCII (0x20
+/// Bag text as a refusal prints it: every char outside printable ASCII (0x20
 /// to 0x7E) is written as a JSON `\uXXXX` escape in lowercase hex, and a char
-/// above U+FFFF as its surrogate pair. Such a char can sit only inside a JSON
-/// string, where the escape stands for the same char, so the output is JSON
-/// text for the same value, and DEL, C1 controls and bidi controls in bag text
-/// never reach the terminal raw.
-struct PrintableJson<'a>(&'a str);
+/// above U+FFFF as its surrogate pair, so DEL, C1 controls and bidi controls in
+/// bag text never reach the terminal raw. Printable ASCII is written as is.
+/// Applied to JSON text, the output is JSON text for the same value: such a
+/// char can sit only inside a JSON string, where the escape stands for it.
+pub(crate) struct PrintableAscii<'a>(pub(crate) &'a str);
 
-impl std::fmt::Display for PrintableJson<'_> {
+impl std::fmt::Display for PrintableAscii<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for c in self.0.chars() {
             if (' '..='~').contains(&c) {
@@ -2537,9 +2537,10 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
             Some(n) => n as u32,
             None => {
                 return Err(invalid(format!(
-                    "`trace_format` is {v}, which is not a scheduler-trace format version — it \
-                     is the key this binary gates on to decide whether it can decode this bag's \
-                     trace at all, so an unreadable value is refused rather than assumed"
+                    "`trace_format` is {}, which is not a scheduler-trace format version \u{2014} \
+                     it is the key this binary gates on to decide whether it can decode this \
+                     bag's trace at all, so an unreadable value is refused rather than assumed",
+                    PrintableAscii(&v.to_string())
                 )))
             }
         },
@@ -3576,7 +3577,7 @@ mod tests {
             ("\"\u{1f600}\"", "\"\\ud83d\\ude00\""),
             ("\"\u{1f}\"", "\"\\u001f\""),
         ] {
-            assert_eq!(PrintableJson(text).to_string(), printed, "{text:?}");
+            assert_eq!(PrintableAscii(text).to_string(), printed, "{text:?}");
         }
     }
 

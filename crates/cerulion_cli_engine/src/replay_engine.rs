@@ -117,7 +117,8 @@ use crate::replay_inject;
 use crate::replay_rederive;
 
 use crate::replay_cmd::{
-    ReplayError, TraceManifest, DEPARTURE_RING_RANK, TRACE_MANIFEST_PREFIX, TRACE_MANIFEST_SUFFIX,
+    PrintableAscii, ReplayError, TraceManifest, DEPARTURE_RING_RANK, TRACE_MANIFEST_PREFIX,
+    TRACE_MANIFEST_SUFFIX,
 };
 use crate::replay_field_registry::FrameDecoder;
 use crate::tolerance::MetricKind;
@@ -2231,6 +2232,15 @@ impl RecordedDriverStamp {
     }
 }
 
+/// Node ids from the bag, comma-separated, each printed through
+/// [`PrintableAscii`] so a refusal never carries their raw bytes.
+fn printable_ids(ids: &[&str]) -> String {
+    ids.iter()
+        .map(|id| PrintableAscii(id).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A recording's driver flags, checked against the graph the bag embeds: one
 /// flag for every native node of that graph and for nothing else.
 ///
@@ -2264,10 +2274,11 @@ impl DriverStamp {
                 return Err(ReplayError::BagInvalidAttachment {
                     name: crate::replay_cmd::RECORDER_ATTACHMENT.to_string(),
                     reason: format!(
-                        "`node_external` is {value}, which is not a map of node ids to true or \
+                        "`node_external` is {}, which is not a map of node ids to true or \
                          false. It is the key a replay judges external (driver) nodes by, so an \
                          unreadable value is refused rather than guessed. Re-record the bag, or \
-                         repair the attachment"
+                         repair the attachment",
+                        PrintableAscii(&value)
                     ),
                 })
             }
@@ -2284,7 +2295,7 @@ impl DriverStamp {
                 detail: format!(
                     "recorder.json's `node_external` names node(s) the embedded graph does not \
                      run: {}",
-                    extra.join(", ")
+                    printable_ids(&extra)
                 ),
             });
         }
@@ -2298,7 +2309,7 @@ impl DriverStamp {
                 detail: format!(
                     "recorder.json's `node_external` does not name node(s) the embedded graph \
                      runs: {}",
-                    missing.join(", ")
+                    printable_ids(&missing)
                 ),
             });
         }

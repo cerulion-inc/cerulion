@@ -2277,6 +2277,93 @@ fn an_unreadable_driver_stamp_is_refused() {
     }
 }
 
+/// Every refusal of the `recorder.json` contract carrier that quotes bag text
+/// prints it as printable ASCII: a `trace_format` that is not a version, a
+/// `node_external` that is not a map, a `node_external` key the graph does
+/// not run, and a graph node the stamp does not name. Each value holds DEL,
+/// U+009B and U+202E, read through the real reader, and each arrives as a
+/// JSON `\uXXXX` escape inside the refusal's own sentence.
+#[test]
+fn a_contract_carrier_refusal_prints_bag_text_as_printable_ascii() {
+    let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
+    let raw = "x\u{7f}\u{9b}\u{202e}y";
+    let shown = "x\\u007f\\u009b\\u202ey";
+    let mut unnamed_node = replay_grade_attachments(&["node0"]);
+    unnamed_node[0] = att(
+        "graph.yaml",
+        "application/yaml",
+        b"name: replaytest\nprefix: replaytest\nnodes:\n  - id: \"x\\x7f\\u009b\\u202ey\"\n    \
+          type: test_pub\n    outputs:\n      - name: data\n        schema: test/Data\n"
+            .to_vec(),
+    );
+    unnamed_node.push(recorder_att_with_stamp(
+        supported,
+        Some(serde_json::json!({})),
+    ));
+    let mut trace_format = replay_grade_attachments(&["node0"]);
+    trace_format.push(recorder_att_with(Some(serde_json::json!(raw)), None));
+    let mut stamp_value = replay_grade_attachments(&["node0"]);
+    stamp_value.push(recorder_att_with_stamp(
+        supported,
+        Some(serde_json::json!(raw)),
+    ));
+    let mut wrong: Vec<String> = Vec::new();
+    let mut stamp_key = replay_grade_attachments(&["node0"]);
+    stamp_key.push(recorder_att_with_stamp(
+        supported,
+        Some(serde_json::json!({ "pub1": false, raw: true })),
+    ));
+    for (name, atts, want) in [
+        (
+            "trace_format",
+            trace_format,
+            format!(
+                "bag attachment `__cerulion/recorder.json` is present but invalid: `trace_format` \
+                 is \"{shown}\", which is not a scheduler-trace format version \u{2014} it is the \
+                 key this binary gates on to decide whether it can decode this bag's trace at \
+                 all, so an unreadable value is refused rather than assumed"
+            ),
+        ),
+        (
+            "stamp_value",
+            stamp_value,
+            format!(
+                "bag attachment `__cerulion/recorder.json` is present but invalid: `node_external` \
+                 is \"{shown}\", which is not a map of node ids to true or false. It is the key a \
+                 replay judges external (driver) nodes by, so an unreadable value is refused \
+                 rather than guessed. Re-record the bag, or repair the attachment"
+            ),
+        ),
+        (
+            "stamp_key",
+            stamp_key,
+            format!(
+                "bag internal consistency check failed: recorder.json's `node_external` names \
+                 node(s) the embedded graph does not run: {shown} \u{2014} the recording is \
+                 corrupt or hand-edited; re-record with `cerulion graph run --record`"
+            ),
+        ),
+        (
+            "unnamed_node",
+            unnamed_node,
+            format!(
+                "bag internal consistency check failed: recorder.json's `node_external` does not \
+                 name node(s) the embedded graph runs: {shown} \u{2014} the recording is corrupt \
+                 or hand-edited; re-record with `cerulion graph run --record`"
+            ),
+        ),
+    ] {
+        let (_dir, path) = tmp_bag(&format!("ascii_{name}.mcap"));
+        write_bag(&path, &[fire(0, 0), fire(0, 1)], &atts, true);
+        let err = gate(&path);
+        if err.to_string() != want || err.exit_code() != 2 {
+            wrong.push(format!("{name}: exit {}, {err}", err.exit_code()));
+        }
+    }
+    // Every row is judged before the verdict, so one run names each site.
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// ORDERING: an unreadable stamp on a bag from a NEWER format gets the
 /// version refusal, which names the cause.
 #[test]
