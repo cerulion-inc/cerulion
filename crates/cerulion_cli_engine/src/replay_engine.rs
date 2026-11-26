@@ -11399,9 +11399,11 @@ fn install_budget_override(site: BudgetSite, budget: usize) -> VerifierBudgetGua
 /// ordinary crafted bag blows it and the pass declines with
 /// [`VerifierDecline::ReadLogBudget`].
 ///
-/// A real bag big enough to reach [`DEFAULT_VERIFIER_RECORD_BUDGET`] is not
-/// something a test can craft, so without this seam that decline (and the two
-/// below) would be awkward to isolate independently.
+/// `--verifier-record-budget` lowers all three sites together, and the read log
+/// is checked first, so only a per-site override reaches the frame-index and
+/// schedule declines behind a read log that fits ([`BudgetSite`]). This one
+/// also lowers the per-step fold bound ([`per_step_fold_budget`]), so a small
+/// bag reaches a hostile run count.
 #[cfg(any(test, feature = "test-seams"))]
 pub fn override_read_log_record_budget(budget: usize) -> VerifierBudgetGuard {
     install_budget_override(BudgetSite::ReadLog, budget)
@@ -14663,10 +14665,10 @@ fn rank_step_targets(
 /// Called ONLY when `--duration` truncated the read-log census at `from_step`
 /// and `plan_edge_admission` saw zero reads for a topic inside `[0, from_step)`.
 /// Distinguishes a topic whose consumer did not read before the `--duration`
-/// cut from a recording that has no read-log coverage for that topic. Only the
-/// five READ kinds count: the annotation kinds and batch frames never reach a
-/// stage's schedule, so they never make [`replay_inject::plan_edge_admission`]
-/// see a record either.
+/// cut from a recording that has no read-log coverage for that topic. Only a
+/// READ kind ([`replay_inject::ReadKind::from_outcome`]) counts: the annotation
+/// kinds and batch frames never reach a stage's schedule, so they never make
+/// [`replay_inject::plan_edge_admission`] see a record either.
 fn rank_has_read_for_edges_from(
     trace: &RecordedTrace,
     rank: u32,
@@ -14695,16 +14697,10 @@ fn rank_has_read_for_edges_from(
             continue;
         };
         let (input_idx, kind, _) = decode_read_outcome_meta(r.global_level, width);
-        if !matches!(
-            read_outcome_kind_from_wire(kind),
-            Some(
-                ReadOutcomeKind::Served
-                    | ReadOutcomeKind::Held
-                    | ReadOutcomeKind::NoFrame
-                    | ReadOutcomeKind::DrainedBatch
-                    | ReadOutcomeKind::Decimated
-            )
-        ) {
+        if read_outcome_kind_from_wire(kind)
+            .and_then(replay_inject::ReadKind::from_outcome)
+            .is_none()
+        {
             continue;
         }
         let Some(input) = recorded_inputs
