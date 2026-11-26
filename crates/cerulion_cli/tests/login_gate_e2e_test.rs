@@ -1035,3 +1035,31 @@ fn a_harness_planted_in_a_folder_other_users_can_write_never_runs() {
         ),
     );
 }
+
+#[test]
+fn account_service_refusal_redacts_url_credentials_and_query() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let secret_url =
+        "https://ci-bot:super-secret-pass@auth.example.com:8443/v1?api_key=tok999#frag";
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[("CERULION_ACCOUNT_SERVICE", secret_url)],
+        &["account", "devices", "list"],
+    );
+    assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    let expected = "Error: This command requires the Cerulion account service (https://auth.example.com:8443/v1), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
+    assert!(
+        stderr.contains(expected),
+        "refusal must show redacted URL; want:\n{expected}\ngot:\n{stderr}"
+    );
+    for secret in ["ci-bot", "super-secret-pass", "tok999", "frag"] {
+        assert!(
+            !stderr.contains(secret),
+            "stderr leaked credential {secret:?}: {stderr}"
+        );
+    }
+    assert_no_identity_was_written(home.path());
+}

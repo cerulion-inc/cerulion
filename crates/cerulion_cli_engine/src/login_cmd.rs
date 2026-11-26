@@ -13,7 +13,7 @@
 //!   surface at all; the hosted default does not, and login then takes the
 //!   account id from `/v1/me` (see [`DEFAULT_ACCOUNT_SERVICE`]),
 //! - persists `~/.cerulion/auth.json` (with `logged_in_ever: true`), and
-//! - exposes [`ensure_login_gate`] — the entry every account or remote-robot
+//! - exposes [`ensure_login_gate`], the entry every account or remote-robot
 //!   command consults, which **auto-triggers** the login flow at first-ever need.
 //!
 //! ## Endpoint resolution
@@ -93,7 +93,7 @@ const POLL_HARD_CAP: Duration = Duration::from_secs(600);
 /// Per-request HTTP timeout.
 const HTTP_TIMEOUT: Duration = cerulion_discovery::robot_state::ACCOUNT_HTTP_TIMEOUT;
 
-/// Resolve the account-service base URL (env override → production default),
+/// Resolve the account-service base URL (env override -> production default),
 /// trailing slash trimmed.
 pub fn account_service_base() -> String {
     let base = std::env::var(ACCOUNT_SERVICE_ENV)
@@ -101,6 +101,23 @@ pub fn account_service_base() -> String {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_ACCOUNT_SERVICE.to_string());
     base.trim_end_matches('/').to_string()
+}
+
+/// Strip userinfo, query parameters, and fragments from an account-service URL
+/// before printing it to stderr, logs, or error messages. Malformed values fail
+/// closed to a placeholder so credentials can never leak.
+#[must_use]
+pub fn redact_service_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw.trim()) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.as_str().trim_end_matches('/').to_string()
+        }
+        Err(_) => "<invalid CERULION_ACCOUNT_SERVICE URL>".to_string(),
+    }
 }
 
 // ===========================================================================
@@ -259,17 +276,21 @@ pub const NON_INTERACTIVE_REFUSAL: &str = "This command requires the Cerulion ac
 /// (default account service).
 pub const SIGNED_OUT_REFUSAL: &str = "This command requires the Cerulion account service (https://app.cerulion.com), and this machine is signed out.\nRun `cerulion login` in a terminal to sign in again.";
 
-/// Format the non-interactive never-signed-in refusal naming `service`.
+/// Format the non-interactive never-signed-in refusal naming `service`
+/// (with any URL credentials, query, or fragment stripped).
 #[must_use]
 pub fn non_interactive_refusal(service: &str) -> String {
+    let service = redact_service_url(service);
     format!(
         "This command requires the Cerulion account service ({service}), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did."
     )
 }
 
-/// Format the non-interactive signed-out refusal naming `service`.
+/// Format the non-interactive signed-out refusal naming `service`
+/// (with any URL credentials, query, or fragment stripped).
 #[must_use]
 pub fn signed_out_refusal(service: &str) -> String {
+    let service = redact_service_url(service);
     format!(
         "This command requires the Cerulion account service ({service}), and this machine is signed out.\nRun `cerulion login` in a terminal to sign in again."
     )
@@ -348,7 +369,7 @@ fn gate_with(
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
         LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(None),
         gate @ (LocalGate::RefuseNeverLoggedIn | LocalGate::RefuseSignedOut) => {
-            let service = account_service_base();
+            let service = redact_service_url(&account_service_base());
             if !interactive {
                 let refusal = if gate == LocalGate::RefuseSignedOut {
                     signed_out_refusal(&service)
@@ -458,8 +479,9 @@ pub fn run_login_carrying(
             account
         }
         None => {
+            let service = redact_service_url(&base);
             tracing::info!(
-                service = %base,
+                service = %service,
                 "the account service issues no device certificates; resolving the account id via /v1/me"
             );
             discard_cert = true;
@@ -1167,7 +1189,11 @@ fn revoke_session_with_timeout(state: &AuthState, timeout: Duration) -> CliResul
         }))
         .send()
         .map_err(|e| {
-            CliError::Login(format!("the account service ({base}) is unreachable: {e}"))
+            let service = redact_service_url(&base);
+            CliError::Login(format!(
+                "the account service ({service}) is unreachable: {}",
+                e.without_url()
+            ))
         })?;
     let status = resp.status();
     if status.is_success() {
@@ -1582,8 +1608,10 @@ pub(crate) fn fetch_pop_challenge(
         .bearer_auth(session_token)
         .send()
         .map_err(|e| {
+            let service = redact_service_url(base);
             CliError::Login(format!(
-                "requesting a proof-of-possession challenge ({base}) failed: {e}"
+                "requesting a proof-of-possession challenge ({service}) failed: {}",
+                e.without_url()
             ))
         })?;
     if resp.status().as_u16() == 404 {
@@ -1790,7 +1818,11 @@ fn post_json<T: for<'de> Deserialize<'de>>(
         .json(body)
         .send()
         .map_err(|e| {
-            CliError::Login(format!("the account service ({base}) is unreachable: {e}"))
+            let service = redact_service_url(&base);
+            CliError::Login(format!(
+                "the account service ({service}) is unreachable: {}",
+                e.without_url()
+            ))
         })?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -2087,6 +2119,85 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "the refusal must be immediate, not a poll"
         );
+    }
+
+    #[test]
+    fn refusal_and_prompt_redact_credentials_and_query_from_account_url() {
+        let _g = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", dir.path().to_str().unwrap());
+        let secret_url = "http://alice:s3cr3t@127.0.0.1:1/api?token=topsecret#frag";
+        let _svc = EnvGuard::set(ACCOUNT_SERVICE_ENV, secret_url);
+
+        // 1. Never-signed-in non-interactive refusal.
+        let mut out = Vec::new();
+        let err = ensure_login_gate_with(&mut out, false)
+            .expect_err("never-signed-in non-interactive must refuse")
+            .to_string();
+        assert_eq!(
+            err,
+            "This command requires the Cerulion account service (http://127.0.0.1:1/api), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did."
+        );
+        for secret in ["alice", "s3cr3t", "topsecret", "frag"] {
+            assert!(!err.contains(secret), "refusal leaked {secret:?}: {err}");
+        }
+
+        // 2. Signed-out non-interactive refusal.
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"account_id":"acct","logged_in_ever":true,"signed_out":true}"#,
+        )
+        .unwrap();
+        let signed_out = ensure_login_gate_with(&mut out, false)
+            .expect_err("signed-out non-interactive must refuse")
+            .to_string();
+        assert_eq!(
+            signed_out,
+            "This command requires the Cerulion account service (http://127.0.0.1:1/api), and this machine is signed out.\nRun `cerulion login` in a terminal to sign in again."
+        );
+        for secret in ["alice", "s3cr3t", "topsecret", "frag"] {
+            assert!(
+                !signed_out.contains(secret),
+                "signed-out refusal leaked {secret:?}: {signed_out}"
+            );
+        }
+
+        // 3. Interactive prompt and unreachable error redact credentials too.
+        let mut prompt_out = Vec::new();
+        let interactive_err = ensure_login_gate_with(&mut prompt_out, true)
+            .expect_err("closed loopback port must fail login start")
+            .to_string();
+        let prompt = String::from_utf8_lossy(&prompt_out);
+        assert!(
+            prompt.contains("(http://127.0.0.1:1/api)"),
+            "prompt must name redacted service: {prompt}"
+        );
+        for secret in ["alice", "s3cr3t", "topsecret", "frag"] {
+            assert!(
+                !prompt.contains(secret),
+                "interactive prompt leaked {secret:?}: {prompt}"
+            );
+            assert!(
+                !interactive_err.contains(secret),
+                "unreachable error leaked {secret:?}: {interactive_err}"
+            );
+        }
+
+        // 4. Malformed URL fails closed without echoing raw text.
+        drop(_svc);
+        let _bad = EnvGuard::set(
+            ACCOUNT_SERVICE_ENV,
+            "not-a-url alice:badpass?api_key=leakme",
+        );
+        let bad_err = ensure_login_gate_with(&mut out, false)
+            .expect_err("malformed URL still refuses")
+            .to_string();
+        for secret in ["alice", "badpass", "leakme", "not-a-url"] {
+            assert!(
+                !bad_err.contains(secret),
+                "malformed URL refusal leaked {secret:?}: {bad_err}"
+            );
+        }
     }
 
     #[test]
