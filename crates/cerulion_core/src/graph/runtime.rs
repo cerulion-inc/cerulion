@@ -8737,14 +8737,14 @@ impl GraphRuntime {
                         role: stage_role,
                     },
                     read_stage.capacity(),
-                    if node_per_set_sync && node_trigger_names.contains(input.name.as_str()) {
-                        // A per-set `Sync` trigger input pops through the
-                        // matcher's own ops, which are NOT the two gated drain
-                        // bodies, so a gate here would be bypassed. Named
-                        // before the multi-publisher fact because it is the
-                        // harder one: a bypass admits a frame the recording did
-                        // not, where an ambiguous sequence only fails to pin
-                        // one.
+                    if node_per_set_sync
+                        && node_trigger_names.contains(input.name.as_str())
+                        && body_feed.is_none()
+                    {
+                        // An UNFED per-set `Sync` trigger input stays blocked
+                        // so unfed replays keep their existing best-effort path;
+                        // a FED stage gates its matcher ops through the private
+                        // feed.
                         Some(crate::read_outcome::GateBlocker::PerSetSyncEdge)
                     } else if annotated_edge && body_feed.is_none() {
                         // A FED stage is fed by (writer, sequence), so a
@@ -19050,12 +19050,39 @@ impl GraphRuntime {
     }
 
     /// Re-read the armed flag off the stages, the ONE writer of
-    /// `replay_read_armed`.
+    /// `replay_read_armed`, and mirror per-set `Sync` trigger arming onto the
+    /// scheduler's `sync_replay_refill` flag.
     fn refresh_replay_read_armed(&mut self) {
         self.replay_read_armed = self
             .replay_read_plans
             .iter()
             .any(|(_node, plan)| plan.is_armed());
+        for binding in &self.sync_input_bindings {
+            if !binding.per_set {
+                continue;
+            }
+            let node_id = binding.node_id.as_ref();
+            let trigger_armed = self
+                .sync_input_bindings
+                .iter()
+                .filter(|b| b.per_set && b.node_id.as_ref() == node_id)
+                .any(|b| {
+                    let Some(input_idx) = self
+                        .read_log_input_names
+                        .get(node_id)
+                        .and_then(|names| names.iter().position(|n| n == b.input_name.as_ref()))
+                    else {
+                        return false;
+                    };
+                    self.replay_read_plans.iter().any(|(_, plan)| {
+                        plan.is_armed()
+                            && plan.key().node == node_id
+                            && usize::from(plan.key().input_idx) == input_idx
+                    })
+                });
+            self.scheduler
+                .set_sync_replay_refill(node_id, trigger_armed);
+        }
     }
 
     /// Is any read gate armed (Principle #3; false on a virgin runtime).
