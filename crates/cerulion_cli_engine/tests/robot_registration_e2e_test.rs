@@ -842,8 +842,9 @@ fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_off
     server.0.kill().unwrap();
     server.0.wait().unwrap();
 
-    // The command-wide gate accepts the same durable robot authority as netd.
-    // No account file or reachable issuer is needed, and the read writes no trust.
+    // The login gate for gated account/remote verbs accepts the same durable
+    // robot authority as netd. No account file or reachable issuer is needed,
+    // and the read writes no trust.
     let saved_auth = std::fs::read(home.join("auth.json")).unwrap();
     std::fs::remove_file(home.join("auth.json")).unwrap();
     let saved_key = std::fs::read(remoted.join("device_key")).unwrap();
@@ -852,15 +853,20 @@ fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_off
     for _ in 0..2 {
         let output = bounded_output(
             Command::new(built_binary("cerulion"))
-                .args(["topic", "list", "--local"])
+                .args(["account", "devices", "list"])
                 .env("CERULION_STATE_ROOT", &root)
                 .env("CERULION_LOGIN_GATE", "1")
                 .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "claimed robot must pass the login gate (not exit 7); stderr={stderr}"
+        );
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains("not logged in"),
+            "claimed robot must reach the post-gate session check without dialing; stderr={stderr}"
         );
         assert!(!home.join("auth.json").exists());
         assert_eq!(
@@ -878,7 +884,7 @@ fn real_worker_and_writer_publish_claimed_state_and_serve_the_registered_key_off
         std::fs::write(&path, b"corrupt").unwrap();
         let output = bounded_output(
             Command::new(built_binary("cerulion"))
-                .args(["topic", "list", "--local"])
+                .args(["account", "devices", "list"])
                 .env("CERULION_STATE_ROOT", &root)
                 .env("CERULION_LOGIN_GATE", "1")
                 .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1"),

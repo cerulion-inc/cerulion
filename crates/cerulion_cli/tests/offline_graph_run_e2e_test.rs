@@ -13,30 +13,14 @@
 use std::io::Read as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED;
 use serial_test::serial;
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn wait_bounded(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
-    let start = Instant::now();
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(status) => return Some(status),
-            None if start.elapsed() > timeout => return None,
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
-}
+mod mp_support;
+use mp_support::ChildGuard;
 
 fn send_signal(pid: u32, sig: libc::c_int) {
     // SAFETY: kill(2) with a valid child pid and signal; no memory is touched.
@@ -169,7 +153,7 @@ fn graph_validate_and_graph_run_succeed_without_sign_in() {
         .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
         .spawn()
         .expect("spawn cerulion graph run");
-    let mut guard = ChildGuard(child);
+    let mut guard = ChildGuard::single_process(child);
 
     let live_stderr = wait_for_log_line(
         &stderr_path,
@@ -200,11 +184,13 @@ fn graph_validate_and_graph_run_succeed_without_sign_in() {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn cerulion topic echo");
-    let mut echo_guard = ChildGuard(echo_child);
+    let mut echo_guard = ChildGuard::single_process(echo_child);
     let echo_log = wait_for_log_line(&echo_stdout, "seq=", Duration::from_secs(10));
-    send_signal(echo_guard.0.id(), libc::SIGINT);
-    let echo_status = wait_bounded(&mut echo_guard.0, Duration::from_secs(10))
+    send_signal(echo_guard.id(), libc::SIGINT);
+    let echo_status = echo_guard
+        .wait_bounded(Duration::from_secs(10))
         .expect("topic echo did not exit after SIGINT");
+    echo_guard.finish().assert_clean();
     assert!(
         echo_status.success(),
         "topic echo must exit 0 on SIGINT, got {echo_status:?}"
@@ -214,9 +200,11 @@ fn graph_validate_and_graph_run_succeed_without_sign_in() {
         "topic echo on '{topic}' must observe a delivered frame; stdout:\n{echo_log}"
     );
 
-    send_signal(guard.0.id(), libc::SIGINT);
-    let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
+    send_signal(guard.id(), libc::SIGINT);
+    let status = guard
+        .wait_bounded(Duration::from_secs(40))
         .expect("graph run did not exit after SIGINT");
+    guard.finish().assert_clean();
     assert!(
         status.success(),
         "graph run must exit 0 on SIGINT, got {status:?}; stderr:\n{}",
