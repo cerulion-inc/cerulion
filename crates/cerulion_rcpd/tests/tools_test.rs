@@ -24,7 +24,7 @@ use cerulion_rcpd::server::RcpServer;
 use cerulion_rcpd::tools::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL, ESTOP_TOOL};
 use cerulion_rcpd::RcpdError;
 use native_ros2_messages::std_msgs::String as RosString;
-use oracle::{manager, manifest, manifest_with, publish_json, unique};
+use oracle::{manager, manifest, publish_json, unique};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ResourceContents,
 };
@@ -107,6 +107,11 @@ vectors!(
     estop_refuses_motion_and_lets_reads_run,
     a_latch_left_by_an_earlier_daemon_refuses_motion,
     an_irreversible_tool_is_receipted_labelled_and_latch_gated,
+    a_clear_reopens_motion_and_a_later_estop_closes_it_again,
+    a_clear_with_nothing_latched_is_receipted_and_publishes_nothing,
+    a_clear_opens_a_latch_left_by_an_earlier_daemon,
+    an_undeletable_latch_file_keeps_the_estop_engaged,
+    under_operator_clearing_the_agent_cannot_clear,
 );
 
 /// Answers every call frame, oldest first, with `{call_id, tool, ok, n}` on
@@ -197,18 +202,8 @@ struct Fixture {
 impl Fixture {
     async fn new(tag: &str, with_graph: bool) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        Self::in_dir(tag, with_graph, dir, "").await
-    }
-
-    /// A fixture whose manifest ends with `extra` (a `limits` section).
-    async fn with_extra(tag: &str, extra: &str) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        Self::in_dir(tag, true, dir, extra).await
-    }
-
-    async fn in_dir(tag: &str, with_graph: bool, dir: tempfile::TempDir, extra: &str) -> Self {
         let prefix = unique(tag);
-        let loaded = manifest_with(dir.path(), &prefix, extra);
+        let loaded = manifest(dir.path(), &prefix);
         let mgr = manager(tag);
         let stop = Arc::new(AtomicBool::new(false));
         let graph = with_graph.then(|| spawn_graph(mgr.clone(), prefix.clone(), stop.clone()));
@@ -549,8 +544,6 @@ fn the_audit_refuses_a_cut_head_and_a_missing_rotated_file() {
     assert!(err.contains("is missing"), "{err}");
 }
 
-const OPERATOR_CLEARS: &str = "limits:\n  estop_clear: operator\n";
-
 /// The `tools/list` entries as JSON, keyed by name.
 async fn listed(f: &Fixture) -> std::collections::BTreeMap<String, Value> {
     f.client
@@ -611,199 +604,6 @@ async fn tools_list_labels_every_safety_class() {
     }
     let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
     assert!(estop.contains("estop_clear"), "{estop}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_agent_clears_the_estop_and_a_later_estop_latches_again() {
-    let mut f = Fixture::new("clear", true).await;
-    let latch = latch_path(&f.receipts);
-    let step = json!({ "q": [0.0, 0.0] });
-
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "first" })).await;
-    assert!(!is_error);
-    assert!(latch.exists(), "the latch file is written on engage");
-    let (_, body) = f.call("arm.step", step.clone()).await;
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("estop_clear"),
-        "{body}"
-    );
-
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({ "reason": "safe" })).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["estopped"], json!(false));
-    assert_eq!(body["was_estopped"], json!(true));
-    assert_eq!(body["graph_acknowledged"], json!(true));
-    assert_eq!(
-        body["result"]["tool"],
-        json!(ESTOP_CLEAR_TOOL),
-        "the graph was told"
-    );
-    assert!(body["receipt"]["seq"].is_u64(), "{body}");
-    assert!(!latch.exists(), "the clear deletes the latch file");
-
-    let (is_error, body) = f.call("arm.step", step.clone()).await;
-    assert!(!is_error, "motion runs after the clear: {body}");
-
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "second" })).await;
-    assert!(!is_error);
-    assert!(
-        latch.exists(),
-        "an engage after a clear writes the file again"
-    );
-    assert_eq!(std::fs::read_to_string(&latch).expect("latch"), "second\n");
-    let (_, body) = f.call("arm.step", step.clone()).await;
-    assert_eq!(
-        body["error"]["code"],
-        json!("estopped"),
-        "an engage after a clear latches"
-    );
-
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        [ESTOP_TOOL, ESTOP_CLEAR_TOOL, "arm.step", ESTOP_TOOL]
-    );
-    assert_eq!(
-        seen[1]["args"],
-        json!({ "reason": "safe" }),
-        "the clear is journaled"
-    );
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.step", "denied"),
-            (ESTOP_CLEAR_TOOL, "intent"),
-            (ESTOP_CLEAR_TOOL, "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.step", "denied"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_clear_while_not_estopped_is_receipted_and_changes_nothing() {
-    let mut f = Fixture::new("clear_idle", true).await;
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({ "speed": 1 })).await;
-    assert!(is_error, "arguments outside the schema are refused: {body}");
-    assert_eq!(body["error"]["code"], json!("invalid_args"));
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["was_estopped"], json!(false));
-    assert_eq!(body["estopped"], json!(false));
-    let (is_error, _) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(!is_error);
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        ["arm.step"],
-        "a clear with nothing latched is not journaled"
-    );
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_CLEAR_TOOL, "error:invalid_args"),
-            (ESTOP_CLEAR_TOOL, "intent"),
-            (ESTOP_CLEAR_TOOL, "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_agent_clears_a_latch_left_by_an_earlier_daemon() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let receipts = dir.path().join("receipts/log.jsonl");
-    std::fs::create_dir_all(receipts.parent().expect("parent")).expect("mkdir");
-    std::fs::write(latch_path(&receipts), "earlier stop\n").expect("write latch");
-    let mut f = Fixture::in_dir("clear_restart", true, dir, "").await;
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["was_estopped"], json!(true));
-    assert!(!latch_path(&receipts).exists());
-    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(!is_error, "{body}");
-    f.stop_graph();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_latch_file_that_cannot_be_deleted_keeps_the_estop_engaged() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let receipts = dir.path().join("receipts/log.jsonl");
-    // A non-empty directory where the latch file goes: it exists, so the
-    // daemon starts latched, and `remove_file` cannot delete it.
-    std::fs::create_dir_all(latch_path(&receipts).join("pinned")).expect("mkdir");
-    let mut f = Fixture::in_dir("clear_fails", true, dir, "").await;
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(is_error, "{body}");
-    assert_eq!(body["error"]["code"], json!("clear_failed"));
-    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert_eq!(
-        body["error"]["code"],
-        json!("estopped"),
-        "the latch stays closed"
-    );
-    assert!(f.stop_graph().is_empty(), "nothing was journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_CLEAR_TOOL, "intent"),
-            (ESTOP_CLEAR_TOOL, "error:clear_failed"),
-            ("arm.step", "denied"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn under_operator_clearing_the_agent_cannot_clear_the_estop() {
-    let mut f = Fixture::with_extra("operator", OPERATOR_CLEARS).await;
-    let tools = listed(&f).await;
-    assert!(
-        !tools.contains_key(ESTOP_CLEAR_TOOL),
-        "estop_clear is not listed"
-    );
-    let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
-    assert!(!estop.contains("estop_clear"), "{estop}");
-
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({})).await;
-    assert!(!is_error);
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(is_error, "{body}");
-    assert_eq!(body["error"]["code"], json!("estop_clear_disabled"));
-    assert!(latch_path(&f.receipts).exists(), "the latch file stays");
-    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    assert!(
-        !body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("estop_clear"),
-        "{body}"
-    );
-
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(tools, [ESTOP_TOOL], "the refused clear was never journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            (ESTOP_CLEAR_TOOL, "denied"),
-            ("arm.step", "denied"),
-        ])
-    );
 }
 
 /// The latch state the receipt log implies: an `estop` intent closes it; an

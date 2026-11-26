@@ -250,17 +250,29 @@ pub enum Latch {
     Absent,
     /// A latch file an earlier daemon left.
     LeftClosed,
+    /// A latch file that cannot be deleted: a non-empty directory at its path.
+    Undeletable,
+}
+
+/// Who clears the e-stop: the manifest's `limits.estop_clear`.
+pub enum Clearing {
+    /// `agent`, the default.
+    Agent,
+    /// `operator`.
+    Operator,
 }
 
 /// The state a vector starts from.
 pub struct Given {
+    pub clearing: Clearing,
     pub latch: Latch,
 }
 
 impl Given {
-    /// A first start: no latch file.
+    /// A first start under the default limits: no latch file.
     pub fn fresh() -> Self {
         Self {
+            clearing: Clearing::Agent,
             latch: Latch::Absent,
         }
     }
@@ -311,7 +323,11 @@ impl<D: Daemon> Session<D> {
     pub async fn open(given: &Given) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let prefix = unique("vector");
-        let loaded = manifest(dir.path(), &prefix);
+        let limits = match given.clearing {
+            Clearing::Agent => "",
+            Clearing::Operator => "limits:\n  estop_clear: operator\n",
+        };
+        let loaded = manifest_with(dir.path(), &prefix, limits);
         let mgr = manager("vector");
         let graph = graph::Graph::spawn(mgr.clone(), &prefix);
         let receipts: PathBuf = dir.path().join("receipts/log.jsonl");
@@ -321,6 +337,9 @@ impl<D: Daemon> Session<D> {
             Latch::LeftClosed => {
                 std::fs::create_dir_all(dir.path().join("receipts")).expect("mkdir");
                 std::fs::write(&latch_file, "earlier stop\n").expect("write latch file");
+            }
+            Latch::Undeletable => {
+                std::fs::create_dir_all(latch_file.join("pinned")).expect("mkdir");
             }
         }
         let (daemon, stream) = D::boot(&mgr, &loaded, &receipts);
