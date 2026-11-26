@@ -2405,6 +2405,7 @@ const CDYLIB_CHECK_PREFIX: &str = "cdylib '";
 /// itself, so these are re-performed exactly like topology.
 const DATA_TRIGGER_CHECK_PREFIX: &str = "data_trigger binding '";
 const SYNC_TRIGGER_CHECK_PREFIX: &str = "sync trigger binding '";
+const SYNC_WINDOW_CHECK_PREFIX: &str = "sync window '";
 
 /// True when a failing report check would ALSO stop the run under
 /// `--no-validate`, so advertising that flag against it would be false.
@@ -3524,6 +3525,7 @@ fn graph_validate_with_cache(
     if topology_valid {
         if let Ok(entry_infos) = &loaded_infos {
             checks.extend(input_backpressure_check(config, entry_infos));
+            checks.extend(sync_window_period_checks(config, entry_infos));
         }
     }
 
@@ -3715,6 +3717,62 @@ fn input_backpressure_check(
             ),
         )
     })
+}
+
+/// Advisory `sync window '<node>'` lines mirroring `GraphRuntime::build`'s
+/// `check_sync_window_periods` warning. Emits zero checks when every Sync
+/// node's window stays strictly below its slowest resolved trigger-input period
+/// (or when any trigger input's period cannot be resolved), so clean graphs
+/// keep their existing check count.
+fn sync_window_period_checks(
+    config: &GraphConfig,
+    entry_infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+) -> Vec<ValidationCheck> {
+    let mut infos = entry_infos.clone();
+    let Ok(()) = cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut infos,
+        cerulion_core::graph::topology::MissingInputMeta::Refuse,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(topology) = cerulion_core::graph::GraphTopology::build(config, &infos) else {
+        return Vec::new();
+    };
+    cerulion_core::graph::check_sync_window_periods(config, &topology, &infos)
+        .into_iter()
+        .map(|w| {
+            let label = format!("{SYNC_WINDOW_CHECK_PREFIX}{}'", w.node_id);
+            match w.kind {
+                cerulion_core::graph::SyncWindowKind::Bounded { window_ms } => {
+                    ValidationCheck::pass_with_warning(
+                        label,
+                        format!(
+                            "sync_window_ms = {window_ms} >= slowest trigger input '{}' period \
+                             ({} ms)",
+                            w.slowest_input, w.slowest_period_ms
+                        ),
+                        "a window at or above input_period - skew can silently pair every \
+                         subsequent sample with the previous period after one drop; lower \
+                         sync_window_ms strictly below period - skew",
+                    )
+                }
+                cerulion_core::graph::SyncWindowKind::Unbounded => {
+                    ValidationCheck::pass_with_warning(
+                        label,
+                        format!(
+                            "unbounded_sync aligns periodic trigger inputs (slowest '{}' period \
+                             {} ms)",
+                            w.slowest_input, w.slowest_period_ms
+                        ),
+                        "with no window bound, one dropped frame can silently pair every \
+                         subsequent sample with the previous period; prefer sync_window_ms \
+                         strictly below period - skew",
+                    )
+                }
+            }
+        })
+        .collect()
 }
 
 /// `GraphRuntime::build`'s refusal of a queue deeper than
@@ -38218,6 +38276,189 @@ nodes:
                 }
             }
         }
+    }
+
+    // ─── `sync window`: build-time sync window period advisory at validate ─
+
+    fn sync_window_workspace(yaml: &str) -> (tempfile::TempDir, PathBuf) {
+        let (tmp, graphs_dir) = setup_workspace();
+        let ws_root = graphs_dir.parent().unwrap().to_path_buf();
+        for node_type in ["cam", "imu", "fuse"] {
+            let src = ws_root.join("nodes").join(node_type).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), "").unwrap();
+            touch_cdylib(&ws_root, node_type, "debug");
+        }
+        std::fs::write(graphs_dir.join("sync_win.yaml"), yaml).unwrap();
+        (tmp, ws_root)
+    }
+
+    fn sync_window_graph_yaml() -> &'static str {
+        r#"prefix: sw
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: cam/image
+      - name: imu
+        source: imu/sample
+"#
+    }
+
+    fn sync_window_infos(
+        cam_period_ms: u64,
+        imu_period_ms: u64,
+        fuse_policy: cerulion_core::MacroPolicy,
+    ) -> DeclaredInfos {
+        use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, OutputMeta};
+        let trigger_in = |name: &str| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0x5eed,
+            trigger: true,
+            depth: 4,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
+        };
+        DeclaredInfos(vec![
+            (
+                "cam",
+                cerulion_core::NodeInfo::with_meta(
+                    Vec::new(),
+                    vec![OutputMeta::new("image".to_string(), 0x5eed, None)],
+                )
+                .with_policy(cerulion_core::MacroPolicy::Period {
+                    period_ms: cam_period_ms,
+                }),
+            ),
+            (
+                "imu",
+                cerulion_core::NodeInfo::with_meta(
+                    Vec::new(),
+                    vec![OutputMeta::new("sample".to_string(), 0x5eed, None)],
+                )
+                .with_policy(cerulion_core::MacroPolicy::Period {
+                    period_ms: imu_period_ms,
+                }),
+            ),
+            (
+                "fuse",
+                cerulion_core::NodeInfo::with_meta(
+                    vec![trigger_in("image"), trigger_in("imu")],
+                    Vec::new(),
+                )
+                .with_policy(fuse_policy),
+            ),
+        ])
+    }
+
+    #[test]
+    fn graph_validate_warns_when_sync_window_reaches_declared_period() {
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = sync_window_workspace(sync_window_graph_yaml());
+
+        // Bounded sync: sync_window_ms = 33 >= slowest period 33 ms.
+        let bounded = sync_window_infos(33, 5, cerulion_core::MacroPolicy::Sync { window_ms: 33 });
+        let report = graph_validate_with_inspector(&ws_root, "sync_win", false, &bounded).unwrap();
+        assert!(
+            report.all_passed(),
+            "sync window warning must remain a non-fatal WARN:\n{report}"
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.label == "sync window 'fuse'")
+            .unwrap_or_else(|| panic!("expected sync window check line in:\n{report}"));
+        assert!(check.passed, "check must pass with warning:\n{report}");
+        assert!(
+            check.detail.contains("sync_window_ms = 33")
+                && check.detail.contains("image")
+                && check.detail.contains("33 ms"),
+            "detail must name window, slowest input, and period: {}",
+            check.detail
+        );
+        let warn = check
+            .warning
+            .as_deref()
+            .expect("sync window check must carry a warning");
+        assert!(
+            warn.contains("period - skew") && warn.contains("previous period"),
+            "warning must name the period - skew bound and phase-lock hazard: {warn}"
+        );
+
+        // Unbounded sync over periodic inputs also warns without failing validation.
+        let unbounded = sync_window_infos(33, 33, cerulion_core::MacroPolicy::UnboundedSync);
+        let report_unb =
+            graph_validate_with_inspector(&ws_root, "sync_win", false, &unbounded).unwrap();
+        assert!(
+            report_unb.all_passed(),
+            "unbounded_sync must still pass:\n{report_unb}"
+        );
+        let check_unb = report_unb
+            .checks
+            .iter()
+            .find(|c| c.label == "sync window 'fuse'")
+            .unwrap_or_else(|| {
+                panic!("expected unbounded sync window check line in:\n{report_unb}")
+            });
+        assert!(check_unb.passed);
+        assert!(
+            check_unb.detail.contains("unbounded_sync") && check_unb.detail.contains("33 ms"),
+            "unexpected detail: {}",
+            check_unb.detail
+        );
+        assert!(
+            check_unb
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("period - skew")),
+            "unexpected warning: {:?}",
+            check_unb.warning
+        );
+    }
+
+    #[test]
+    fn graph_validate_emits_no_sync_window_line_when_window_is_safe() {
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = sync_window_workspace(sync_window_graph_yaml());
+        let safe = sync_window_infos(33, 5, cerulion_core::MacroPolicy::Sync { window_ms: 15 });
+        let report = graph_validate_with_inspector(&ws_root, "sync_win", false, &safe).unwrap();
+        assert!(report.all_passed(), "safe sync graph must pass:\n{report}");
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.label.starts_with("sync window '")),
+            "safe window 15 < 33 must emit zero sync window check lines:\n{report}"
+        );
+    }
+
+    #[test]
+    fn graph_validate_sync_window_verdict_is_deterministic_across_two_runs() {
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = sync_window_workspace(sync_window_graph_yaml());
+        let infos = sync_window_infos(33, 5, cerulion_core::MacroPolicy::Sync { window_ms: 50 });
+        let run1 = graph_validate_with_inspector(&ws_root, "sync_win", false, &infos).unwrap();
+        let run2 = graph_validate_with_inspector(&ws_root, "sync_win", false, &infos).unwrap();
+        let text1 = run1.to_string();
+        let text2 = run2.to_string();
+        assert!(
+            text1.contains("sync window 'fuse': sync_window_ms = 50 >= slowest trigger input 'image' period (33 ms)"),
+            "missing expected hand-written check text:\n{text1}"
+        );
+        assert_eq!(text1, text2, "two validate runs must render identically");
     }
 
     /// A graph with no `network:` block gets no `network ingress` line.
