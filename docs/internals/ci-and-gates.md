@@ -443,12 +443,15 @@ else. Serving the network is a second rule the variable does not reach:
   or robot pairing, so local offline runs succeed without opening a network
   listener;
 - a real-clock `graph run` with an enabled `network:` block (`mode: peer` or
-  `mode: client`) that lists `egress:` topics, a `ros2 attach` that is not a
+  `mode: client`) that lists `egress:` topics, or that lists `ingress:` topics
+  under explicit `CERULION_LAN_ACCESS=open`, a `ros2 attach` that is not a
   dry run, `graph run-gateway`, and a `cerulion-netd` started with
   `CERULION_NETD_LISTEN` still refuse without a saved login (an expired one
   counts) with `` serving the network requires a prior login; run `cerulion login` ``.
-  The runs and `ros2 attach` also accept a saved robot pairing; the netd
-  listener does not.
+  A real-clock `graph run` with declared `network: ingress:` under paired access
+  without saved explicit robot pairings enters the login gate (which
+  `CERULION_LOGIN_GATE=off` switches off in CI). The runs and `ros2 attach` also
+  accept a saved robot pairing; the netd listener does not.
 
 A job with no account keeps a `graph run` or `node run` explicitly local with
 `--network off` (also spelled `--local`) or `CERULION_NETWORK=off`, and a

@@ -12,9 +12,12 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   `viz --robot`, `graph live`, `graph fires`, `topic echo|hz|info|pub|snapshot --robot`,
   `service call --robot`). Keep `command_needs_identity` exhaustive; local/offline verbs
   run without sign-in (`tests/login_gate_e2e_test.rs`, `tests/offline_graph_run_e2e_test.rs`).
-- Serving uses netd `require_serving_authority` for explicit `network: egress:`, `ros2 attach`,
-  `graph run-gateway`, and `cerulion-netd`; permissive-default `graph run` / `node run` degrades
-  to `RunNetwork::Off` with one loud warning when unsigned-in and never opens a network listener.
+- Serving uses netd `require_serving_authority` for explicit `network: egress:`,
+  explicit `network: ingress:` under `CERULION_LAN_ACCESS=open`, `ros2 attach`,
+  `graph run-gateway`, and `cerulion-netd`; explicit `network: ingress:` under paired
+  access without saved `robots.toml` pairings enters `ensure_login_gate` (exit 7
+  non-interactively); permissive-default `graph run` / `node run` degrades to
+  `RunNetwork::Off` with one loud warning when unsigned-in and never opens a network listener.
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.

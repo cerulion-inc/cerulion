@@ -1381,17 +1381,24 @@ proceeds with zero network, offline and on an expired session. On a machine that
 never signed in, a gated command runs the device-code flow inline when stderr
 and stdin are both terminals, and otherwise refuses at once with exit 7 naming
 the resolved Cerulion account service (`CERULION_ACCOUNT_SERVICE`, default
-`https://app.cerulion.com`). A signed-out store (`cerulion logout` or Studio's
+`https://app.cerulion.com`, with URL userinfo, query parameters, and fragments
+stripped by `redact_service_url`). A signed-out store (`cerulion logout` or Studio's
 "Sign out": `logged_in_ever` kept, no tokens) loads as `LoadedAuth::SignedOut`
-and receives its own refusal naming the Cerulion account service. In
+and receives its own refusal naming the redacted Cerulion account service. In
 `cerulion doctor`, `account.login` reports `Status::Info` when never signed in
 or signed out (so offline hosts exit 0) and `Status::Fail` only for a corrupt
 file or missing config directory.
 
-For network serving during `graph run` / `node run`, `apply_serving_authority_with`
-in `crates/cerulion_cli_engine/src/graph_cmd.rs` splits `RunNetwork::Strict`
-from `RunNetwork::Permissive`: an explicit `network: egress:` block still
-refuses without `require_serving_authority()`, while a permissive-default
+For network serving and declared ingress during `graph run` / `node run`,
+`apply_serving_authority_with` in `crates/cerulion_cli_engine/src/graph_cmd.rs`
+splits `RunNetwork::Strict` from `RunNetwork::Permissive`: an explicit
+`network: egress:` block still refuses without `require_serving_authority()`;
+an explicit `network: ingress:` block under `LanAccess::Open` also requires
+`require_serving_authority()` before startup (so the gateway child does not exit
+leaving declared inputs absent), and under `LanAccess::Paired` checks saved
+explicit robot pairings (`robots.toml` plus the machine key) first and otherwise
+runs `ensure_login_gate` (interactive sign-in at a terminal, or
+`CliError::AuthRequired` / exit 7 non-interactively); while a permissive-default
 (blockless) run without a prior login or robot pairing degrades to
 `RunNetwork::Off` with one loud `tracing::warn!` naming the graph and
 `cerulion login`, never opening a network listener without a sign-in. Explicit
