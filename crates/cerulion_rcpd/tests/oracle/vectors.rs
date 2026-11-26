@@ -6,8 +6,8 @@
 use serde_json::json;
 
 use super::{
-    call, entry, frame, latch_holds, no_latch_file, reply, Clearing, Effect, Event, Given, Latch,
-    Outcome, Says, Stage, Vector,
+    call, entry, frame, latch_holds, no_latch_file, reply, start, Clearing, Effect, Event, Given,
+    Latch, Outcome, Says, Stage, Vector,
 };
 
 /// `tools/list` is the manifest's tools in the order it declares them, then
@@ -174,11 +174,12 @@ pub fn a_silent_graph_times_out_and_the_call_may_have_run() -> Vector {
 /// `ok` when the graph answered"; "Its description in `tools/list` names
 /// `estop_clear` under `limits.estop_clear: agent`"; "The latch is also
 /// written to `<receipts>.estop`, a file holding the `reason` of the `estop`
-/// that wrote it (cut to 200 characters), then a newline". Tools, step 4: "While the e-stop is engaged a `reversible` or
-/// `irreversible` tool is refused (`estopped`) and receipted `denied`; the
-/// message says how the latch clears: with `estop_clear` under
-/// `limits.estop_clear: agent`"; "`read` tools skip this step." Safety
-/// classes: `read` writes no intent receipt and "runs" while e-stopped.
+/// that wrote it (cut to 200 characters), then a newline". Tools, step 4:
+/// "While the e-stop is engaged a `reversible` or `irreversible` tool is
+/// refused (`estopped`) and receipted `denied`; the message says how the latch
+/// clears: with `estop_clear` under `limits.estop_clear: agent`"; "`read`
+/// tools skip this step." Safety classes: `read` writes no intent receipt and
+/// "runs" while e-stopped.
 pub fn estop_refuses_motion_and_lets_reads_run() -> Vector {
     Vector {
         given: Given::fresh(),
@@ -509,6 +510,102 @@ pub fn under_operator_clearing_the_agent_cannot_clear() -> Vector {
                 .mentioning("/error/message", "operator")
                 .omitting("/error/message", "estop_clear"),
             latch_holds("stop\n"),
+        ],
+    }
+}
+
+/// `estop` does not wait behind a call in flight: it is published and
+/// answered while the graph still holds that call's answer; the call in
+/// flight then completes, and a motion call sent after the estop is refused.
+///
+/// docs/rcp.md, E-stop: `estop` "closes the latch before anything else,
+/// without waiting for a call in flight; publishes its own frame ... ahead of
+/// anything queued"; "While the latch is closed, `reversible` and
+/// `irreversible` calls are refused". Tools: "Calls other than `estop` are
+/// handled one at a time, in the order they arrive." Reaching rcpd from a
+/// desk: "the call it is running has already reached the graph, which
+/// receives the e-stop frame next". AGENTS.md: `estop` "never waits on
+/// `call_lock`". The estop's own receipts, frame and reply as in
+/// [`estop_refuses_motion_and_lets_reads_run`].
+pub fn estop_does_not_wait_behind_a_call_in_flight() -> Vector {
+    let q = || json!({ "q": [0.0, 0.0] });
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            start(1, "arm.slow", q()),
+            Event::AwaitFrame("arm.slow"),
+            call(2, "estop", json!({ "reason": "now" })),
+            start(3, "arm.step", q()),
+            Event::Release,
+            Event::AwaitReply(1),
+            Event::AwaitReply(3),
+        ],
+        expect: vec![
+            entry("arm.slow", Stage::Intent),
+            frame("arm.slow", q()),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "now" })),
+            entry("estop", Stage::Ok),
+            reply(2, Outcome::Ran)
+                .answering(1)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("arm.slow", Stage::Ok),
+            reply(1, Outcome::Ran).answering(0),
+            entry("arm.step", Stage::Denied),
+            reply(3, Outcome::Refused("estopped")),
+        ],
+    }
+}
+
+/// An `estop` that lands while a clear waits behind a call in flight is not
+/// cleared by that clear.
+///
+/// docs/rcp.md, E-stop: `estop_clear` "waits behind a call in flight, then:
+/// refuses with `estop_overtaken`, receipted `error:estop_overtaken` with
+/// nothing changed, when an `estop` was called after the clear was
+/// requested (the refusal carries `estopped`, the state of the latch)". The
+/// estop's own receipts, frame, reply and latch file as in
+/// [`estop_refuses_motion_and_lets_reads_run`].
+/// Nothing a client sees shows the clear has reached the daemon, so a
+/// [`Event::Pause`] lets it arrive before the estop.
+pub fn an_estop_during_a_waiting_clear_is_not_cleared_by_it() -> Vector {
+    let q = || json!({ "q": [0.0, 0.0] });
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            start(1, "arm.slow", q()),
+            Event::AwaitFrame("arm.slow"),
+            start(2, "estop_clear", json!({ "reason": "queued" })),
+            Event::Pause,
+            call(3, "estop", json!({ "reason": "late" })),
+            Event::Release,
+            Event::AwaitReply(1),
+            Event::AwaitReply(2),
+            call(4, "arm.step", q()),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            entry("arm.slow", Stage::Intent),
+            frame("arm.slow", q()),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "late" })),
+            entry("estop", Stage::Ok),
+            reply(3, Outcome::Ran)
+                .answering(1)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("arm.slow", Stage::Ok),
+            reply(1, Outcome::Ran).answering(0),
+            entry("estop_clear", Stage::Error("estop_overtaken")),
+            reply(2, Outcome::Refused("estop_overtaken"))
+                .receipted()
+                .carrying("/estopped", json!(true)),
+            entry("arm.step", Stage::Denied),
+            reply(4, Outcome::Refused("estopped")),
+            latch_holds("late\n"),
         ],
     }
 }

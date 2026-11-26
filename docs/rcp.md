@@ -207,7 +207,8 @@ other argument is refused as `invalid_args`, receipted
 
 1. refuses with `estop_overtaken`, receipted `error:estop_overtaken` with
    nothing changed, when an `estop` was called after the clear was
-   requested; otherwise appends an `intent` receipt and syncs it to disk;
+   requested (the refusal carries `estopped`, the state of the latch);
+   otherwise appends an `intent` receipt and syncs it to disk;
 2. deletes `<receipts>.estop` and opens the latch (a file that cannot be
    deleted leaves the latch closed and returns `clear_failed`, receipted
    `error:clear_failed`);
@@ -217,8 +218,9 @@ other argument is refused as `invalid_args`, receipted
    graph's answer; when it was open, publishes nothing;
 4. appends `ok`; `error:graph_unacknowledged` when no answer came; or
    `error:estop_overtaken` when an `estop` closed the latch after step 2 and
-   before the frame was published, which returns the `estop_overtaken` error and leaves the
-   `estop` frame as the graph's last.
+   before the frame was published, which returns the `estop_overtaken` error
+   (carrying `estopped`, the state of the latch) and leaves the `estop` frame
+   as the graph's last.
 
 It returns `estopped` (the latch after the clear), `was_estopped`,
 `graph_acknowledged`, `receipt` (its `intent` receipt) and, when it
