@@ -117,7 +117,7 @@ pub fn resim_segment_dir() -> Option<&'static Path> {
     SEGMENT_NAME_DIR.map(Path::new)
 }
 
-/// The directory a resim takes its slot lock in: [`SEGMENT_NAME_DIR`], or
+/// The directory a resim takes its slot lock in: [`resim_segment_dir`], or
 /// `base`'s iceoryx2 root where there is none.
 ///
 /// The lock sits where a slot's segment names collide, so its exclusion covers
