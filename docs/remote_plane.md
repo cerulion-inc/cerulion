@@ -303,8 +303,16 @@ a dial that also carries a direct address (`--addr`) is classified by the copy
 that arrives first, so it gets the reserve only when the relay copy is first.
 A desk whose key this robot has not yet recorded as paired, such as an account
 desk on its first relay dial, also shares its relay URL's eight unpaired
-slots, which one unpaired key can hold on its own. Established sessions are
-not globally capped.
+slots, which one unpaired key can hold on its own. After the TLS handshake
+completes, unpaired ops bootstrap sessions, refused connections, and skeleton
+control-frame connections share a 64-connection concurrency cap; connections
+above that cap are closed immediately. Unpaired ops bootstrap sessions must
+also deliver their opening frame within 5 s before entering the blocking pool.
+Paired sessions on their live plane (`cerulion/ops/1`, `cerulion/wire/2`,
+`cerulion/rcp/1`) are exempt from that 64-connection cap so unpaired peers
+cannot fill the daemon's blocking pool ahead of a paired `engage-estop`;
+established paired sessions are not globally capped and still share the
+daemon's 512-thread blocking pool with one another.
 
 ## A dropped connection does not drop the lease
 

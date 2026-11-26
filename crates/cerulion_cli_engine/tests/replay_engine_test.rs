@@ -17782,6 +17782,817 @@ fn strict_state_judges_the_executed_nodes_and_only_those() {
     assert!(err.to_string().contains(CP2_COUNTER), "{err}");
 }
 
+// --- Late-starting recorded frames at mid-run resume ----------------------
+
+const LATE_CHAIN_TOPIC: &str = "/lt/counter/out";
+
+fn late_chain_yaml() -> &'static str {
+    "name: lt\nprefix: lt\nnodes:\n\
+     \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay\n    inputs:\n      - name: inp\n        source: counter/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn late_chain_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "counter",
+            Box::new(CounterEntry::new()) as Box<dyn NodeEntry>,
+        ),
+        (
+            "relay",
+            Box::new(RelayNodeEntry::with_state(ext_relay_state())) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+/// Build a mid-run bag of `counter -> relay` (recorded with read log) resuming
+/// at step 1 (step-0 anchor), with recorded frames trimmed to start at
+/// `attach_step` (so frames before `attach_step` are absent while `relay`'s
+/// recorded reads at step 1..`attach_step - 1` prove earlier frames existed).
+fn write_late_frames_resume_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    attach_step: u64,
+    recorder_json: Option<Vec<u8>>,
+) -> std::path::PathBuf {
+    let rec = record_uniform_with_read_log_at(
+        late_chain_yaml(),
+        late_chain_factories,
+        &[],
+        CP_STEPS,
+        &[0],
+    );
+    let attach_ns = rec
+        .trace
+        .iter()
+        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == attach_step)
+        .expect("the reference run recorded a boundary for the attach step")
+        .fire_time_ns;
+    let mid = make_mid_run_with_tap_attach(&rec, 1, attach_ns);
+    let kept_seqs: Vec<u32> = mid.messages[LATE_CHAIN_TOPIC]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        kept_seqs,
+        (attach_step as u32..CP_STEPS as u32).collect::<Vec<_>>(),
+        "hand oracle: frames begin at sequence {attach_step}"
+    );
+    let mut records = state_records(CHECKPOINT_RUN, 0, 0, &anchor_blob(CHECKPOINT_SHAPE, 1));
+    records.extend(state_records(CHECKPOINT_RUN, 0, 1, &relay_anchor_blob()));
+    let mut manifest_keys = serde_json::Map::new();
+    manifest_keys.insert("read_log_capacity".to_string(), serde_json::json!(0));
+    manifest_keys.insert("read_log_capacities".to_string(), rec.stage_rows.clone());
+    manifest_keys.insert("publishers".to_string(), ri_publishers(&rec));
+    let bag = dir.path().join(name);
+    write_checkpoint_bag_with_manifest_keys(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[("counter", 0), ("relay", 1)])),
+        None,
+        None,
+        recorder_json,
+        manifest_keys,
+    );
+    bag
+}
+
+#[test]
+#[serial]
+fn a_lockstep_mid_run_bag_whose_frames_begin_after_resume_is_refused_before_step_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_late_frames_resume_bag(&dir, "lockstep_late_frames.mcap", 3, None);
+    let report = dir.path().join("no_report.json");
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Verify,
+        replay_engine::ReplayPurpose::Resim,
+    ] {
+        let (res, _) = ri_replay_reporting(
+            &bag,
+            late_chain_factories,
+            purpose,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let err = res.expect_err("late-starting frames must be refused before step 1");
+        assert_eq!(err.exit_code(), 2, "{purpose:?}: {err}");
+        assert!(
+            matches!(err, ReplayError::StateRestore { .. }),
+            "{purpose:?}: expected StateRestore, got {err:?}"
+        );
+        let text = err.to_string();
+        for needle in [
+            LATE_CHAIN_TOPIC,
+            "resume step 1",
+            "sequence 1",
+            "step 1",
+            "sequence 3",
+            "CERULION_FLASHBACK_WINDOW_MS",
+            "cerulion graph run --record",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{purpose:?}: missing '{needle}' in: {text}"
+            );
+        }
+        assert!(
+            !report.exists(),
+            "{purpose:?}: refusal before step 1 must write no report"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_free_run_mid_run_bag_whose_frames_begin_after_resume_is_refused_without_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_late_frames_resume_bag(
+        &dir,
+        "free_run_late_frames.mcap",
+        3,
+        Some(ri_free_run_recorder_json()),
+    );
+    let report = dir.path().join("no_report.json");
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Resim,
+        replay_engine::ReplayPurpose::Verify,
+    ] {
+        let (res, _) = ri_replay_reporting(
+            &bag,
+            late_chain_factories,
+            purpose,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let err = res.expect_err("late-starting free-run capture must refuse before step 1");
+        assert_eq!(err.exit_code(), 2, "{purpose:?}: {err}");
+        assert!(
+            matches!(err, ReplayError::StateRestore { .. }),
+            "{purpose:?}: expected StateRestore, got {err:?}"
+        );
+        let text = err.to_string();
+        for needle in [
+            LATE_CHAIN_TOPIC,
+            "resume step 1",
+            "sequence 1",
+            "sequence 3",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{purpose:?}: missing '{needle}' in: {text}"
+            );
+        }
+        assert!(
+            !report.exists(),
+            "{purpose:?}: refusal before step 1 must write no report"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_slow_period_producer_whose_first_resumed_frame_lands_after_anchor_still_replays() {
+    // Two-node graph (`counter` at 5 ms, `slow` at 30 ms). Resume at step 3
+    // (target 20 ms, anchor step 2 at 15 ms). `slow` does not fire at step 3
+    // and first commits at step 5 (target 30 ms). Tap attaches between step 2
+    // and step 3 (16 ms): `slow` has no pre-anchor frame and its first held
+    // frame is at target(5) = 30 ms, so rung (ii) is exact and must replay.
+    let rec = cp2_reference();
+    let target_at = |step: u64| -> u64 {
+        rec.trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+            .unwrap_or_else(|| panic!("boundary for step {step}"))
+            .fire_time_ns
+    };
+    let first_step = 3u64;
+    let attach_ns = target_at(first_step - 1) + 1_000_000;
+    assert!(
+        target_at(first_step - 1) < attach_ns && attach_ns < target_at(first_step),
+        "tap attach sits strictly between anchor step and resumed step"
+    );
+    let mid = make_mid_run_with_tap_attach(&rec, first_step, attach_ns);
+    assert_eq!(
+        mid.messages[CP2_SLOW_TOPIC].len(),
+        1,
+        "hand oracle: slow emits one frame, at step 5 (30 ms)"
+    );
+    let slow_hdr = WireHeader::read_from_buf(&mid.messages[CP2_SLOW_TOPIC][0]).expect("header");
+    assert_eq!(slow_hdr.timestamp_ns, target_at(5));
+    assert!(slow_hdr.timestamp_ns > target_at(first_step));
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("cp2_slow_rung_ii.mcap");
+    let mut records = state_records(
+        CHECKPOINT_RUN,
+        first_step - 1,
+        0,
+        &anchor_blob(CHECKPOINT_SHAPE, first_step),
+    );
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        first_step - 1,
+        1,
+        &anchor_blob(CHECKPOINT_SHAPE, 0),
+    ));
+    write_checkpoint_bag(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[(CP2_COUNTER, 0), (CP2_SLOW, 1)])),
+        None,
+    );
+
+    let outcome = replay(&bag, cp2_factories, None, None)
+        .expect("a slow producer's genuine first post-anchor frame must replay");
+    assert!(
+        outcome.passed,
+        "{:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    let resume = outcome.resume.expect("mid-run resume report");
+    let seed = resume
+        .sequence_seeds
+        .get(CP2_SLOW_TOPIC)
+        .expect("slow topic is seeded");
+    assert_eq!(seed.rung, "first-frame-after-anchor");
+    assert_eq!(seed.seed, slow_hdr.sequence);
+}
+
+#[test]
+#[serial]
+fn a_discarded_first_fire_does_not_falsely_refuse_a_later_first_frame() {
+    // Source fires at steps 0..4, with step 1 (fire 2) live-discarded so no
+    // frame is committed at step 1; its first committing fire after the step-0
+    // anchor is at step 2 (sequence 1). With tap attach at step 2's target,
+    // step 0's frame is absent and the first held frame matches step 2's
+    // target, so the resume is admitted rather than falsely refused.
+    const STEPS: usize = 5;
+    const DISCARD_FIRE: u64 = 2; // step 1 (0-based)
+    let rec = record_uniform(
+        discard_source_yaml(),
+        || discard_record_factories(DISCARD_FIRE),
+        &[],
+        STEPS,
+    );
+    let target_at = |step: u64| -> u64 {
+        rec.trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+            .unwrap_or_else(|| panic!("boundary for step {step}"))
+            .fire_time_ns
+    };
+    let step1_fire = rec
+        .trace
+        .iter()
+        .find(|r| r.record_type == RECORD_TYPE_FIRE && r.step == 1)
+        .expect("step 1 fire recorded");
+    assert!(step1_fire.is_discarded(), "step 1 fire carries discard bit");
+
+    let mid = make_mid_run_with_tap_attach(&rec, 1, target_at(2));
+    let out_topic = "/dg/source/out";
+    let kept_seqs: Vec<u32> = mid.messages[out_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        kept_seqs,
+        vec![1, 2, 3],
+        "hand oracle: step 2 commits sequence 1, step 3 sequence 2, step 4 sequence 3"
+    );
+
+    let mut anchor_sink = cerulion_core::state::VecSink::new();
+    cerulion_core::state_restore::capture_anchor_blob(
+        &DiscardAtSourceNode {
+            counter: 1.0,
+            err_at: Some(DISCARD_FIRE),
+            ..Default::default()
+        },
+        &mut anchor_sink,
+    )
+    .expect("discard source anchor serializes");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("discarded_first_fire_resume.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &bag,
+        &state_records(CHECKPOINT_RUN, 0, 0, &anchor_sink.into_inner()),
+        Some(&coverage_for_nodes(&[("source", 0)])),
+        None,
+    );
+
+    let outcome = replay(&bag, discard_replay_factories, None, None)
+        .expect("discarded first fire must not trigger late-frame refusal");
+    assert!(
+        outcome.passed,
+        "{:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    let resume = outcome.resume.expect("mid-run resume report");
+    let seed = resume
+        .sequence_seeds
+        .get(out_topic)
+        .expect("source topic is seeded");
+    assert_eq!(seed.rung, "first-frame-after-anchor");
+    assert_eq!(seed.seed, 1);
+}
+
+#[test]
+#[serial]
+fn late_start_resume_refusal_is_deterministic_across_two_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_late_frames_resume_bag(&dir, "lockstep_late_det.mcap", 3, None);
+    let a = replay(&bag, late_chain_factories, None, None).expect_err("first run refuses");
+    let b = replay(&bag, late_chain_factories, None, None).expect_err("second run refuses");
+    assert_eq!(a.exit_code(), 2);
+    assert_eq!(b.exit_code(), 2);
+    assert_eq!(a.to_string(), b.to_string());
+}
+
+#[test]
+#[serial]
+fn a_free_run_verify_reading_pre_anchor_seq_before_first_held_frame_names_late_start() {
+    // Free-run --verify mid-run capture resuming at step 1 (step-0 anchor).
+    // Step 0 has no external input; before step 1 (target 10 ms), external
+    // frame seq 0 arrives at 5 ms so `relay` reads seq 0 at step 1 and emits
+    // its output at 10 ms. With tap attach at step 1's target (10 ms),
+    // `/xr/relay/out` holds its frame at 10 ms (`at_anchor = [0]`), so resume
+    // passes, while `/xr/ext/cam` begins at sequence 1 (seq 0 absent).
+    // `plan_feeds` then refuses with `read_identity_frame_missing` naming the
+    // late start rather than blaming recorder loss.
+    let ext_topic = "/xr/ext/cam";
+    let externals = vec![ExternalDrive {
+        topic: ext_topic.to_string(),
+        per_step: vec![
+            vec![],
+            vec![10.0],
+            vec![20.0],
+            vec![30.0],
+            vec![40.0],
+            vec![50.0],
+        ],
+    }];
+    let rec =
+        record_uniform_with_read_log_at(ext_graph_yaml(), ext_relay_factories, &externals, 6, &[0]);
+    let target_1 = rec
+        .trace
+        .iter()
+        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == 1)
+        .expect("step 1 boundary")
+        .fire_time_ns;
+    let mid = make_mid_run_with_tap_attach(&rec, 1, target_1);
+    let kept_ext: Vec<u32> = mid.messages[ext_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        kept_ext,
+        vec![1, 2, 3, 4],
+        "hand oracle: external frames begin at sequence 1 (seq 0 absent)"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("free_run_pre_anchor_read.mcap");
+    let mut manifest_keys = serde_json::Map::new();
+    manifest_keys.insert("read_log_capacity".to_string(), serde_json::json!(0));
+    manifest_keys.insert("read_log_capacities".to_string(), rec.stage_rows.clone());
+    manifest_keys.insert("publishers".to_string(), ri_publishers(&rec));
+    write_checkpoint_bag_with_manifest_keys(
+        &mid,
+        &bag,
+        &state_records(CHECKPOINT_RUN, 0, CHECKPOINT_NODE_IDX, &relay_anchor_blob()),
+        Some(&coverage_naming(
+            "relay",
+            cerulion_bagd::STATE_COVERAGE_VERSION,
+            1,
+            Some(CHECKPOINT_NODE_IDX),
+        )),
+        None,
+        None,
+        Some(ri_free_run_recorder_json()),
+        manifest_keys,
+    );
+
+    let (res, _) = ri_replay(
+        &bag,
+        ext_relay_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = res.expect_err("reading missing pre-anchor seq 0 must refuse under --verify");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    match &err {
+        ReplayError::ReadLogNotEnforceable {
+            edge,
+            cause,
+            detail,
+        } => {
+            assert_eq!(edge.as_deref(), Some("relay.inp"), "{err:?}");
+            assert_eq!(cause, "read_identity_frame_missing", "{err:?}");
+            assert!(
+                detail.contains("begin at sequence 1, after sequence 0"),
+                "expected late-start wording in: {detail}"
+            );
+            assert!(
+                !detail.contains("(the recorder lost it)"),
+                "must not blame recorder loss when frames begin later: {detail}"
+            );
+        }
+        other => panic!("expected ReadLogNotEnforceable, got {other:?}"),
+    }
+}
+
+/// A single-output periodic node that skips writing its lazy output on chosen
+/// ticks (never loaning the output, so `FIRE` carries no discard bit and no
+/// wire sequence is consumed).
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct SparseOutNode {
+    #[output]
+    out: Vector3,
+    ticks: u64,
+    /// Skip writing while `ticks <= skip_through` (1-based tick count).
+    skip_through: u64,
+    /// Also skip writing on this exact 1-based tick, if `Some`.
+    skip_tick: Option<u64>,
+}
+
+#[cerulion_node_impl]
+impl SparseOutNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        if self.ticks <= self.skip_through || Some(self.ticks) == self.skip_tick {
+            return Ok(());
+        }
+        self.out.x = self.ticks as f64;
+        Ok(())
+    }
+}
+
+fn sparse_out_yaml() -> &'static str {
+    "name: sp\nprefix: sp\nnodes:\n\
+     \x20 - id: sparse\n    type: sparse_out_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+#[test]
+#[serial]
+fn a_sparse_publisher_leaving_first_resumed_tick_unwritten_replays() {
+    // Two valid sparse-publishing shapes, both resuming at step 1 (step-0
+    // anchor) with no pre-anchor frame held:
+    //   (A) Node waits until its 3rd tick (step 2) to publish its first frame
+    //       (sequence 0, timestamp target(2)).
+    //   (B) Node publishes seq 0 at step 0 (before tap attach), leaves step 1
+    //       unwritten (discard bit clear), and publishes seq 1 at step 2.
+    // Both recordings are complete from step 1 on; `first-frame-after-anchor`
+    // seeds the exact sequence and replay must pass with exit 0.
+    const STEPS: usize = 5;
+    let out_topic = "/sp/sparse/out";
+    for (label, skip_through, skip_tick, want_seqs, want_seed) in [
+        ("first-write-at-step-2", 2u64, None, vec![0u32, 1, 2], 0u32),
+        (
+            "skip-resumed-tick-1",
+            0u64,
+            Some(2u64),
+            vec![1u32, 2, 3],
+            1u32,
+        ),
+    ] {
+        let make_factories = move || {
+            factories(vec![(
+                "sparse",
+                Box::new(SparseOutNodeEntry::with_state(SparseOutNode {
+                    ticks: 0,
+                    skip_through,
+                    skip_tick,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            )])
+        };
+        let rec = record_uniform(sparse_out_yaml(), make_factories, &[], STEPS);
+        let target_at = |step: u64| -> u64 {
+            rec.trace
+                .iter()
+                .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+                .unwrap_or_else(|| panic!("{label}: boundary for step {step}"))
+                .fire_time_ns
+        };
+        let step1_fire = rec
+            .trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_FIRE && r.step == 1)
+            .expect("step 1 fire recorded");
+        assert!(
+            !step1_fire.is_discarded(),
+            "{label}: an untouched lazy output leaves the discard bit clear"
+        );
+
+        let attach_ns = target_at(0) + 1_000_000;
+        assert!(attach_ns < target_at(1));
+        let mid = make_mid_run_with_tap_attach(&rec, 1, attach_ns);
+        let kept_seqs: Vec<u32> = mid.messages[out_topic]
+            .iter()
+            .map(|f| frame_seq(f))
+            .collect();
+        assert_eq!(kept_seqs, want_seqs, "{label}: hand oracle");
+
+        let mut anchor_sink = cerulion_core::state::VecSink::new();
+        cerulion_core::state_restore::capture_anchor_blob(
+            &SparseOutNode {
+                ticks: 1,
+                skip_through,
+                skip_tick,
+                ..Default::default()
+            },
+            &mut anchor_sink,
+        )
+        .expect("sparse anchor serializes");
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("sparse_{label}.mcap"));
+        write_checkpoint_bag(
+            &mid,
+            &bag,
+            &state_records(CHECKPOINT_RUN, 0, 0, &anchor_sink.into_inner()),
+            Some(&coverage_for_nodes(&[("sparse", 0)])),
+            None,
+        );
+
+        let outcome = replay(&bag, make_factories, None, None)
+            .unwrap_or_else(|e| panic!("{label}: valid sparse recording must replay: {e}"));
+        assert!(
+            outcome.passed,
+            "{label}: {:?} / {:?}",
+            outcome.violations, outcome.trace_divergence
+        );
+        let resume = outcome.resume.expect("mid-run resume report");
+        let seed = resume
+            .sequence_seeds
+            .get(out_topic)
+            .expect("sparse topic is seeded");
+        assert_eq!(seed.rung, "first-frame-after-anchor", "{label}");
+        assert_eq!(seed.seed, want_seed, "{label}");
+    }
+}
+
+#[test]
+#[serial]
+fn a_sparse_publisher_with_consumer_leaving_first_resumed_tick_unwritten_replays() {
+    // Same sparse publisher wired to a data-triggered consumer with read log:
+    // step 0 publishes seq 0 (consumed at step 0), step 1 fires without writing
+    // (discard bit clear, consumer does not fire), steps 2..4 publish seq 1..3
+    // (consumed at steps 2..4). With tap attach between step 0 and step 1, no
+    // pre-anchor frame is held, every resumed read names sequence >= 1, and
+    // replay passes cleanly.
+    const STEPS: usize = 5;
+    let yaml = "name: spc\nprefix: spc\nnodes:\n\
+                \x20 - id: sparse\n    type: sparse_out_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+                \x20 - id: relay\n    type: relay\n    inputs:\n      - name: inp\n        source: sparse/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let sparse_topic = "/spc/sparse/out";
+    let make_factories = || {
+        factories(vec![
+            (
+                "sparse",
+                Box::new(SparseOutNodeEntry::with_state(SparseOutNode {
+                    ticks: 0,
+                    skip_through: 0,
+                    skip_tick: Some(2),
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(ext_relay_state())) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+    let rec = record_uniform_with_read_log_at(yaml, make_factories, &[], STEPS, &[0]);
+    let target_at = |step: u64| -> u64 {
+        rec.trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+            .unwrap_or_else(|| panic!("boundary for step {step}"))
+            .fire_time_ns
+    };
+    let attach_ns = target_at(0) + 1_000_000;
+    let mid = make_mid_run_with_tap_attach(&rec, 1, attach_ns);
+    let kept_seqs: Vec<u32> = mid.messages[sparse_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(kept_seqs, vec![1, 2, 3], "hand oracle: seq 1..=3 held");
+
+    let mut sparse_sink = cerulion_core::state::VecSink::new();
+    cerulion_core::state_restore::capture_anchor_blob(
+        &SparseOutNode {
+            ticks: 1,
+            skip_through: 0,
+            skip_tick: Some(2),
+            ..Default::default()
+        },
+        &mut sparse_sink,
+    )
+    .expect("sparse anchor serializes");
+    let mut records = state_records(CHECKPOINT_RUN, 0, 0, &sparse_sink.into_inner());
+    records.extend(state_records(CHECKPOINT_RUN, 0, 1, &relay_anchor_blob()));
+    let mut manifest_keys = serde_json::Map::new();
+    manifest_keys.insert("read_log_capacity".to_string(), serde_json::json!(0));
+    manifest_keys.insert("read_log_capacities".to_string(), rec.stage_rows.clone());
+    manifest_keys.insert("publishers".to_string(), ri_publishers(&rec));
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sparse_with_consumer.mcap");
+    write_checkpoint_bag_with_manifest_keys(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[("sparse", 0), ("relay", 1)])),
+        None,
+        None,
+        None,
+        manifest_keys,
+    );
+
+    let outcome = replay(&bag, make_factories, None, None)
+        .expect("sparse publisher with consumer must replay cleanly");
+    assert!(
+        outcome.passed,
+        "{:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    let resume = outcome.resume.expect("mid-run resume report");
+    let seed = resume
+        .sequence_seeds
+        .get(sparse_topic)
+        .expect("sparse topic is seeded");
+    assert_eq!(seed.rung, "first-frame-after-anchor");
+    assert_eq!(seed.seed, 1);
+}
+
+#[test]
+#[serial]
+fn a_mid_run_capture_with_late_unread_driver_output_replays() {
+    // One-rank free-run graph with an external driver (`cam`) whose output
+    // `/drvu/cam/image` is unread by any graph node, plus an ordinary periodic
+    // node (`counter`) whose output `/drvu/counter/out` is covered from step 1.
+    // The camera fired at step 1, while its frames in the bag begin at step 3
+    // (sequences 3..). Because driver-only topics are recorded inputs and no
+    // consumer reads `/drvu/cam/image`, replay must pass cleanly.
+    const STEPS: usize = 6;
+    let yaml = "name: drvu\nprefix: drvu\nnodes:\n\
+                \x20 - id: cam\n    type: drv_camera_node\n    outputs:\n      - name: image\n        schema: geometry_msgs/Vector3\n\
+                \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let cam_topic = "/drvu/cam/image";
+    let counter_topic = "/drvu/counter/out";
+    let live_factories = || {
+        factories(vec![
+            (
+                "cam",
+                Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode {
+                    connected: true,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+            (
+                "counter",
+                Box::new(CounterEntry::new()) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+    let replay_factories = || {
+        factories(vec![
+            (
+                "cam",
+                Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode {
+                    connected: false,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+            (
+                "counter",
+                Box::new(CounterEntry::new()) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+    let rec = record_reference_impl_fed(
+        yaml,
+        live_factories,
+        &[],
+        &[DELTA_MS; STEPS],
+        16,
+        true,
+        None,
+        &["cam"],
+        &[0],
+        None,
+    );
+    let target_at = |step: u64| -> u64 {
+        rec.trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+            .unwrap_or_else(|| panic!("boundary for step {step}"))
+            .fire_time_ns
+    };
+    // Trim trace to resume at step 1; keep counter frames from step 1 onward
+    // (covered), while trimming the unread driver topic's frames to start at
+    // step 3 (late).
+    let mut mid = make_mid_run_with_tap_attach(&rec, 1, target_at(1));
+    let target_3 = target_at(3);
+    mid.messages
+        .get_mut(cam_topic)
+        .expect("cam frames")
+        .retain(|f| WireHeader::read_from_buf(f).is_some_and(|h| h.timestamp_ns >= target_3));
+    let cam_seqs: Vec<u32> = mid.messages[cam_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        cam_seqs,
+        vec![3, 4, 5],
+        "hand oracle: unread driver frames begin at step 3 (seq 3)"
+    );
+    let counter_seqs: Vec<u32> = mid.messages[counter_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        counter_seqs,
+        vec![1, 2, 3, 4, 5],
+        "hand oracle: counter frames cover step 1 onward"
+    );
+
+    let mut cam_sink = cerulion_core::state::VecSink::new();
+    cerulion_core::state_restore::capture_anchor_blob(
+        &DrvCameraNode {
+            connected: false,
+            frames: 1.0,
+            ..Default::default()
+        },
+        &mut cam_sink,
+    )
+    .expect("cam anchor serializes");
+    let mut records = state_records(CHECKPOINT_RUN, 0, 0, &cam_sink.into_inner());
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        0,
+        1,
+        &anchor_blob(CHECKPOINT_SHAPE, 1),
+    ));
+
+    let stamped = stamped_recorder_json(
+        replay_engine::CoordinationMode::FreeRun,
+        &[("cam", true), ("counter", false)],
+    );
+    let unstamped = ri_free_run_recorder_json();
+
+    let dir = tempfile::tempdir().unwrap();
+    for (stamp_label, recorder_json) in [("stamped", stamped), ("unstamped", unstamped)] {
+        let bag = dir.path().join(format!("unread_driver_{stamp_label}.mcap"));
+        let mut manifest_keys = serde_json::Map::new();
+        manifest_keys.insert("publishers".to_string(), ri_publishers(&rec));
+        write_checkpoint_bag_with_manifest_keys(
+            &mid,
+            &bag,
+            &records,
+            Some(&coverage_for_nodes(&[("cam", 0), ("counter", 1)])),
+            None,
+            None,
+            Some(recorder_json),
+            manifest_keys,
+        );
+        for purpose in [
+            replay_engine::ReplayPurpose::Verify,
+            replay_engine::ReplayPurpose::Resim,
+        ] {
+            let (res, _) = ri_replay(&bag, replay_factories, purpose);
+            let outcome = res.unwrap_or_else(|e| {
+                panic!("{stamp_label}/{purpose:?}: unread driver with late frames must replay: {e}")
+            });
+            assert!(
+                outcome.passed,
+                "{stamp_label}/{purpose:?}: {:?} / {:?}",
+                outcome.violations, outcome.trace_divergence
+            );
+            let resume = outcome.resume.expect("mid-run resume report");
+            assert!(
+                !resume.sequence_seeds.contains_key(cam_topic),
+                "{stamp_label}/{purpose:?}: driver-only topic must not be seeded"
+            );
+            assert_eq!(
+                resume
+                    .sequence_seeds
+                    .get(counter_topic)
+                    .expect("counter topic seeded")
+                    .seed,
+                1,
+                "{stamp_label}/{purpose:?}"
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // The FRAMEWORK SECTION of the anchor blob, end to end
 // ===========================================================================
@@ -20287,6 +21098,18 @@ const DECLARED_LITERAL_SHAPE_SITES: &[(&str, &str)] = &[
     (
         "write_checkpoint_bag_with_params",
         "`GainCounterEntry`, which delegates its shape to `CounterEntry`",
+    ),
+    (
+        "write_late_frames_resume_bag",
+        "the `lt` counter (beside `relay`'s real macro anchor)",
+    ),
+    (
+        "a_mid_run_capture_with_late_unread_driver_output_replays",
+        "the `drvu` counter (beside `cam`'s real macro anchor)",
+    ),
+    (
+        "a_slow_period_producer_whose_first_resumed_frame_lands_after_anchor_still_replays",
+        "`cp2`'s two Period counters (`counter` and `slow`)",
     ),
     // --- not a stamp at all ----------------------------------------------
     (
