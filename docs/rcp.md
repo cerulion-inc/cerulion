@@ -154,7 +154,8 @@ order:
    characters from `[A-Za-z0-9_.-]`) is receipted under the verb
    `<invalid-tool-name>`.
 2. The arguments are checked against `input_schema` (`invalid_args`,
-   receipted `error:invalid_args`).
+   receipted `error:invalid_args`); the error message names the argument
+   that failed.
 3. A call whose frame would exceed 63 KiB is refused (`args_too_large`).
 4. While the e-stop is engaged a `reversible` or `irreversible` tool is
    refused (`estopped`) and receipted `denied`. `read` tools skip this step.
@@ -171,6 +172,7 @@ order:
 
 A successful call returns one text block,
 `{"call_id": N, "receipt": {"seq", "hash", "prev"}, "result": <the graph's answer>, "safety_class": "..."}`.
+`N` is an integer below 2^53, so a JSON number holds it exactly.
 A refused call returns `isError: true` with
 `{"error": {"code", "message"}, "receipt": ...}`. Calls other than `estop`
 are handled one at a time, in the order they arrive.
