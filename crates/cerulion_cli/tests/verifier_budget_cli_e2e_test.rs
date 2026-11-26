@@ -14,7 +14,8 @@
 //!    creating a `--record-out` file.
 //! 3. With `--verifier-record-budget 200000 --duration 1.0`, the read-log
 //!    census covers only steps inside the 1.0 s window (16000 reads), so the
-//!    verify passes over those 1000 ticks instead of being refused.
+//!    resim is admitted and re-executes those 1000 ticks instead of being
+//!    refused.
 //! 4. Usage errors (`--verifier-record-budget 0` and `--verifier-record-budget`
 //!    without `--resim`) exit 2 naming the flag, and `bag play --help` lists
 //!    `--verifier-record-budget <COUNT>`.
@@ -317,9 +318,9 @@ fn long_recording_past_old_cap_verifies_and_over_configured_budget_refuses_namin
         "recording with {EXPECTED_READS} reads must verify under default budget;\nstdout:\n{pass_out}\nstderr:\n{pass_err}"
     );
     assert!(
-        pass_out.contains("replay PASS:")
-            && pass_out.contains(&format!("{STEPS} tick(s) replayed")),
-        "stdout must report replay PASS over all {STEPS} ticks:\n{pass_out}"
+        pass_err.contains("replay PASS:")
+            && pass_err.contains(&format!("{STEPS} tick(s) replayed")),
+        "stderr must report replay PASS over all {STEPS} ticks:\n{pass_err}"
     );
 
     // 2. Lowering `--verifier-record-budget` to 200000 refuses
@@ -365,8 +366,11 @@ fn long_recording_past_old_cap_verifies_and_over_configured_budget_refuses_namin
     );
 
     // 3. Bounding with `--duration 1.0` scopes the read-log census to the
-    //    first 1000 steps (16000 reads, under 200000), so the same verify under
-    //    the same 200000 budget passes over exactly those 1000 ticks.
+    //    first 1000 steps (16000 reads, under 200000), so a resim under the
+    //    same 200000 budget is admitted and re-executes exactly those 1000
+    //    ticks. It is a neutral resim because `--duration` bounds the run, not
+    //    the comparison: a `--verify` would count the recorded frames past the
+    //    cut as missing.
     let bounded = run_cerulion(
         root,
         &[
@@ -375,7 +379,6 @@ fn long_recording_past_old_cap_verifies_and_over_configured_budget_refuses_namin
             bag_str,
             "--resim",
             "all",
-            "--verify",
             "--verifier-record-budget",
             "200000",
             "--duration",
@@ -390,8 +393,8 @@ fn long_recording_past_old_cap_verifies_and_over_configured_budget_refuses_namin
         "--duration 1.0 must fit 16000 reads inside budget 200000;\nstdout:\n{bounded_out}\nstderr:\n{bounded_err}"
     );
     assert!(
-        bounded_out.contains("replay PASS:") && bounded_out.contains("1000 tick(s) replayed"),
-        "stdout must report replay PASS over the 1000 ticks inside --duration:\n{bounded_out}"
+        bounded_err.contains("re-executed 1000 step(s)"),
+        "stderr must report the 1000 steps inside --duration:\n{bounded_err}"
     );
 
     // 4. Usage errors on the real binary: zero count and missing `--resim`
