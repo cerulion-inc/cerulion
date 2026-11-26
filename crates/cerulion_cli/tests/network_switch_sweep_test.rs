@@ -54,15 +54,21 @@ mod cases;
 use cases::{By, Case, Expect, Home, CASES};
 
 /// The refusal the gate prints on a machine that never signed in, without a
-/// terminal: its first line, hand-written from the text a user reads.
-const GATE_REFUSAL: &str =
-    "Error: This machine has never signed in to a Cerulion account, and every command needs one.";
+/// terminal: its first line, hand-written from the text a user reads, naming
+/// the resolved account service URL.
+fn gate_refusal(service_url: &str) -> String {
+    format!(
+        "Error: This command requires the Cerulion account service ({service_url}), and this machine has never signed in."
+    )
+}
 
 /// What one spawn did.
 struct Run {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+    /// The loopback URL handed to `CERULION_ACCOUNT_SERVICE` for this spawn.
+    service_url: String,
     /// One entry per connection the listener accepted: the request line, or
     /// `<no request line>`.
     contacts: Vec<String>,
@@ -452,6 +458,7 @@ fn spawn_with(
     for (name, value) in extra {
         cmd.env(name, value);
     }
+    let service_url = rec.url.clone();
     let (code, stdout, stderr) = run_bounded(cmd, argv, terminal, SPAWN_BOUND);
     let contacts = rec.drain();
     drop(rec);
@@ -462,6 +469,7 @@ fn spawn_with(
         code,
         stdout,
         stderr,
+        service_url,
         contacts,
     }
 }
@@ -489,7 +497,7 @@ fn assert_no_sign_in_beside(what: &str, run: &Run, own: &str) {
 /// The sign-in texts [`assert_no_sign_in`] refuses, lowercase.
 const SIGN_IN_MARKERS: [&str; 5] = [
     "never signed in",
-    "not signed in to a cerulion account",
+    "this machine is not signed in",
     "signing you in",
     "cerulion login",
     "verification",
@@ -621,8 +629,9 @@ fn without_the_switch_every_refused_verb_meets_the_login_gate() {
         let home = tempfile::tempdir().expect("a home");
         let run = spawn(home.path(), None, case.argv, false);
         assert_eq!(run.code, Some(7), "{what}: stderr={}", run.stderr);
+        let expected_refusal = gate_refusal(&run.service_url);
         assert!(
-            run.stderr.contains(GATE_REFUSAL),
+            run.stderr.contains(&expected_refusal),
             "{what}: the gate's refusal; stderr={}",
             run.stderr
         );
@@ -658,21 +667,22 @@ fn every_verb_the_switch_does_not_refuse_meets_the_login_gate_and_sends_nothing(
             run.stdout,
             run.stderr
         );
+        let expected_refusal = gate_refusal(&run.service_url);
         assert!(
-            run.stderr.contains(GATE_REFUSAL),
+            run.stderr.contains(&expected_refusal),
             "{what}: the gate's refusal; stderr={}",
             run.stderr
         );
         assert!(
             !run.stderr.contains("disables") && !run.stderr.contains("kill-switch"),
-            "{what}: a local verb is not refused by the switch; stderr={}",
+            "{what}: an account verb is not refused by the switch; stderr={}",
             run.stderr
         );
         assert_no_contact(&what, &run);
         assert!(run.stdout.is_empty(), "{what}: stdout={}", run.stdout);
         true
     });
-    assert!(gated >= 40, "the table lost its gated rows: {gated}");
+    assert!(gated >= 2, "the table lost its gated rows: {gated}");
 }
 
 #[test]
@@ -703,7 +713,7 @@ fn every_verb_without_the_gate_runs_under_the_switch_and_sends_nothing() {
         assert_no_contact(&what, &run);
         true
     });
-    assert!(ran >= 6, "the table lost its ungated rows: {ran}");
+    assert!(ran >= 30, "the table lost its ungated rows: {ran}");
 }
 
 #[test]

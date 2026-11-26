@@ -38,10 +38,12 @@
 //! The answer topic has no producer inside the graph, so
 //! `cerulion bag play --resim` re-injects the recorded answer frames at
 //! their recorded steps, whatever the re-executed graph asks; a gate whose
-//! ask changed reads the re-injected answer as `not_recorded`. A running
-//! daemon's eye reads the same topics, and tells a replay's asks and wrist
-//! frames by the node their publisher runs under ([`source`]): it drops such
-//! an ask with no request, no answer and no receipt, and never holds such a
+//! ask changed reads the re-injected answer as `not_recorded`. A resim runs
+//! on a private shared-memory namespace of its own, so its asks and wrist
+//! frames never reach a running daemon's eye. Node-name classification
+//! ([`source`]) stays as defense in depth for plain `cerulion bag play` and
+//! any replay-named publisher on the shared namespace: the eye drops such an
+//! ask with no request, no answer and no receipt, and never holds such a
 //! frame ([`host`]).
 //! [`replay`] serves a recorded answer by `ask_id` and the ask text
 //! (`ask_sha256`), and answers any other ask with `not_recorded`. [`verify`]

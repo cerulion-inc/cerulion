@@ -131,6 +131,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 #   reg_channel.rs      the runtime-egress REGISTRATION control plane:
 #                       record encode/decode + the 250ms republish pump. Runs at
 #                       route-OPEN time (once per dynamic topic).
+#   rmw_graph_registry.rs
+#                       the rmw cross-process topic graph control plane:
+#                       snapshot frame codec and gather fold. Runs on rmw
+#                       endpoint lifecycle and graph introspection queries,
+#                       never on publish or receive hot paths.
 #   run_artifacts.rs    the `runs` verb's RUN-DIRECTORY half —
 #                       reading a live run's `graph.yaml`/`run.json` off disk and
 #                       folding them into served entries, once per remote runs GET
@@ -157,7 +162,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 #                       in-memory test team issuer for networked tests.
 TRANSPORT_EXCLUDE="adaptive_sizer.rs bridge.rs cerulion_q.rs discovery.rs \
 gateway.rs mirror_registry.rs mod.rs network.rs \
-reg_channel.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs \
+reg_channel.rs rmw_graph_registry.rs run_artifacts.rs run_registry.rs service.rs shm_guard.rs \
 team_auth.rs test_ca.rs"
 
 # cerulion_core/src/graph — the level executor lives here (runtime.rs).

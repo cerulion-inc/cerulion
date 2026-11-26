@@ -382,7 +382,7 @@ fn hidden_pair_refuses_every_spelling_before_discovery_the_switch_and_the_gate()
         let fresh = fresh.to_str().unwrap();
         let control = run_with(
             root.path(),
-            &["graph", "list"],
+            &["account", "devices", "list"],
             &[quiet_iceoryx2, ("CERULION_HOME", fresh)],
         );
         assert_eq!(
