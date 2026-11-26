@@ -1308,3 +1308,93 @@ fn the_verb_closes_a_report_only_run_by_saying_nothing_was_removed() {
         super::NOTHING_WAS_REMOVED
     );
 }
+
+#[test]
+fn resim_slot_sweep_rendering_covers_clean_report_only_remove_and_errors() {
+    use cerulion_cli_engine::ipc_cleanup::ResimSweepReport;
+
+    // Empty/clean report renders nothing in either mode.
+    let clean = ResimSweepReport::default();
+    assert_eq!(
+        super::render_resim_slot_sweep(&clean, SweepMode::ReportOnly),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        super::render_resim_slot_sweep(&clean, SweepMode::Remove),
+        Vec::<String>::new()
+    );
+
+    // ReportOnly with dead nodes and leftover segments names counts and says none was removed.
+    let report_only = ResimSweepReport {
+        slots_checked: 2,
+        dead_nodes: 1,
+        leftover_segments: 3,
+        ..ResimSweepReport::default()
+    };
+    let ro_lines = super::render_resim_slot_sweep(&report_only, SweepMode::ReportOnly);
+    assert_eq!(
+        ro_lines,
+        vec![
+            "Resim namespace slots `cerulion clean` would sweep: 1 dead iceoryx2 node(s) and 3 \
+             leftover shared-memory segment(s) across 2 lockable slot(s) (report only; none was \
+             removed)"
+                .to_string(),
+        ]
+    );
+    assert_eq!(
+        super::render_resim_slot_sweep(&report_only, SweepMode::ReportOnly),
+        ro_lines
+    );
+
+    // Remove with cleaned nodes, removed segments, failures, and errors.
+    let removed = ResimSweepReport {
+        slots_checked: 2,
+        dead_nodes: 2,
+        cleaned_nodes: 1,
+        failed_node_cleanups: 1,
+        leftover_segments: 3,
+        segments_removed: 2,
+        segments_failed: 1,
+        errors: vec!["/tmp/cer_resim_00000000.lock: too many levels of symbolic links".to_string()],
+        ..ResimSweepReport::default()
+    };
+    let rm_lines = super::render_resim_slot_sweep(&removed, SweepMode::Remove);
+    assert_eq!(
+        rm_lines,
+        vec![
+            "Resim namespace slots: cleaned 1 dead iceoryx2 node(s) (1 failed); removed 2 \
+             leftover shared-memory segment(s) (1 failed)."
+                .to_string(),
+            "Resim namespace slot errors:".to_string(),
+            "  /tmp/cer_resim_00000000.lock: too many levels of symbolic links".to_string(),
+        ]
+    );
+    assert_eq!(
+        super::render_resim_slot_sweep(&removed, SweepMode::Remove),
+        rm_lines
+    );
+}
+
+#[test]
+fn the_clean_verb_sweeps_resim_slots_before_state_files_and_folds_convergence() {
+    let src = code_only(&read_main());
+    let body = fn_body(&src, "clean_iceoryx2_state");
+    let default_sweep = body
+        .find("clean_dead_nodes(")
+        .expect("default dead-node sweep must run");
+    let resim_sweep = body
+        .find("clean_resim_slots(")
+        .expect("resim slot sweep must run");
+    let diagnostic = body
+        .find("report_shm_state_population(")
+        .expect("shm_state diagnostic must run");
+    assert!(
+        default_sweep < resim_sweep && resim_sweep < diagnostic,
+        "order must be default sweep -> resim sweep -> shm_state diagnostic; body was:\n{body}"
+    );
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("let converged = default_converged && resim_converged;"),
+        "convergence must require both default and resim sweeps to converge; body was:\n{body}"
+    );
+}

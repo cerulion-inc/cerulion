@@ -128,6 +128,14 @@ pub(super) struct StaleReading {
     /// The `.shm_state` scan, on the platforms that keep those files; `None`
     /// elsewhere.
     pub(super) state_files: Option<StateFileScan>,
+    /// Dead nodes found across lockable resim namespace slots.
+    pub(super) resim_dead_nodes: u64,
+    /// Leftover shared-memory segments found across lockable resim slots.
+    pub(super) resim_leftover_segments: u64,
+    /// Errors encountered while inspecting lockable resim namespace slots.
+    pub(super) resim_errors: usize,
+    /// Why the resim slot scan did not finish in full, if incomplete.
+    pub(super) resim_incomplete: Option<String>,
 }
 
 /// What the report-only `.shm_state` scan found.
@@ -145,6 +153,15 @@ pub(super) struct StateFileScan {
 
 fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn join_clauses(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => only.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [head @ .., last] => format!("{}, and {last}", head.join(", ")),
+    }
 }
 
 /// The decision for `shm.stale-nodes`.
@@ -172,6 +189,26 @@ pub(super) fn decide_stale(r: &StaleReading) -> Outcome {
             scan.dir
         ));
     }
+    if r.resim_dead_nodes > 0 {
+        found.push(format!(
+            "{} in resim namespace slots",
+            plural(
+                r.resim_dead_nodes,
+                "dead iceoryx2 node",
+                "dead iceoryx2 nodes"
+            )
+        ));
+    }
+    if r.resim_leftover_segments > 0 {
+        found.push(format!(
+            "{} in resim namespace slots",
+            plural(
+                r.resim_leftover_segments,
+                "leftover shared-memory segment",
+                "leftover shared-memory segments"
+            )
+        ));
+    }
     let mut incomplete = Vec::new();
     if r.registry_errors > 0 {
         incomplete.push(format!(
@@ -182,6 +219,14 @@ pub(super) fn decide_stale(r: &StaleReading) -> Outcome {
     }
     if let Some(why) = r.state_files.as_ref().and_then(|s| s.incomplete.as_ref()) {
         incomplete.push(why.clone());
+    }
+    if let Some(why) = &r.resim_incomplete {
+        incomplete.push(why.clone());
+    } else if r.resim_errors > 0 {
+        incomplete.push(format!(
+            "resim namespace slots could not be read in full ({})",
+            plural(len(r.resim_errors), "error", "errors")
+        ));
     }
     let mut outcome = if !incomplete.is_empty() {
         let so_far = if found.is_empty() {
@@ -197,13 +242,19 @@ pub(super) fn decide_stale(r: &StaleReading) -> Outcome {
             format!("no dead iceoryx2 node in {}", r.node_dir),
         )
     } else {
-        Outcome::new(Status::Warn, format!("{} left", found.join(" and ")))
+        Outcome::new(Status::Warn, format!("{} left", join_clauses(&found)))
             .with_fix("run `cerulion clean`; it removes only what processes that are gone left")
     };
     outcome = outcome
         .reading("node_dir", Reading::Text(r.node_dir.clone()))
         .reading("dead_nodes", Reading::Int(len(r.dead_nodes)))
-        .reading("registry_errors", Reading::Int(len(r.registry_errors)));
+        .reading("registry_errors", Reading::Int(len(r.registry_errors)))
+        .reading("resim_dead_nodes", Reading::Int(r.resim_dead_nodes))
+        .reading(
+            "resim_leftover_segments",
+            Reading::Int(r.resim_leftover_segments),
+        )
+        .reading("resim_errors", Reading::Int(len(r.resim_errors)));
     if let Some(scan) = &r.state_files {
         outcome = outcome
             .reading("state_file_dir", Reading::Text(scan.dir.clone()))
@@ -284,6 +335,15 @@ fn run_size(_ctx: &Context) -> Outcome {
 
 fn run_stale(_ctx: &Context) -> Outcome {
     let report = crate::ipc_cleanup::sweep_dead_nodes(SweepMode::ReportOnly);
+    let resim = crate::ipc_cleanup::sweep_resim_slots_global(
+        SweepMode::ReportOnly,
+        Some(crate::shm_state::SHM_STATE_REPORT_BUDGET),
+    );
+    let resim_incomplete = if resim.truncated {
+        Some("the scan of resim namespace slots ran out of its time budget".to_string())
+    } else {
+        None
+    };
     #[cfg(unix)]
     let state_files = crate::shm_state::platform_uses_shm_state_files().then(|| {
         let budget = crate::shm_state::SHM_STATE_REPORT_BUDGET;
@@ -307,6 +367,10 @@ fn run_stale(_ctx: &Context) -> Outcome {
         dead_nodes: report.dead_nodes.len(),
         registry_errors: report.registry_errors.len(),
         state_files,
+        resim_dead_nodes: resim.dead_nodes,
+        resim_leftover_segments: resim.leftover_segments,
+        resim_errors: resim.errors.len(),
+        resim_incomplete,
     })
 }
 
@@ -395,6 +459,10 @@ mod tests {
                 dead,
                 incomplete: None,
             }),
+            resim_dead_nodes: 0,
+            resim_leftover_segments: 0,
+            resim_errors: 0,
+            resim_incomplete: None,
         }
     }
 
@@ -462,6 +530,72 @@ mod tests {
         assert_eq!(
             o.readings.get("state_scan_complete"),
             Some(&Reading::Bool(false))
+        );
+    }
+
+    #[test]
+    fn stale_passes_when_resim_slots_are_clean() {
+        let r = reading(0, 0, None);
+        let o = decide_stale(&r);
+        assert_eq!(o.status, Status::Pass);
+        assert_eq!(o.summary, "no dead iceoryx2 node in /tmp/iceoryx2/nodes");
+        assert_eq!(o.fix, None);
+        assert_eq!(o.readings.get("resim_dead_nodes"), Some(&Reading::Int(0)));
+        assert_eq!(
+            o.readings.get("resim_leftover_segments"),
+            Some(&Reading::Int(0))
+        );
+        assert_eq!(o.readings.get("resim_errors"), Some(&Reading::Int(0)));
+        assert_eq!(decide_stale(&r), o, "decision must be deterministic");
+    }
+
+    #[test]
+    fn stale_warns_on_resim_slot_residue() {
+        let mut r = reading(0, 0, None);
+        r.resim_dead_nodes = 1;
+        r.resim_leftover_segments = 2;
+        let o = decide_stale(&r);
+        assert_eq!(o.status, Status::Warn);
+        assert_eq!(
+            o.summary,
+            "1 dead iceoryx2 node in resim namespace slots and 2 leftover shared-memory segments \
+             in resim namespace slots left"
+        );
+        assert_eq!(
+            o.fix.as_deref(),
+            Some("run `cerulion clean`; it removes only what processes that are gone left")
+        );
+        assert_eq!(o.readings.get("resim_dead_nodes"), Some(&Reading::Int(1)));
+        assert_eq!(
+            o.readings.get("resim_leftover_segments"),
+            Some(&Reading::Int(2))
+        );
+        assert_eq!(o.readings.get("resim_errors"), Some(&Reading::Int(0)));
+        assert_eq!(decide_stale(&r), o, "decision must be deterministic");
+
+        // Error arm: resim slot inspection errors warn and point to --report-only.
+        let mut err_r = reading(0, 0, None);
+        err_r.resim_leftover_segments = 1;
+        err_r.resim_errors = 2;
+        let err_o = decide_stale(&err_r);
+        assert_eq!(err_o.status, Status::Warn);
+        assert_eq!(
+            err_o.summary,
+            "resim namespace slots could not be read in full (2 errors); found so far: 1 leftover \
+             shared-memory segment in resim namespace slots"
+        );
+        assert!(err_o.fix.unwrap().contains("--report-only"));
+        assert_eq!(err_o.readings.get("resim_errors"), Some(&Reading::Int(2)));
+
+        // Truncated arm: time budget exhaustion warns.
+        let mut trunc_r = reading(0, 0, None);
+        trunc_r.resim_incomplete =
+            Some("the scan of resim namespace slots ran out of its time budget".to_string());
+        let trunc_o = decide_stale(&trunc_r);
+        assert_eq!(trunc_o.status, Status::Warn);
+        assert_eq!(
+            trunc_o.summary,
+            "the scan of resim namespace slots ran out of its time budget"
         );
     }
 }

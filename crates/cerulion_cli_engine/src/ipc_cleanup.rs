@@ -1081,6 +1081,11 @@ fn contained_sweep(sweep: impl FnOnce() -> CleanupState) -> CleanupState {
 // was: a run that clears this sweep walks straight into that one. Two copies of
 // one policy is how they drift, so the budget, the decision
 // and the report have a single definition and both callers import it.
+pub use crate::resim_slots::{
+    resim_namespace_prefix, resim_namespace_slot, resim_segment_dir, resim_slot_lock_dir,
+    sweep_resim_slots, sweep_resim_slots_global, ResimSweepReport, RESIM_NAMESPACE_MARKER,
+    RESIM_NAMESPACE_SLOTS,
+};
 pub use cerulion_core::transport::dead_node_sweep::{
     run_budgeted_sweep, sweep_step, BoundedCleanup, SweepStep, STARTUP_DEAD_NODE_SWEEP_BUDGET,
 };
@@ -1165,6 +1170,7 @@ pub fn run_exit_hygiene() {
     exit_hygiene_pass(
         EXIT_HYGIENE_BUDGET,
         cleanup_dead_iceoryx2_nodes_bounded,
+        |remaining| sweep_resim_slots_global(SweepMode::Remove, Some(remaining)),
         |_remaining| {
             // `#[cfg(unix)]` AND the runtime predicate — they say different
             // things and neither substitutes for the other.
@@ -1222,10 +1228,12 @@ pub fn run_exit_hygiene() {
 /// observes instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HygieneStep {
-    /// The bounded dead-node sweep ran.
+    /// The bounded dead-node sweep ran on the default namespace.
     SweptDeadNodes,
-    /// The registry had converged, so the state-file pass was REACHED. (Whether
-    /// it then does anything is a platform question the caller owns.)
+    /// The bounded sweep across lockable resim namespace slots ran.
+    SweptResimSlots,
+    /// The registries had converged, so the state-file pass was REACHED.
+    /// (Whether it then does anything is a platform question the caller owns.)
     ReachedStateFileReclamation,
 }
 
@@ -1234,9 +1242,15 @@ pub enum HygieneStep {
 /// Extracted so the contract is testable: the production pass reads and deletes
 /// from the developer's real `/tmp` and cannot be executed in a unit test, but
 /// the decision it embodies can. Returns the steps it ran, in order.
-fn exit_hygiene_pass<S, R>(budget: Duration, sweep: S, reclaim: R) -> Vec<HygieneStep>
+fn exit_hygiene_pass<S, P, R>(
+    budget: Duration,
+    sweep: S,
+    sweep_resim: P,
+    reclaim: R,
+) -> Vec<HygieneStep>
 where
     S: FnOnce(Duration) -> BoundedCleanup,
+    P: FnOnce(Duration) -> ResimSweepReport,
     R: FnOnce(Duration),
 {
     let started = std::time::Instant::now();
@@ -1248,17 +1262,6 @@ where
     // the only order that cannot strand either.
     let swept = sweep(budget);
     steps.push(HygieneStep::SweptDeadNodes);
-    // The level mirrors the state-file half below, and the STARTUP path's own
-    // split: a removal that FAILED is a fault with an operator remedy
-    // (permissions, or version skew from an upgrade), while a removal that
-    // succeeded is housekeeping. Filing the first under the second is
-    // under-reporting a condition the startup sweep already warns about.
-    //
-    // `deferred` alone stays quiet either way: it is the ordinary outcome of a
-    // bounded pass on a busy desk, the next graceful exit picks it up, and
-    // saying so on every shutdown would be exactly the noise the state-file
-    // half deliberately avoids. Its operator-actionable form already exists on
-    // the STARTUP path, which names `cerulion clean`.
     if swept.failed_cleanups > 0 {
         tracing::warn!(
             cleanups = swept.cleanups,
@@ -1269,8 +1272,6 @@ where
              errors when the dead node belonged to a different user, or post-upgrade version skew)"
         );
     } else if swept.cleanups > 0 {
-        // Housekeeping that succeeded: `debug!` (the failure arm above stays
-        // a warn), so the last line of a run stays the run's own result.
         tracing::debug!(
             cleanups = swept.cleanups,
             deferred = swept.deferred,
@@ -1279,16 +1280,39 @@ where
         );
     }
 
-    // PASS 2 — the state files, on what is LEFT of the one budget, and only
-    // over a CONVERGED registry.
-    if !registry_converged(&swept) {
-        // Deliberately NOT a warn: the sweep above already said its piece about
-        // the condition, at the right level, and a desk that ends every run with
-        // a second line about a consequence of it is the noise this pass exists
-        // to avoid. Declining is the SAFE outcome.
+    // PASS 2: lockable resim namespace slots, using what remains of the one
+    // exit hygiene budget, before the global `.shm_state` pass.
+    let resim = sweep_resim(budget.saturating_sub(started.elapsed()));
+    steps.push(HygieneStep::SweptResimSlots);
+    let resim_failures = resim
+        .failed_node_cleanups
+        .saturating_add(resim.segments_failed)
+        .saturating_add(resim.errors.len() as u64);
+    if resim_failures > 0 {
+        tracing::warn!(
+            cleaned_nodes = resim.cleaned_nodes,
+            failed_node_cleanups = resim.failed_node_cleanups,
+            segments_removed = resim.segments_removed,
+            segments_failed = resim.segments_failed,
+            total_failures = resim_failures,
+            "exit hygiene: could not clean every lockable resim namespace slot"
+        );
+    } else if resim.cleaned_nodes > 0 || resim.segments_removed > 0 {
+        tracing::debug!(
+            cleaned_nodes = resim.cleaned_nodes,
+            segments_removed = resim.segments_removed,
+            "exit hygiene: reclaimed stale resim namespace state left by earlier runs"
+        );
+    }
+
+    // PASS 3 — the state files, on what is LEFT of the one budget, and only
+    // over CONVERGED registries.
+    if !registry_converged(&swept) || !resim.nodes_converged() {
         tracing::debug!(
             failed_cleanups = swept.failed_cleanups,
             deferred = swept.deferred,
+            resim_failed_node_cleanups = resim.failed_node_cleanups,
+            resim_deferred_nodes = resim.deferred_nodes,
             "exit hygiene: leaving stale shared-memory state files alone — dead iceoryx2 \
              nodes are still registered and removing a name mapping they still need would \
              make them permanently unreclaimable"
@@ -1498,7 +1522,7 @@ pub(crate) mod tests {
             deferred: 0,
         };
 
-        // ORDER: the sweep runs, and only afterwards is the file pass reached.
+        // ORDER: default sweep, then resim slots, and only afterwards is the file pass reached.
         let order = std::sync::Mutex::new(Vec::new());
         let steps = exit_hygiene_pass(
             Duration::from_secs(2),
@@ -1506,24 +1530,29 @@ pub(crate) mod tests {
                 order.lock().expect("order").push("sweep");
                 converged
             },
+            |_| {
+                order.lock().expect("order").push("resim");
+                ResimSweepReport::default()
+            },
             |_| order.lock().expect("order").push("reclaim"),
         );
         assert_eq!(
             *order.lock().expect("order"),
-            vec!["sweep", "reclaim"],
-            "the dead-node sweep must run BEFORE anything removes a name mapping it needs"
+            vec!["sweep", "resim", "reclaim"],
+            "dead-node sweeps must run BEFORE anything removes a name mapping they need"
         );
         assert_eq!(
             steps,
             vec![
                 HygieneStep::SweptDeadNodes,
+                HygieneStep::SweptResimSlots,
                 HygieneStep::ReachedStateFileReclamation
             ]
         );
 
         // GATE: each non-converged shape stops the file pass being reached at
         // all — asserted per shape, so neither term can be dropped.
-        for (label, swept) in [
+        for (label, swept, resim) in [
             (
                 "a refused cleanup",
                 BoundedCleanup {
@@ -1531,6 +1560,7 @@ pub(crate) mod tests {
                     failed_cleanups: 1,
                     deferred: 0,
                 },
+                ResimSweepReport::default(),
             ),
             (
                 "a deferred node",
@@ -1539,29 +1569,52 @@ pub(crate) mod tests {
                     failed_cleanups: 0,
                     deferred: 1,
                 },
+                ResimSweepReport::default(),
+            ),
+            (
+                "a refused resim slot node cleanup",
+                converged,
+                ResimSweepReport {
+                    failed_node_cleanups: 1,
+                    ..ResimSweepReport::default()
+                },
+            ),
+            (
+                "a truncated resim slot sweep",
+                converged,
+                ResimSweepReport {
+                    truncated: true,
+                    ..ResimSweepReport::default()
+                },
             ),
         ] {
             let reached = std::sync::atomic::AtomicBool::new(false);
             let steps = exit_hygiene_pass(
                 Duration::from_secs(2),
                 |_| swept,
+                |_| resim.clone(),
                 |_| reached.store(true, std::sync::atomic::Ordering::SeqCst),
             );
             assert!(
                 !reached.load(std::sync::atomic::Ordering::SeqCst),
                 "{label} leaves an entry registered, so the file pass must not run"
             );
-            assert_eq!(steps, vec![HygieneStep::SweptDeadNodes], "{label}");
+            assert_eq!(
+                steps,
+                vec![HygieneStep::SweptDeadNodes, HygieneStep::SweptResimSlots],
+                "{label}"
+            );
         }
     }
 
-    /// The file pass gets what is LEFT of the ONE budget, never a fresh one —
+    /// The resim and file passes get what is LEFT of the ONE budget, never a fresh one —
     /// the same "a bound you can pay twice is not a bound" rule as the registry
     /// walk. Driven with a sweep that really does consume wall.
     #[test]
     fn the_state_file_pass_inherits_what_the_sweep_left_of_the_budget() {
         let budget = Duration::from_millis(300);
         let spent = Duration::from_millis(120);
+        let resim_handed = std::sync::Mutex::new(None);
         let handed = std::sync::Mutex::new(None);
         exit_hygiene_pass(
             budget,
@@ -1573,7 +1626,20 @@ pub(crate) mod tests {
                     deferred: 0,
                 }
             },
+            |remaining| {
+                *resim_handed.lock().expect("resim_handed") = Some(remaining);
+                ResimSweepReport::default()
+            },
             |remaining| *handed.lock().expect("handed") = Some(remaining),
+        );
+        let resim_handed = resim_handed
+            .lock()
+            .expect("resim_handed")
+            .expect("the resim pass was reached");
+        assert!(
+            resim_handed <= budget - spent,
+            "the resim pass was handed {resim_handed:?} of a {budget:?} budget the sweep had \
+             already spent {spent:?} of"
         );
         let handed = handed
             .lock()

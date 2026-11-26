@@ -3198,7 +3198,9 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 /// removed; the state-file half stays a bounded read; and the report closes
 /// by saying nothing was removed.
 fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
-    let (result, converged) = clean_dead_nodes(mode);
+    let (result, default_converged) = clean_dead_nodes(mode);
+    let resim_converged = clean_resim_slots(mode);
+    let converged = default_converged && resim_converged;
     // The reclamation is DOWNGRADED to a report when the sweep above
     // left dead nodes registered. A `.shm_state` file is the only mapping from
     // an iceoryx2 resource name to the object behind it, so removing one that a
@@ -3223,6 +3225,78 @@ fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
         println!("{NOTHING_WAS_REMOVED}");
     }
     result
+}
+
+/// Sweep every lockable resim private namespace slot and print its summary.
+/// Returns whether every lockable slot's node registry converged.
+fn clean_resim_slots(mode: SweepMode) -> bool {
+    let report = cerulion_cli_engine::ipc_cleanup::sweep_resim_slots_global(mode, None);
+    for line in render_resim_slot_sweep(&report, mode) {
+        println!("{line}");
+    }
+    report.nodes_converged()
+}
+
+/// Render the resim-slot section for `cerulion clean` and `clean --report-only`.
+/// Empty when lockable resim slots have nothing to report and no errors.
+fn render_resim_slot_sweep(
+    report: &cerulion_cli_engine::ipc_cleanup::ResimSweepReport,
+    mode: SweepMode,
+) -> Vec<String> {
+    let has_activity = match mode {
+        SweepMode::ReportOnly => {
+            report.dead_nodes > 0 || report.leftover_segments > 0 || !report.errors.is_empty()
+        }
+        SweepMode::Remove => {
+            report.cleaned_nodes > 0
+                || report.failed_node_cleanups > 0
+                || report.segments_removed > 0
+                || report.segments_failed > 0
+                || !report.errors.is_empty()
+        }
+    };
+    if !has_activity {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    match mode {
+        SweepMode::ReportOnly => {
+            if report.dead_nodes > 0 || report.leftover_segments > 0 {
+                lines.push(format!(
+                    "Resim namespace slots `cerulion clean` would sweep: {} dead iceoryx2 node(s) \
+                     and {} leftover shared-memory segment(s) across {} lockable slot(s) \
+                     (report only; none was removed)",
+                    report.dead_nodes, report.leftover_segments, report.slots_checked
+                ));
+            }
+        }
+        SweepMode::Remove => {
+            if report.cleaned_nodes > 0
+                || report.failed_node_cleanups > 0
+                || report.segments_removed > 0
+                || report.segments_failed > 0
+            {
+                lines.push(format!(
+                    "Resim namespace slots: cleaned {} dead iceoryx2 node(s) ({} failed); \
+                     removed {} leftover shared-memory segment(s) ({} failed).",
+                    report.cleaned_nodes,
+                    report.failed_node_cleanups,
+                    report.segments_removed,
+                    report.segments_failed
+                ));
+            }
+        }
+    }
+    if !report.errors.is_empty() {
+        lines.push("Resim namespace slot errors:".to_string());
+        for err in report.errors.iter().take(NODES_SHOWN) {
+            lines.push(format!("  {err}"));
+        }
+        if report.errors.len() > NODES_SHOWN {
+            lines.push(format!("  and {} more", report.errors.len() - NODES_SHOWN));
+        }
+    }
+    lines
 }
 
 /// The closing line of every `--report-only` run: the whole verb's promise,
