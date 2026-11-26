@@ -144,15 +144,21 @@ declares.
 
 ## Tools
 
-`tools/list` returns the manifest's tools, the built-in `estop`, and, under
-`limits.estop_clear: agent`, the built-in `estop_clear`. Nothing else can be
-called. A call runs these steps in order:
+`tools/list` returns the manifest's tools in the order the manifest declares
+them, then the built-in `estop`, then, under `limits.estop_clear: agent`, the
+built-in `estop_clear`. Nothing else can be called. A call runs these steps in
+order:
 
-1. A name the manifest does not declare is refused (`not_in_manifest`).
-2. The arguments are checked against `input_schema` (`invalid_args`).
+1. A name the manifest does not declare is refused (`not_in_manifest`) and
+   receipted `denied`. A name outside the tool name rule (1 to 128
+   characters from `[A-Za-z0-9_.-]`) is receipted under the verb
+   `<invalid-tool-name>`.
+2. The arguments are checked against `input_schema` (`invalid_args`,
+   receipted `error:invalid_args`); the error message names the argument
+   that failed, in double quotes.
 3. A call whose frame would exceed 63 KiB is refused (`args_too_large`).
 4. While the e-stop is engaged a `reversible` or `irreversible` tool is
-   refused (`estopped`). `read` tools skip this step.
+   refused (`estopped`) and receipted `denied`. `read` tools skip this step.
 5. A `reversible` or `irreversible` tool appends an `intent` receipt and
    syncs it to disk.
 6. The call is published on `journal.calls_topic` as one `std_msgs/String`
@@ -166,6 +172,7 @@ called. A call runs these steps in order:
 
 A successful call returns one text block,
 `{"call_id": N, "receipt": {"seq", "hash", "prev"}, "result": <the graph's answer>, "safety_class": "..."}`.
+`N` is an integer below 2^53, so a JSON number holds it exactly.
 A refused call returns `isError: true` with
 `{"error": {"code", "message"}, "receipt": ...}`. Calls other than `estop`
 are handled one at a time, in the order they arrive.

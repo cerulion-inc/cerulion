@@ -1,25 +1,30 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The tool surface through an in-process MCP client, against a stand-in graph
-//! thread that answers the journaled calls.
+//! thread that answers the journaled calls: the hand-written event/effect
+//! vectors of [`oracle`] run against the `ToolHost` daemon, beside plain tests
+//! of the state, audit and scope paths.
 //!
 //! Transport isolation is per test (`init_for_test` SHM roots, unique topics),
 //! so the tests run in parallel.
 
+mod oracle;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_core::message::ShmMessage;
 use cerulion_core::wire::MaxSliceLen;
-use cerulion_core::{TransportConfig, TransportManager};
+use cerulion_core::TransportManager;
 use cerulion_rcpd::journal::Journal;
-use cerulion_rcpd::manifest::{LoadedManifest, RcpManifest};
+use cerulion_rcpd::manifest::LoadedManifest;
 use cerulion_rcpd::observer::GraphSource;
 use cerulion_rcpd::server::RcpServer;
 use cerulion_rcpd::tools::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL, ESTOP_TOOL};
 use cerulion_rcpd::RcpdError;
 use native_ros2_messages::std_msgs::String as RosString;
+use oracle::{manager, manifest, manifest_with, publish_json, unique};
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ResourceContents,
 };
@@ -27,83 +32,79 @@ use rmcp::service::RunningService;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::{json, Value};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 static REMOTE_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn unique(tag: &str) -> String {
-    format!(
-        "rcpd_tools_{tag}_{}_{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+/// The `ToolHost` daemon for the vectors: a `ToolHost` behind `RcpServer`,
+/// built as the binary builds it.
+struct ToolHostDaemon {
+    receipts: PathBuf,
 }
 
-fn manager(tag: &str) -> Arc<TransportManager> {
-    TransportManager::init_for_test(
-        TransportConfig {
-            node_name: unique(tag),
-            ..Default::default()
-        },
-        cerulion_core::testing::iceoryx_test_config(),
-    )
-    .expect("init isolated transport manager")
+impl oracle::Daemon for ToolHostDaemon {
+    fn boot(
+        mgr: &Arc<TransportManager>,
+        manifest: &LoadedManifest,
+        receipts: &Path,
+    ) -> (Self, tokio::io::DuplexStream) {
+        let host = open_host_as_configured(mgr, manifest, receipts).expect("host");
+        let feed = GraphSource::new(mgr.clone(), manifest.identity.clone()).feed();
+        let server = RcpServer::with_tools(feed, host, manifest.state.clone());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(server) = server.serve(server_io).await {
+                let _ = server.waiting().await;
+            }
+        });
+        let daemon = Self {
+            receipts: receipts.to_path_buf(),
+        };
+        (daemon, client_io)
+    }
+
+    fn entries(&self) -> Vec<(String, String)> {
+        receipt_pairs(&self.receipts)
+    }
 }
 
-/// A manifest on topics private to this test: three reversible tools
-/// (`arm.slow` is answered late, `arm.mute` never), one read tool, one
-/// irreversible tool, one state topic.
-fn manifest(dir: &Path, prefix: &str) -> LoadedManifest {
-    manifest_with(dir, prefix, "")
+/// The receipt log at `path` as `(verb, outcome)`, `error:<detail>` for an
+/// error outcome, after checking its chain. A log with no lines has no chain
+/// to check (the audit refuses an empty log).
+fn receipt_pairs(path: &Path) -> Vec<(String, String)> {
+    let entries = cerud::receipt::read_all(path).expect("read receipts");
+    if !entries.is_empty() {
+        let report = cerulion_rcpd::audit::verify_log(path).expect("chain intact");
+        assert_eq!(report.entries, entries.len());
+    }
+    entries
+        .iter()
+        .map(|r| {
+            let outcome = serde_json::to_value(&r.outcome).expect("outcome");
+            let tag = match outcome.get("detail").and_then(Value::as_str) {
+                Some(detail) => format!("error:{detail}"),
+                None => outcome["outcome"].as_str().unwrap_or("").to_string(),
+            };
+            (r.verb.clone(), tag)
+        })
+        .collect()
 }
 
-/// [`manifest`] with `extra` (top-level YAML, such as a `limits` section)
-/// appended.
-fn manifest_with(dir: &Path, prefix: &str, extra: &str) -> LoadedManifest {
-    let step = |name: &str, timeout_ms: u32| {
-        format!(
-            "  - name: {name}
-    description: one period
-    safety_class: reversible
-    timeout_ms: {timeout_ms}
-    input_schema:
-      type: object
-      properties:
-        q: {{ type: array, items: {{ type: number }}, minItems: 2, maxItems: 2 }}
-      required: [q]
-"
-        )
-    };
-    let yaml = format!(
-        "robot: tools_fixture
-journal:
-  calls_topic: /{prefix}/calls
-  results_topic: /{prefix}/results
-state:
-  - name: arm
-    topic: /{prefix}/state
-tools:
-{}{}{}  - name: arm.peek
-    description: read only
-    safety_class: read
-    input_schema: {{ type: object, properties: {{}} }}
-  - name: arm.cut
-    description: cut the cable
-    safety_class: irreversible
-    input_schema: {{ type: object, properties: {{}} }}
-{extra}",
-        step("arm.step", 3000),
-        step("arm.slow", 3000),
-        step("arm.mute", 300),
-    );
-    let path = dir.join("rcp.yaml");
-    std::fs::write(&path, yaml).expect("write manifest");
-    RcpManifest::load_full(&path).expect("load manifest")
+/// One test per vector, each against a fresh `ToolHost`.
+macro_rules! vectors {
+    ($($name:ident),* $(,)?) => {$(
+        #[tokio::test(flavor = "multi_thread")]
+        async fn $name() {
+            oracle::run::<ToolHostDaemon>(oracle::vectors::$name()).await;
+        }
+    )*};
 }
 
-fn publish_json(publisher: &mut cerulion_core::CerulionPublisher, value: &Value) {
-    let mut proxy = publisher.loan_proxy::<RosString>().expect("loan");
-    proxy.set_data(&value.to_string()).expect("set");
-}
+vectors!(
+    the_tool_list_is_the_manifest_then_estop_then_estop_clear,
+    each_call_is_published_once_answered_by_its_call_id_and_receipted,
+    an_undeclared_tool_and_bad_arguments_never_reach_the_graph,
+    a_name_no_tool_can_have_is_receipted_under_a_fixed_verb,
+    a_silent_graph_times_out_and_the_call_may_have_run,
+);
 
 /// Answers every call frame, oldest first, with `{call_id, tool, ok, n}` on
 /// the results topic followed by a decoy answer to no call (`call_id` 0), and
@@ -234,20 +235,7 @@ impl Fixture {
     }
 
     fn receipts(&self) -> Vec<(String, String)> {
-        let report = cerulion_rcpd::audit::verify_log(&self.receipts).expect("chain intact");
-        let entries = cerud::receipt::read_all(&self.receipts).expect("read receipts");
-        assert_eq!(report.entries, entries.len());
-        entries
-            .iter()
-            .map(|r| {
-                let outcome = serde_json::to_value(&r.outcome).expect("outcome");
-                let tag = match outcome.get("detail").and_then(Value::as_str) {
-                    Some(detail) => format!("error:{detail}"),
-                    None => outcome["outcome"].as_str().unwrap_or("").to_string(),
-                };
-                (r.verb.clone(), tag)
-            })
-            .collect()
+        receipt_pairs(&self.receipts)
     }
 
     fn stop_graph(&mut self) -> Vec<Value> {
@@ -299,93 +287,6 @@ fn open_host_as_configured(
     )?;
     ToolHost::open(loaded.tools.clone(), journal, latch, receipts, lock)
         .map(|host| Arc::new(host.with_estop_clear(loaded.limits.estop_clear)))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn tools_list_is_the_manifest_plus_estop() {
-    let f = Fixture::new("list", false).await;
-    let names: Vec<String> = f
-        .client
-        .list_all_tools()
-        .await
-        .expect("list")
-        .into_iter()
-        .map(|t| t.name.to_string())
-        .collect();
-    assert_eq!(
-        names,
-        [
-            "arm.step",
-            "arm.slow",
-            "arm.mute",
-            "arm.peek",
-            "arm.cut",
-            ESTOP_TOOL,
-            ESTOP_CLEAR_TOOL
-        ]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_call_is_receipted_journaled_and_answered_past_a_decoy() {
-    let mut f = Fixture::new("happy", true).await;
-    for i in 0..3 {
-        let (is_error, body) = f.call("arm.step", json!({ "q": [0.1, -0.2] })).await;
-        assert!(!is_error, "call {i}: {body}");
-        assert_eq!(body["result"]["ok"], json!(true));
-        assert_eq!(body["result"]["call_id"], body["call_id"]);
-        assert!(body["call_id"].as_u64().is_some_and(|id| id < (1 << 52)));
-    }
-    let seen = f.stop_graph();
-    assert_eq!(seen.len(), 3, "exactly one journaled frame per call");
-    assert_eq!(seen[0]["tool"], json!("arm.step"));
-    assert_eq!(seen[0]["args"], json!({ "q": [0.1, -0.2] }));
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn undeclared_tools_and_bad_args_never_reach_the_graph() {
-    let mut f = Fixture::new("deny", true).await;
-    let (is_error, body) = f.call("arm.fly", json!({})).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("not_in_manifest"));
-    let (is_error, _) = f.call(&"x".repeat(300), json!({})).await;
-    assert!(is_error);
-    let (is_error, body) = f.call("arm.step", json!({ "q": [1.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("invalid_args"));
-    let (is_error, body) = f
-        .call("arm.step", json!({ "q": [1.0, 2.0], "speed": 3 }))
-        .await;
-    assert!(is_error);
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("speed"),
-        "{body}"
-    );
-
-    assert!(f.stop_graph().is_empty(), "nothing was journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.fly", "denied"),
-            ("<invalid-tool-name>", "denied"),
-            ("arm.step", "error:invalid_args"),
-            ("arm.step", "error:invalid_args"),
-        ])
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -532,20 +433,6 @@ async fn a_second_daemon_on_the_same_receipt_log_is_refused() {
     assert!(reason.contains("another cerulion-rcpd"), "{reason}");
     drop(first);
     open_host(&mgr, &loaded, &receipts).expect("the lock is released with the daemon");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_silent_graph_times_out_and_says_the_call_may_have_run() {
-    let mut f = Fixture::new("timeout", true).await;
-    let (is_error, body) = f.call("arm.mute", json!({ "q": [0.0, 0.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("timeout"));
-    assert_eq!(body["may_have_executed"], json!(true));
-    assert_eq!(f.stop_graph().len(), 1, "the call was published");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[("arm.mute", "intent"), ("arm.mute", "error:timeout")])
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
