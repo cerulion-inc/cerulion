@@ -358,6 +358,7 @@ fn reconstruct(flats: &[FlatEntry]) -> Vec<TraceEntry> {
             global_level: f.global_level,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         })
         .collect()
 }

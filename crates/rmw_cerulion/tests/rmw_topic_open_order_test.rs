@@ -8,12 +8,15 @@
 //! topic with the smaller endpoint first, then a TRANSIENT_LOCAL depth-16
 //! publisher, and requires the second open to succeed.
 //!
-//! The late-joiner arms pin what a late subscription takes from the retained
-//! messages, by its durability: VOLATILE none, TRANSIENT_LOCAL up to its depth
-//! and the topic's history limit (16, or 12 for a type above the 16 MiB slice
-//! tier; KEEP_ALL takes up to the limit whatever its depth), and BEST_AVAILABLE
-//! as TRANSIENT_LOCAL only when the topic has publishers and every one
-//! retains, in this process or another. The cross-process arms re-execute this binary as the
+//! The late-joiner arms pin what a publisher retains and what a late
+//! subscription takes from it. A publisher retains its own depth on a topic an
+//! rmw endpoint created, whatever the topic's history limit (16, or 12 for a
+//! type above the 16 MiB slice tier): VOLATILE none, TRANSIENT_LOCAL its depth,
+//! KEEP_ALL the limit. A late subscription takes by its durability: VOLATILE
+//! none, TRANSIENT_LOCAL up to its depth (KEEP_ALL up to the limit whatever its
+//! depth), and BEST_AVAILABLE as TRANSIENT_LOCAL only when the topic has
+//! publishers and every one retains, in this process or another. A VOLATILE
+//! publisher's loans reuse the slot its subscription released. The cross-process arms re-execute this binary as the
 //! publishing child (`subprocess_child_publishes_then_waits`, `#[ignore]`d and
 //! inert without its environment). The BEST_AVAILABLE arms build only where the
 //! rmw headers declare that durability (Iron and later).
@@ -454,9 +457,8 @@ fn a_late_volatile_subscription_receives_no_backlog_from_a_volatile_publisher() 
                 retained: Vec::new(),
                 live: vec![LIVE_X],
             },
-            "every rmw topic is created with a 16-deep history, so a late VOLATILE \
-             subscription must ask for none or it replays a VOLATILE publisher's \
-             old messages; it takes only the live one"
+            "a VOLATILE publisher retains none of its 8 messages and a late VOLATILE \
+             subscription asks for none; it takes only the live one"
         );
     }
 }
@@ -477,6 +479,95 @@ fn a_late_volatile_subscription_receives_no_backlog_from_a_transient_local_publi
     }
 }
 
+#[test]
+#[serial]
+fn a_late_transient_local_subscription_receives_no_backlog_from_a_volatile_publisher() {
+    unsafe {
+        assert_eq!(
+            late_joiner_receives("vol_tl", volatile(10), transient_local(DEEP), 0),
+            LateTake {
+                retained: Vec::new(),
+                live: vec![LIVE_X],
+            },
+            "the topic is created with a 16-deep history, but a VOLATILE publisher \
+             retains none of its 8 messages, so even a late TRANSIENT_LOCAL depth-16 \
+             subscription takes only the live one"
+        );
+    }
+}
+
+/// Opens a fresh topic with a VOLATILE subscription (which creates it with the
+/// topic's history limit), then borrows, fills and publishes `count` messages
+/// (`x` = 0 to `count - 1`) from a publisher with `pub_qos`, taking each one
+/// (the copying take releases its slot) before the next borrow. Returns the
+/// number of distinct addresses the borrows returned.
+unsafe fn distinct_borrow_slots(tag: &str, pub_qos: ffi::rmw_qos_profile_t, count: usize) -> usize {
+    let suffix = unique_suffix();
+    let ts = point_ts(&format!("Sr{suffix}"));
+    let (_, node) = setup_node(&format!("slot_reuse_{tag}_{suffix}"));
+    let topic = CString::new(format!("/rmw_open_order/slots/{tag}/{suffix}")).expect("topic");
+    let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+    let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+    let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &volatile(10), &sub_opts);
+    assert!(
+        !subscription.is_null(),
+        "the subscription creates the topic"
+    );
+    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &pub_qos, &pub_opts);
+    assert!(!publisher.is_null(), "the publisher opens the topic");
+    assert!((*publisher).can_loan_messages, "a fixed type loans");
+    let mut slots = Vec::with_capacity(count);
+    for i in 0..count {
+        let mut loaned: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            rmw_borrow_loaned_message(publisher, ts, &mut loaned),
+            RMW_RET_OK
+        );
+        assert!(!loaned.is_null());
+        slots.push(loaned as usize);
+        *(loaned as *mut CPoint) = CPoint {
+            x: i as f64,
+            y: 0.0,
+            z: 0.0,
+        };
+        assert_eq!(
+            rmw_publish_loaned_message(publisher, loaned, std::ptr::null_mut()),
+            RMW_RET_OK
+        );
+        assert_eq!(
+            take_point(subscription),
+            Some(i as f64),
+            "message {i} is taken before the next borrow"
+        );
+    }
+    assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+    assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    slots.sort_unstable();
+    slots.dedup();
+    slots.len()
+}
+
+#[test]
+#[serial]
+fn a_volatile_publisher_reuses_the_slot_its_subscription_released() {
+    unsafe {
+        assert_eq!(
+            distinct_borrow_slots("volatile", volatile(10), 3 * DEEP),
+            1,
+            "a VOLATILE publisher keeps no sent message, so each of its 48 borrows \
+             takes back the one slot the take before it released, though the topic \
+             was created with a 16-deep history"
+        );
+        assert_eq!(
+            distinct_borrow_slots("transient_local", transient_local(DEEP), 3 * DEEP),
+            DEEP + 1,
+            "control: a TRANSIENT_LOCAL depth-16 publisher holds its 16 newest messages, \
+             so its borrows rotate through 17 slots"
+        );
+    }
+}
+
 /// How a native (non-rmw) subscriber attaches in [`native_late_joiner_receives`]:
 /// the graph-input and Python path, or the open-only path `cerulion topic
 /// echo` and `hz` use.
@@ -486,8 +577,8 @@ enum Native {
     OpenOnly,
 }
 
-/// Publishes `RETAINED` messages (`x` = 0 to `RETAINED - 1`) from a VOLATILE
-/// rmw publisher on a topic it creates (or that `native_history` > 0
+/// Publishes `RETAINED` messages (`x` = 0 to `RETAINED - 1`) from an rmw
+/// publisher with `pub_qos` on a topic it creates (or that `native_history` > 0
 /// pre-created natively with that much history), attaches a native
 /// subscriber, publishes one live message ([`LIVE_X`]; its send delivers any
 /// retained history first), and returns the `x` of every message the native
@@ -496,6 +587,7 @@ unsafe fn native_late_joiner_receives(
     tag: &str,
     native: Native,
     native_history: usize,
+    pub_qos: ffi::rmw_qos_profile_t,
 ) -> Vec<f64> {
     const RETAINED: usize = 4;
     let suffix = unique_suffix();
@@ -521,11 +613,8 @@ unsafe fn native_late_joiner_receives(
         None
     };
     let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
-    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &volatile(10), &pub_opts);
-    assert!(
-        !publisher.is_null(),
-        "the VOLATILE rmw publisher opens the topic"
-    );
+    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &pub_qos, &pub_opts);
+    assert!(!publisher.is_null(), "the rmw publisher opens the topic");
     let send = |x: f64| {
         let msg = CPoint { x, y: 0.0, z: 0.0 };
         assert_eq!(
@@ -579,7 +668,7 @@ unsafe fn native_late_joiner_receives(
 fn a_native_subscriber_receives_no_backlog_from_a_volatile_rmw_publisher() {
     unsafe {
         assert_eq!(
-            native_late_joiner_receives("with_buffers", Native::WithBuffers, 0),
+            native_late_joiner_receives("with_buffers", Native::WithBuffers, 0, volatile(10)),
             vec![LIVE_X],
             "a native subscriber (graph input, Python) that attaches after a VOLATILE \
              rmw publisher sent 4 messages receives only the live one: the rmw-created \
@@ -590,10 +679,43 @@ fn a_native_subscriber_receives_no_backlog_from_a_volatile_rmw_publisher() {
 
 #[test]
 #[serial]
+fn an_open_only_native_subscriber_receives_no_backlog_from_a_transient_local_rmw_publisher() {
+    unsafe {
+        assert_eq!(
+            native_late_joiner_receives("open_only_tl", Native::OpenOnly, 0, transient_local(10)),
+            vec![LIVE_X],
+            "`cerulion topic echo` and `hz` attach open-only and ask for no history, so on \
+             a topic an rmw endpoint created they take none of a TRANSIENT_LOCAL rmw \
+             publisher's 4 retained messages, only the live one"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_native_subscriber_receives_no_backlog_from_a_transient_local_rmw_publisher() {
+    unsafe {
+        assert_eq!(
+            native_late_joiner_receives(
+                "tl_publisher",
+                Native::WithBuffers,
+                0,
+                transient_local(10)
+            ),
+            vec![LIVE_X],
+            "a native subscriber that asks for no particular history takes none on a \
+             topic an rmw endpoint created, even from a TRANSIENT_LOCAL publisher that \
+             retained its 4 messages; it receives only the live one"
+        );
+    }
+}
+
+#[test]
+#[serial]
 fn an_open_only_native_subscriber_receives_no_backlog_from_a_volatile_rmw_publisher() {
     unsafe {
         assert_eq!(
-            native_late_joiner_receives("open_only", Native::OpenOnly, 0),
+            native_late_joiner_receives("open_only", Native::OpenOnly, 0, volatile(10)),
             vec![LIVE_X],
             "`cerulion topic echo` and `hz` attach open-only; after a VOLATILE rmw \
              publisher sent 4 messages they receive only the live one"
@@ -606,7 +728,7 @@ fn an_open_only_native_subscriber_receives_no_backlog_from_a_volatile_rmw_publis
 fn a_native_subscriber_still_receives_history_a_native_creator_declared() {
     unsafe {
         assert_eq!(
-            native_late_joiner_receives("native_history", Native::OpenOnly, 4),
+            native_late_joiner_receives("native_history", Native::OpenOnly, 4, volatile(10)),
             vec![0.0, 1.0, 2.0, 3.0, LIVE_X],
             "on a topic a native creator made with history 4, a native late joiner still \
              receives the 4 retained messages and the live one (graph latched topics keep \
@@ -956,9 +1078,8 @@ fn a_keep_all_transient_local_publisher_reports_the_topics_limit() {
         );
         assert_eq!(
             taken, want,
-            "its backlog reaches a late TRANSIENT_LOCAL depth-16 subscription (every \
-             publisher's ring is sized from the topic, so this half does not depend on \
-             the publisher's depth)"
+            "it retains the topic's limit, so a late TRANSIENT_LOCAL depth-16 \
+             subscription takes the newest 16 of 20, then the live one"
         );
         let (control, control_depths) = late_subscription_takes(
             "keep_last_pub",
@@ -972,7 +1093,15 @@ fn a_keep_all_transient_local_publisher_reports_the_topics_limit() {
             vec![5],
             "control: a KEEP_LAST depth-5 TRANSIENT_LOCAL publisher reports 5"
         );
-        assert_eq!(control, want);
+        assert_eq!(
+            control,
+            LateTake {
+                retained: xs(15..20),
+                live: vec![LIVE_X],
+            },
+            "control: it retains the 5 it reports, so the same depth-16 subscription \
+             takes the newest 5 of 20, then the live one"
+        );
     }
 }
 
@@ -1056,9 +1185,9 @@ fn a_late_best_available_subscription_takes_no_backlog_when_a_volatile_publisher
 #[cfg(cerulion_has_durability_best_available)]
 #[test]
 #[serial]
-fn a_late_transient_local_subscription_on_the_mixed_topic_takes_both_rings() {
+fn a_late_transient_local_subscription_on_the_mixed_topic_takes_only_the_transient_local_ring() {
     unsafe {
-        let want_retained = vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let want_retained = xs(0..4);
         let (taken, _) = late_subscription_takes(
             "mixed_tl",
             &[transient_local(DEEP), volatile(10)],
@@ -1070,8 +1199,8 @@ fn a_late_transient_local_subscription_on_the_mixed_topic_takes_both_rings() {
             sorted(taken.retained),
             want_retained,
             "control for the BEST_AVAILABLE zero: on the same topic shape a \
-             TRANSIENT_LOCAL subscription takes the 4 messages each publisher's ring \
-             holds, so the rings were not empty"
+             TRANSIENT_LOCAL subscription takes the 4 messages the TRANSIENT_LOCAL \
+             publisher retained, and none of the VOLATILE one's"
         );
         assert_eq!(taken.live, vec![LIVE_X]);
     }
@@ -1083,7 +1212,7 @@ fn a_late_transient_local_subscription_on_the_mixed_topic_takes_both_rings() {
 fn a_best_available_publisher_retains_like_a_transient_local_one() {
     unsafe {
         let want = LateTake {
-            retained: xs(0..8),
+            retained: xs(4..8),
             live: vec![LIVE_X],
         };
         let (to_tl, depths) = late_subscription_takes(
@@ -1101,9 +1230,8 @@ fn a_best_available_publisher_retains_like_a_transient_local_one() {
         );
         assert_eq!(
             to_tl, want,
-            "a late TRANSIENT_LOCAL depth-10 subscription takes the 8 retained \
-             messages, then the live one (as from any publisher on an rmw-created topic; \
-             the depth above and the BEST_AVAILABLE arm below are what pin the publisher)"
+            "it retains its depth of 4, so a late TRANSIENT_LOCAL depth-10 \
+             subscription takes the newest 4 of its 8 messages, then the live one"
         );
         let (to_ba, _) = late_subscription_takes(
             "pub_ba",
@@ -1158,7 +1286,8 @@ const ENV_CHILD: &str = "CER_OPEN_ORDER_CHILD";
 const ENV_TOPIC: &str = "CER_OPEN_ORDER_TOPIC";
 #[cfg(cerulion_has_durability_best_available)]
 const ENV_TYPE: &str = "CER_OPEN_ORDER_TYPE";
-/// `transient_local` or `volatile`.
+/// `transient_local`, or `mixed`: a TRANSIENT_LOCAL publisher and a VOLATILE
+/// one.
 #[cfg(cerulion_has_durability_best_available)]
 const ENV_DURABILITY: &str = "CER_OPEN_ORDER_DURABILITY";
 #[cfg(cerulion_has_durability_best_available)]
@@ -1168,7 +1297,7 @@ const CHILD_TEST: &str = "subprocess_child_publishes_then_waits";
 #[cfg(cerulion_has_durability_best_available)]
 const CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Child to parent, one per stdout line: the backlog is sent; the live
-/// message is sent; the publisher and node are destroyed.
+/// message is sent; the publishers and node are destroyed.
 #[cfg(cerulion_has_durability_best_available)]
 const READY: &str = "OPEN_ORDER_CHILD_READY";
 #[cfg(cerulion_has_durability_best_available)]
@@ -1176,9 +1305,10 @@ const SENT_LIVE: &str = "OPEN_ORDER_CHILD_SENT_LIVE";
 #[cfg(cerulion_has_durability_best_available)]
 const DONE: &str = "OPEN_ORDER_CHILD_DONE";
 
-/// THE CHILD: opens the topic with one publisher, sends the backlog, then
-/// keeps its publisher pumped through `rmw_wait` (as an executor does) and
-/// obeys `LIVE` (send one live message) and `EXIT` on stdin.
+/// THE CHILD: opens the topic with one publisher per durability its mode
+/// names, sends the backlog from each, then keeps them pumped through
+/// `rmw_wait` (as an executor does) and obeys `LIVE` (the first publisher sends
+/// one live message) and `EXIT` on stdin.
 #[cfg(cerulion_has_durability_best_available)]
 #[test]
 #[ignore]
@@ -1194,8 +1324,8 @@ fn subprocess_child_publishes_then_waits() {
         .parse()
         .expect("count");
     let pub_qos = match std::env::var(ENV_DURABILITY).as_deref() {
-        Ok("transient_local") => transient_local(DEEP),
-        Ok("volatile") => volatile(10),
+        Ok("transient_local") => vec![transient_local(DEEP)],
+        Ok("mixed") => vec![transient_local(DEEP), volatile(10)],
         other => panic!("unknown durability {other:?}"),
     };
     let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
@@ -1212,9 +1342,15 @@ fn subprocess_child_publishes_then_waits() {
         let (context, node) = setup_node(&format!("open_order_child_{}", std::process::id()));
         let topic = CString::new(topic).expect("topic");
         let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
-        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &pub_qos, &pub_opts);
-        assert!(!publisher.is_null(), "child publisher");
-        let publish = |x: f64| {
+        let publishers: Vec<_> = pub_qos
+            .iter()
+            .map(|q| {
+                let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), q, &pub_opts);
+                assert!(!publisher.is_null(), "child publisher");
+                publisher
+            })
+            .collect();
+        let publish = |publisher: *mut ffi::rmw_publisher_t, x: f64| {
             let msg = CPoint { x, y: 0.0, z: 0.0 };
             assert_eq!(
                 rmw_publish(
@@ -1225,8 +1361,10 @@ fn subprocess_child_publishes_then_waits() {
                 RMW_RET_OK
             );
         };
-        for i in 0..sent {
-            publish(i as f64);
+        for &publisher in &publishers {
+            for i in 0..sent {
+                publish(publisher, i as f64);
+            }
         }
         println!("{READY}");
         let ws = rmw_create_wait_set(context, 4);
@@ -1252,7 +1390,7 @@ fn subprocess_child_publishes_then_waits() {
             );
             match lines_rx.try_recv().as_deref() {
                 Ok("LIVE") => {
-                    publish(LIVE_X);
+                    publish(publishers[0], LIVE_X);
                     println!("{SENT_LIVE}");
                 }
                 Ok("EXIT") => break,
@@ -1264,7 +1402,9 @@ fn subprocess_child_publishes_then_waits() {
             }
         }
         assert_eq!(rmw_destroy_wait_set(ws), RMW_RET_OK);
-        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        for publisher in publishers {
+            assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        }
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
         println!("{DONE}");
     }
@@ -1368,17 +1508,17 @@ struct CrossProcessTake {
     /// The late BEST_AVAILABLE depth-5 subscription.
     best_available: LateTake,
     /// A TRANSIENT_LOCAL depth-5 control subscription opened after it,
-    /// taken before the live message: the newest 5 of what the child's ring
-    /// held.
+    /// taken before the live message: the newest 5 of what each of the
+    /// child's publishers retained.
     control: Vec<f64>,
-    /// The topic's retain marks while the child's publisher lived.
+    /// The topic's retain marks while the child's publishers lived.
     marks_alive: Option<Vec<bool>>,
     /// The topic's retain marks after the child exited.
     marks_after: Option<Vec<bool>>,
 }
 
-/// A child process publishes `sent` messages with `durability` on a fresh
-/// topic. Then a BEST_AVAILABLE depth-5 subscription opens in THIS process
+/// A child process opens a fresh topic with the publishers `durability` names,
+/// each of which sends `sent` messages. Then a BEST_AVAILABLE depth-5 subscription opens in THIS process
 /// and takes until `retained` messages arrived, a TRANSIENT_LOCAL depth-5
 /// control subscription takes until `control` arrived, the child sends one
 /// live message, and the first subscription takes again until that one
@@ -1486,7 +1626,8 @@ fn a_best_available_subscription_takes_the_backlog_of_a_transient_local_publishe
 #[cfg(cerulion_has_durability_best_available)]
 #[test]
 #[serial]
-fn a_best_available_subscription_takes_no_backlog_from_a_volatile_publisher_in_another_process() {
+fn a_best_available_subscription_takes_no_backlog_when_a_volatile_publisher_in_another_process_is_on_the_topic(
+) {
     unsafe {
         let want = LateTake {
             retained: Vec::new(),
@@ -1494,31 +1635,36 @@ fn a_best_available_subscription_takes_no_backlog_from_a_volatile_publisher_in_a
         };
         let want_control = xs(3..8);
         let seen = cross_process_best_available_takes(
-            "vol",
-            "volatile",
+            "mixed",
+            "mixed",
             8,
             want.retained.len(),
             want_control.len(),
         );
         assert_eq!(
             seen.best_available, want,
-            "the only publisher, in another process, is VOLATILE, so BEST_AVAILABLE \
-             resolves VOLATILE: none of the 8 messages its ring holds, only the live one"
+            "one of the other process's two publishers is VOLATILE, so BEST_AVAILABLE \
+             resolves VOLATILE: none of their 16 messages, only the live one"
         );
         assert_eq!(
             seen.control, want_control,
             "control for that zero: a TRANSIENT_LOCAL subscription on the same topic \
-             takes the newest 5 of the 8 the other process's ring holds"
+             takes the newest 5 of the 8 the TRANSIENT_LOCAL publisher retained, and \
+             none of the VOLATILE publisher's 8, which it does not retain"
         );
         assert_marks(
-            seen.marks_alive,
-            Some(vec![false]),
-            "the other process's VOLATILE publisher carries no retaining mark",
+            seen.marks_alive.map(|mut marks| {
+                marks.sort_unstable();
+                marks
+            }),
+            Some(vec![false, true]),
+            "of the other process's publishers, only the TRANSIENT_LOCAL one carries the \
+             retaining mark",
         );
         assert_marks(
             seen.marks_after,
             Some(Vec::new()),
-            "the destroyed publisher leaves the topic's publisher list",
+            "the destroyed publishers leave the topic's publisher list",
         );
     }
 }

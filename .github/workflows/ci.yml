@@ -1252,6 +1252,12 @@ jobs:
       - name: README theme twins are current
         run: python3 tools/scripts/build_media_theme_variants.py --check
 
+      # The harness charts are drawn from their results package, and the
+      # README's chart embeds the committed Cerulion lockup twins: this fails
+      # when a chart differs from what the package and those twins give.
+      - name: Harness charts are current
+        run: python3 -B docs/media/charts/build_harness_charts.py --check
+
       # PR naming. `<type>(<scope>): <description>` for the title,
       # `<type>/<kebab-slug>` for the branch — no personal prefix, and no
       # tracker id baked into a branch name (a branch name is permanent and
