@@ -5518,4 +5518,184 @@ mod local_scope_flag_tests {
             "the compatibility spelling must remain discoverable: {help}"
         );
     }
+
+    fn collapse_ws(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn topic_list_help_outputs() -> (String, String) {
+        let mut command = Cli::command();
+        let list = command
+            .find_subcommand_mut("topic")
+            .unwrap()
+            .find_subcommand_mut("list")
+            .unwrap();
+        (
+            list.render_help().to_string(),
+            list.render_long_help().to_string(),
+        )
+    }
+
+    #[test]
+    fn topic_list_help_names_cerulion_network_in_short_and_long_help() {
+        let (short_help, long_help) = topic_list_help_outputs();
+        let short_norm = collapse_ws(&short_help);
+        let long_norm = collapse_ws(&long_help);
+
+        for (label, norm) in [("short (-h)", &short_norm), ("long (--help)", &long_norm)] {
+            assert!(
+                norm.contains("CERULION_NETWORK=off"),
+                "{label} help must name CERULION_NETWORK=off:\n{norm}"
+            );
+            assert!(
+                norm.contains("CERULION_NETD_NETWORK=off"),
+                "{label} help must name CERULION_NETD_NETWORK=off:\n{norm}"
+            );
+            assert!(
+                norm.contains("unrecognized") && norm.contains("closed"),
+                "{label} help must document fail-closed handling for unrecognized values:\n{norm}"
+            );
+            assert!(norm.contains("--local"), "{label} help missing --local");
+            assert!(
+                norm.contains("--no-network"),
+                "{label} help missing --no-network"
+            );
+        }
+
+        assert!(
+            long_norm.contains("fails closed on any unrecognized value"),
+            "long help about must document fail-closed CERULION_NETWORK parsing:\n{long_norm}"
+        );
+        assert!(long_norm.contains("paired"), "{long_help}");
+        assert!(!long_norm.contains("without pairing"), "{long_help}");
+        assert!(!long_norm.contains("no pairing"), "{long_help}");
+
+        let command = Cli::command();
+        let list = command
+            .find_subcommand("topic")
+            .unwrap()
+            .find_subcommand("list")
+            .unwrap();
+        let long_about = collapse_ws(
+            &list
+                .get_long_about()
+                .expect("topic list has long_about")
+                .to_string(),
+        );
+        assert!(
+            long_about.contains("CERULION_NETWORK=off"),
+            "topic list long_about must name CERULION_NETWORK=off: {long_about}"
+        );
+        assert!(
+            long_about.contains("fails closed on any unrecognized value"),
+            "topic list long_about must state fail-closed parsing: {long_about}"
+        );
+        assert!(
+            long_about.contains("CERULION_NETD_NETWORK=off"),
+            "topic list long_about must name CERULION_NETD_NETWORK=off: {long_about}"
+        );
+    }
+
+    #[test]
+    fn topic_list_local_arg_help_names_env_switches_and_mirror_caveat() {
+        let command = Cli::command();
+        let list = command
+            .find_subcommand("topic")
+            .unwrap()
+            .find_subcommand("list")
+            .unwrap();
+        let arg = list
+            .get_arguments()
+            .find(|arg| arg.get_id() == "no_network")
+            .expect("topic list must define no_network arg");
+
+        let short_arg_help = collapse_ws(&arg.get_help().expect("no_network help").to_string());
+        let long_arg_help = collapse_ws(
+            &arg.get_long_help()
+                .or_else(|| arg.get_help())
+                .expect("no_network long help")
+                .to_string(),
+        );
+
+        for (label, text) in [
+            ("get_help", &short_arg_help),
+            ("get_long_help", &long_arg_help),
+        ] {
+            assert!(
+                text.contains("CERULION_NETWORK=off"),
+                "{label} must name CERULION_NETWORK=off: {text}"
+            );
+            assert!(
+                text.contains("unrecognized values fail closed"),
+                "{label} must state unrecognized values fail closed: {text}"
+            );
+            assert!(
+                text.contains("CERULION_NETD_NETWORK=off"),
+                "{label} must name CERULION_NETD_NETWORK=off: {text}"
+            );
+            assert!(
+                text.contains("REMOTE streaming"),
+                "{label} must preserve the REMOTE streaming mirror note: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn topic_list_help_rejects_removed_network_flag_and_has_no_typographic_dashes() {
+        let (short_help, long_help) = topic_list_help_outputs();
+        for (label, text) in [("short (-h)", &short_help), ("long (--help)", &long_help)] {
+            assert!(
+                !text.contains('\u{2013}') && !text.contains('\u{2014}'),
+                "{label} help must not contain typographic dashes:\n{text}"
+            );
+            assert!(
+                !text.contains("--network"),
+                "{label} help must not advertise the removed --network flag:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn topic_list_help_rendering_is_deterministic() {
+        let (first_short, first_long) = topic_list_help_outputs();
+        let (second_short, second_long) = topic_list_help_outputs();
+        assert_eq!(
+            first_short, second_short,
+            "short help must be deterministic"
+        );
+        assert_eq!(first_long, second_long, "long help must be deterministic");
+    }
+
+    #[test]
+    fn topic_list_help_and_unknown_network_flag_error_arms() {
+        for flag in ["-h", "--help"] {
+            let err = Cli::try_parse_from(["cerulion", "topic", "list", flag])
+                .err()
+                .expect("help flag exits before dispatch");
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp, "{flag}");
+            let rendered = collapse_ws(&err.to_string());
+            assert!(
+                rendered.contains("CERULION_NETWORK=off"),
+                "{flag} help output must name CERULION_NETWORK=off:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("CERULION_NETD_NETWORK=off"),
+                "{flag} help output must name CERULION_NETD_NETWORK=off:\n{rendered}"
+            );
+        }
+
+        for argv in [
+            vec!["cerulion", "topic", "list", "--network"],
+            vec!["cerulion", "topic", "list", "--network", "off"],
+        ] {
+            let err = Cli::try_parse_from(argv.clone())
+                .err()
+                .expect("removed --network flag must be rejected");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{argv:?}"
+            );
+        }
+    }
 }
