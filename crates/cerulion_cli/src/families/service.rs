@@ -96,9 +96,13 @@ impl VerbFamily for Service {
         }
     }
 
-    /// The same rule as every `topic` verb.
-    fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-        true
+    /// Only `--robot` authenticates to a remote robot; local service calls need
+    /// no account sign-in.
+    fn needs_identity(&self, matches: &ArgMatches) -> bool {
+        matches!(
+            ServiceAction::from_arg_matches(matches),
+            Ok(ServiceAction::Call { robot: Some(_), .. })
+        )
     }
 
     fn run(&self, matches: &ArgMatches) -> ExitCode {

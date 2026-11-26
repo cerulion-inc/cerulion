@@ -16,7 +16,7 @@ You reach the harness through `cerulion rcp`, Cerulion's MCP server command:
 | `cerulion rcp bench` | Reruns one start state with and without the harness, against your own model: one of the published benchmark with `--cell`, otherwise one the harness was developed on. |
 | `cerulion rcp bench --verify` | Checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. |
 
-Both run under the free Cerulion account, as almost every `cerulion` command does: run `cerulion login` once.
+Neither `cerulion rcp --sim` nor `cerulion rcp bench` requires a Cerulion account sign-in or reaches a remote robot.
 
 ## Try it
 
@@ -28,7 +28,6 @@ clone and no setting, and a `cerulion` built in a checkout of this repository fi
 ([Where the harness lives](#where-the-harness-lives)). A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`.
 
 ```bash
-cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 ```
 

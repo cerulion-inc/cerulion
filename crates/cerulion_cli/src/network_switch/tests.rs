@@ -93,7 +93,7 @@ fn every_row_states_its_outcome() {
             Expect::Runs { code, says } => {
                 assert!(code != 7 && !says.is_empty(), "{:?}", case.argv);
             }
-            Expect::NotSpawned(why) => {
+            Expect::LocalNoGate(why) | Expect::NotSpawned(why) => {
                 assert!(!why.is_empty(), "{:?}: no reason", case.argv);
             }
             Expect::SignIn { request, .. } => {
@@ -207,7 +207,11 @@ fn the_decision_agrees_with_every_row_under_every_spelling() {
                     }
                 }
             }
-            Expect::Gated | Expect::Runs { .. } | Expect::NotSpawned(_) | Expect::SignIn { .. } => {
+            Expect::Gated
+            | Expect::Runs { .. }
+            | Expect::LocalNoGate(_)
+            | Expect::NotSpawned(_)
+            | Expect::SignIn { .. } => {
                 for (value, _) in spellings(By::Network) {
                     assert_eq!(
                         families::network_refusal(&matches, &SwitchEnv::network(value)),
@@ -235,12 +239,22 @@ fn the_decision_agrees_with_every_row_under_every_spelling() {
                 }
             }
         }
-        if matches!(case.expect, Expect::Gated) {
-            assert!(
-                families::needs_identity(&matches),
-                "{:?} is listed as gated but the gate does not run for it",
-                case.argv
-            );
+        match case.expect {
+            Expect::Gated | Expect::Refused { .. } => {
+                assert!(
+                    families::needs_identity(&matches),
+                    "{:?} is gated or remote-refused so the login gate must cover it",
+                    case.argv
+                );
+            }
+            Expect::Runs { .. } | Expect::LocalNoGate(_) => {
+                assert!(
+                    !families::needs_identity(&matches),
+                    "{:?} is local/ungated so the login gate must not run for it",
+                    case.argv
+                );
+            }
+            Expect::NotSpawned(_) | Expect::SignIn { .. } => {}
         }
     }
     assert!(refused >= 7, "the table lost its refused rows: {refused}");

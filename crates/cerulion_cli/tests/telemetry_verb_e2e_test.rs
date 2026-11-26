@@ -1631,7 +1631,7 @@ fn a_refused_command_claims_nothing_and_the_login_after_it_carries_the_id() {
         ("POSTHOG_HOST", sink.url.as_str()),
         ("CERULION_LOGIN_GATE", "on"),
     ];
-    let refused = cerulion(home.path(), &gate_on, &["graph", "list"]);
+    let refused = cerulion(home.path(), &gate_on, &["account", "devices", "list"]);
     assert!(
         refused.stderr.contains("never signed in"),
         "the gate refuses the command: {}",

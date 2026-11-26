@@ -83,8 +83,9 @@ impl VerbFamily for Schema {
         None
     }
 
+    /// Local schema commands work offline without an account sign-in.
     fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-        true
+        false
     }
 
     fn run(&self, matches: &ArgMatches) -> ExitCode {

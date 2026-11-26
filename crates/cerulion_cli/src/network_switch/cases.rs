@@ -10,7 +10,8 @@
 //!
 //! The tree check forces a row for every verb, but which [`Expect`] a row
 //! carries is the author's call: a verb that reaches the network some other
-//! way than `--robot` and is listed as [`Expect::Gated`] passes both tests.
+//! way than `--robot` and is listed as [`Expect::Runs`] or
+//! [`Expect::LocalNoGate`] passes the in-process check.
 
 /// One invocation.
 pub(crate) struct Case {
@@ -39,6 +40,10 @@ pub(crate) enum Expect {
     /// The switch does not refuse it, and it runs without the gate: exit
     /// `code`, with `says` in its output.
     Runs { code: i32, says: &'static str },
+    /// Local/offline verb: not refused by the switch and does not enter the
+    /// login gate, and the sweep does not spawn it for the reason given
+    /// (blocks waiting for a stream, TTY, daemon, or harness).
+    LocalNoGate(&'static str),
     /// The switch does not refuse it (or it never meets the switch's check),
     /// and the sweep does not spawn it, for the reason given.
     NotSpawned(&'static str),
@@ -138,6 +143,31 @@ const fn gated(verb: &'static [&'static str], argv: &'static [&'static str]) -> 
         verb,
         argv,
         expect: Expect::Gated,
+    }
+}
+
+const fn local_runs(
+    verb: &'static [&'static str],
+    argv: &'static [&'static str],
+    code: i32,
+    says: &'static str,
+) -> Case {
+    Case {
+        verb,
+        argv,
+        expect: Expect::Runs { code, says },
+    }
+}
+
+const fn local_no_gate(
+    verb: &'static [&'static str],
+    argv: &'static [&'static str],
+    why: &'static str,
+) -> Case {
+    Case {
+        verb,
+        argv,
+        expect: Expect::LocalNoGate(why),
     }
 }
 
@@ -282,59 +312,228 @@ pub(crate) static CASES: &[Case] = &[
             by: By::Network,
         },
     },
-    // ---- the same verbs without --robot are not refused ----
-    gated(
+    // ---- the same verbs without --robot are local and ungated ----
+    local_runs(
         &["topic", "pub"],
-        &["topic", "pub", "/cmd_vel", "std_msgs/String", "{data: hi}"],
+        &[
+            "topic",
+            "pub",
+            "/cmd_vel",
+            "std_msgs/String",
+            "{data: hi}",
+            "--wait-subscribers",
+            "0",
+        ],
+        0,
+        "published: topic=/cmd_vel type=std_msgs/String frames=1",
     ),
-    gated(&["topic", "snapshot"], &["topic", "snapshot", "/camera"]),
-    gated(
+    local_runs(
+        &["topic", "snapshot"],
+        &["topic", "snapshot", "/camera", "--timeout", "0"],
+        3,
+        "/camera",
+    ),
+    local_no_gate(
         &["service", "call"],
         &["service", "call", "/reset", "std_srvs/srv/Trigger"],
+        "waits for a local service server or workspace .srv definition (covered directly in sweep)",
     ),
-    gated(&["viz"], &["viz", "/camera"]),
-    // ---- the simulated robot and the benchmark reach no robot and no
-    // Cerulion service, so the switch does not refuse them ----
-    gated(&["rcp"], &["rcp", "--sim"]),
-    gated(&["rcp"], &["rcp", "--sim", "--http", "127.0.0.1:8765"]),
-    gated(&["rcp", "bench"], &["rcp", "bench", "--model", "m"]),
-    gated(&["rcp", "bench"], &["rcp", "bench", "--verify"]),
-    // ---- not refused under the switch, behind the login gate ----
-    gated(&["workspace", "create"], &["workspace", "create", "demo"]),
-    gated(&["workspace", "init"], &["workspace", "init"]),
-    gated(&["node", "create"], &["node", "create", "Demo"]),
-    gated(&["node", "delete"], &["node", "delete", "Demo"]),
-    gated(&["node", "modify"], &["node", "modify", "Demo"]),
-    gated(&["node", "build"], &["node", "build", "Demo"]),
-    gated(&["node", "stage"], &["node", "stage", "Demo"]),
-    gated(&["node", "run"], &["node", "run", "Demo"]),
-    gated(&["node", "list"], &["node", "list"]),
-    gated(&["node", "info"], &["node", "info", "Demo"]),
-    gated(&["graph", "create"], &["graph", "create", "demo"]),
-    gated(&["graph", "run"], &["graph", "run", "demo"]),
-    gated(&["graph", "validate"], &["graph", "validate", "demo"]),
-    gated(&["graph", "list"], &["graph", "list"]),
-    gated(&["graph", "levels"], &["graph", "levels", "demo"]),
-    gated(&["graph", "profile"], &["graph", "profile", "demo"]),
-    gated(&["graph", "partition"], &["graph", "partition", "demo"]),
-    gated(&["graph", "plan"], &["graph", "plan", "demo"]),
-    gated(&["graph", "pause"], &["graph", "pause", "run-1"]),
-    gated(&["graph", "resume"], &["graph", "resume", "run-1"]),
-    gated(&["topic", "list"], &["topic", "list"]),
-    gated(&["topic", "info"], &["topic", "info", "/camera"]),
-    gated(&["topic", "echo"], &["topic", "echo", "/camera"]),
-    gated(&["topic", "hz"], &["topic", "hz", "/camera"]),
-    gated(&["topic", "type"], &["topic", "type", "/camera"]),
-    gated(&["topic", "find"], &["topic", "find", "std_msgs/String"]),
-    gated(&["topic", "bw"], &["topic", "bw", "/camera"]),
-    gated(
+    local_no_gate(
+        &["viz"],
+        &["viz", "/camera"],
+        "spawns or attaches to cerulion-vizd and stays attached until Ctrl+C",
+    ),
+    // ---- the simulated robot and the benchmark are local and ungated ----
+    local_no_gate(
+        &["rcp"],
+        &["rcp", "--sim"],
+        "launches the local harness simulator (covered in login_gate_e2e_test)",
+    ),
+    local_no_gate(
+        &["rcp"],
+        &["rcp", "--sim", "--http", "127.0.0.1:8765"],
+        "launches the local harness HTTP server (covered in login_gate_e2e_test)",
+    ),
+    local_no_gate(
+        &["rcp", "bench"],
+        &["rcp", "bench", "--model", "m"],
+        "launches the local harness benchmark (covered in login_gate_e2e_test)",
+    ),
+    local_no_gate(
+        &["rcp", "bench"],
+        &["rcp", "bench", "--verify"],
+        "launches the local harness verifier (covered in login_gate_e2e_test)",
+    ),
+    // ---- local/offline verbs: not refused under the switch and ungated ----
+    local_runs(
+        &["workspace", "create"],
+        &["workspace", "create", "demo"],
+        0,
+        "Created workspace",
+    ),
+    local_runs(
+        &["workspace", "init"],
+        &["workspace", "init"],
+        0,
+        "Initialized workspace",
+    ),
+    local_runs(
+        &["node", "create"],
+        &["node", "create", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "delete"],
+        &["node", "delete", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "modify"],
+        &["node", "modify", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "build"],
+        &["node", "build", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "stage"],
+        &["node", "stage", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "run"],
+        &["node", "run", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "list"],
+        &["node", "list"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["node", "info"],
+        &["node", "info", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "create"],
+        &["graph", "create", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "run"],
+        &["graph", "run", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "validate"],
+        &["graph", "validate", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "list"],
+        &["graph", "list"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "levels"],
+        &["graph", "levels", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "profile"],
+        &["graph", "profile", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "partition"],
+        &["graph", "partition", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "plan"],
+        &["graph", "plan", "demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["graph", "pause"],
+        &["graph", "pause", "run-1"],
+        4,
+        "run-1",
+    ),
+    local_runs(
+        &["graph", "resume"],
+        &["graph", "resume", "run-1"],
+        4,
+        "run-1",
+    ),
+    local_runs(
+        &["topic", "list"],
+        &["topic", "list"],
+        0,
+        "No active local topics.",
+    ),
+    local_runs(
+        &["topic", "info"],
+        &["topic", "info", "/camera"],
+        1,
+        "/camera",
+    ),
+    local_no_gate(
+        &["topic", "echo"],
+        &["topic", "echo", "/camera"],
+        "streams local topic messages until Ctrl+C",
+    ),
+    local_no_gate(
+        &["topic", "hz"],
+        &["topic", "hz", "/camera"],
+        "measures local topic rate until Ctrl+C",
+    ),
+    local_runs(
+        &["topic", "type"],
+        &["topic", "type", "/camera"],
+        1,
+        "/camera",
+    ),
+    local_no_gate(
+        &["topic", "find"],
+        &["topic", "find", "std_msgs/String"],
+        "exits 0 with empty stdout when no local topic matches the type",
+    ),
+    local_no_gate(
+        &["topic", "bw"],
+        &["topic", "bw", "/camera"],
+        "measures local topic bandwidth until Ctrl+C",
+    ),
+    local_no_gate(
         &["ros2", "migrate"],
         &["ros2", "migrate", "--workspace", "ws"],
+        "depends on optional clang migration binary availability",
     ),
-    gated(
+    local_no_gate(
         &["ros2", "attach"],
         &["ros2", "attach", "--iface", "127.0.0.1"],
+        "opens a DDS discovery window (serving gate covered in serving_login_e2e_test)",
     ),
+    // ---- account-service verbs: not refused under the switch, behind the login gate ----
     gated(
         &["account", "devices", "list"],
         &["account", "devices", "list"],
@@ -343,21 +542,70 @@ pub(crate) static CASES: &[Case] = &[
         &["account", "devices", "revoke"],
         &["account", "devices", "revoke", "device-1"],
     ),
-    gated(&["tui"], &["tui"]),
-    gated(&["trace", "inspect"], &["trace", "inspect", "traces"]),
-    gated(&["bag", "play"], &["bag", "play", "run.mcap"]),
-    gated(&["bag", "info"], &["bag", "info", "run.mcap"]),
-    gated(&["bag", "migrate"], &["bag", "migrate", "run.mcap"]),
-    gated(&["bag", "record"], &["bag", "record", "/camera"]),
-    gated(&["flashback"], &["flashback"]),
-    gated(&["schema", "create"], &["schema", "create", "Demo"]),
-    gated(&["schema", "delete"], &["schema", "delete", "Demo"]),
-    gated(&["schema", "info"], &["schema", "info", "std_msgs/String"]),
-    gated(&["schema", "list"], &["schema", "list"]),
+    local_no_gate(&["tui"], &["tui"], "requires an interactive terminal UI"),
+    local_runs(
+        &["trace", "inspect"],
+        &["trace", "inspect", "traces"],
+        1,
+        "traces",
+    ),
+    local_runs(
+        &["bag", "play"],
+        &["bag", "play", "run.mcap"],
+        1,
+        "run.mcap",
+    ),
+    local_runs(
+        &["bag", "info"],
+        &["bag", "info", "run.mcap"],
+        1,
+        "run.mcap",
+    ),
+    local_runs(
+        &["bag", "migrate"],
+        &["bag", "migrate", "run.mcap"],
+        1,
+        "run.mcap",
+    ),
+    local_no_gate(
+        &["bag", "record"],
+        &["bag", "record", "/camera"],
+        "records local topics until Ctrl+C",
+    ),
+    local_runs(
+        &["flashback"],
+        &["flashback"],
+        1,
+        "no serving graph on this machine answered",
+    ),
+    local_runs(
+        &["schema", "create"],
+        &["schema", "create", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["schema", "delete"],
+        &["schema", "delete", "Demo"],
+        1,
+        "Workspace not found",
+    ),
+    local_runs(
+        &["schema", "info"],
+        &["schema", "info", "std_msgs/String"],
+        0,
+        "std_msgs/String",
+    ),
+    local_runs(
+        &["schema", "list"],
+        &["schema", "list"],
+        0,
+        "Built-in ROS 2 messages:",
+    ),
     // ---- account sign-in: not covered by the switch, so allowed under it ----
     Case {
-        verb: &["graph", "list"],
-        argv: &["graph", "list"],
+        verb: &["account", "devices", "list"],
+        argv: &["account", "devices", "list"],
         expect: Expect::SignIn {
             home: Home::Fresh,
             terminal: true,

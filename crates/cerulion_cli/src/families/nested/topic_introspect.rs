@@ -120,9 +120,9 @@ impl NestedVerbs for TopicIntrospect {
         None
     }
 
-    /// The same rule as every `topic` verb.
+    /// Local topic introspection works offline without an account sign-in.
     fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-        true
+        false
     }
 
     fn run(&self, matches: &ArgMatches) -> ExitCode {
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn the_new_topic_verbs_are_quiet_and_gated_like_the_built_in_ones() {
+    fn the_new_topic_verbs_are_quiet_and_local_without_login() {
         for argv in [
             &["cerulion", "topic", "type", "/t"][..],
             &["cerulion", "topic", "find", "std_msgs/String"],
@@ -313,7 +313,7 @@ mod tests {
             let (verbs, sub) = super::super::find(super::super::NESTED, &matches)
                 .unwrap_or_else(|| panic!("{argv:?} is not a nested verb"));
             assert_eq!(verbs.log_class(sub), VerbLogClass::OneShot, "{argv:?}");
-            assert!(verbs.needs_identity(sub), "{argv:?}");
+            assert!(!verbs.needs_identity(sub), "{argv:?}");
         }
     }
 }
