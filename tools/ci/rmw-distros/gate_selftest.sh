@@ -148,6 +148,24 @@ done
 for d in foxy galactic; do rclcpp_pairs_run "$d" || { echo "SELFTEST FAIL: $d is not on RCLCPP_PAIR_DISTROS"; fail=1; }; done
 rclcpp_pairs_run jazzy && { echo "SELFTEST FAIL: jazzy is on RCLCPP_PAIR_DISTROS"; fail=1; }
 rclcpp_pairs_run fox && { echo "SELFTEST FAIL: a prefix of a listed distro matched"; fail=1; }
-rm -f "$plain" "$plain.c" "$plain.s" "$plain.n" "$t" "$l" "$t.py" "$l.py" "$l.stray" "$t.none" "$t.bad" "$l.bad" "$l.none" "$t.many" "$l.late" "$l.dup"
-[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named, the serial-suite skip decision pinned on both arches, and the rclcpp pair judge's pass and every red path (bad floor, abort, traceback, rmw or core error, malformed frame, early end, crash at the deadline, duplicate, floor, loss, stray number) named, node_status pinned, and the pair rows pinned"
+# 13. The schema hash capture: the row list names jazzy and nothing else, the MEASURED reader takes
+#     only well-formed lines at the start of a line (the `--show-output` shape, beside cargo's own
+#     "0 measured" summary), and the judge reds a missing type, a duplicate type and a type that got
+#     no frame, each by name.
+schema_hash_capture_runs jazzy || { echo "SELFTEST FAIL: jazzy is not on SCHEMA_HASH_CAPTURE_DISTROS"; fail=1; }
+for d in humble lyrical galactic foxy jazz; do schema_hash_capture_runs "$d" && { echo "SELFTEST FAIL: $d is on SCHEMA_HASH_CAPTURE_DISTROS"; fail=1; }; done
+m="$plain.m"
+printf 'running 1 test\ntest cap ... ok\n\nsuccesses:\n\n---- cap stdout ----\nMEASURED geometry_msgs/Pose 0x8db061f3f9baff7d\nMEASURED sensor_msgs/Imu 0xa99349e4f040ba93\nMEASURED sensor_msgs/Imu 0xA99349E4F040BA93\nMEASURED sensor_msgs/Imu 0xa99349e4f040ba9\ntest cap ... MEASURED std_msgs/Header 0x0000000000000001\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n' > "$m"
+want_m="$(printf 'MEASURED geometry_msgs/Pose 0x8db061f3f9baff7d\nMEASURED sensor_msgs/Imu 0xa99349e4f040ba93')"
+[ "$(measured_hashes "$m")" = "$want_m" ] || { echo "SELFTEST FAIL: measured_hashes read other than the two well-formed lines:"; measured_hashes "$m"; fail=1; }
+measured_hashes_judge "$m" 2 selftest > /dev/null || { echo "SELFTEST FAIL: two distinct MEASURED lines failed a judge that wants two"; fail=1; }
+case "$(measured_hashes_judge "$m" 3 selftest)" in *"GATE FAIL"*"2 MEASURED line(s) over 2 distinct type(s), expected 3"*) : ;; *) echo "SELFTEST FAIL: a missing type was not named"; fail=1 ;; esac
+printf 'MEASURED sensor_msgs/Imu 0xa99349e4f040ba93\nMEASURED sensor_msgs/Imu 0xa99349e4f040ba93\n' > "$m.dup"
+case "$(measured_hashes_judge "$m.dup" 2 selftest)" in *"GATE FAIL"*"over 1 distinct"*) : ;; *) echo "SELFTEST FAIL: a type measured twice passed as two types"; fail=1 ;; esac
+{ cat "$m"; printf 'NOT MEASURED geometry_msgs/PoseStamped: no frame within the deadline\n'; } > "$m.none"
+case "$(measured_hashes_judge "$m.none" 2 selftest)" in *"GATE FAIL"*"got no frame"*"PoseStamped"*) : ;; *) echo "SELFTEST FAIL: a type that got no frame was not named"; fail=1 ;; esac
+: > "$m.empty"
+case "$(measured_hashes_judge "$m.empty" 2 selftest)" in *"GATE FAIL"*"0 MEASURED line(s)"*) : ;; *) echo "SELFTEST FAIL: a log with no MEASURED line passed"; fail=1 ;; esac
+rm -f "$plain" "$plain.c" "$plain.s" "$plain.n" "$t" "$l" "$t.py" "$l.py" "$l.stray" "$t.none" "$t.bad" "$l.bad" "$l.none" "$t.many" "$l.late" "$l.dup" "$m" "$m.dup" "$m.none" "$m.empty"
+[ "$fail" -eq 0 ] && echo "SELFTEST PASS: harvester proven over the coloured fixture (3 binaries + doc tests, 5 qualified failures incl. one doc test), the symbol audit over three nm fixtures, the refuse-row pin guard, and the rclpy red paths (missing .so, absent import probe, timeout rc) each named, the serial-suite skip decision pinned on both arches, and the rclcpp pair judge's pass and every red path (bad floor, abort, traceback, rmw or core error, malformed frame, early end, crash at the deadline, duplicate, floor, loss, stray number) named, node_status pinned, the pair rows pinned, and the schema hash capture row, its MEASURED reader and its judge (missing type, duplicate type, no frame, empty log) named"
 exit "$fail"
