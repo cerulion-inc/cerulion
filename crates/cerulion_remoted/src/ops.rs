@@ -116,6 +116,14 @@ use crate::shutdown::ShutdownStage;
 use crate::trust::SharedTrust;
 use crate::verbs;
 
+/// Sentinel returned by the blocking session worker when the shared
+/// [`OpsServer`]'s hash-chained receipt sink is poisoned (a prior session
+/// panicked mid receipt write). Checked both before `spawn_blocking` and again
+/// inside the worker immediately before `serve_connection` so a session queued
+/// behind a busy blocking pool cannot acknowledge a handshake after the sink
+/// poisons.
+struct ReceiptSinkPoisoned;
+
 /// Per-session wall bound. An authed-then-stalled peer must not hold a session's
 /// blocking task + connection indefinitely (a resource-hold DoS on the always-on
 /// daemon — the bootstrap surface admits any TLS-authed key). Generous for a real
@@ -270,6 +278,11 @@ pub struct OpsServing {
     /// The stage the serving loop runs after its accept loop stops and before
     /// the daemon tears down ([`crate::shutdown`]).
     shutdown: ShutdownStage,
+    /// Test-only hook fired immediately after `spawn_blocking` enqueues a
+    /// session worker, so tests can deterministically poison the receipt sink
+    /// while the worker is queued behind a full blocking pool.
+    #[cfg(any(test, feature = "test-seam"))]
+    on_blocking_queued_for_test: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl OpsServing {
@@ -345,6 +358,8 @@ impl OpsServing {
             deadline: OPS_SESSION_DEADLINE,
             bootstrap_first_frame_deadline: OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE,
             shutdown,
+            #[cfg(any(test, feature = "test-seam"))]
+            on_blocking_queued_for_test: None,
         })
     }
 
@@ -384,6 +399,19 @@ impl OpsServing {
     #[doc(hidden)]
     pub fn with_bootstrap_first_frame_deadline_for_test(mut self, deadline: Duration) -> Self {
         self.bootstrap_first_frame_deadline = deadline;
+        self
+    }
+
+    /// Test-only: register a hook fired immediately after `spawn_blocking`
+    /// queues a session worker, so tests can observe the queued window
+    /// deterministically without sleeping.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-seam"))]
+    pub fn with_on_blocking_queued_for_test(
+        mut self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.on_blocking_queued_for_test = Some(Arc::new(hook));
         self
     }
 
@@ -526,15 +554,11 @@ impl OpsServing {
         };
 
         // Fail closed before spawning a blocking task if the shared receipt
-        // sink mutex is poisoned (a prior session panicked mid hash-chain
-        // write). `cerud::record_receipt` also fails each append closed; this
-        // gives an immediate refusal with an accurate QUIC close reason.
+        // sink mutex is already poisoned, and check again inside the worker
+        // immediately before `serve_connection` in case it poisons while the
+        // worker is queued behind a busy blocking pool.
         if self.server.receipt_sink_poisoned() {
-            tracing::error!(remote_id = %remote_id,
-                "cerulion_remoted ops: REFUSING to serve — the receipt sink mutex is POISONED \
-                 (a prior session panicked mid hash-chain write); appending now could corrupt \
-                 the audit log. Fail-closed; restart the daemon to recover the chain tail.");
-            connection.close(0u32.into(), b"ops receipt sink poisoned");
+            refuse_poisoned_receipt_sink(&remote_id, &connection);
             return;
         }
 
@@ -550,13 +574,24 @@ impl OpsServing {
         };
         let server = self.server.clone();
         let mut join = tokio::task::spawn_blocking(move || {
-            server.serve_connection(OpsConnection { stream, caller })
+            if server.receipt_sink_poisoned() {
+                Err(ReceiptSinkPoisoned)
+            } else {
+                Ok(server.serve_connection(OpsConnection { stream, caller }))
+            }
         });
+        #[cfg(any(test, feature = "test-seam"))]
+        if let Some(hook) = &self.on_blocking_queued_for_test {
+            hook();
+        }
 
         tokio::select! {
             res = &mut join => match res {
-                Ok(Ok(())) => tracing::debug!(remote_id = %remote_id, "cerulion_remoted ops: session ended cleanly"),
-                Ok(Err(e)) => tracing::warn!(remote_id = %remote_id, error = %e, "cerulion_remoted ops: session ended with error"),
+                Ok(Ok(Ok(()))) => tracing::debug!(remote_id = %remote_id, "cerulion_remoted ops: session ended cleanly"),
+                Ok(Ok(Err(e))) => tracing::warn!(remote_id = %remote_id, error = %e, "cerulion_remoted ops: session ended with error"),
+                Ok(Err(ReceiptSinkPoisoned)) => {
+                    refuse_poisoned_receipt_sink(&remote_id, &connection);
+                }
                 Err(join_err) => tracing::error!(remote_id = %remote_id, error = %join_err, "cerulion_remoted ops: session task panicked"),
             },
             _ = &mut overall => {
@@ -742,6 +777,16 @@ fn close(connection: &Connection) {
 
 fn close_bootstrap_first_frame(connection: &Connection) {
     connection.close(0u32.into(), b"ops bootstrap first-frame deadline");
+}
+
+fn refuse_poisoned_receipt_sink(remote_id: &cerulion_link::EndpointId, connection: &Connection) {
+    tracing::error!(
+        remote_id = %remote_id,
+        "cerulion_remoted ops: REFUSING to serve, the receipt sink mutex is POISONED \
+         (a prior session panicked mid hash-chain write); appending now could corrupt \
+         the audit log. Fail-closed; restart the daemon to recover the chain tail."
+    );
+    connection.close(0u32.into(), b"ops receipt sink poisoned");
 }
 
 #[cfg(test)]
