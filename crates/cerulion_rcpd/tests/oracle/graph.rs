@@ -87,11 +87,13 @@ fn answer_batch(
         }
         let decoy = json!({ "call_id": 0, "decoy": true });
         publish_json(results, &decoy);
-        publish_json(
-            results,
-            &json!({ "call_id": call["call_id"], "tool": call["tool"] }),
-        );
+        publish_json(results, &answer(&call));
         publish_json(results, &decoy);
     }
     any
+}
+
+/// The graph's answer to the frame `call`.
+pub fn answer(call: &Value) -> Value {
+    json!({ "call_id": call["call_id"], "tool": call["tool"] })
 }
