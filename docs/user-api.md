@@ -1142,12 +1142,23 @@ every subsequent pair off by one full period while both
 `sync_unmatched_discard_count` and `sync_closer_skip_count` stay at zero. When
 every trigger input of a Sync node resolves statically to a declared period
 (through single-producer `period_ms` or transitive `DataTrigger` chains, taking
-`sample(N)` admission rounding up to the next producer tick and `throttle_ms`
-into account), both graph build (`tracing::warn!`) and `cerulion graph validate`
-(non-fatal warning check) warn when `sync_window_ms` is at or above the slowest
-resolved trigger-input period, or when `unbounded_sync` aligns resolved periodic
-inputs. Graphs with an `external`, multi-publisher, or external-topic trigger
-input are skipped to avoid false positives.
+`throttle_ms` into account), both graph build (`tracing::warn!`) and `cerulion
+graph validate` (non-fatal warning check) warn when `sync_window_ms` is at or
+above the slowest resolved trigger-input period, or when `unbounded_sync` aligns
+resolved periodic inputs. Graphs with an `external`, multi-publisher, or
+external-topic trigger input are skipped to avoid false positives.
+
+A `sample(N)` gate on a trigger input does not raise this ceiling, and the
+warning compares against the producer's period, not the gate's spacing. Each
+input's gate admits a frame when its stamp is at least `N` ms after the last
+frame that gate admitted, so the gate's phase comes from its own first admitted
+frame and moves after a dropped frame. Two 30 ms producers with `sample(31)` on
+both inputs admit every second frame in step; when one frame is lost, that gate
+moves to the other producer ticks, no same-tick pair is admitted again, and a
+32 ms window pairs frames 30 ms minus skew apart with both counters at zero.
+With `sample(N)` on one input only, the plain input still delivers every frame,
+so the same pairing needs no drop. To align at a lower rate, sample the Sync
+node's output, or lower the producers' rate with `period_ms`.
 
 A complete set that sits unfired (a burst that stopped at its per-step cap, or a
 set held at a pre-fire defer) is a carried backlog: the live loop sizes its next

@@ -38509,7 +38509,7 @@ nodes:
     }
 
     #[test]
-    fn graph_validate_resolves_non_divisible_sample_gate_to_next_admitted_tick() {
+    fn graph_validate_reports_the_producer_period_under_a_sample_gate() {
         let _env = unset_target_dir_for_test();
         let (_tmp, ws_root) = sync_window_workspace(sync_window_graph_yaml());
 
@@ -38522,9 +38522,10 @@ nodes:
             )
         };
 
-        // 30 ms streams with sample(31) admit on ticks 0, 60, 120, ... (60 ms).
-        // Window 32 is safe and must emit zero sync-window warnings.
-        let safe_infos = make_sampled(32);
+        // 30 ms streams with sample(31): a dropped frame moves a gate onto a
+        // different producer tick, so the bound stays the 30 ms producer
+        // period. Window 29 is below it and emits no sync-window line.
+        let safe_infos = make_sampled(29);
         let safe_report =
             graph_validate_with_inspector(&ws_root, "sync_win", false, &safe_infos).unwrap();
         assert!(safe_report.all_passed(), "report:\n{safe_report}");
@@ -38533,11 +38534,12 @@ nodes:
                 .checks
                 .iter()
                 .any(|c| c.label.starts_with("sync window '")),
-            "window 32 < admitted period 60 must not warn:\n{safe_report}"
+            "window 29 < producer period 30 must not warn:\n{safe_report}"
         );
 
-        // Window 60 reaches the admitted 60 ms period and reports 60 ms, not 31 ms.
-        let warn_infos = make_sampled(60);
+        // Window 32 reaches the 30 ms producer period and reports 30 ms, not
+        // the 60 ms admitted spacing.
+        let warn_infos = make_sampled(32);
         let warn_report =
             graph_validate_with_inspector(&ws_root, "sync_win", false, &warn_infos).unwrap();
         assert!(warn_report.all_passed(), "report:\n{warn_report}");
@@ -38547,8 +38549,8 @@ nodes:
             .find(|c| c.label == "sync window 'fuse'")
             .unwrap_or_else(|| panic!("expected sync window check line in:\n{warn_report}"));
         assert!(
-            check.detail.contains("sync_window_ms = 60") && check.detail.contains("(60 ms)"),
-            "expected admitted period 60 ms in detail, got: {}",
+            check.detail.contains("sync_window_ms = 32") && check.detail.contains("(30 ms)"),
+            "expected producer period 30 ms in detail, got: {}",
             check.detail
         );
     }

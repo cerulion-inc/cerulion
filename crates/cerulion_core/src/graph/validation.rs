@@ -21,7 +21,7 @@ use crate::error::{TransportError, TransportResult};
 use crate::wire::WireHeader;
 
 use super::config::{GraphConfig, InputDef, NetworkMode, NodeDef};
-use super::node::{BackpressurePolicy, MacroPolicy, NodeInfo};
+use super::node::{MacroPolicy, NodeInfo};
 use super::topology::{GraphTopology, MAX_CONSUMER_DEPTH};
 use super::{malformed_absolute_name, resolve_output_topic, resolve_source};
 
@@ -1216,7 +1216,6 @@ pub fn check_sync_window_periods(
                 topology,
                 entry_infos,
                 &node_by_id,
-                &node_def.id,
                 input,
                 &mut visited,
             ) else {
@@ -1252,12 +1251,17 @@ pub fn check_sync_window_periods(
     warnings
 }
 
+/// The declared period of the single in-graph producer behind `input`.
+///
+/// A `sample(N)` gate on the input never lifts this period. Each gate keeps
+/// its own phase, set by the first frame it admitted and moved by any dropped
+/// frame, so two gated inputs (or one gated and one plain) can admit frames
+/// one producer period apart from different producer ticks.
 fn resolve_input_period_ms<'a>(
     config: &'a GraphConfig,
     topology: &'a GraphTopology,
     entry_infos: &'a IndexMap<String, NodeInfo>,
     node_by_id: &IndexMap<&'a str, &'a NodeDef>,
-    consumer_node_id: &str,
     input: &InputDef,
     visited: &mut HashSet<&'a str>,
 ) -> Option<u64> {
@@ -1265,48 +1269,15 @@ fn resolve_input_period_ms<'a>(
     if config.is_multi_publisher(&topic) {
         return None;
     }
-    let flow = topology.topic(&topic)?;
-    let producer_id = flow.sole_producer()?;
-    let producer_period = resolve_node_period_ms(
+    let producer_id = topology.topic(&topic)?.sole_producer()?;
+    resolve_node_period_ms(
         config,
         topology,
         entry_infos,
         node_by_id,
         producer_id,
         visited,
-    )?;
-    let sample_interval_ms = flow
-        .consumers
-        .iter()
-        .find(|c| c.node_id == consumer_node_id && c.input == input.name)
-        .and_then(|c| match c.policy {
-            BackpressurePolicy::Sample(ms) => Some(ms),
-            BackpressurePolicy::DropOldest | BackpressurePolicy::Block => None,
-        });
-    match sample_interval_ms {
-        Some(ms) => effective_sampled_period_ms(producer_period, ms),
-        None => Some(producer_period),
-    }
-}
-
-/// Effective period of frames a `sample(N)` gate admits from a steady periodic
-/// producer with period `producer_period_ms`.
-///
-/// The subscriber admits a frame iff its wire timestamp is at least
-/// `sample_interval_ms` after the last accepted frame, and only sees frames
-/// emitted on producer ticks `0, P, 2P, ...`. When the gate falls between
-/// ticks, the next admitted frame lands on tick `ceil(N / P) * P`. Returns
-/// `None` on zero period or `u64` overflow.
-fn effective_sampled_period_ms(producer_period_ms: u64, sample_interval_ms: u64) -> Option<u64> {
-    if producer_period_ms == 0 {
-        return None;
-    }
-    if sample_interval_ms <= producer_period_ms {
-        return Some(producer_period_ms);
-    }
-    sample_interval_ms
-        .div_ceil(producer_period_ms)
-        .checked_mul(producer_period_ms)
+    )
 }
 
 fn resolve_node_period_ms<'a>(
@@ -1331,7 +1302,6 @@ fn resolve_node_period_ms<'a>(
                 topology,
                 entry_infos,
                 node_by_id,
-                node_id,
                 trigger_input,
                 visited,
             )?;
@@ -2481,6 +2451,7 @@ mod capture_sync_stamp_tests {
 #[cfg(test)]
 mod sync_window_period_tests {
     use super::*;
+    use crate::graph::node::BackpressurePolicy;
     use crate::graph::parse_graph;
 
     fn swp_input_meta(
@@ -2790,46 +2761,48 @@ nodes:
             }]
         );
 
-        // sample(50) on `imu` lifts its effective period to max(10, 50) = 50,
-        // so window 33 < 50 is silent, while window 50 warns naming `imu`.
-        infos.insert(
-            "fuse".to_string(),
-            swp_node_info(
-                vec![
-                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
-                    swp_input_meta("imu", true, BackpressurePolicy::Sample(50)),
-                ],
-                vec![],
-                MacroPolicy::Sync { window_ms: 33 },
+        // sample(50) on `imu` does not lift its 10 ms producer period, so the
+        // slowest period stays the 33 ms image stream: window 32 is silent,
+        // while windows 33 and 50 warn naming `image`.
+        for (window_ms, expected) in [
+            (32, vec![]),
+            (
+                33,
+                vec![SyncWindowPeriodWarning {
+                    node_id: "fuse".to_string(),
+                    kind: SyncWindowKind::Bounded { window_ms: 33 },
+                    slowest_input: "image".to_string(),
+                    slowest_period_ms: 33,
+                }],
             ),
-        );
-        let topo_sampled_ok = GraphTopology::build(&config, &infos).unwrap();
-        assert_eq!(
-            check_sync_window_periods(&config, &topo_sampled_ok, &infos),
-            vec![]
-        );
-
-        infos.insert(
-            "fuse".to_string(),
-            swp_node_info(
-                vec![
-                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
-                    swp_input_meta("imu", true, BackpressurePolicy::Sample(50)),
-                ],
-                vec![],
-                MacroPolicy::Sync { window_ms: 50 },
+            (
+                50,
+                vec![SyncWindowPeriodWarning {
+                    node_id: "fuse".to_string(),
+                    kind: SyncWindowKind::Bounded { window_ms: 50 },
+                    slowest_input: "image".to_string(),
+                    slowest_period_ms: 33,
+                }],
             ),
-        );
-        let topo_sampled_warn = GraphTopology::build(&config, &infos).unwrap();
-        assert_eq!(
-            check_sync_window_periods(&config, &topo_sampled_warn, &infos),
-            vec![SyncWindowPeriodWarning {
-                node_id: "fuse".to_string(),
-                kind: SyncWindowKind::Bounded { window_ms: 50 },
-                slowest_input: "imu".to_string(),
-                slowest_period_ms: 50,
-            }]
-        );
+        ] {
+            infos.insert(
+                "fuse".to_string(),
+                swp_node_info(
+                    vec![
+                        swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                        swp_input_meta("imu", true, BackpressurePolicy::Sample(50)),
+                    ],
+                    vec![],
+                    MacroPolicy::Sync { window_ms },
+                ),
+            );
+            let topo_sampled = GraphTopology::build(&config, &infos).unwrap();
+            assert_eq!(
+                check_sync_window_periods(&config, &topo_sampled, &infos),
+                expected,
+                "window {window_ms} with sample(50) on imu"
+            );
+        }
 
         // throttle_ms on intermediate DataTrigger `rect` lifts `image` period
         // from 33 ms to 60 ms, so window 50 < 60 is silent while window 60 warns.
@@ -3202,10 +3175,19 @@ nodes:
         assert_eq!(run1, run2);
     }
 
-    /// Hand-written oracles for `sample(N)` gates falling between producer
-    /// ticks vs landing on a tick, plus checked-arithmetic overflow handling.
+    /// Hand-written oracles: a `sample(N)` gate never lifts the period the
+    /// check compares against.
+    ///
+    /// Each input's gate keeps its own `last_accepted_ns`, so its phase is set
+    /// by the first frame it admitted and moves after any dropped frame. Two
+    /// 30 ms producers with `sample(31)` on both inputs admit A at 0 and B at 5;
+    /// when A's 60 ms frame is lost, A admits 90, 150, ... while B admits
+    /// 65, 125, ..., so no same-tick pair is ever admitted again and the
+    /// nearest partner is one producer period away (25 ms at 5 ms skew). The
+    /// bound is therefore the producer period, 30 ms, never the 60 ms admitted
+    /// spacing.
     #[test]
-    fn sample_gate_between_and_on_producer_ticks_resolves_admitted_period() {
+    fn a_sample_gate_never_lifts_the_producer_period() {
         let yaml = r#"
 prefix: swp
 nodes:
@@ -3228,189 +3210,73 @@ nodes:
         source: b/out
 "#;
         let config = parse_graph(yaml).unwrap();
-        let run_case = |period_a: u64,
-                        sample_a: BackpressurePolicy,
-                        period_b: u64,
-                        sample_b: BackpressurePolicy,
-                        window_ms: u64| {
-            let mut infos = IndexMap::new();
-            infos.insert(
-                "a".to_string(),
-                swp_node_info(
-                    vec![],
-                    vec!["out"],
-                    MacroPolicy::Period {
-                        period_ms: period_a,
-                    },
-                ),
-            );
-            infos.insert(
-                "b".to_string(),
-                swp_node_info(
-                    vec![],
-                    vec!["out"],
-                    MacroPolicy::Period {
-                        period_ms: period_b,
-                    },
-                ),
-            );
-            infos.insert(
-                "fuse".to_string(),
-                swp_node_info(
-                    vec![
-                        swp_input_meta("a", true, sample_a),
-                        swp_input_meta("b", true, sample_b),
-                    ],
-                    vec![],
-                    MacroPolicy::Sync { window_ms },
-                ),
-            );
-            let topo = GraphTopology::build(&config, &infos).unwrap();
-            check_sync_window_periods(&config, &topo, &infos)
+        let run_case =
+            |sample_a: BackpressurePolicy, sample_b: BackpressurePolicy, window_ms: u64| {
+                let mut infos = IndexMap::new();
+                infos.insert(
+                    "a".to_string(),
+                    swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 30 }),
+                );
+                infos.insert(
+                    "b".to_string(),
+                    swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 30 }),
+                );
+                infos.insert(
+                    "fuse".to_string(),
+                    swp_node_info(
+                        vec![
+                            swp_input_meta("a", true, sample_a),
+                            swp_input_meta("b", true, sample_b),
+                        ],
+                        vec![],
+                        MacroPolicy::Sync { window_ms },
+                    ),
+                );
+                let topo = GraphTopology::build(&config, &infos).unwrap();
+                check_sync_window_periods(&config, &topo, &infos)
+            };
+        let warn_30 = |window_ms: u64| {
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms },
+                slowest_input: "a".to_string(),
+                slowest_period_ms: 30,
+            }]
         };
+        let s31 = BackpressurePolicy::Sample(31);
+        let plain = BackpressurePolicy::DropOldest;
 
-        // Gate between ticks: two 30 ms streams with sample(31) admit frames on
-        // ticks 0, 60, 120, ... (ceil(31 / 30) * 30 = 60 ms). A 32 ms window
-        // (and 59 ms) is safe; 60 ms warns reporting 60 ms, not 31 ms.
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(31),
-                30,
-                BackpressurePolicy::Sample(31),
-                32
-            ),
-            vec![]
-        );
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(31),
-                30,
-                BackpressurePolicy::Sample(31),
-                59
-            ),
-            vec![]
-        );
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(31),
-                30,
-                BackpressurePolicy::Sample(31),
-                60
-            ),
-            vec![SyncWindowPeriodWarning {
-                node_id: "fuse".to_string(),
-                kind: SyncWindowKind::Bounded { window_ms: 60 },
-                slowest_input: "a".to_string(),
-                slowest_period_ms: 60,
-            }]
-        );
+        // sample(31) on both inputs: windows 32 and 59 warn against the 30 ms
+        // producer period (one dropped frame shifts a gate's phase); 29 is silent.
+        assert_eq!(run_case(s31, s31, 32), warn_30(32));
+        assert_eq!(run_case(s31, s31, 59), warn_30(59));
+        assert_eq!(run_case(s31, s31, 29), vec![]);
 
-        // Gate just past 2nd tick: 30 ms producer with sample(61) admits on
-        // ticks 0, 90, 180, ... (ceil(61 / 30) * 30 = 90 ms).
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(61),
-                30,
-                BackpressurePolicy::DropOldest,
-                89
-            ),
-            vec![]
-        );
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(61),
-                30,
-                BackpressurePolicy::DropOldest,
-                90
-            ),
-            vec![SyncWindowPeriodWarning {
-                node_id: "fuse".to_string(),
-                kind: SyncWindowKind::Bounded { window_ms: 90 },
-                slowest_input: "a".to_string(),
-                slowest_period_ms: 90,
-            }]
-        );
+        // sample(31) on one input only: the plain input keeps every 30 ms frame,
+        // so the bound is 30 ms with no drop needed; window 32 warns.
+        assert_eq!(run_case(s31, plain, 32), warn_30(32));
+        assert_eq!(run_case(plain, s31, 32), warn_30(32));
+        assert_eq!(run_case(s31, plain, 29), vec![]);
 
-        // Gate ON a tick (exact multiple): 30 ms producer with sample(60)
-        // admits on ticks 0, 60, 120, ... (60 ms).
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(60),
-                30,
-                BackpressurePolicy::DropOldest,
-                59
-            ),
-            vec![]
-        );
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(60),
-                30,
-                BackpressurePolicy::DropOldest,
-                60
-            ),
-            vec![SyncWindowPeriodWarning {
-                node_id: "fuse".to_string(),
-                kind: SyncWindowKind::Bounded { window_ms: 60 },
-                slowest_input: "a".to_string(),
-                slowest_period_ms: 60,
-            }]
-        );
-
-        // Gate ON a tick (equal to period) and below period: both admit every
-        // 30 ms tick.
-        for gate in [0, 15, 30] {
+        // Wide gates, a gate on a tick, a gate at or below the period, and the
+        // largest gate: all report the 30 ms producer period.
+        for gate in [0, 15, 30, 60, 61, u64::MAX] {
+            let sampled = BackpressurePolicy::Sample(gate);
             assert_eq!(
-                run_case(
-                    30,
-                    BackpressurePolicy::Sample(gate),
-                    30,
-                    BackpressurePolicy::DropOldest,
-                    29
-                ),
+                run_case(sampled, plain, 29),
                 vec![],
-                "gate={gate} on 30 ms stream must keep 30 ms period (window 29 silent)"
+                "gate={gate}: window 29 is below the 30 ms producer period"
             );
             assert_eq!(
-                run_case(
-                    30,
-                    BackpressurePolicy::Sample(gate),
-                    30,
-                    BackpressurePolicy::DropOldest,
-                    30
-                ),
-                vec![SyncWindowPeriodWarning {
-                    node_id: "fuse".to_string(),
-                    kind: SyncWindowKind::Bounded { window_ms: 30 },
-                    slowest_input: "a".to_string(),
-                    slowest_period_ms: 30,
-                }],
-                "gate={gate} on 30 ms stream must warn at window 30"
+                run_case(sampled, plain, 30),
+                warn_30(30),
+                "gate={gate}: window 30 reaches the 30 ms producer period"
             );
         }
 
-        // Checked arithmetic: a gate whose next tick overflows u64 skips
-        // cleanly instead of panicking or reporting a truncated period.
-        assert_eq!(
-            run_case(
-                30,
-                BackpressurePolicy::Sample(u64::MAX),
-                30,
-                BackpressurePolicy::DropOldest,
-                u64::MAX,
-            ),
-            vec![]
-        );
-
-        // Transitive DataTrigger with sample(31) on 30 ms upstream: admitted
-        // frames reach the Sync node every 60 ms, not 31 ms.
+        // A sample(31) gate upstream of a DataTrigger node: the DataTrigger
+        // fires only on admitted frames, so its output carries the same
+        // shiftable phase, and the bound stays the 30 ms camera period.
         let chain_yaml = r#"
 prefix: swp
 nodes:
@@ -3441,7 +3307,7 @@ nodes:
         source: imu/sample
 "#;
         let chain_config = parse_graph(chain_yaml).unwrap();
-        let make_chain_infos = |window_ms: u64| {
+        let chain_case = |window_ms: u64| {
             let mut infos = IndexMap::new();
             infos.insert(
                 "cam".to_string(),
@@ -3476,23 +3342,17 @@ nodes:
                     MacroPolicy::Sync { window_ms },
                 ),
             );
-            infos
+            let topo = GraphTopology::build(&chain_config, &infos).unwrap();
+            check_sync_window_periods(&chain_config, &topo, &infos)
         };
-        let chain_infos_59 = make_chain_infos(59);
-        let chain_topo_59 = GraphTopology::build(&chain_config, &chain_infos_59).unwrap();
+        assert_eq!(chain_case(29), vec![]);
         assert_eq!(
-            check_sync_window_periods(&chain_config, &chain_topo_59, &chain_infos_59),
-            vec![]
-        );
-        let chain_infos_60 = make_chain_infos(60);
-        let chain_topo_60 = GraphTopology::build(&chain_config, &chain_infos_60).unwrap();
-        assert_eq!(
-            check_sync_window_periods(&chain_config, &chain_topo_60, &chain_infos_60),
+            chain_case(32),
             vec![SyncWindowPeriodWarning {
                 node_id: "fuse".to_string(),
-                kind: SyncWindowKind::Bounded { window_ms: 60 },
+                kind: SyncWindowKind::Bounded { window_ms: 32 },
                 slowest_input: "image".to_string(),
-                slowest_period_ms: 60,
+                slowest_period_ms: 30,
             }]
         );
     }

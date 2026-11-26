@@ -224,8 +224,10 @@ naming here because they are easy to get wrong:
   shared by `GraphRuntime::build_with_scheduler` (structured `tracing::warn!`) and
   `cerulion_cli_engine::graph_cmd` (`cerulion graph validate` advisory warning and the
   multi-process supervisor) to flag `sync_window_ms >= slowest_period_ms` or `unbounded_sync`
-  when every trigger input resolves to a declared period (rounding `sample(N)` up to the next
-  admitted producer tick `ceil(N / period) * period`), without refusing any graph. On split
+  when every trigger input resolves to a declared period, without refusing any graph. A
+  `sample(N)` gate never lifts the resolved period: each gate keeps its own last admitted
+  stamp, so a drop (or a different first frame) moves one gate onto other producer ticks and
+  admitted frames from different ticks sit one producer period minus skew apart. On split
   multi-process runs the full-graph `PlanningOnly` build skips logging, the supervisor computes
   the warnings over the whole graph and stamps each Sync node's findings onto its owning
   worker's `WorkerPlan::sync_window_period_warnings`, and that worker passes them through
