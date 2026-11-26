@@ -334,6 +334,8 @@ fn help_lists_the_whole_re_execution_surface() {
         "--report",
         "--tolerance",
         "--record-out",
+        "--feed-index-budget",
+        "--verifier-record-budget",
         "--rate",
         "--duration",
         "--start-offset",

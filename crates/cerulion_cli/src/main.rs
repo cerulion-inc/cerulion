@@ -505,6 +505,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         allow_param_change,
         record_out,
         feed_index_budget,
+        verifier_record_budget,
         ..
     } = action
     else {
@@ -525,6 +526,7 @@ fn play_flags_of(action: &BagAction) -> Option<cerulion_cli_engine::resim_cmd::P
         allow_param_change: *allow_param_change,
         record_out: record_out.clone(),
         feed_index_budget: *feed_index_budget,
+        verifier_record_budget: *verifier_record_budget,
     })
 }
 
@@ -559,6 +561,7 @@ fn is_resim_family(action: &BagAction) -> bool {
             allow_param_change,
             record_out,
             feed_index_budget,
+            verifier_record_budget,
             ..
         } => {
             // The two BOTH-HALVES flags are deliberately ABSENT
@@ -592,6 +595,7 @@ fn is_resim_family(action: &BagAction) -> bool {
                 || *allow_param_change
                 || record_out.is_some()
                 || feed_index_budget.is_some()
+                || verifier_record_budget.is_some()
         }
         // `bag migrate` REWRITES a bag rather than executing one — no
         // resim flags exist on it, so it can never be a resim-surface misuse.
@@ -668,6 +672,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
             allow_param_change,
             record_out,
             feed_index_budget,
+            verifier_record_budget,
         } => {
             // A `--resim` invocation never reaches here — `main`
             // intercepts it for the 0–6 exit contract. What DOES reach here is
@@ -688,6 +693,7 @@ fn run_bag(action: BagAction) -> CliResult<()> {
                     allow_param_change,
                     record_out,
                     feed_index_budget,
+                    verifier_record_budget,
                 },
             )
             .map_err(cerulion_cli_engine::error::CliError::Validation)?;
@@ -5309,6 +5315,9 @@ mod resim_flag_mapping_tests {
             record_out: Some(PathBuf::from("/tmp/o.mcap")),
             // Rides the `verify` switch, so the arm without it maps none.
             feed_index_budget: verify.then_some(4096),
+            // Rides the `strict_state` switch so one arm maps it and the
+            // other maps none.
+            verifier_record_budget: strict_state.then_some(500_000),
         }
     }
 
@@ -5347,6 +5356,11 @@ mod resim_flag_mapping_tests {
             Some(4096),
             "`--feed-index-budget` must survive the variant -> PlayFlags mapping"
         );
+        assert_eq!(
+            f.verifier_record_budget,
+            Some(500_000),
+            "`--verifier-record-budget` must survive the variant -> PlayFlags mapping"
+        );
     }
 
     #[test]
@@ -5361,9 +5375,38 @@ mod resim_flag_mapping_tests {
         assert!(f.rate.is_none());
         assert!(f.topics.is_empty());
         assert!(f.feed_index_budget.is_none());
+        assert!(f.verifier_record_budget.is_none());
         // The two bag-time bounds are `Option`s for the same
         // reason `--rate` is — the refusal seam has to tell "asked for nothing"
         // from "asked for the default".
+    }
+
+    #[test]
+    fn resim_verifier_budget_flag_wiring() {
+        use clap::Parser as _;
+        let cli = cli::Cli::try_parse_from([
+            "cerulion",
+            "bag",
+            "play",
+            "b.mcap",
+            "--resim",
+            "all",
+            "--verify",
+            "--verifier-record-budget",
+            "750000",
+        ])
+        .expect("clap parses --verifier-record-budget");
+        let Commands::Bag { action } = cli.command else {
+            panic!("expected bag command");
+        };
+        let flags = play_flags_of(&action).expect("bag play maps to PlayFlags");
+        assert_eq!(flags.verifier_record_budget, Some(750_000));
+        let mode = cerulion_cli_engine::resim_cmd::resolve_play_mode(flags)
+            .expect("resolve_play_mode accepts positive verifier record budget");
+        let cerulion_cli_engine::resim_cmd::PlayMode::Resim { options, .. } = mode else {
+            panic!("expected resim mode");
+        };
+        assert_eq!(options.verifier_record_budget, Some(750_000));
     }
 
     #[test]
@@ -5405,6 +5448,7 @@ mod is_resim_family_tests {
         allow_param_change: bool,
         record_out: Option<PathBuf>,
         feed_index_budget: Option<u64>,
+        verifier_record_budget: Option<u64>,
     }
 
     fn play(f: Flags) -> BagAction {
@@ -5423,6 +5467,7 @@ mod is_resim_family_tests {
             allow_param_change: f.allow_param_change,
             record_out: f.record_out,
             feed_index_budget: f.feed_index_budget,
+            verifier_record_budget: f.verifier_record_budget,
         }
     }
 
@@ -5539,6 +5584,13 @@ mod is_resim_family_tests {
                 "--feed-index-budget",
                 play(Flags {
                     feed_index_budget: Some(4096),
+                    ..Flags::default()
+                }),
+            ),
+            (
+                "--verifier-record-budget",
+                play(Flags {
+                    verifier_record_budget: Some(500_000),
                     ..Flags::default()
                 }),
             ),
