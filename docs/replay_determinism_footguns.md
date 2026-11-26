@@ -464,11 +464,28 @@ trace format 10 too.
 
 ### Divergence LOCALIZES to the producing rank
 
-Cross-rank edges are served from the **recorded frames**, injected through the
-real accounting drain and steered by the consumer's own read log. So:
+Cross-rank edges are served from the **recorded frames**, never from a
+co-replaying producer rank. How those frames reach the consumer depends on the
+replay mode and the bag's `trace_format`:
 
-- **A cross-rank edge-read divergence is impossible by construction.** The input
-  side of every cross-rank edge is the bag, not a co-replaying candidate.
+- Under `cerulion bag play <bag> --resim all --verify` on a free-run recording
+  at `trace_format` 8 or later, every read stage is served through a **private
+  per-input feed** by recorded `(writer, sequence)` identity (see `docs/bag.md`).
+  Popping reads receive the exact recorded batch and served frames, and
+  non-popping `Held(body)` reads receive nothing, so live `drop_oldest` queue
+  evictions reproduce read for read with no `join_mismatch`.
+- Under neutral `--resim all` without `--verify`, or on a free-run bag recorded
+  below `trace_format` 8, cross-rank topics use read-log-steered shared-queue
+  injection (`BestEffort`). Because frames evicted on `drop_oldest` overflow
+  are never popped, the consumer's popped count no longer lands on the served
+  sequence after an eviction, so steered injection stands down for that topic
+  with `join_mismatch` and falls back to the recorded-clock injection window.
+
+So:
+
+- **A cross-rank edge-read divergence is impossible by construction** under
+  `--verify` on recordings at `trace_format` 8 or later. The input side of
+  every cross-rank edge is the bag, not a co-replaying candidate.
 - **A changed producer reads as "rank A produced different bytes"**, not as a
   cascade of consumer-side symptoms downstream of it. That is sharper blame, not
   weaker: the verdict names the rank that changed instead of everything that
