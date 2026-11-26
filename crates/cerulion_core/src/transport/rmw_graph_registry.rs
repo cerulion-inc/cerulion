@@ -1,9 +1,33 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The cross-process rmw topic graph registry codec and gather fold.
+//! The cross-process rmw topic graph registry `/__cerulion/rmw_graph`.
 //!
-//! Defines the host-wide wire format v1, fixed shared-memory service sizing
-//! constants, snapshot frame encoder and decoder, per-writer generation fold,
-//! and required-writer filter for `/__cerulion/rmw_graph`.
+//! Every `rmw_cerulion` process on a host holds one [`RmwGraphWriter`]. The
+//! writer keeps the process's `(topic, type_name)` pairs and publishes them as
+//! snapshot frames on [`RMW_GRAPH_REGISTRY_SERVICE_NAME`]. A reader in another
+//! process gathers one snapshot from every live writer with
+//! [`TransportManager::gather_rmw_graph`](super::TransportManager::gather_rmw_graph).
+//!
+//! # Writer and doorbell
+//!
+//! The writer sends a full snapshot each time its pair set changes. A
+//! background pump waits on the doorbell event service
+//! [`RMW_GRAPH_DOORBELL_SERVICE_NAME`] and sends the snapshot again when a
+//! reader rings it, or after [`RMW_GRAPH_REPUBLISH_INTERVAL`] when no ring
+//! comes. A reader rings before each drain pass, so a live writer answers
+//! within one pass. The writer opens its ports on the first `add` or
+//! `remove`. When that open fails, the pair counts are kept and the open runs
+//! again on the next `add` or `remove`.
+//!
+//! # Gather verdict
+//!
+//! The writers a gather must hear are the publishers that iceoryx2 lists on
+//! the registry service, minus the publishers whose owner node is `Dead`, minus
+//! the caller's own writer ([`required_writers`]). The gather reads the node
+//! list and never removes a node. With no required writer it returns
+//! [`GatherCompleteness::Settled`] at once, without a subscriber or a ring.
+//! Otherwise it returns `Settled` as soon as each required writer delivered a
+//! complete generation, or [`GatherCompleteness::Incomplete`] when the window
+//! ends first. The entries of an `Incomplete` gather are still real.
 //!
 //! # Wire contract (frame v1)
 //!
@@ -29,12 +53,30 @@
 //! # Static configuration stability
 //!
 //! The sizing constants ([`RMW_GRAPH_MAX_WRITERS`], [`RMW_GRAPH_MAX_READERS`],
-//! [`RMW_GRAPH_QUEUE_DEPTH`], [`RMW_GRAPH_FRAME_LEN`]) and frame v1 are fixed
+//! [`RMW_GRAPH_MAX_NODES`], [`RMW_GRAPH_QUEUE_DEPTH`], [`RMW_GRAPH_FRAME_LEN`])
+//! and frame v1 are fixed
 //! for [`RMW_GRAPH_REGISTRY_SERVICE_NAME`]. Both writers and readers open the
 //! service with these constants, so an incompatible change requires a new
 //! service name.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use iceoryx2::node::{Node, NodeState, NodeView};
+use iceoryx2::port::listener::Listener;
+use iceoryx2::port::notifier::Notifier;
+use iceoryx2::port::publisher::Publisher;
+use iceoryx2::port::subscriber::Subscriber;
+use iceoryx2::prelude::{CallbackProgression, ServiceName};
+use iceoryx2::service::port_factory::publish_subscribe::PortFactory;
+use iceoryx2::service::port_factory::PortFactory as _;
+
+use super::failure_regime_latch::{lock_regime_latch, FailureRegimeLatch, RegimeDecision};
+use super::{CerService, TransportManager};
+use crate::error::{TransportError, TransportResult};
 
 pub use super::mirror_registry::GatherCompleteness;
 
@@ -57,6 +99,20 @@ pub const RMW_GRAPH_MAX_READERS: usize = 16;
 /// Per-reader subscriber queue depth (fixed for service v1; at least
 /// `2 * RMW_GRAPH_MAX_WRITERS`).
 pub const RMW_GRAPH_QUEUE_DEPTH: usize = 128;
+
+/// Maximum iceoryx2 nodes that may open the registry or doorbell service at
+/// once: every writer process plus every reader process (fixed for service
+/// v1). A reader in a writer's own process shares that writer's node.
+pub const RMW_GRAPH_MAX_NODES: usize = RMW_GRAPH_MAX_WRITERS + RMW_GRAPH_MAX_READERS;
+
+/// How long a writer's pump waits for a doorbell ring before it sends its
+/// snapshot again anyway. The doorbell answers a gather within one pass; this
+/// interval serves a gather only when the doorbell could not be opened on the
+/// writer or the reader side.
+pub const RMW_GRAPH_REPUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The pause between two drain passes of a gather.
+const GATHER_POLL: Duration = Duration::from_millis(20);
 
 /// Maximum doorbell listeners (one per live writer process).
 pub const RMW_GRAPH_DOORBELL_MAX_LISTENERS: usize = RMW_GRAPH_MAX_WRITERS;
@@ -200,6 +256,27 @@ fn read_u128_le(bytes: &[u8], offset: usize) -> Option<u128> {
     Some(u128::from_le_bytes(arr))
 }
 
+/// Check that one `(topic, type_name)` pair can be carried in a frame: both
+/// names non-empty and within [`MAX_RMW_GRAPH_TOPIC_LEN`] and
+/// [`MAX_RMW_GRAPH_TYPE_LEN`].
+fn validate_entry(topic: &str, type_name: &str) -> Result<(), RmwGraphFrameError> {
+    if topic.is_empty() {
+        return Err(RmwGraphFrameError::EmptyTopic);
+    }
+    if type_name.is_empty() {
+        return Err(RmwGraphFrameError::EmptyType);
+    }
+    if topic.len() > MAX_RMW_GRAPH_TOPIC_LEN {
+        return Err(RmwGraphFrameError::TopicTooLong { len: topic.len() });
+    }
+    if type_name.len() > MAX_RMW_GRAPH_TYPE_LEN {
+        return Err(RmwGraphFrameError::TypeTooLong {
+            len: type_name.len(),
+        });
+    }
+    Ok(())
+}
+
 fn write_part(
     writer_id: u128,
     generation: u32,
@@ -247,20 +324,7 @@ where
 {
     let mut sorted = BTreeSet::new();
     for (topic, type_name) in entries {
-        if topic.is_empty() {
-            return Err(RmwGraphFrameError::EmptyTopic);
-        }
-        if type_name.is_empty() {
-            return Err(RmwGraphFrameError::EmptyType);
-        }
-        if topic.len() > MAX_RMW_GRAPH_TOPIC_LEN {
-            return Err(RmwGraphFrameError::TopicTooLong { len: topic.len() });
-        }
-        if type_name.len() > MAX_RMW_GRAPH_TYPE_LEN {
-            return Err(RmwGraphFrameError::TypeTooLong {
-                len: type_name.len(),
-            });
-        }
+        validate_entry(topic, type_name)?;
         sorted.insert((topic, type_name));
     }
 
@@ -565,6 +629,567 @@ pub fn required_writers<N: Ord>(
         })
         .map(|(publisher_id, _)| *publisher_id)
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Shared-memory services
+// ---------------------------------------------------------------------------
+
+fn service_name(name: &str) -> TransportResult<ServiceName> {
+    name.try_into().map_err(|e| TransportError::Internal {
+        reason: format!("rmw graph registry: invalid service name '{name}': {e:?}"),
+    })
+}
+
+/// Open the registry pub/sub service. Writers and readers both call this, so
+/// every side states the same static config and `open_or_create` agrees.
+fn open_registry_service(
+    node: &Node<CerService>,
+) -> TransportResult<PortFactory<CerService, [u8], ()>> {
+    node.service_builder(&service_name(RMW_GRAPH_REGISTRY_SERVICE_NAME)?)
+        .publish_subscribe::<[u8]>()
+        .subscriber_max_buffer_size(RMW_GRAPH_QUEUE_DEPTH)
+        .max_subscribers(RMW_GRAPH_MAX_READERS)
+        .max_publishers(RMW_GRAPH_MAX_WRITERS)
+        .max_nodes(RMW_GRAPH_MAX_NODES)
+        .history_size(0)
+        .enable_safe_overflow(true)
+        .open_or_create()
+        .map_err(|e| TransportError::Internal {
+            reason: format!(
+                "rmw graph registry: could not open the service \
+                 '{RMW_GRAPH_REGISTRY_SERVICE_NAME}': {e:?}"
+            ),
+        })
+}
+
+/// Open the doorbell event service, with the same static config on every side.
+fn open_doorbell_service(
+    node: &Node<CerService>,
+) -> TransportResult<iceoryx2::service::port_factory::event::PortFactory<CerService>> {
+    node.service_builder(&service_name(RMW_GRAPH_DOORBELL_SERVICE_NAME)?)
+        .event()
+        .event_id_max_value(super::CERULION_MAX_EVENT_ID)
+        .max_listeners(RMW_GRAPH_DOORBELL_MAX_LISTENERS)
+        .max_notifiers(RMW_GRAPH_DOORBELL_MAX_NOTIFIERS)
+        .max_nodes(RMW_GRAPH_MAX_NODES)
+        .open_or_create()
+        .map_err(|e| TransportError::Internal {
+            reason: format!(
+                "rmw graph registry: could not open the doorbell service \
+                 '{RMW_GRAPH_DOORBELL_SERVICE_NAME}': {e:?}"
+            ),
+        })
+}
+
+/// The listener a writer's pump waits on and the notifier its teardown rings.
+fn open_writer_doorbell(
+    node: &Node<CerService>,
+) -> TransportResult<(Listener<CerService>, Notifier<CerService>)> {
+    let service = open_doorbell_service(node)?;
+    let listener = service
+        .listener_builder()
+        .create()
+        .map_err(|e| TransportError::Internal {
+            reason: format!("rmw graph registry: could not create the doorbell listener: {e:?}"),
+        })?;
+    let notifier = service
+        .notifier_builder()
+        .create()
+        .map_err(|e| TransportError::Internal {
+            reason: format!("rmw graph registry: could not create the doorbell notifier: {e:?}"),
+        })?;
+    Ok((listener, notifier))
+}
+
+/// Log one failure of the condition `what` on its latch: loud at a regime's
+/// head and at each decade, debug in between.
+fn report_failure(latch: &mut FailureRegimeLatch, what: &'static str, error: &str) {
+    match latch.on_failure() {
+        RegimeDecision::Loud => tracing::warn!(
+            service = RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            what,
+            error = %error,
+            "rmw graph registry degraded; a topic list across processes may miss topics \
+             until it recovers"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            service = RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            what,
+            error = %error,
+            suppressed,
+            "rmw graph registry degraded; a topic list across processes may miss topics \
+             until it recovers"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            service = RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            what,
+            error = %error,
+            total_failures = total,
+            suppressed,
+            "rmw graph registry degraded; a topic list across processes may miss topics \
+             until it recovers"
+        ),
+    }
+}
+
+fn report_recovery(latch: &mut FailureRegimeLatch, what: &'static str) {
+    if let Some(suppressed) = latch.on_success() {
+        tracing::info!(
+            service = RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            what,
+            suppressed,
+            "rmw graph registry recovered"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Writer
+// ---------------------------------------------------------------------------
+
+struct WriterPorts {
+    publisher: Publisher<CerService, [u8], ()>,
+    writer_id: u128,
+}
+
+struct WriterState {
+    /// `(topic, type_name)` to the number of local endpoints that use it.
+    pairs: BTreeMap<(String, String), usize>,
+    /// Bumped each time the set of pairs changes. Every frame of one
+    /// generation carries the same snapshot, so a reader may complete a
+    /// generation from parts of different sends.
+    generation: u32,
+    ports: Option<WriterPorts>,
+    open_failures: FailureRegimeLatch,
+    send_failures: FailureRegimeLatch,
+}
+
+impl WriterState {
+    /// Open the publisher if it is not open. Returns whether it opened now.
+    fn open_ports(&mut self, node: &Node<CerService>) -> bool {
+        if self.ports.is_some() {
+            return false;
+        }
+        let opened = open_registry_service(node).and_then(|factory| {
+            factory
+                .publisher_builder()
+                .initial_max_slice_len(RMW_GRAPH_FRAME_LEN)
+                .create()
+                .map_err(|e| TransportError::Internal {
+                    reason: format!("rmw graph registry: could not create the publisher: {e:?}"),
+                })
+        });
+        match opened {
+            Ok(publisher) => {
+                let writer_id = publisher.id().value();
+                self.ports = Some(WriterPorts {
+                    publisher,
+                    writer_id,
+                });
+                report_recovery(&mut self.open_failures, "open");
+                true
+            }
+            Err(e) => {
+                report_failure(&mut self.open_failures, "open", &e.to_string());
+                false
+            }
+        }
+    }
+
+    /// Send every part of the current generation.
+    fn publish(&mut self) {
+        let Some(ports) = &self.ports else {
+            return;
+        };
+        let frames = match encode_snapshot(
+            ports.writer_id,
+            self.generation,
+            self.pairs.keys().map(|(t, ty)| (t.as_str(), ty.as_str())),
+        ) {
+            Ok(frames) => frames,
+            Err(e) => {
+                report_failure(&mut self.send_failures, "encode", &e.to_string());
+                return;
+            }
+        };
+        for frame in &frames {
+            let sent = match ports.publisher.loan_slice_uninit(frame.len()) {
+                Ok(sample) => sample
+                    .write_from_slice(frame)
+                    .send()
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(e) = sent {
+                report_failure(&mut self.send_failures, "send", &e);
+                return;
+            }
+        }
+        report_recovery(&mut self.send_failures, "send");
+    }
+}
+
+struct WriterShared {
+    state: Mutex<WriterState>,
+    rings_answered: AtomicU64,
+}
+
+impl WriterShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, WriterState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The background pump, joined on drop.
+struct PumpHandle {
+    exit: Arc<AtomicBool>,
+    /// Rung on drop so the pump leaves its wait at once. `None` when the
+    /// doorbell could not be opened; a drop then waits out at most one
+    /// [`RMW_GRAPH_REPUBLISH_INTERVAL`].
+    wake: Option<Notifier<CerService>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for PumpHandle {
+    fn drop(&mut self) {
+        self.exit.store(true, Ordering::Relaxed);
+        if let Some(wake) = &self.wake {
+            let _ = wake.notify();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[derive(Default)]
+struct PumpSlot {
+    handle: Option<PumpHandle>,
+    failures: FailureRegimeLatch,
+}
+
+/// The writer half of the rmw graph registry: one per `rmw_cerulion` process,
+/// made by [`TransportManager::open_rmw_graph_writer`].
+///
+/// [`add`](Self::add) and [`remove`](Self::remove) count local endpoints per
+/// `(topic, type_name)` pair. The publisher opens on the first call; a failed
+/// open is logged once per failure regime and runs again on the next call, and
+/// the counts are kept either way. Dropping the writer stops its pump and
+/// releases its ports, so other processes stop listing its pairs.
+pub struct RmwGraphWriter {
+    // Field order is drop order: the pump joins first, then the ports in
+    // `shared` drop, then the transport that owns their node.
+    pump: Mutex<PumpSlot>,
+    shared: Arc<WriterShared>,
+    transport: Arc<TransportManager>,
+}
+
+impl std::fmt::Debug for RmwGraphWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RmwGraphWriter")
+            .field("writer_id", &self.writer_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl RmwGraphWriter {
+    pub(crate) fn new(transport: Arc<TransportManager>) -> Self {
+        Self {
+            pump: Mutex::new(PumpSlot::default()),
+            shared: Arc::new(WriterShared {
+                state: Mutex::new(WriterState {
+                    pairs: BTreeMap::new(),
+                    generation: 0,
+                    ports: None,
+                    open_failures: FailureRegimeLatch::new(),
+                    send_failures: FailureRegimeLatch::new(),
+                }),
+                rings_answered: AtomicU64::new(0),
+            }),
+            transport,
+        }
+    }
+
+    /// Count one more local endpoint on `(topic, type_name)` and publish the
+    /// new snapshot when the pair is new.
+    ///
+    /// # Errors
+    ///
+    /// [`RmwGraphFrameError`] when a name is empty or longer than its frame
+    /// limit. Nothing is recorded then. A shared-memory failure is not an
+    /// error here: it is logged, and the pair is kept for the next attempt.
+    pub fn add(&self, topic: &str, type_name: &str) -> Result<(), RmwGraphFrameError> {
+        validate_entry(topic, type_name)?;
+        let mut state = self.shared.lock();
+        let count = state
+            .pairs
+            .entry((topic.to_string(), type_name.to_string()))
+            .or_insert(0);
+        *count += 1;
+        let changed = *count == 1;
+        self.sync(state, changed);
+        Ok(())
+    }
+
+    /// Count one less local endpoint on `(topic, type_name)`. The pair leaves
+    /// the snapshot when its count reaches zero. A pair that was never added
+    /// changes nothing.
+    pub fn remove(&self, topic: &str, type_name: &str) {
+        let mut state = self.shared.lock();
+        let key = (topic.to_string(), type_name.to_string());
+        let changed = match state.pairs.get_mut(&key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                state.pairs.remove(&key);
+                true
+            }
+            None => false,
+        };
+        self.sync(state, changed);
+    }
+
+    /// The writer identity other processes see in this writer's frames (its
+    /// publisher id). `None` until the publisher has opened.
+    #[must_use]
+    pub fn writer_id(&self) -> Option<u128> {
+        self.shared.lock().ports.as_ref().map(|p| p.writer_id)
+    }
+
+    /// How many doorbell rings this writer's pump has answered.
+    #[must_use]
+    pub fn doorbell_rings_answered(&self) -> u64 {
+        self.shared.rings_answered.load(Ordering::Relaxed)
+    }
+
+    fn sync(&self, mut state: std::sync::MutexGuard<'_, WriterState>, changed: bool) {
+        let opened_now = state.open_ports(&self.transport.node);
+        if state.ports.is_none() {
+            return;
+        }
+        if changed {
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if changed || opened_now {
+            state.publish();
+        }
+        drop(state);
+        self.ensure_pump();
+    }
+
+    fn ensure_pump(&self) {
+        let mut slot = self.pump.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.handle.is_some() {
+            return;
+        }
+        let (listener, wake) = match open_writer_doorbell(&self.transport.node) {
+            Ok((listener, notifier)) => (Some(listener), Some(notifier)),
+            Err(e) => {
+                report_failure(&mut slot.failures, "doorbell", &e.to_string());
+                (None, None)
+            }
+        };
+        let exit = Arc::new(AtomicBool::new(false));
+        let exit_thread = Arc::clone(&exit);
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("cer-rmw-graph".to_string())
+            .spawn(move || pump_loop(&exit_thread, &shared, listener));
+        match spawned {
+            Ok(join) => {
+                if wake.is_some() {
+                    report_recovery(&mut slot.failures, "pump");
+                }
+                slot.handle = Some(PumpHandle {
+                    exit,
+                    wake,
+                    join: Some(join),
+                });
+            }
+            Err(e) => report_failure(&mut slot.failures, "pump", &e.to_string()),
+        }
+    }
+}
+
+/// Until told to exit: wait for a doorbell ring or one
+/// [`RMW_GRAPH_REPUBLISH_INTERVAL`], then send the current snapshot again.
+fn pump_loop(exit: &AtomicBool, shared: &WriterShared, doorbell: Option<Listener<CerService>>) {
+    let mut wait_failures = FailureRegimeLatch::new();
+    while !exit.load(Ordering::Relaxed) {
+        match doorbell.as_ref() {
+            Some(listener) => match listener.timed_wait(|_| {}, RMW_GRAPH_REPUBLISH_INTERVAL) {
+                Ok(rings) => {
+                    shared.rings_answered.fetch_add(rings, Ordering::Relaxed);
+                    report_recovery(&mut wait_failures, "doorbell_wait");
+                }
+                Err(e) => {
+                    report_failure(&mut wait_failures, "doorbell_wait", &e.to_string());
+                    // A failing wait returns at once; sleep so it cannot spin.
+                    std::thread::sleep(RMW_GRAPH_REPUBLISH_INTERVAL);
+                }
+            },
+            None => std::thread::sleep(RMW_GRAPH_REPUBLISH_INTERVAL),
+        }
+        if exit.load(Ordering::Relaxed) {
+            return;
+        }
+        shared.lock().publish();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gather
+// ---------------------------------------------------------------------------
+
+// Process-wide, because a ROS tool can gather about ten times a second and a
+// latch per gather would log on every call.
+static MALFORMED_FAILURES: Mutex<FailureRegimeLatch> = Mutex::new(FailureRegimeLatch::new());
+static RECEIVE_FAILURES: Mutex<FailureRegimeLatch> = Mutex::new(FailureRegimeLatch::new());
+static NODE_LIST_FAILURES: Mutex<FailureRegimeLatch> = Mutex::new(FailureRegimeLatch::new());
+
+/// `(publisher_id, owner_node_id)` of every publisher on the registry service.
+fn listed_writers(factory: &PortFactory<CerService, [u8], ()>) -> Vec<(u128, u128)> {
+    let mut listed = Vec::new();
+    factory.dynamic_config().list_publishers(|details| {
+        listed.push((details.publisher_id.value(), details.node_id.value()));
+        CallbackProgression::Continue
+    });
+    listed
+}
+
+/// The ids of the nodes iceoryx2 reports `Dead`. Reads only; never reaps.
+fn dead_nodes(config: &iceoryx2::config::Config) -> BTreeSet<u128> {
+    let mut dead = BTreeSet::new();
+    let listed = Node::<CerService>::list(config, |state| {
+        if let NodeState::Dead(view) = &state {
+            dead.insert(view.id().value());
+        }
+        CallbackProgression::Continue
+    });
+    match listed {
+        Ok(()) => report_recovery(&mut lock_regime_latch(&NODE_LIST_FAILURES), "node_list"),
+        Err(e) => report_failure(
+            &mut lock_regime_latch(&NODE_LIST_FAILURES),
+            "node_list",
+            &format!("{e:?}"),
+        ),
+    }
+    dead
+}
+
+/// Drain at most one queue of frames into `fold`. Returns how many frames
+/// failed to decode.
+fn drain_into(
+    subscriber: &Subscriber<CerService, [u8], ()>,
+    fold: &mut RmwGraphGatherFold,
+) -> usize {
+    let mut malformed = 0usize;
+    for _ in 0..RMW_GRAPH_QUEUE_DEPTH {
+        match subscriber.receive() {
+            Ok(Some(sample)) => match decode_frame(sample.payload()) {
+                Ok(frame) => fold.ingest(frame),
+                Err(e) => {
+                    malformed += 1;
+                    report_failure(
+                        &mut lock_regime_latch(&MALFORMED_FAILURES),
+                        "decode",
+                        &e.to_string(),
+                    );
+                }
+            },
+            Ok(None) => break,
+            Err(e) => {
+                report_failure(
+                    &mut lock_regime_latch(&RECEIVE_FAILURES),
+                    "receive",
+                    &e.to_string(),
+                );
+                return malformed;
+            }
+        }
+    }
+    report_recovery(&mut lock_regime_latch(&RECEIVE_FAILURES), "receive");
+    malformed
+}
+
+/// The reader's doorbell notifier for one gather. Without one the gather
+/// still hears each writer's interval send, only later.
+fn open_gather_notifier(node: &Node<CerService>) -> Option<Notifier<CerService>> {
+    let notifier = open_doorbell_service(node).and_then(|service| {
+        service
+            .notifier_builder()
+            .create()
+            .map_err(|e| TransportError::Internal {
+                reason: format!("rmw graph registry: could not create a gather notifier: {e:?}"),
+            })
+    });
+    match notifier {
+        Ok(notifier) => Some(notifier),
+        Err(e) => {
+            tracing::debug!(
+                service = RMW_GRAPH_DOORBELL_SERVICE_NAME,
+                error = %e,
+                "rmw graph registry gather has no doorbell; it waits for the interval sends"
+            );
+            None
+        }
+    }
+}
+
+/// Gather one snapshot from every other live writer on `node`'s namespace.
+/// See the module docs for the verdict.
+pub(crate) fn gather_from_node(
+    node: &Node<CerService>,
+    own_writer: Option<u128>,
+    window: Duration,
+) -> TransportResult<RmwGraphGather> {
+    let settled_empty = || RmwGraphGather {
+        topics: BTreeMap::new(),
+        completeness: GatherCompleteness::Settled,
+    };
+    let factory = open_registry_service(node)?;
+    let listed = listed_writers(&factory);
+    if required_writers(&listed, &BTreeSet::new(), own_writer).is_empty() {
+        return Ok(settled_empty());
+    }
+    let dead = dead_nodes(node.config());
+    let mut required = required_writers(&listed, &dead, own_writer);
+    if required.is_empty() {
+        return Ok(settled_empty());
+    }
+    let subscriber =
+        factory
+            .subscriber_builder()
+            .create()
+            .map_err(|e| TransportError::Internal {
+                reason: format!(
+                    "rmw graph registry: could not create the gather subscriber: {e:?}"
+                ),
+            })?;
+    let bell = open_gather_notifier(node);
+    let mut fold = RmwGraphGatherFold::new();
+    let mut malformed = 0usize;
+    let deadline = Instant::now() + window;
+    loop {
+        if let Some(bell) = &bell {
+            let _ = bell.notify();
+        }
+        malformed += drain_into(&subscriber, &mut fold);
+        required = required_writers(&listed_writers(&factory), &dead, own_writer);
+        if fold.is_settled(&required) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(GATHER_POLL);
+    }
+    let gather = fold.finish(&required);
+    if gather.completeness.is_settled() && malformed == 0 {
+        report_recovery(&mut lock_regime_latch(&MALFORMED_FAILURES), "decode");
+    }
+    Ok(gather)
 }
 
 #[cfg(test)]
