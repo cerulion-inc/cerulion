@@ -98,8 +98,9 @@
 //! swept by the next run that ends gracefully, which is exactly the progressive
 //! behaviour the budget already assumes.
 //!
-//! Nothing about the STARTUP path changed. It still pays only the bounded
-//! dead-node sweep, and it still reclaims no state files.
+//! Nothing about the `graph run` STARTUP path changed. It still pays only the
+//! bounded dead-node sweep, and it still reclaims no state files (a resim's
+//! slot claim does reclaim state files belonging to the slot it takes).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -525,6 +526,22 @@ pub enum UnreadableReason {
     TooLarge {
         /// The size `symlink_metadata` reported.
         bytes: u64,
+    },
+    /// Owned by another user (`fstat` uid does not match the current effective
+    /// uid). Refused so another local account's file in `/tmp` is never
+    /// reclaimed.
+    ForeignOwner {
+        /// The owner uid `fstat` reported on the opened file.
+        uid: u32,
+        /// The invoking process's effective uid.
+        expected: u32,
+    },
+    /// More than one directory entry links to this inode (`fstat` `nlink != 1`).
+    /// Refused so a hard link planted under another name cannot trick
+    /// reclamation into unlinking a live namespace's shared-memory object.
+    MultipleLinks {
+        /// The hard-link count `fstat` reported on the opened file.
+        links: u64,
     },
     /// The stat or the read itself failed.
     Io,
@@ -1046,6 +1063,31 @@ pub struct StateFileRead {
     pub content: Vec<u8>,
     /// How long ago the OPENED handle says it was last written.
     pub age: FileAge,
+    /// Owner uid reported by `fstat` on the opened handle (Unix only).
+    pub uid: Option<u32>,
+    /// Hard-link count reported by `fstat` on the opened handle (Unix only).
+    pub nlink: Option<u64>,
+}
+
+/// Refuse a state file whose `fstat` owner uid does not match `expected_euid`.
+fn check_state_file_owner(uid: u32, expected_euid: u32) -> Result<(), UnreadableReason> {
+    if uid == expected_euid {
+        Ok(())
+    } else {
+        Err(UnreadableReason::ForeignOwner {
+            uid,
+            expected: expected_euid,
+        })
+    }
+}
+
+/// Refuse a state file whose `fstat` hard-link count is not 1.
+fn check_state_file_links(nlink: u64) -> Result<(), UnreadableReason> {
+    if nlink == 1 {
+        Ok(())
+    } else {
+        Err(UnreadableReason::MultipleLinks { links: nlink })
+    }
 }
 
 /// Read one candidate entry's content, refusing anything hostile BEFORE it
@@ -1061,11 +1103,14 @@ pub struct StateFileRead {
 /// 3. Refuse anything past the size cap, using the size that same stat
 ///    reported.
 /// 4. Open with `O_NOFOLLOW | O_NONBLOCK` (Unix), then RE-STAT the open
-///    handle and refuse if the type changed. Steps 1-3 raced a swap: an
-///    attacker who replaces the path with a FIFO between the stat and the open
-///    would otherwise get the block back. `O_NONBLOCK` means even that open
-///    returns immediately, and the `fstat` on the handle refuses what it
-///    really got.
+///    handle and refuse if the type changed, if the file is not owned by the
+///    current effective uid, or if its hard-link count is not 1. Steps 1-3
+///    raced a swap: an attacker who replaces the path with a FIFO between the
+///    stat and the open would otherwise get the block back. `O_NONBLOCK` means
+///    even that open returns immediately, and the `fstat` on the handle
+///    refuses what it really got. Checking `uid` and `nlink == 1` on the
+///    opened handle stops a hard link to another namespace's live state file
+///    from ever being reclaimed.
 /// 5. Read at most the cap, and take the AGE off the same open handle (step 4's
 ///    `fstat`) rather than off the pre-open stat — a swapped path is refused by
 ///    the type check either way, but the age must describe the bytes we read.
@@ -1091,7 +1136,7 @@ pub fn read_state_file(path: &Path) -> Result<StateFileRead, UnreadableReason> {
     }
     let mut file = options.open(path).map_err(|_| UnreadableReason::Io)?;
 
-    // The handle's OWN type — this is what closes the stat-to-open race.
+    // The handle's OWN type, owner, and link count; closes the stat-to-open race.
     let opened = file.metadata().map_err(|_| UnreadableReason::Io)?;
     if !opened.file_type().is_file() {
         return Err(UnreadableReason::NotARegularFile);
@@ -1101,6 +1146,17 @@ pub fn read_state_file(path: &Path) -> Result<StateFileRead, UnreadableReason> {
             bytes: opened.len(),
         });
     }
+    #[cfg(unix)]
+    let (uid, nlink) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let uid = opened.uid();
+        let nlink = opened.nlink();
+        check_state_file_owner(uid, cerulion_hygiene::euid())?;
+        check_state_file_links(nlink)?;
+        (Some(uid), Some(nlink))
+    };
+    #[cfg(not(unix))]
+    let (uid, nlink) = (None, None);
 
     use std::io::Read as _;
     let mut buf = Vec::new();
@@ -1111,6 +1167,8 @@ pub fn read_state_file(path: &Path) -> Result<StateFileRead, UnreadableReason> {
     Ok(StateFileRead {
         content: buf,
         age: file_age(&opened),
+        uid,
+        nlink,
     })
 }
 
@@ -1474,15 +1532,28 @@ fn record_failure(report: &mut ShmStateReport, message: String) {
 /// it creates the object), so only the file goes. Content that does not parse
 /// names nothing to unlink, and the file stays.
 ///
-/// No pid or age evidence is taken: the caller is the evidence. A resim calls
-/// this for the namespace of the slot whose lock it holds, once that namespace
-/// holds no node.
+/// The opened file must be a regular file owned by this user with one
+/// directory link (`nlink == 1`, enforced by [`read_state_file`]), and any
+/// named creator pid must be either dead (`ProcessLiveness::Gone`) or this
+/// process's own pid. A refusal leaves both the object and the file untouched.
 pub fn remove_unused_state_file(path: &Path, probe: &dyn SystemProbe) -> Result<(), String> {
     let read = read_state_file(path).map_err(|reason| format!("{}: {reason:?}", path.display()))?;
     match parse_real_shm_name(&read.content) {
-        Ok(real) => probe
-            .unlink_shm_object(&real.name)
-            .map_err(|err| format!("{}: {err}", real.name))?,
+        Ok(real) => {
+            let own_pid = i32::try_from(std::process::id()).ok();
+            let creator_ok = own_pid == Some(real.creator_pid)
+                || probe.process_liveness(real.creator_pid) == ProcessLiveness::Gone;
+            if !creator_ok {
+                return Err(format!(
+                    "{}: creator pid {} is not dead or this process",
+                    path.display(),
+                    real.creator_pid
+                ));
+            }
+            probe
+                .unlink_shm_object(&real.name)
+                .map_err(|err| format!("{}: {err}", real.name))?;
+        }
         Err(UnparsableReason::Empty) => {}
         Err(reason) => return Err(format!("{}: {reason:?}", path.display())),
     }
@@ -2207,6 +2278,8 @@ mod tests {
         StateFileRead {
             content: content.to_vec(),
             age,
+            uid: None,
+            nlink: None,
         }
     }
 
@@ -2240,6 +2313,11 @@ mod tests {
             UnreadableReason::Io,
             UnreadableReason::NotARegularFile,
             UnreadableReason::TooLarge { bytes: 1 << 30 },
+            UnreadableReason::ForeignOwner {
+                uid: 0,
+                expected: 1000,
+            },
+            UnreadableReason::MultipleLinks { links: 2 },
         ] {
             assert_eq!(
                 classify(Err(reason.clone()), &probe),
@@ -4522,14 +4600,13 @@ mod tests {
         );
     }
 
-    /// A resim's reclaim of a namespace no process uses: the object a state
-    /// file names is unlinked, then the file goes. No pid evidence is taken,
-    /// so a creator the probe reads ALIVE does not hold the file back.
+    /// A resim's reclaim of a namespace no process uses: once the creator pid
+    /// is gone, the object a state file names is unlinked, then the file goes.
     #[test]
     fn an_unused_state_file_goes_after_the_object_it_names() {
         let dir = tempdir("shm_unused_named");
         let path = write_state_file(&dir, "cer_resim_00000005_seg", "4242_1700000000_123456_7");
-        let probe = FakeProbe::all_alive();
+        let probe = FakeProbe::all_dead();
         assert_eq!(remove_unused_state_file(&path, &probe), Ok(()));
         assert_eq!(
             probe.unlinked(),
@@ -4563,7 +4640,7 @@ mod tests {
     fn an_unused_state_file_whose_object_cannot_be_unlinked_stays() {
         let dir = tempdir("shm_unused_unlink_fails");
         let path = write_state_file(&dir, "cer_resim_00000005_seg", "4242_1700000000_123456_7");
-        let probe = FakeProbe::all_alive().failing_unlink("4242_1700000000_123456_7", "EACCES");
+        let probe = FakeProbe::all_dead().failing_unlink("4242_1700000000_123456_7", "EACCES");
         assert_eq!(
             remove_unused_state_file(&path, &probe),
             Err("4242_1700000000_123456_7: EACCES".to_string())
@@ -4588,6 +4665,137 @@ mod tests {
         assert!(dir_err.contains("NotARegularFile"), "{dir_err}");
         assert!(forged.exists() && directory.exists());
         assert_eq!(probe.unlinked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_state_file_refuses_hard_link_with_nlink_gt_one() {
+        let dir = tempdir("shm_hard_link");
+        let original = write_state_file(&dir, "iox2_live_seg", "4242_1700000000_123456_7");
+        let linked = dir.join(format!("cer_resim_00000000_linked{SHM_STATE_SUFFIX}"));
+        std::fs::hard_link(&original, &linked).expect("create hard link");
+
+        assert_eq!(
+            read_state_file(&linked),
+            Err(UnreadableReason::MultipleLinks { links: 2 }),
+            "hard-linked state file (nlink == 2) must be refused"
+        );
+        let probe = FakeProbe::all_dead();
+        let err = remove_unused_state_file(&linked, &probe)
+            .expect_err("remove_unused_state_file must refuse a hard-linked state file");
+        assert!(err.contains("MultipleLinks"), "{err}");
+        assert!(linked.exists() && original.exists());
+        assert_eq!(probe.unlinked(), Vec::<String>::new());
+
+        let report = scan(
+            &dir,
+            SHM_STATE_REPORT_BUDGET,
+            classify_budget(SHM_STATE_REPORT_BUDGET),
+            ScanMode::Reclaim,
+            &probe,
+        );
+        assert_eq!(report.counted, 2);
+        assert_eq!(report.reclaimed_files, 0);
+        assert_eq!(report.unproven, 2);
+        assert!(linked.exists() && original.exists());
+        assert_eq!(probe.unlinked(), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_state_file_refuses_foreign_owner_uid() {
+        let cases = [
+            (1000, 1000, Ok(())),
+            (0, 0, Ok(())),
+            (
+                0,
+                1000,
+                Err(UnreadableReason::ForeignOwner {
+                    uid: 0,
+                    expected: 1000,
+                }),
+            ),
+            (
+                1001,
+                1000,
+                Err(UnreadableReason::ForeignOwner {
+                    uid: 1001,
+                    expected: 1000,
+                }),
+            ),
+        ];
+        for (uid, expected_euid, oracle) in cases {
+            assert_eq!(check_state_file_owner(uid, expected_euid), oracle);
+            assert_eq!(
+                check_state_file_owner(uid, expected_euid),
+                check_state_file_owner(uid, expected_euid)
+            );
+        }
+        assert_eq!(check_state_file_links(1), Ok(()));
+        assert_eq!(
+            check_state_file_links(0),
+            Err(UnreadableReason::MultipleLinks { links: 0 })
+        );
+        assert_eq!(
+            check_state_file_links(2),
+            Err(UnreadableReason::MultipleLinks { links: 2 })
+        );
+    }
+
+    #[test]
+    fn remove_unused_state_file_refuses_live_other_pid_and_accepts_dead_or_self_pid() {
+        let dir = tempdir("shm_unused_pid_gate");
+        let other_pid = if std::process::id() == 4242 {
+            4243
+        } else {
+            4242
+        };
+
+        // Alive other pid: refused, object and file stay untouched.
+        let alive_path = write_state_file(
+            &dir,
+            "cer_resim_00000005_alive",
+            &format!("{other_pid}_1700000000_123456_1"),
+        );
+        let alive_probe = FakeProbe::all_alive();
+        assert!(
+            remove_unused_state_file(&alive_path, &alive_probe).is_err(),
+            "a live other creator pid must be refused"
+        );
+        assert!(alive_path.exists());
+        assert_eq!(alive_probe.unlinked(), Vec::<String>::new());
+
+        // Unknown other pid: refused, object and file stay untouched.
+        let unknown_path = write_state_file(
+            &dir,
+            "cer_resim_00000005_unknown",
+            &format!("{other_pid}_1700000000_123456_2"),
+        );
+        let unknown_probe = FakeProbe::default();
+        assert!(
+            remove_unused_state_file(&unknown_path, &unknown_probe).is_err(),
+            "an unknown other creator pid must be refused"
+        );
+        assert!(unknown_path.exists());
+        assert_eq!(unknown_probe.unlinked(), Vec::<String>::new());
+
+        // Dead other pid: accepted, object unlinked then file removed.
+        let dead_name = format!("{other_pid}_1700000000_123456_3");
+        let dead_path = write_state_file(&dir, "cer_resim_00000005_dead", &dead_name);
+        let dead_probe = FakeProbe::all_dead();
+        assert_eq!(remove_unused_state_file(&dead_path, &dead_probe), Ok(()));
+        assert_eq!(dead_probe.unlinked(), vec![dead_name]);
+        assert!(!dead_path.exists());
+
+        // Own pid: accepted even when the probe reports it alive.
+        let self_name = format!("{}_1700000000_123456_4", std::process::id());
+        let self_path = write_state_file(&dir, "cer_resim_00000005_self", &self_name);
+        let self_probe = FakeProbe::all_alive();
+        assert_eq!(remove_unused_state_file(&self_path, &self_probe), Ok(()));
+        assert_eq!(self_probe.unlinked(), vec![self_name]);
+        assert!(!self_path.exists());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

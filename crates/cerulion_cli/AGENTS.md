@@ -41,7 +41,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   - `mp_record`, `mp_execution_mode`, `network_gateway{,_mp}` e2e:
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`;
     `mp_auto_partition`: those two + `..._trigger_block_cdylib`
-  - `replay_cli_test`: `period` + `..._period_{perturbed,panic}_cdylib` + `test_node_nondeterministic_cdylib`.
+  - `replay_cli_test`: `period`, `data_trigger`, `period_{perturbed,panic}`, `test_node_nondeterministic_cdylib`.
     `graph_start_order_e2e`: `test_node_start_order_{prod,cons}_cdylib`.
   - `signal_matrix`: `period` only. `credit_death`: + `..._trigger_block_cdylib`.
     `mp_split_pair`: `period` + `period_input`. `mp_consumer_first_spawn`: those two + `data_trigger`.
