@@ -10363,6 +10363,7 @@ fn pass_wiring<'a>(
     // bypasses the gate (`run_rank_pass`).
     let wiring = cerulion_core::graph::CrossProcessWiring::requirements_only(provisioning)
         .with_paced_topic_warnings(&[])
+        .with_sync_window_period_warnings(&[])
         .with_sibling_topics(sibling_topics);
     if depth_floors.is_empty() {
         wiring

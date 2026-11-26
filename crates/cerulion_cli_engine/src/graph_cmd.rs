@@ -8111,7 +8111,8 @@ pub fn graph_run_worker(
     )
     .with_sibling_topics(&plan.sibling_topics)
     .with_sibling_consumed_topics(&plan.sibling_consumed_topics)
-    .with_paced_topic_warnings(&plan.paced_topic_warnings);
+    .with_paced_topic_warnings(&plan.paced_topic_warnings)
+    .with_sync_window_period_warnings(&plan.sync_window_period_warnings);
 
     // (6) resolve the subgraph's node cdylibs. The plan's subgraph already holds
     // ONLY this worker's nodes, so this shares `graph_run`'s loader filtered to
@@ -10892,6 +10893,25 @@ fn stamp_paced_topic_warnings(
     }
 }
 
+/// Stamp into each worker plan the sync-window period warnings for Sync nodes
+/// in that worker's subgraph. Each Sync node lives in exactly one worker plan,
+/// so its full-graph warning fires once (never zero on a cross-worker split,
+/// never twice). Pure (plan in, plan out).
+fn stamp_sync_window_period_warnings(
+    plan: &mut crate::multiprocess::DeploymentPlan,
+    warnings: &[cerulion_core::graph::SyncWindowPeriodWarning],
+) {
+    for w in &mut plan.workers {
+        let members: std::collections::HashSet<&str> =
+            w.subgraph.nodes.iter().map(|n| n.id.as_str()).collect();
+        w.sync_window_period_warnings = warnings
+            .iter()
+            .filter(|warning| members.contains(warning.node_id.as_str()))
+            .cloned()
+            .collect();
+    }
+}
+
 /// Stamp the user's `--no-cpu-dma-lock` opt-out into EVERY
 /// worker plan — if `graph_run_worker`'s (8.7) cap block hardcoded
 /// `CpuDmaLockMode::Auto`, an explicit opt-out would be silently ignored by
@@ -12129,6 +12149,17 @@ fn graph_run_supervisor(
     stamp_paced_topic_warnings(
         &mut plan,
         &loaded_topology_for_reconcile.paced_topic_warnings(),
+    );
+    // Each worker logs the sync-window period warnings for Sync nodes in its
+    // own subgraph, derived here from the whole graph so producers in other
+    // process groups are resolved even under `graph run --no-validate`.
+    stamp_sync_window_period_warnings(
+        &mut plan,
+        &cerulion_core::graph::check_sync_window_periods(
+            &config,
+            &loaded_topology_for_reconcile,
+            &loaded_entry_infos,
+        ),
     );
     if !credit_edges.is_empty() {
         // Name the EDGES, not just a count. An
@@ -46164,6 +46195,7 @@ mod worker_tests {
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
             paced_topic_warnings: Vec::new(),
+            sync_window_period_warnings: Vec::new(),
             // Not recording (every case fails before the ring seam).
             recording_ring: None,
             trace_ring: None,
@@ -47491,6 +47523,7 @@ mod supervisor_tests {
             sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             credit_edges: Vec::new(),
             paced_topic_warnings: Vec::new(),
+            sync_window_period_warnings: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,
             trace_ring: None,
@@ -48079,6 +48112,136 @@ mod supervisor_tests {
             .workers
             .iter()
             .all(|w| w.paced_topic_warnings.is_empty()));
+    }
+
+    /// `stamp_sync_window_period_warnings` hands each worker the full-graph
+    /// warnings of the Sync nodes in its subgraph, and no others, and the
+    /// stamped list survives plan JSON round-trip with back-compat default.
+    #[test]
+    fn stamp_sync_window_period_warnings_goes_to_the_sync_nodes_worker_once() {
+        use cerulion_core::graph::{SyncWindowKind, SyncWindowPeriodWarning};
+
+        let yaml = r#"
+prefix: swp_mp
+process_groups:
+  producers:
+    - cam
+    - imu
+  fusion:
+    - fuse
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: cam/image
+      - name: imu
+        source: imu/sample
+"#;
+        let config = cerulion_core::graph::parse_graph(yaml).unwrap();
+        let trigger_in = |name: &str| cerulion_core::graph::node::InputMeta {
+            name: name.to_string(),
+            schema_hash: 0x5eed,
+            trigger: true,
+            depth: 4,
+            backpressure: cerulion_core::graph::node::BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
+        };
+        let mut infos: indexmap::IndexMap<String, cerulion_core::NodeInfo> =
+            indexmap::IndexMap::new();
+        infos.insert(
+            "cam".to_string(),
+            cerulion_core::NodeInfo::from_names(vec![], vec!["image".to_string()])
+                .with_policy(cerulion_core::MacroPolicy::Period { period_ms: 33 }),
+        );
+        infos.insert(
+            "imu".to_string(),
+            cerulion_core::NodeInfo::from_names(vec![], vec!["sample".to_string()])
+                .with_policy(cerulion_core::MacroPolicy::Period { period_ms: 5 }),
+        );
+        infos.insert(
+            "fuse".to_string(),
+            cerulion_core::NodeInfo::with_meta(
+                vec![trigger_in("image"), trigger_in("imu")],
+                Vec::new(),
+            )
+            .with_policy(cerulion_core::MacroPolicy::Sync { window_ms: 33 }),
+        );
+        let topo = cerulion_core::graph::GraphTopology::build(&config, &infos).unwrap();
+        let full_warnings = cerulion_core::graph::check_sync_window_periods(&config, &topo, &infos);
+        let expected = SyncWindowPeriodWarning {
+            node_id: "fuse".to_string(),
+            kind: SyncWindowKind::Bounded { window_ms: 33 },
+            slowest_input: "image".to_string(),
+            slowest_period_ms: 33,
+        };
+        assert_eq!(full_warnings, vec![expected.clone()]);
+
+        let mut plan = bare_plan();
+        plan.workers[0].subgraph.nodes = vec![config.nodes[0].clone(), config.nodes[1].clone()];
+        plan.workers[1].subgraph.nodes = vec![config.nodes[2].clone()];
+        stamp_sync_window_period_warnings(&mut plan, &full_warnings);
+
+        assert!(
+            plan.workers[0].sync_window_period_warnings.is_empty(),
+            "producer worker must receive zero sync-window warnings"
+        );
+        assert_eq!(
+            plan.workers[1].sync_window_period_warnings,
+            vec![expected.clone()],
+            "fusion worker must receive the Sync node's warning once"
+        );
+
+        let json = serde_json::to_string(&plan.workers[1]).expect("serialize worker plan");
+        let back: WorkerPlan = serde_json::from_str(&json).expect("deserialize worker plan");
+        assert_eq!(
+            back.sync_window_period_warnings,
+            plan.workers[1].sync_window_period_warnings
+        );
+
+        // Old plan files without `sync_window_period_warnings` deserialize empty.
+        let mut raw_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        raw_value
+            .as_object_mut()
+            .unwrap()
+            .remove("sync_window_period_warnings");
+        let back_compat: WorkerPlan = serde_json::from_value(raw_value).unwrap();
+        assert!(back_compat.sync_window_period_warnings.is_empty());
+
+        // Unknown fields inside `SyncWindowPeriodWarning` are refused.
+        let bad_warning = serde_json::json!({
+            "node_id": "fuse",
+            "kind": { "Bounded": { "window_ms": 33 } },
+            "slowest_input": "image",
+            "slowest_period_ms": 33,
+            "bogus": true
+        });
+        assert!(serde_json::from_value::<SyncWindowPeriodWarning>(bad_warning).is_err());
+
+        // A warning for a node in neither worker stamps nothing on either.
+        let other = SyncWindowPeriodWarning {
+            node_id: "elsewhere".to_string(),
+            kind: SyncWindowKind::Unbounded,
+            slowest_input: "image".to_string(),
+            slowest_period_ms: 33,
+        };
+        stamp_sync_window_period_warnings(&mut plan, &[other]);
+        assert!(plan
+            .workers
+            .iter()
+            .all(|w| w.sync_window_period_warnings.is_empty()));
     }
 
     /// The ONE-RECIPE depth cross-check accepts an agreeing pair

@@ -344,3 +344,208 @@ fn unmatched_discard_warn_states_period_bound_not_unconditional_widen() {
         Ok(())
     });
 }
+
+#[test]
+#[traced_test]
+fn split_two_worker_graph_warns_once_for_cross_worker_sync() {
+    // Full graph has producers (cam 33 ms, imu 5 ms) in worker 0 and Sync node
+    // `fuse` (window 33 ms) in worker 1. Neither the PlanningOnly build nor the
+    // producer worker should warn, and the Sync node's worker must warn ONCE.
+    let full_config = two_producer_sync_graph("swp_split");
+    let cam_info = NodeInfo::from_names(vec![], vec!["image".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 33 });
+    let imu_info = NodeInfo::from_names(vec![], vec!["sample".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 5 });
+    let fuse_info = NodeInfo::with_meta(
+        vec![meta_input("image", true), meta_input("imu", true)],
+        Vec::new(),
+    )
+    .with_policy(MacroPolicy::Sync { window_ms: 33 });
+
+    // 1. PlanningOnly build of the full graph must emit zero warnings.
+    let planning_transport = cerulion_core::TransportManager::init_for_test(
+        cerulion_core::TransportConfig {
+            node_name: format!("swp_split_plan_{}", std::process::id()),
+            ..Default::default()
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("planning transport");
+    let mut planning_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    planning_factories.insert("cam".to_string(), make_entry(cam_info.clone()));
+    planning_factories.insert("imu".to_string(), make_entry(imu_info.clone()));
+    planning_factories.insert("fuse".to_string(), make_entry(fuse_info.clone()));
+    let planning_rt = GraphRuntime::build_with_schema_hashes_provisioning_and_recorded(
+        full_config.clone(),
+        planning_factories,
+        &planning_transport,
+        Arc::new(VirtualClock::new()),
+        None,
+        None,
+        None,
+        cerulion_core::graph::BuildPurpose::PlanningOnly,
+    )
+    .expect("planning build");
+    planning_rt.shutdown();
+
+    // Compute full-graph advisories once (as the multi-process supervisor does)
+    // and partition them to the worker that owns each flagged Sync node.
+    let mut full_infos: IndexMap<String, NodeInfo> = IndexMap::new();
+    full_infos.insert("cam".to_string(), cam_info.clone());
+    full_infos.insert("imu".to_string(), imu_info.clone());
+    full_infos.insert("fuse".to_string(), fuse_info.clone());
+    let full_topo =
+        cerulion_core::graph::GraphTopology::build(&full_config, &full_infos).expect("full topo");
+    let full_warnings =
+        cerulion_core::graph::check_sync_window_periods(&full_config, &full_topo, &full_infos);
+    assert_eq!(
+        full_warnings,
+        vec![cerulion_core::graph::SyncWindowPeriodWarning {
+            node_id: "fuse".to_string(),
+            kind: cerulion_core::graph::SyncWindowKind::Bounded { window_ms: 33 },
+            slowest_input: "image".to_string(),
+            slowest_period_ms: 33,
+        }]
+    );
+
+    // 2. Two worker subgraphs: worker 0 owns producers (stamped with none),
+    // worker 1 owns `fuse` reading cross-worker absolute topics (stamped with
+    // the full-graph warning for `fuse`).
+    let producers_cfg = GraphConfig {
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        level_assignments: None,
+        network: None,
+        name: None,
+        identity: "swp_split_graph".to_string(),
+        prefix: "swp_split".to_string(),
+        nodes: vec![full_config.nodes[0].clone(), full_config.nodes[1].clone()],
+    };
+    let mut prod_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    prod_factories.insert("cam".to_string(), make_entry(cam_info));
+    prod_factories.insert("imu".to_string(), make_entry(imu_info));
+    let rt_prod = GraphRuntime::build_for_test_with_policy_and_wiring(
+        producers_cfg,
+        prod_factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        cerulion_core::MonitorWaitPolicy::off(),
+        cerulion_core::graph::CrossProcessWiring::none().with_sync_window_period_warnings(&[]),
+    )
+    .expect("producer worker build");
+    drop(rt_prod);
+
+    let fusion_cfg = GraphConfig {
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        level_assignments: None,
+        network: None,
+        name: None,
+        identity: "swp_split_graph".to_string(),
+        prefix: "swp_split".to_string(),
+        nodes: vec![NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: "fuse".to_string(),
+            node_type: "fuse".to_string(),
+            inputs: vec![
+                wired("image", "/swp_split/cam/image"),
+                wired("imu", "/swp_split/imu/sample"),
+            ],
+            outputs: vec![],
+        }],
+    };
+    let mut fuse_factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    fuse_factories.insert("fuse".to_string(), make_entry(fuse_info));
+    let rt_fuse = GraphRuntime::build_for_test_with_policy_and_wiring(
+        fusion_cfg,
+        fuse_factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        cerulion_core::MonitorWaitPolicy::off(),
+        cerulion_core::graph::CrossProcessWiring::none()
+            .with_sync_window_period_warnings(&full_warnings),
+    )
+    .expect("fusion worker build");
+    drop(rt_fuse);
+
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("WARN")
+                    && l.contains(
+                        "sync_window_ms is at or above the slowest resolved trigger-input period",
+                    )
+            })
+            .collect();
+        if hits.len() != 1 {
+            return Err(format!(
+                "expected exactly one sync-window WARN across the two-worker split graph, got {}: {hits:?}",
+                hits.len()
+            ));
+        }
+        let line = hits[0];
+        for needle in [
+            "node_id=fuse",
+            "input=image",
+            "period_ms=33",
+            "sync_window_ms=33",
+        ] {
+            if !line.contains(needle) {
+                return Err(format!("missing {needle:?} in warn line: {line}"));
+            }
+        }
+        Ok(())
+    });
+}
+
+#[test]
+#[traced_test]
+fn worker_with_empty_stamped_sync_warnings_logs_none() {
+    let config = two_producer_sync_graph("swp_empty_stamp");
+    let cam_info = NodeInfo::from_names(vec![], vec!["image".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 33 });
+    let imu_info = NodeInfo::from_names(vec![], vec!["sample".to_string()])
+        .with_policy(MacroPolicy::Period { period_ms: 5 });
+    let fuse_info = NodeInfo::with_meta(
+        vec![meta_input("image", true), meta_input("imu", true)],
+        Vec::new(),
+    )
+    .with_policy(MacroPolicy::Sync { window_ms: 33 });
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("cam".to_string(), make_entry(cam_info));
+    factories.insert("imu".to_string(), make_entry(imu_info));
+    factories.insert("fuse".to_string(), make_entry(fuse_info));
+
+    let rt = GraphRuntime::build_for_test_with_policy_and_wiring(
+        config,
+        factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        cerulion_core::MonitorWaitPolicy::off(),
+        cerulion_core::graph::CrossProcessWiring::none().with_sync_window_period_warnings(&[]),
+    )
+    .expect("build with empty stamped warnings");
+    drop(rt);
+
+    logs_assert(|lines: &[&str]| {
+        let hits = lines
+            .iter()
+            .filter(|l| {
+                l.contains("WARN")
+                    && (l.contains("sync_window_ms is at or above")
+                        || l.contains("unbounded_sync aligns periodic"))
+            })
+            .count();
+        if hits != 0 {
+            return Err(format!(
+                "expected zero warnings when stamped list is empty, got {hits}"
+            ));
+        }
+        Ok(())
+    });
+}

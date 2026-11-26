@@ -1093,7 +1093,8 @@ fn validate_network_topic_list(list: &str, topics: &[String]) -> TransportResult
 }
 
 /// Which Sync policy triggered a [`SyncWindowPeriodWarning`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum SyncWindowKind {
     /// `#[cerulion_node(sync_window_ms = window_ms)]` with
     /// `window_ms >= slowest_period_ms`.
@@ -1113,7 +1114,8 @@ pub enum SyncWindowKind {
 /// the earlier-arriving stream to pair every subsequent sample with the
 /// previous period while keeping both `sync_unmatched_discard_count` and
 /// `sync_closer_skip_count` at zero.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyncWindowPeriodWarning {
     /// The Sync node's id in the graph.
     pub node_id: String,

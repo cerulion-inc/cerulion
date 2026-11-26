@@ -304,6 +304,14 @@ pub struct CrossProcessWiring<'a> {
     /// the topics whose producer node this worker builds, because the
     /// worker's own topology holds only its subgraph's consumers.
     pub(crate) paced_topic_warnings: Option<&'a [super::topology::PacedTopicWarning]>,
+    /// The sync-window period warnings this build logs. `None` (every
+    /// single-process build): the build derives them from its own topology,
+    /// which is the whole graph. `Some(list)` (a multi-process worker): it logs
+    /// exactly `list`, the warnings its supervisor derived from the whole graph
+    /// for the Sync nodes this worker builds, because a worker's own topology
+    /// cannot resolve trigger producers in other process groups.
+    pub(crate) sync_window_period_warnings:
+        Option<&'a [super::validation::SyncWindowPeriodWarning]>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -316,6 +324,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_consumed_topics: None,
             input_depth_floors: None,
             paced_topic_warnings: None,
+            sync_window_period_warnings: None,
         }
     }
 
@@ -334,6 +343,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_consumed_topics: None,
             input_depth_floors: None,
             paced_topic_warnings: None,
+            sync_window_period_warnings: None,
         }
     }
 
@@ -352,6 +362,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_consumed_topics: None,
             input_depth_floors: None,
             paced_topic_warnings: None,
+            sync_window_period_warnings: None,
         }
     }
 
@@ -399,6 +410,19 @@ impl<'a> CrossProcessWiring<'a> {
         warnings: &'a [super::topology::PacedTopicWarning],
     ) -> Self {
         self.paced_topic_warnings = Some(warnings);
+        self
+    }
+
+    /// Log exactly `warnings` as this build's sync-window period warnings, in
+    /// place of the ones its own topology would give. Chained onto one of the
+    /// constructors above: a multi-process worker passes its plan's list (from
+    /// the supervisor's whole-graph check), and a replay pass passes an empty
+    /// slice so a replay logs none.
+    pub fn with_sync_window_period_warnings(
+        mut self,
+        warnings: &'a [super::validation::SyncWindowPeriodWarning],
+    ) -> Self {
+        self.sync_window_period_warnings = Some(warnings);
         self
     }
 
@@ -6386,9 +6410,20 @@ impl GraphRuntime {
             for warning in paced {
                 warning.log(config.identity());
             }
-            for warning in
-                super::validation::check_sync_window_periods(&config, &topology, &entry_infos)
-            {
+            let derived_sync;
+            let sync_warnings: &[super::validation::SyncWindowPeriodWarning] =
+                match cross_process.sync_window_period_warnings {
+                    Some(planned) => planned,
+                    None => {
+                        derived_sync = super::validation::check_sync_window_periods(
+                            &config,
+                            &topology,
+                            &entry_infos,
+                        );
+                        &derived_sync
+                    }
+                };
+            for warning in sync_warnings {
                 warning.log();
             }
         }

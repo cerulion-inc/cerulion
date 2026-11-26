@@ -222,9 +222,15 @@ naming here because they are easy to get wrong:
   on periodic inputs) can silently phase-lock onto `(A_{k+1}, B_k)` after one drop while both
   counters stay zero; `graph::validation::check_sync_window_periods` is the single pure checker
   shared by `GraphRuntime::build_with_scheduler` (structured `tracing::warn!`) and
-  `cerulion_cli_engine::graph_cmd` (`cerulion graph validate` advisory warning) to flag
-  `sync_window_ms >= slowest_period_ms` or `unbounded_sync` when every trigger input resolves
-  to a declared period, without refusing any graph.
+  `cerulion_cli_engine::graph_cmd` (`cerulion graph validate` advisory warning and the
+  multi-process supervisor) to flag `sync_window_ms >= slowest_period_ms` or `unbounded_sync`
+  when every trigger input resolves to a declared period (rounding `sample(N)` up to the next
+  admitted producer tick `ceil(N / period) * period`), without refusing any graph. On split
+  multi-process runs the full-graph `PlanningOnly` build skips logging, the supervisor computes
+  the warnings over the whole graph and stamps each Sync node's findings onto its owning
+  worker's `WorkerPlan::sync_window_period_warnings`, and that worker passes them through
+  `CrossProcessWiring::with_sync_window_period_warnings` so each split Sync node warns once
+  (never zero, never twice).
 - **Sync can match on CAPTURE time.** By default a head's stamp is the frame's WIRE stamp
   (publish time). A node whose `NodeInfo` carries capture-stamp locations
   (`NodeInfo::with_sync_capture_stamps`) aligns on each message's `header.stamp` instead,
