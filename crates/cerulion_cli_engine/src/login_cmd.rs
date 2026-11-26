@@ -1818,7 +1818,7 @@ fn post_json<T: for<'de> Deserialize<'de>>(
         .json(body)
         .send()
         .map_err(|e| {
-            let service = redact_service_url(&base);
+            let service = redact_service_url(base);
             CliError::Login(format!(
                 "the account service ({service}) is unreachable: {}",
                 e.without_url()
