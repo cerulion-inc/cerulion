@@ -1283,10 +1283,30 @@ fn resolve_input_period_ms<'a>(
             BackpressurePolicy::Sample(ms) => Some(ms),
             BackpressurePolicy::DropOldest | BackpressurePolicy::Block => None,
         });
-    Some(match sample_interval_ms {
-        Some(ms) => producer_period.max(ms),
-        None => producer_period,
-    })
+    match sample_interval_ms {
+        Some(ms) => effective_sampled_period_ms(producer_period, ms),
+        None => Some(producer_period),
+    }
+}
+
+/// Effective period of frames a `sample(N)` gate admits from a steady periodic
+/// producer with period `producer_period_ms`.
+///
+/// The subscriber admits a frame iff its wire timestamp is at least
+/// `sample_interval_ms` after the last accepted frame, and only sees frames
+/// emitted on producer ticks `0, P, 2P, ...`. When the gate falls between
+/// ticks, the next admitted frame lands on tick `ceil(N / P) * P`. Returns
+/// `None` on zero period or `u64` overflow.
+fn effective_sampled_period_ms(producer_period_ms: u64, sample_interval_ms: u64) -> Option<u64> {
+    if producer_period_ms == 0 {
+        return None;
+    }
+    if sample_interval_ms <= producer_period_ms {
+        return Some(producer_period_ms);
+    }
+    sample_interval_ms
+        .div_ceil(producer_period_ms)
+        .checked_mul(producer_period_ms)
 }
 
 fn resolve_node_period_ms<'a>(
@@ -3180,5 +3200,300 @@ nodes:
         let run2 = check_sync_window_periods(&config, &topo, &infos);
         assert_eq!(run1, expected);
         assert_eq!(run1, run2);
+    }
+
+    /// Hand-written oracles for `sample(N)` gates falling between producer
+    /// ticks vs landing on a tick, plus checked-arithmetic overflow handling.
+    #[test]
+    fn sample_gate_between_and_on_producer_ticks_resolves_admitted_period() {
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: a
+    type: a
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: b
+    type: b
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: a
+        source: a/out
+      - name: b
+        source: b/out
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let run_case = |period_a: u64,
+                        sample_a: BackpressurePolicy,
+                        period_b: u64,
+                        sample_b: BackpressurePolicy,
+                        window_ms: u64| {
+            let mut infos = IndexMap::new();
+            infos.insert(
+                "a".to_string(),
+                swp_node_info(
+                    vec![],
+                    vec!["out"],
+                    MacroPolicy::Period {
+                        period_ms: period_a,
+                    },
+                ),
+            );
+            infos.insert(
+                "b".to_string(),
+                swp_node_info(
+                    vec![],
+                    vec!["out"],
+                    MacroPolicy::Period {
+                        period_ms: period_b,
+                    },
+                ),
+            );
+            infos.insert(
+                "fuse".to_string(),
+                swp_node_info(
+                    vec![
+                        swp_input_meta("a", true, sample_a),
+                        swp_input_meta("b", true, sample_b),
+                    ],
+                    vec![],
+                    MacroPolicy::Sync { window_ms },
+                ),
+            );
+            let topo = GraphTopology::build(&config, &infos).unwrap();
+            check_sync_window_periods(&config, &topo, &infos)
+        };
+
+        // Gate between ticks: two 30 ms streams with sample(31) admit frames on
+        // ticks 0, 60, 120, ... (ceil(31 / 30) * 30 = 60 ms). A 32 ms window
+        // (and 59 ms) is safe; 60 ms warns reporting 60 ms, not 31 ms.
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(31),
+                30,
+                BackpressurePolicy::Sample(31),
+                32
+            ),
+            vec![]
+        );
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(31),
+                30,
+                BackpressurePolicy::Sample(31),
+                59
+            ),
+            vec![]
+        );
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(31),
+                30,
+                BackpressurePolicy::Sample(31),
+                60
+            ),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 60 },
+                slowest_input: "a".to_string(),
+                slowest_period_ms: 60,
+            }]
+        );
+
+        // Gate just past 2nd tick: 30 ms producer with sample(61) admits on
+        // ticks 0, 90, 180, ... (ceil(61 / 30) * 30 = 90 ms).
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(61),
+                30,
+                BackpressurePolicy::DropOldest,
+                89
+            ),
+            vec![]
+        );
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(61),
+                30,
+                BackpressurePolicy::DropOldest,
+                90
+            ),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 90 },
+                slowest_input: "a".to_string(),
+                slowest_period_ms: 90,
+            }]
+        );
+
+        // Gate ON a tick (exact multiple): 30 ms producer with sample(60)
+        // admits on ticks 0, 60, 120, ... (60 ms).
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(60),
+                30,
+                BackpressurePolicy::DropOldest,
+                59
+            ),
+            vec![]
+        );
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(60),
+                30,
+                BackpressurePolicy::DropOldest,
+                60
+            ),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 60 },
+                slowest_input: "a".to_string(),
+                slowest_period_ms: 60,
+            }]
+        );
+
+        // Gate ON a tick (equal to period) and below period: both admit every
+        // 30 ms tick.
+        for gate in [0, 15, 30] {
+            assert_eq!(
+                run_case(
+                    30,
+                    BackpressurePolicy::Sample(gate),
+                    30,
+                    BackpressurePolicy::DropOldest,
+                    29
+                ),
+                vec![],
+                "gate={gate} on 30 ms stream must keep 30 ms period (window 29 silent)"
+            );
+            assert_eq!(
+                run_case(
+                    30,
+                    BackpressurePolicy::Sample(gate),
+                    30,
+                    BackpressurePolicy::DropOldest,
+                    30
+                ),
+                vec![SyncWindowPeriodWarning {
+                    node_id: "fuse".to_string(),
+                    kind: SyncWindowKind::Bounded { window_ms: 30 },
+                    slowest_input: "a".to_string(),
+                    slowest_period_ms: 30,
+                }],
+                "gate={gate} on 30 ms stream must warn at window 30"
+            );
+        }
+
+        // Checked arithmetic: a gate whose next tick overflows u64 skips
+        // cleanly instead of panicking or reporting a truncated period.
+        assert_eq!(
+            run_case(
+                30,
+                BackpressurePolicy::Sample(u64::MAX),
+                30,
+                BackpressurePolicy::DropOldest,
+                u64::MAX,
+            ),
+            vec![]
+        );
+
+        // Transitive DataTrigger with sample(31) on 30 ms upstream: admitted
+        // frames reach the Sync node every 60 ms, not 31 ms.
+        let chain_yaml = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: raw
+        schema: sensor_msgs/Image
+  - id: rect
+    type: rect
+    inputs:
+      - name: raw
+        source: cam/raw
+    outputs:
+      - name: rect_img
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: rect/rect_img
+      - name: imu
+        source: imu/sample
+"#;
+        let chain_config = parse_graph(chain_yaml).unwrap();
+        let make_chain_infos = |window_ms: u64| {
+            let mut infos = IndexMap::new();
+            infos.insert(
+                "cam".to_string(),
+                swp_node_info(vec![], vec!["raw"], MacroPolicy::Period { period_ms: 30 }),
+            );
+            infos.insert(
+                "rect".to_string(),
+                swp_node_info(
+                    vec![swp_input_meta("raw", true, BackpressurePolicy::Sample(31))],
+                    vec!["rect_img"],
+                    MacroPolicy::DataTrigger {
+                        input_name: "raw".to_string(),
+                    },
+                ),
+            );
+            infos.insert(
+                "imu".to_string(),
+                swp_node_info(
+                    vec![],
+                    vec!["sample"],
+                    MacroPolicy::Period { period_ms: 10 },
+                ),
+            );
+            infos.insert(
+                "fuse".to_string(),
+                swp_node_info(
+                    vec![
+                        swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                        swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                    ],
+                    vec![],
+                    MacroPolicy::Sync { window_ms },
+                ),
+            );
+            infos
+        };
+        let chain_infos_59 = make_chain_infos(59);
+        let chain_topo_59 = GraphTopology::build(&chain_config, &chain_infos_59).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&chain_config, &chain_topo_59, &chain_infos_59),
+            vec![]
+        );
+        let chain_infos_60 = make_chain_infos(60);
+        let chain_topo_60 = GraphTopology::build(&chain_config, &chain_infos_60).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&chain_config, &chain_topo_60, &chain_infos_60),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 60 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 60,
+            }]
+        );
     }
 }

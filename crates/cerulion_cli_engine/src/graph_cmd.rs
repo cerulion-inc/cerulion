@@ -38352,13 +38352,29 @@ nodes:
         imu_period_ms: u64,
         fuse_policy: cerulion_core::MacroPolicy,
     ) -> DeclaredInfos {
-        use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, OutputMeta};
+        sync_window_infos_with_backpressure(
+            cam_period_ms,
+            imu_period_ms,
+            fuse_policy,
+            cerulion_core::graph::node::BackpressurePolicy::DropOldest,
+        )
+    }
+
+    /// [`sync_window_infos`] with `backpressure` on both of `fuse`'s trigger
+    /// inputs.
+    fn sync_window_infos_with_backpressure(
+        cam_period_ms: u64,
+        imu_period_ms: u64,
+        fuse_policy: cerulion_core::MacroPolicy,
+        backpressure: cerulion_core::graph::node::BackpressurePolicy,
+    ) -> DeclaredInfos {
+        use cerulion_core::graph::node::{InputMeta, OutputMeta};
         let trigger_in = |name: &str| InputMeta {
             name: name.to_string(),
             schema_hash: 0x5eed,
             trigger: true,
             depth: 4,
-            backpressure: BackpressurePolicy::DropOldest,
+            backpressure,
             expect_within_ms: None,
             accumulate: false,
             consume: Default::default(),
@@ -38490,6 +38506,51 @@ nodes:
             "missing expected hand-written check text:\n{text1}"
         );
         assert_eq!(text1, text2, "two validate runs must render identically");
+    }
+
+    #[test]
+    fn graph_validate_resolves_non_divisible_sample_gate_to_next_admitted_tick() {
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = sync_window_workspace(sync_window_graph_yaml());
+
+        let make_sampled = |window_ms: u64| {
+            sync_window_infos_with_backpressure(
+                30,
+                30,
+                cerulion_core::MacroPolicy::Sync { window_ms },
+                cerulion_core::graph::node::BackpressurePolicy::Sample(31),
+            )
+        };
+
+        // 30 ms streams with sample(31) admit on ticks 0, 60, 120, ... (60 ms).
+        // Window 32 is safe and must emit zero sync-window warnings.
+        let safe_infos = make_sampled(32);
+        let safe_report =
+            graph_validate_with_inspector(&ws_root, "sync_win", false, &safe_infos).unwrap();
+        assert!(safe_report.all_passed(), "report:\n{safe_report}");
+        assert!(
+            !safe_report
+                .checks
+                .iter()
+                .any(|c| c.label.starts_with("sync window '")),
+            "window 32 < admitted period 60 must not warn:\n{safe_report}"
+        );
+
+        // Window 60 reaches the admitted 60 ms period and reports 60 ms, not 31 ms.
+        let warn_infos = make_sampled(60);
+        let warn_report =
+            graph_validate_with_inspector(&ws_root, "sync_win", false, &warn_infos).unwrap();
+        assert!(warn_report.all_passed(), "report:\n{warn_report}");
+        let check = warn_report
+            .checks
+            .iter()
+            .find(|c| c.label == "sync window 'fuse'")
+            .unwrap_or_else(|| panic!("expected sync window check line in:\n{warn_report}"));
+        assert!(
+            check.detail.contains("sync_window_ms = 60") && check.detail.contains("(60 ms)"),
+            "expected admitted period 60 ms in detail, got: {}",
+            check.detail
+        );
     }
 
     /// A graph with no `network:` block gets no `network ingress` line.
