@@ -1983,10 +1983,11 @@ impl CerulionSubscriber {
     /// the step's plan. The caller has already established that a gate is
     /// armed, so `Ungated` cannot come back.
     #[inline(never)]
-    fn gate_admission(
+    fn gate_admission_at(
         gate: &crate::read_outcome::ReadPlanStage,
+        empty_recorded: bool,
     ) -> Option<(crate::read_outcome::DueRead, u32)> {
-        match gate.admit_at() {
+        match gate.admit_at_site(empty_recorded) {
             (crate::read_outcome::GateAnswer::Exact(due), ordinal) => Some((due, ordinal)),
             // `Ungated` is unreachable from an armed gate; withholding on it
             // keeps the two answers that mean "pop nothing" on one arm rather
@@ -3540,7 +3541,7 @@ impl CerulionSubscriber {
         self.batch_frames.borrow_mut().clear();
         let granted = match self.replay_gate() {
             None => None,
-            Some(gate) => match Self::gate_admission(gate) {
+            Some(gate) => match Self::gate_admission_at(gate, true) {
                 Some(grant) => Some(grant),
                 None => {
                     // The gate held the pop back: nothing left the queue, and
@@ -4116,7 +4117,7 @@ impl CerulionSubscriber {
     /// unified trigger accounting (`popped` = frames consumed this drain,
     /// `latest_ts` = the surviving sample's wire timestamp, None on Empty/Err).
     fn drain_to_latest_with_accounting(&mut self) -> DrainOutcome {
-        self.drain_with_accounting_impl(false)
+        self.drain_with_accounting_impl(false, true)
     }
 
     /// Pop exactly ONE sample (FIFO head) with the same accounting-once pass
@@ -4128,7 +4129,14 @@ impl CerulionSubscriber {
     /// pop returns `Empty` (popped = 1, decimation counted); the next read
     /// pops the next frame.
     fn drain_one_with_accounting(&mut self) -> DrainOutcome {
-        self.drain_with_accounting_impl(true)
+        self.drain_with_accounting_impl(true, true)
+    }
+
+    /// Site-aware twin of [`Self::drain_one_with_accounting`]: forwards
+    /// `empty_recorded` to [`Self::gate_admission_at`] so post-fire per-set
+    /// `Sync` refill passes withhold silently on an empty partner queue.
+    fn drain_one_with_accounting_at(&mut self, empty_recorded: bool) -> DrainOutcome {
+        self.drain_with_accounting_impl(true, empty_recorded)
     }
 
     /// The single drain-and-account implementation behind BOTH consume modes
@@ -4146,10 +4154,14 @@ impl CerulionSubscriber {
     ///
     /// With no armed gate the answer is `Ungated` and the body below runs byte
     /// for byte as it does today.
-    fn drain_with_accounting_impl(&mut self, limit_one: bool) -> DrainOutcome {
+    fn drain_with_accounting_impl(
+        &mut self,
+        limit_one: bool,
+        empty_recorded: bool,
+    ) -> DrainOutcome {
         let granted = match self.replay_gate() {
             None => None,
-            Some(gate) => match Self::gate_admission(gate) {
+            Some(gate) => match Self::gate_admission_at(gate, empty_recorded) {
                 Some(grant) => Some(grant),
                 None => {
                     // No stale EVENT drain here either, for the reason the body
@@ -5204,6 +5216,16 @@ impl CerulionSubscriber {
         if self.next_head.is_some() {
             return Ok(true);
         }
+        // Under an armed replay read gate, the private feed queue stays empty
+        // until an admission fills it, so probing `has_samples()` would always
+        // answer `false`. Ask the step's plan whether the next spendable entry
+        // is a recorded matcher peek instead.
+        if let Some(gate) = self.replay_gate() {
+            return gate.next_is_peek().map_err(|_| TransportError::Receive {
+                topic: self.topic.clone(),
+                reason: "replay read gate poisoned during sync_next_arrived".to_string(),
+            });
+        }
         // The CHECKED twin, never `has_pending_sample`: that one is
         // `has_samples().unwrap_or(false)`, and `false` is this call site's
         // PASS WITNESS.
@@ -5307,7 +5329,7 @@ impl CerulionSubscriber {
         }
         // Pop EXACTLY one, in FIFO order, with the same accounting-once pass
         // every other read on this input runs.
-        let outcome = self.drain_one_with_accounting();
+        let outcome = self.drain_one_with_accounting_at(site == SyncAlignSite::Boundary);
         let forgiven = outcome.forgiven;
         match outcome.slot {
             FrozenSlot::Sample(sample) => {
@@ -5492,7 +5514,7 @@ impl CerulionSubscriber {
         // Nothing staged (an `Advance` the gate reached without a `NeedStamp`,
         // or a `DiscardTie`): refill from the queue, with the ordinary
         // accounting-once pass and the ordinary read-log record.
-        let outcome = self.drain_one_with_accounting();
+        let outcome = self.drain_one_with_accounting_at(site == SyncAlignSite::Boundary);
         if self.read_capture_armed() {
             match &outcome.slot {
                 // Same rule as the boundary drain — an
@@ -5836,7 +5858,9 @@ impl CerulionSubscriber {
         // freeze.
         let outcome = match self.consume_mode {
             ConsumeMode::Latest => self.drain_to_latest_with_accounting(),
-            ConsumeMode::EachFifo => self.drain_one_with_accounting(),
+            ConsumeMode::EachFifo => self.drain_one_with_accounting_at(
+                !(self.per_set_sync_trigger && site == TriggerDrainSite::Refill),
+            ),
         };
         // The UNIFIED trigger-drain read outcome: a DrainedBatch
         // (served-seq = the surviving/newest frame, popped = the batch), a
@@ -8592,5 +8616,274 @@ mod tests {
         assert!(plan.take_violations().is_empty(), "every admission settled");
         let (a, b) = (u128::from(FED_WRITER_A), u128::from(FED_WRITER_B));
         assert_eq!(seen, vec![(a, 10), (b, 100), (a, 11), (b, 101)]);
+    }
+
+    /// A gated, fed per-set `Sync` subscriber drives `FillBoundary`, `ProbeNext`,
+    /// `PeekNext`, `Advance`, `DiscardTie`, and post-fire `FillRefill` through
+    /// the read plan and private feed, settles each frame's sequence, and fails
+    /// closed when the gate is poisoned or a peek is fed the wrong sequence.
+    #[test]
+    fn gated_sync_peek_and_discard_consult_feed_and_settle_sequence() {
+        use crate::read_outcome::{
+            ConsultRule, DueRead, ReadPlanStage, ReadStageRole, ReplayReadViolationKind, StageKey,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        struct SyncFeedEntry {
+            seq: u32,
+            ts: u64,
+            ids: Vec<(u64, u32)>,
+        }
+
+        struct CountingSyncFeed {
+            port: std::sync::Mutex<crate::transport::publisher::CerulionPublisher>,
+            entries: std::collections::HashMap<u32, SyncFeedEntry>,
+            fills: std::sync::atomic::AtomicUsize,
+        }
+
+        impl std::fmt::Debug for CountingSyncFeed {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("CountingSyncFeed").finish_non_exhaustive()
+            }
+        }
+
+        impl crate::replay_feed::ReadFeed for CountingSyncFeed {
+            fn fill(
+                &self,
+                _key: &StageKey,
+                _step: u64,
+                ordinal: u32,
+            ) -> Result<(), crate::replay_feed::ReadFeedFault> {
+                self.fills.fetch_add(1, Ordering::Relaxed);
+                let entry = self.entries.get(&ordinal).expect("planned ordinal");
+                let mut header = crate::wire::WireHeader::new(0xC1289, entry.seq, entry.ts);
+                let total = crate::wire::WireHeader::SIZE + 8;
+                header.total_size = total as u32;
+                let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+                header.write_to_buf(&mut buf);
+                self.port
+                    .lock()
+                    .expect("feed port")
+                    .publish_raw(&buf)
+                    .map(|_| ())
+                    .map_err(|e| crate::replay_feed::ReadFeedFault {
+                        detail: e.to_string(),
+                    })
+            }
+
+            fn frames(&self, _key: &StageKey, _step: u64, ordinal: u32) -> Option<&[(u64, u32)]> {
+                self.entries.get(&ordinal).map(|e| e.ids.as_slice())
+            }
+        }
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "gated_sync_ops".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+
+        // Happy path: FillBoundary (seq 10, ts 1000) -> ProbeNext (true, peek)
+        // -> PeekNext (seq 11, ts 2000) -> Advance (promotes seq 11 without a
+        // feed call; HandOff at ordinal 2 is transparent) -> ProbeNext (false)
+        // -> DiscardTie (refills seq 12, ts 3000 from feed) -> trailing Refill
+        // with empty plan withholds silently without UnplannedConsult.
+        let topic = "gated_sync_happy";
+        let port = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        sub.mark_fifo_consume();
+        sub.mark_per_set_sync_trigger();
+
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            0,
+            SyncFeedEntry {
+                seq: 10,
+                ts: 1_000,
+                ids: vec![(FED_WRITER_A, 10)],
+            },
+        );
+        entries.insert(
+            1,
+            SyncFeedEntry {
+                seq: 11,
+                ts: 2_000,
+                ids: vec![(FED_WRITER_A, 11)],
+            },
+        );
+        entries.insert(
+            3,
+            SyncFeedEntry {
+                seq: 12,
+                ts: 3_000,
+                ids: vec![(FED_WRITER_A, 12)],
+            },
+        );
+        let feed = Arc::new(CountingSyncFeed {
+            port: std::sync::Mutex::new(port),
+            entries,
+            fills: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let now = Arc::new(AtomicU64::new(0));
+        let plan = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sync".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::clone(&now),
+        ));
+        assert!(plan.install_feed(Arc::clone(&feed) as Arc<dyn crate::replay_feed::ReadFeed>));
+        plan.arm(ConsultRule::Recorded).expect("arm");
+        plan.install_step(
+            0,
+            &[
+                DueRead::pops(1, Some(10)),
+                DueRead::peek(1, Some(11)),
+                DueRead::served_without_pop(Some(11)),
+                DueRead::pops(1, Some(12)),
+            ],
+        )
+        .expect("install");
+        sub.set_replay_read_plan(Arc::clone(&plan));
+
+        // 1. FillBoundary pops seq 10 via feed.
+        let (popped, ts) = sub.snapshot_latest_for_trigger();
+        assert_eq!((popped, ts), (1, Some(1_000)));
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 1);
+
+        // 2. ProbeNext sees the recorded Peek (ordinal 1) without calling feed.
+        assert!(sub.sync_next_arrived().expect("probe"));
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 1);
+
+        // 3. PeekNext feeds and pops seq 11 into next_head.
+        assert_eq!(
+            sub.sync_peek_next_stamp(SyncAlignSite::Boundary)
+                .expect("peek"),
+            Some(2_000)
+        );
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 2);
+
+        // 4. Advance promotes next_head (seq 11) with NO feed call.
+        assert_eq!(
+            sub.sync_discard_head(SyncAlignSite::Boundary)
+                .expect("advance"),
+            Some(2_000)
+        );
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 2);
+
+        // 5. ProbeNext skips HandOff (ordinal 2), sees Drain (ordinal 3) -> false.
+        assert!(!sub.sync_next_arrived().expect("probe"));
+
+        // 6. DiscardTie (next_head is None) refills seq 12 from feed.
+        assert_eq!(
+            sub.sync_discard_head(SyncAlignSite::Boundary)
+                .expect("discard_tie"),
+            Some(3_000)
+        );
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 3);
+
+        // 7. After head is consumed (simulate fire by clearing frozen), a
+        // post-fire FillRefill against an exhausted plan withholds silently
+        // with zero UnplannedConsult violations.
+        sub.frozen = None;
+        let (refill_popped, refill_ts, _) =
+            sub.drain_for_trigger_observed(TriggerDrainSite::Refill);
+        assert_eq!((refill_popped, refill_ts), (0, None));
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 3);
+        plan.sweep(0);
+        assert!(
+            plan.take_violations().is_empty(),
+            "happy path settles cleanly with zero violations"
+        );
+
+        // Adversarial 1: feeding the wrong sequence for a Peek mints
+        // SequenceMismatch at settle.
+        let topic_bad = "gated_sync_bad_peek";
+        let port_bad = mgr
+            .create_publisher(topic_bad, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub_bad = mgr.create_subscriber(topic_bad).expect("subscriber");
+        sub_bad.mark_fifo_consume();
+        sub_bad.mark_per_set_sync_trigger();
+        let mut bad_entries = std::collections::HashMap::new();
+        bad_entries.insert(
+            0,
+            SyncFeedEntry {
+                seq: 20,
+                ts: 1_000,
+                ids: vec![(FED_WRITER_A, 20)],
+            },
+        );
+        // Feed publishes seq 99 where the plan expects peek seq 21.
+        bad_entries.insert(
+            1,
+            SyncFeedEntry {
+                seq: 99,
+                ts: 2_000,
+                ids: vec![(FED_WRITER_A, 99)],
+            },
+        );
+        let feed_bad = Arc::new(CountingSyncFeed {
+            port: std::sync::Mutex::new(port_bad),
+            entries: bad_entries,
+            fills: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let plan_bad = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sync".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        assert!(
+            plan_bad.install_feed(Arc::clone(&feed_bad) as Arc<dyn crate::replay_feed::ReadFeed>)
+        );
+        plan_bad.arm(ConsultRule::Recorded).expect("arm");
+        plan_bad
+            .install_step(0, &[DueRead::pops(1, Some(20)), DueRead::peek(1, Some(21))])
+            .expect("install");
+        sub_bad.set_replay_read_plan(Arc::clone(&plan_bad));
+        assert_eq!(sub_bad.snapshot_latest_for_trigger(), (1, Some(1_000)));
+        assert!(sub_bad.sync_next_arrived().expect("probe"));
+        assert_eq!(
+            sub_bad
+                .sync_peek_next_stamp(SyncAlignSite::Boundary)
+                .expect("peek"),
+            Some(2_000)
+        );
+        let violations = plan_bad.take_violations();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(
+            violations[0].kind,
+            ReplayReadViolationKind::SequenceMismatch {
+                expected: Some(21),
+                observed: Some(99),
+            }
+        );
+
+        // Adversarial 2: a poisoned gate causes sync_next_arrived to fail
+        // closed with TransportError::Receive.
+        sub_bad.next_head = None;
+        plan_bad.poison_for_test();
+        let err = sub_bad
+            .sync_next_arrived()
+            .expect_err("poisoned gate fails closed");
+        assert!(
+            matches!(err, TransportError::Receive { .. }),
+            "expected TransportError::Receive, got {err:?}"
+        );
     }
 }
