@@ -144,11 +144,6 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 /// `TransportManager::init`'s conversion became fallible, a PANIC one rename away).
 pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
 
-#[cfg(test)]
-use crate::resim_slots::{
-    check_slot_lock_owner, reclaim_resim_slot, SlotLock, SlotPassedOver, SlotReclaim,
-    RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
-};
 use crate::resim_slots::{
     claim_and_reclaim_resim_slot as claim_and_reclaim_resim_slot_inner,
     resim_ix_config as resim_ix_config_inner, resim_segment_dir, resim_slot_lock_dir, ResimSlot,
@@ -162,16 +157,6 @@ fn resim_ix_config(
     slot: u32,
 ) -> Result<iceoryx2::config::Config, ReplayError> {
     resim_ix_config_inner(base, slot).map_err(|reason| ReplayError::Internal { reason })
-}
-
-#[cfg(test)]
-fn claim_resim_slot(
-    lock_dir: &Path,
-    slots: u32,
-    ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
-) -> Result<ResimSlot, ReplayError> {
-    crate::resim_slots::claim_resim_slot(lock_dir, slots, ready)
-        .map_err(|reason| ReplayError::Internal { reason })
 }
 
 fn claim_and_reclaim_resim_slot(
@@ -42848,10 +42833,13 @@ mod unlisted_macro_output_tests {
 #[cfg(test)]
 mod resim_namespace_tests {
     use super::{
-        check_slot_lock_owner, claim_and_reclaim_resim_slot, claim_resim_slot, reclaim_resim_slot,
-        resim_ix_config, resim_namespace_prefix, resim_namespace_slot,
-        verify_resim_transport_prefix, ResimSlot, SlotLock, SlotPassedOver, SlotReclaim,
-        RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+        claim_and_reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
+        resim_namespace_slot, verify_resim_transport_prefix, ReplayError, ResimSlot,
+        RESIM_NAMESPACE_MARKER,
+    };
+    use crate::resim_slots::{
+        check_slot_lock_owner, reclaim_resim_slot, SlotLock, SlotPassedOver, SlotReclaim,
+        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
@@ -42861,6 +42849,15 @@ mod resim_namespace_tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    fn claim_resim_slot(
+        lock_dir: &Path,
+        slots: u32,
+        ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
+    ) -> Result<ResimSlot, ReplayError> {
+        crate::resim_slots::claim_resim_slot(lock_dir, slots, ready)
+            .map_err(|reason| ReplayError::Internal { reason })
+    }
 
     /// What the child below prints once it holds its node and publisher.
     const CHILD_READY: &str = "resim slot child holds a publisher";

@@ -13,8 +13,10 @@ use cerulion_cli_engine::replay_engine::{
 };
 use cerulion_core::testing::IsolatedRoot;
 use cerulion_core::{TransportConfig, TransportManager};
+use serial_test::serial;
 
 #[test]
+#[serial]
 fn init_resim_transport_refuses_already_initialized_non_resim_singleton() {
     let mut root = IsolatedRoot::mint("resim_wrong_pfx");
     root.prefix = "wrong_pfx_".to_string();
