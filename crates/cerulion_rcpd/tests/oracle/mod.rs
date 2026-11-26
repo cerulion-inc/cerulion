@@ -17,18 +17,20 @@
 //! frame whose `call_id` it carries.
 
 pub mod graph;
+pub mod properties;
 pub mod vectors;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_rcpd::manifest::{LoadedManifest, RcpManifest};
 use native_ros2_messages::std_msgs::String as RosString;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
-use rmcp::service::RunningService;
+use rmcp::service::{Peer, RunningService};
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::io::DuplexStream;
@@ -131,10 +133,23 @@ pub trait Daemon: Sized {
 /// A request's label inside one vector.
 pub type Req = u8;
 
-/// What the client does.
+/// What the client does, and when it waits.
 pub enum Event {
     /// `tools/call` of `tool` with `args`, then wait for its reply.
     Call { req: Req, tool: String, args: Value },
+    /// `tools/call` of `tool` with `args`, without waiting for its reply.
+    Start { req: Req, tool: String, args: Value },
+    /// Wait for the reply to a request sent by [`Event::Start`].
+    AwaitReply(Req),
+    /// Wait until the graph has received a frame for this tool.
+    AwaitFrame(&'static str),
+    /// Let the graph answer the `arm.slow` frames it holds, and later ones
+    /// at once.
+    Release,
+    /// Wait [`PAUSE`]: for a step no client can observe, such as a request
+    /// that reached the daemon and waits behind the call in flight. A pause
+    /// that is too short makes the vector fail, never pass falsely.
+    Pause,
     /// `tools/list`.
     List,
     /// `tools/list`, keeping the description of this tool.
@@ -143,9 +158,24 @@ pub enum Event {
     ProbeLatchFile,
 }
 
+/// How long [`Event::Pause`] waits.
+pub const PAUSE: Duration = Duration::from_millis(200);
+
+/// How long [`Event::AwaitReply`] waits before the vector fails.
+const REPLY_DEADLINE: Duration = Duration::from_secs(30);
+
 /// `tools/call` of `tool` with `args` as request `req`.
 pub fn call(req: Req, tool: impl Into<String>, args: Value) -> Event {
     Event::Call {
+        req,
+        tool: tool.into(),
+        args,
+    }
+}
+
+/// [`call`], without waiting for the reply.
+pub fn start(req: Req, tool: impl Into<String>, args: Value) -> Event {
+    Event::Start {
         req,
         tool: tool.into(),
         args,
@@ -425,26 +455,19 @@ impl<D: Daemon> Session<D> {
         }
     }
 
+    /// The MCP client of the daemon.
+    pub fn client(&self) -> &Peer<RoleClient> {
+        self.client.peer()
+    }
+
     /// `tools/call`: `(isError, body)`; the body is the one text block's JSON.
     pub async fn call(&self, tool: &str, args: &Value) -> (bool, Value) {
-        let params = CallToolRequestParams::new(tool.to_string())
-            .with_arguments(args.as_object().cloned().expect("object args"));
-        let result: CallToolResult = self.client.call_tool(params).await.expect("call_tool");
-        let text = result
-            .content
-            .first()
-            .and_then(|c| c.as_text())
-            .map(|t| t.text.clone())
-            .expect("one text block");
-        (
-            result.is_error == Some(true),
-            serde_json::from_str(&text).expect("JSON body"),
-        )
+        call_on(self.client(), tool, args).await
     }
 
     /// `tools/list`: each tool's name and description, in order.
     pub async fn list(&self) -> Vec<(String, String)> {
-        self.client
+        self.client()
             .list_all_tools()
             .await
             .expect("list")
@@ -464,6 +487,29 @@ impl<D: Daemon> Session<D> {
             Err(e) => panic!("the latch file cannot be read: {e}"),
         }
     }
+
+    /// Stop the stand-in graph; every frame it received, in order.
+    pub fn stop(self) -> Vec<Value> {
+        self.graph.stop()
+    }
+}
+
+/// `tools/call` through `client`: `(isError, body)`; the body is the one
+/// text block's JSON.
+async fn call_on(client: &Peer<RoleClient>, tool: &str, args: &Value) -> (bool, Value) {
+    let params = CallToolRequestParams::new(tool.to_string())
+        .with_arguments(args.as_object().cloned().expect("object args"));
+    let result: CallToolResult = client.call_tool(params).await.expect("call_tool");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("one text block");
+    (
+        result.is_error == Some(true),
+        serde_json::from_str(&text).expect("JSON body"),
+    )
 }
 
 /// Run `events` against a `D` started from `given` and record what each
@@ -471,6 +517,7 @@ impl<D: Daemon> Session<D> {
 pub async fn play<D: Daemon>(given: &Given, events: &[Event]) -> Trace {
     let session = Session::<D>::open(given).await;
     let mut replies = BTreeMap::new();
+    let mut started = BTreeMap::new();
     let mut listed = Vec::new();
     let mut described = Vec::new();
     let mut latch = Vec::new();
@@ -483,6 +530,30 @@ pub async fn play<D: Daemon>(given: &Given, events: &[Event]) -> Trace {
                     "request {req} is sent twice"
                 );
             }
+            Event::Start { req, tool, args } => {
+                let (client, tool, args) = (session.client().clone(), tool.clone(), args.clone());
+                let task = tokio::spawn(async move { call_on(&client, &tool, &args).await });
+                assert!(
+                    started.insert(*req, task).is_none(),
+                    "request {req} is sent twice"
+                );
+            }
+            Event::AwaitReply(req) => {
+                let task = started
+                    .remove(req)
+                    .unwrap_or_else(|| panic!("request {req} was not started"));
+                let answer = tokio::time::timeout(REPLY_DEADLINE, task)
+                    .await
+                    .unwrap_or_else(|_| panic!("request {req} got no reply"))
+                    .expect("request task");
+                assert!(
+                    replies.insert(*req, answer).is_none(),
+                    "request {req} is sent twice"
+                );
+            }
+            Event::AwaitFrame(tool) => session.graph.wait_for(tool).await,
+            Event::Release => session.graph.release(),
+            Event::Pause => tokio::time::sleep(PAUSE).await,
             Event::List => {
                 let names = session.list().await.into_iter().map(|(name, _)| name);
                 listed.push(names.collect());
@@ -496,6 +567,11 @@ pub async fn play<D: Daemon>(given: &Given, events: &[Event]) -> Trace {
             Event::ProbeLatchFile => latch.push(session.read_latch_file()),
         }
     }
+    assert!(
+        started.is_empty(),
+        "requests started but never awaited: {:?}",
+        started.keys().collect::<Vec<_>>()
+    );
     let frames = session.graph.stop();
     let entries = session.daemon.entries();
     Trace {
