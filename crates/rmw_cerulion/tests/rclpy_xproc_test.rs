@@ -38,6 +38,13 @@
 //!   sequence it joined on), and EXPLICITLY that the rmw-written frame's
 //!   `WireHeader::schema_hash` equals the native generated
 //!   `std_msgs::String::SCHEMA_HASH`.
+//! - **Schema hash capture**: a SUBPROCESS rclpy publisher per pinned type
+//!   (`CAPTURE_TYPES`) → one native subscriber per topic reads
+//!   `WireHeader::schema_hash` off the first frame, prints a
+//!   `MEASURED <package>/<Name> 0x<hash>` line per type, and asserts each
+//!   equals the generated `SCHEMA_HASH`. The Jazzy row of the distro lane
+//!   runs it with `--show-output`; its lines are the source for the wire
+//!   hash table in `native_ros2_messages`' `schema_hash_pin_test.rs`.
 //!
 //! ## Topic + schema meeting point
 //!
@@ -732,4 +739,233 @@ fn direction_a_rclpy_string_talker_to_native_subscriber() {
     }
 
     // The talker keeps publishing; PyChild::Drop SIGKILLs + reaps it.
+}
+
+// ===========================================================================
+// Schema hash capture: one rclpy publisher per pinned type → native
+// subscribers that read `WireHeader::schema_hash` off the first frame.
+//
+// The hashes in `LIVE_RMW_MEASURED_HASHES`
+// (`crates/native_ros2_messages/tests/schema_hash_pin_test.rs`) must come off
+// the wire, never from `schema_hash()`. This test is the instrument: stock
+// rclpy hands each type to the rmw through its rosidl introspection
+// typesupport, so the rmw derives the schema from the installed ROS packages,
+// not from the vendored corpus. Each hash is printed as a `MEASURED` line
+// BEFORE any assertion, so a red run still shows what the wire carried.
+// The assertion is wire == the generated constant for every type; the pin
+// test asserts generated == the captured table, so a green lane and a green
+// pin test together mean wire == table.
+// ===========================================================================
+
+/// The pinned types the capture measures, in the order of
+/// `LIVE_RMW_MEASURED_HASHES`, plus `geometry_msgs/Pose`: a type built from
+/// fixed nested fields only, the control whose hash a nested-hash recipe
+/// change must leave alone.
+const CAPTURE_TYPES: &[(&str, &str, u64)] = &[
+    (
+        "vision_msgs",
+        "ObjectHypothesisWithPose",
+        <native_ros2_messages::vision_msgs::ObjectHypothesisWithPose as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "vision_msgs",
+        "Detection2DArray",
+        <native_ros2_messages::vision_msgs::Detection2DArray as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "control_msgs",
+        "DynamicJointState",
+        <native_ros2_messages::control_msgs::DynamicJointState as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "grid_map_msgs",
+        "GridMap",
+        <native_ros2_messages::grid_map_msgs::GridMap as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "object_recognition_msgs",
+        "Table",
+        <native_ros2_messages::object_recognition_msgs::Table as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "geometry_msgs",
+        "PoseStamped",
+        <native_ros2_messages::geometry_msgs::PoseStamped as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "sensor_msgs",
+        "Imu",
+        <native_ros2_messages::sensor_msgs::Imu as ShmMessage>::SCHEMA_HASH,
+    ),
+    (
+        "geometry_msgs",
+        "Pose",
+        <native_ros2_messages::geometry_msgs::Pose as ShmMessage>::SCHEMA_HASH,
+    ),
+];
+
+/// The ROS topic the capture publishes `<package>/<Name>` on: one topic per
+/// type, so each frame's hash belongs to exactly one type.
+fn capture_topic(package: &str, name: &str) -> String {
+    format!("/hash_capture/{package}/{name}")
+}
+
+/// The rclpy child: one default-constructed message per type, published every
+/// 100 ms on its own topic until the deadline. A default message is enough,
+/// because the schema hash depends on the type only, never on the values.
+fn capture_publisher_script() -> String {
+    let mut py = String::from("import time, rclpy\n");
+    for (package, name, _) in CAPTURE_TYPES {
+        py.push_str(&format!("from {package}.msg import {name}\n"));
+    }
+    py.push_str("rclpy.init()\nnode = rclpy.create_node(\"hash_capture_talker\")\npubs = []\n");
+    for (package, name, _) in CAPTURE_TYPES {
+        let topic = capture_topic(package, name);
+        py.push_str(&format!(
+            "pubs.append((node.create_publisher({name}, \"{topic}\", 10), {name}))\n"
+        ));
+    }
+    py.push_str(&format!(
+        "print(\"READY\", flush=True)\n\
+         deadline = time.time() + {CHILD_TIMEOUT_SECS}\n\
+         while rclpy.ok() and time.time() < deadline:\n    \
+         for p, t in pubs:\n        \
+         p.publish(t())\n    \
+         time.sleep(0.1)\n\
+         node.destroy_node()\n\
+         rclpy.shutdown()\n"
+    ));
+    py
+}
+
+/// The import probe the capture runs before it spawns the publisher, so a
+/// message package missing from the container fails with its name.
+fn capture_import_probe() -> String {
+    let mut py = String::new();
+    for (package, name, _) in CAPTURE_TYPES {
+        py.push_str(&format!("from {package}.msg import {name}\n"));
+    }
+    py
+}
+
+/// The capture's inputs, proven without rclpy or a container: every type is
+/// named once, each on its own topic that the rmw maps to itself, and the
+/// publisher script imports and publishes each type exactly once.
+#[test]
+#[serial]
+fn capture_publishes_every_type_once_on_its_own_topic() {
+    let names: std::collections::BTreeSet<(&str, &str)> =
+        CAPTURE_TYPES.iter().map(|(p, n, _)| (*p, *n)).collect();
+    assert_eq!(names.len(), 8, "eight distinct types: {names:?}");
+    assert!(names.contains(&("geometry_msgs", "Pose")));
+    assert_eq!(
+        capture_topic("geometry_msgs", "Pose"),
+        "/hash_capture/geometry_msgs/Pose"
+    );
+
+    let script = capture_publisher_script();
+    let probe = capture_import_probe();
+    for (package, name, _) in CAPTURE_TYPES {
+        let topic = capture_topic(package, name);
+        assert_eq!(cerulion_topic(&topic), topic);
+        let import = format!("from {package}.msg import {name}\n");
+        assert_eq!(script.matches(&import).count(), 1, "{import:?}");
+        assert_eq!(probe.matches(&import).count(), 1, "{import:?}");
+        let publisher = format!("node.create_publisher({name}, \"{topic}\", 10)");
+        assert_eq!(script.matches(&publisher).count(), 1, "{publisher:?}");
+    }
+    assert!(
+        script.contains("\n    for p, t in pubs:\n        p.publish(t())\n    time.sleep(0.1)\n")
+    );
+}
+
+#[test]
+#[ignore = "distro-lane capture: run by tools/ci/rmw-distros/gate.sh on the Jazzy row inside ros:jazzy-ros-base with a staged librmw_cerulion.so and the vision, control, grid map and object recognition message packages (--ignored --show-output); a plain cargo test skips it. Prints one MEASURED line per type"]
+#[serial]
+fn schema_hash_capture_rclpy_publishers_to_native_subscribers() {
+    precondition_or_panic();
+    let probe = Command::new("python3")
+        .args(["-c", &capture_import_probe()])
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn python3: {e}.\n{RECIPE}"));
+    assert!(
+        probe.status.success(),
+        "the capture needs every message package importable under the sourced ROS env \
+         (ros-<distro>-vision-msgs, -control-msgs, -grid-map-msgs, -object-recognition-msgs).\n\
+         stderr:\n{}\n{RECIPE}",
+        String::from_utf8_lossy(&probe.stderr),
+    );
+
+    let mgr = native_manager("hash_capture_native");
+    let mut child = PyChild::spawn(&capture_publisher_script(), "hash-capture-talker");
+    if !child.wait_for("READY", Instant::now() + Duration::from_secs(30)) {
+        let stderr = child.kill_and_stderr();
+        panic!("rclpy capture publisher never printed READY (rmw publisher failed?).\nstderr:\n{stderr}");
+    }
+
+    // Late-join every rmw-created service (bounded retry, as in Direction A).
+    let open_deadline = Instant::now() + Duration::from_secs(10);
+    let mut subs: Vec<CerulionSubscriber> = Vec::with_capacity(CAPTURE_TYPES.len());
+    for (package, name, _) in CAPTURE_TYPES {
+        let topic = cerulion_topic(&capture_topic(package, name));
+        let sub = loop {
+            match mgr.create_subscriber_open_only(&topic) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < open_deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let stderr = child.kill_and_stderr();
+                    panic!("native subscriber could not open the rmw-created topic {topic:?}: {e}.\nstderr:\n{stderr}");
+                }
+            }
+        };
+        subs.push(sub);
+    }
+
+    // The first frame on each topic gives that type's wire hash.
+    let mut measured: Vec<Option<u64>> = vec![None; CAPTURE_TYPES.len()];
+    let collect_deadline = Instant::now() + Duration::from_secs(30);
+    while measured.iter().any(Option::is_none) && Instant::now() < collect_deadline {
+        for (sub, slot) in subs.iter().zip(measured.iter_mut()) {
+            if slot.is_none() {
+                sub.try_receive(|msg| {
+                    slot.get_or_insert(msg.header().schema_hash);
+                })
+                .expect("native try_receive on a capture topic");
+            }
+        }
+        thread::sleep(Duration::from_millis(3));
+    }
+
+    for ((package, name, _), hash) in CAPTURE_TYPES.iter().zip(&measured) {
+        match hash {
+            Some(h) => println!("MEASURED {package}/{name} 0x{h:016x}"),
+            None => println!("NOT MEASURED {package}/{name}: no frame within the deadline"),
+        }
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    for ((package, name, generated), hash) in CAPTURE_TYPES.iter().zip(&measured) {
+        match hash {
+            None => problems.push(format!(
+                "  {package}/{name}: no frame reached the native subscriber"
+            )),
+            Some(h) if h != generated => problems.push(format!(
+                "  {package}/{name}: wire 0x{h:016x}, generated SCHEMA_HASH 0x{generated:016x}"
+            )),
+            Some(_) => {}
+        }
+    }
+    if !problems.is_empty() {
+        let stderr = child.kill_and_stderr();
+        panic!(
+            "{} of {} captured type(s) did not match: the rmw, reading the installed ROS \
+             packages, disagrees with the vendored corpus about the schema hash, or no frame \
+             arrived.\n{}\nstderr:\n{stderr}",
+            problems.len(),
+            CAPTURE_TYPES.len(),
+            problems.join("\n"),
+        );
+    }
 }
