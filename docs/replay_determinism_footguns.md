@@ -264,11 +264,11 @@ pass builds its `block` input with no producer in its rank, no credit word and
 no backpressure probe, and the producer's pass marks the producer as held by
 the edge. For the split edge the verdict is exit 0, or 1 or 6 on a real
 divergence, and the replay stands its producer down (as `block_gated`, or
-`suppressible_fire` for a Sync producer), so the fires its rule owes are not
-judged, even where a consumer in its own process also holds it; its
-`throttle_ms` and a Sync producer's recorded fires still are. Every other
-hold in the bag gets the verdict a bag of the same graph in one process gets,
-by the rules below.
+`suppressible_fire` for a Sync producer), so that producer's fire schedule
+is not judged, even where a consumer in its own process also holds it; only
+its `throttle_ms`, and a Sync producer's recorded fires, still are. Every
+other hold in the bag gets the verdict a bag of the same graph in one process
+gets, by the rules below.
 
 - **The held producer's fire rules stand down.** The consumer's credit word
   in another process can defer it at any step, and the bag records neither
