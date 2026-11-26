@@ -405,13 +405,13 @@ capture of several worker ranks is not resimmable either, since per-rank resume
 is not supported. Either way, `cerulion graph run --record`
 records the run with a recorder that is ready before step 0. A capture already
 on disk (including a 2.0.0 capture stamped `anchor.resimmable: true`) whose
-recorded frames on a re-executed topic start after the topic's first resumed
-commit is refused by name before step 1 (exit 2) by `cerulion bag play --resim`
-(lockstep and free-run, with or without `--verify`) instead of seeding the
-publisher from a later frame; under `--verify`, a read of a pre-anchor frame
-before a writer's first held sequence is refused before step 1 (exit 2,
-`read_identity_frame_missing`) naming the writer's first held sequence rather
-than blaming recorder loss.
+recorded frames on a re-executed topic start after an earlier frame the resumed
+trace reads is refused by name before step 1 (exit 2) by
+`cerulion bag play --resim` (lockstep and free-run, with or without `--verify`)
+instead of seeding the publisher from a later frame; under `--verify`, a read of
+a pre-anchor frame before a writer's first held sequence is refused before step
+1 (exit 2, `read_identity_frame_missing`) naming the writer's first held
+sequence rather than blaming recorder loss.
 
 **An early capture whose free-run worker ranks begin apart is not resimmable.** In a
 capture taken within one Flashback window of the start, a rank that kept no

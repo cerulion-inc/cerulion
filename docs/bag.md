@@ -1397,9 +1397,11 @@ fed:
   ranks is refused by every replay, `--resim all` included, since per-rank
   resume anchors are not supported. On any mid-run replay (lockstep or free-run,
   with or without `--verify`), a re-executed single-writer topic whose recorded
-  frames begin after its first resumed commit is refused by name before step 1
-  (exit 2), naming the topic, the resumed step, the first commit step and the
-  first recorded sequence, instead of seeding the publisher from a later frame.
+  frames begin after an earlier frame that the resumed trace reads is refused by
+  name before step 1 (exit 2), naming the topic, the resumed step, the missing
+  read sequence and step, and the first recorded sequence, instead of seeding
+  the publisher from a later frame. Topics written only by external (driver)
+  nodes are recorded inputs and are excluded from this check.
 
  Replay such a bag with `--resim all` and no
 `--verify`, which re-creates each consumer's queue and labels its reads best
