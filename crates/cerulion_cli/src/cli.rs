@@ -1926,8 +1926,9 @@ pub enum TopicAction {
     /// LOCAL section by default; a count line says when any were, and `--all`
     /// lists them with an `internal` marker. REMOTE rows are not filtered.
     /// Pass `--connect` or `--listen` locators for explicit open LAN compatibility;
-    /// account and paired discovery needs neither. Pass `--local` to skip the remote
-    /// network query (scripts, CI).
+    /// account and paired discovery needs neither. Pass `--local` (or set
+    /// `CERULION_NETWORK=off`, which fails closed on any unrecognized value, or
+    /// `CERULION_NETD_NETWORK=off`) to skip the remote network query (scripts, CI).
     List {
         /// Also list the framework's own internal topics (the recorder's
         /// `/bagd/status`, anything under `/__cerulion/`) in the LOCAL
@@ -1937,11 +1938,12 @@ pub enum TopicAction {
         #[arg(long)]
         all: bool,
         /// Skip the REMOTE network discovery query (scripts, CI, offline).
-        /// Without a CLI or environment kill-switch, remote discovery runs
-        /// automatically. Locally mirrored
-        /// remote topics are still listed as REMOTE streaming rows: that
-        /// information is read from local shared memory, not the network, so
-        /// this flag skips only the network query.
+        /// Without `--local`, `CERULION_NETWORK=off` (unrecognized values fail
+        /// closed to local-only), or `CERULION_NETD_NETWORK=off`, remote
+        /// discovery runs automatically. Locally mirrored remote topics are
+        /// still listed as REMOTE streaming rows: that information is read from
+        /// local shared memory, not the network, so this flag skips only the
+        /// network query.
         #[arg(long = "local", visible_alias = "no-network")]
         no_network: bool,
         /// Additional zenoh locator to connect to for discovery (repeatable),
