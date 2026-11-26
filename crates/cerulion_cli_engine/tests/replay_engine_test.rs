@@ -17782,6 +17782,302 @@ fn strict_state_judges_the_executed_nodes_and_only_those() {
     assert!(err.to_string().contains(CP2_COUNTER), "{err}");
 }
 
+// --- Late-starting recorded frames at mid-run resume ----------------------
+
+/// Build a mid-run bag from `checkpoint_reference()` resuming at step 1
+/// (step-0 anchor, counter=1), with recorded frames trimmed to start at
+/// `attach_step` (so frames before `attach_step` are absent from the bag).
+fn write_late_frames_resume_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    attach_step: u64,
+    recorder_json: Option<Vec<u8>>,
+) -> std::path::PathBuf {
+    let rec = checkpoint_reference();
+    let attach_ns = rec
+        .trace
+        .iter()
+        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == attach_step)
+        .expect("the reference run recorded a boundary for the attach step")
+        .fire_time_ns;
+    let mid = make_mid_run_with_tap_attach(&rec, 1, attach_ns);
+    let kept_seqs: Vec<u32> = mid.messages[CP_TOPIC]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        kept_seqs,
+        (attach_step as u32..CP_STEPS as u32).collect::<Vec<_>>(),
+        "hand oracle: frames begin at sequence {attach_step}"
+    );
+    let bag = dir.path().join(name);
+    write_checkpoint_bag_with_capture(
+        &mid,
+        &bag,
+        &state_records(
+            CHECKPOINT_RUN,
+            0,
+            CHECKPOINT_NODE_IDX,
+            &anchor_blob(CHECKPOINT_SHAPE, 1),
+        ),
+        Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
+        None,
+        None,
+        recorder_json,
+    );
+    bag
+}
+
+#[test]
+#[serial]
+fn a_lockstep_mid_run_bag_whose_frames_begin_after_resume_is_refused_before_step_1() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_late_frames_resume_bag(&dir, "lockstep_late_frames.mcap", 3, None);
+    let report = dir.path().join("no_report.json");
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Verify,
+        replay_engine::ReplayPurpose::Resim,
+    ] {
+        let (res, _) = ri_replay_reporting(
+            &bag,
+            checkpoint_factories,
+            purpose,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let err = res.expect_err("late-starting frames must be refused before step 1");
+        assert_eq!(err.exit_code(), 2, "{purpose:?}: {err}");
+        assert!(
+            matches!(err, ReplayError::StateRestore { .. }),
+            "{purpose:?}: expected StateRestore, got {err:?}"
+        );
+        let text = err.to_string();
+        for needle in [
+            CP_TOPIC,
+            "step 1",
+            "resuming at step 1",
+            "sequence 3",
+            "CERULION_FLASHBACK_WINDOW_MS",
+            "cerulion graph run --record",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{purpose:?}: missing '{needle}' in: {text}"
+            );
+        }
+        assert!(
+            !report.exists(),
+            "{purpose:?}: refusal before step 1 must write no report"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_free_run_mid_run_bag_whose_frames_begin_after_resume_is_refused_without_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_late_frames_resume_bag(
+        &dir,
+        "free_run_late_frames.mcap",
+        3,
+        Some(ri_free_run_recorder_json()),
+    );
+    let report = dir.path().join("no_report.json");
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Resim,
+        replay_engine::ReplayPurpose::Verify,
+    ] {
+        let (res, _) = ri_replay_reporting(
+            &bag,
+            checkpoint_factories,
+            purpose,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let err = res.expect_err("late-starting free-run capture must refuse before step 1");
+        assert_eq!(err.exit_code(), 2, "{purpose:?}: {err}");
+        assert!(
+            matches!(err, ReplayError::StateRestore { .. }),
+            "{purpose:?}: expected StateRestore, got {err:?}"
+        );
+        let text = err.to_string();
+        for needle in [CP_TOPIC, "step 1", "sequence 3"] {
+            assert!(
+                text.contains(needle),
+                "{purpose:?}: missing '{needle}' in: {text}"
+            );
+        }
+        assert!(
+            !report.exists(),
+            "{purpose:?}: refusal before step 1 must write no report"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_slow_period_producer_whose_first_resumed_frame_lands_after_anchor_still_replays() {
+    // Two-node graph (`counter` at 5 ms, `slow` at 30 ms). Resume at step 3
+    // (target 20 ms, anchor step 2 at 15 ms). `slow` does not fire at step 3
+    // and first commits at step 5 (target 30 ms). Tap attaches between step 2
+    // and step 3 (16 ms): `slow` has no pre-anchor frame and its first held
+    // frame is at target(5) = 30 ms, so rung (ii) is exact and must replay.
+    let rec = cp2_reference();
+    let target_at = |step: u64| -> u64 {
+        rec.trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+            .unwrap_or_else(|| panic!("boundary for step {step}"))
+            .fire_time_ns
+    };
+    let first_step = 3u64;
+    let attach_ns = target_at(first_step - 1) + 1_000_000;
+    assert!(
+        target_at(first_step - 1) < attach_ns && attach_ns < target_at(first_step),
+        "tap attach sits strictly between anchor step and resumed step"
+    );
+    let mid = make_mid_run_with_tap_attach(&rec, first_step, attach_ns);
+    assert_eq!(
+        mid.messages[CP2_SLOW_TOPIC].len(),
+        1,
+        "hand oracle: slow emits one frame, at step 5 (30 ms)"
+    );
+    let slow_hdr = WireHeader::read_from_buf(&mid.messages[CP2_SLOW_TOPIC][0]).expect("header");
+    assert_eq!(slow_hdr.timestamp_ns, target_at(5));
+    assert!(slow_hdr.timestamp_ns > target_at(first_step));
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("cp2_slow_rung_ii.mcap");
+    let mut records = state_records(
+        CHECKPOINT_RUN,
+        first_step - 1,
+        0,
+        &anchor_blob(CHECKPOINT_SHAPE, first_step),
+    );
+    records.extend(state_records(
+        CHECKPOINT_RUN,
+        first_step - 1,
+        1,
+        &anchor_blob(CHECKPOINT_SHAPE, 0),
+    ));
+    write_checkpoint_bag(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&[(CP2_COUNTER, 0), (CP2_SLOW, 1)])),
+        None,
+    );
+
+    let outcome = replay(&bag, cp2_factories, None, None)
+        .expect("a slow producer's genuine first post-anchor frame must replay");
+    assert!(
+        outcome.passed,
+        "{:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    let resume = outcome.resume.expect("mid-run resume report");
+    let seed = resume
+        .sequence_seeds
+        .get(CP2_SLOW_TOPIC)
+        .expect("slow topic is seeded");
+    assert_eq!(seed.rung, "first-frame-after-anchor");
+    assert_eq!(seed.seed, slow_hdr.sequence);
+}
+
+#[test]
+#[serial]
+fn a_discarded_first_fire_does_not_falsely_refuse_a_later_first_frame() {
+    // Source fires at steps 0..4, with step 1 (fire 2) live-discarded so no
+    // frame is committed at step 1; its first committing fire after the step-0
+    // anchor is at step 2 (sequence 1). With tap attach at step 2's target,
+    // step 0's frame is absent and the first held frame matches step 2's
+    // target, so the resume is admitted rather than falsely refused.
+    const STEPS: usize = 5;
+    const DISCARD_FIRE: u64 = 2; // step 1 (0-based)
+    let rec = record_uniform(
+        discard_source_yaml(),
+        || discard_record_factories(DISCARD_FIRE),
+        &[],
+        STEPS,
+    );
+    let target_at = |step: u64| -> u64 {
+        rec.trace
+            .iter()
+            .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == step)
+            .unwrap_or_else(|| panic!("boundary for step {step}"))
+            .fire_time_ns
+    };
+    let step1_fire = rec
+        .trace
+        .iter()
+        .find(|r| r.record_type == RECORD_TYPE_FIRE && r.step == 1)
+        .expect("step 1 fire recorded");
+    assert!(step1_fire.is_discarded(), "step 1 fire carries discard bit");
+
+    let mid = make_mid_run_with_tap_attach(&rec, 1, target_at(2));
+    let out_topic = "/dg/source/out";
+    let kept_seqs: Vec<u32> = mid.messages[out_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        kept_seqs,
+        vec![1, 2, 3],
+        "hand oracle: step 2 commits sequence 1, step 3 sequence 2, step 4 sequence 3"
+    );
+
+    let mut anchor_sink = cerulion_core::state::VecSink::new();
+    cerulion_core::state_restore::capture_anchor_blob(
+        &DiscardAtSourceNode {
+            counter: 1.0,
+            err_at: Some(DISCARD_FIRE),
+            ..Default::default()
+        },
+        &mut anchor_sink,
+    )
+    .expect("discard source anchor serializes");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("discarded_first_fire_resume.mcap");
+    write_checkpoint_bag(
+        &mid,
+        &bag,
+        &state_records(CHECKPOINT_RUN, 0, 0, &anchor_sink.into_inner()),
+        Some(&coverage_for_nodes(&[("source", 0)])),
+        None,
+    );
+
+    let outcome = replay(&bag, discard_replay_factories, None, None)
+        .expect("discarded first fire must not trigger late-frame refusal");
+    assert!(
+        outcome.passed,
+        "{:?} / {:?}",
+        outcome.violations, outcome.trace_divergence
+    );
+    let resume = outcome.resume.expect("mid-run resume report");
+    let seed = resume
+        .sequence_seeds
+        .get(out_topic)
+        .expect("source topic is seeded");
+    assert_eq!(seed.rung, "first-frame-after-anchor");
+    assert_eq!(seed.seed, 1);
+}
+
+#[test]
+#[serial]
+fn late_start_resume_refusal_is_deterministic_across_two_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_late_frames_resume_bag(&dir, "lockstep_late_det.mcap", 3, None);
+    let a = replay(&bag, checkpoint_factories, None, None).expect_err("first run refuses");
+    let b = replay(&bag, checkpoint_factories, None, None).expect_err("second run refuses");
+    assert_eq!(a.exit_code(), 2);
+    assert_eq!(b.exit_code(), 2);
+    assert_eq!(a.to_string(), b.to_string());
+}
+
 // ===========================================================================
 // The FRAMEWORK SECTION of the anchor blob, end to end
 // ===========================================================================
@@ -20287,6 +20583,11 @@ const DECLARED_LITERAL_SHAPE_SITES: &[(&str, &str)] = &[
     (
         "write_checkpoint_bag_with_params",
         "`GainCounterEntry`, which delegates its shape to `CounterEntry`",
+    ),
+    ("write_late_frames_resume_bag", "the `cp` counter"),
+    (
+        "a_slow_period_producer_whose_first_resumed_frame_lands_after_anchor_still_replays",
+        "`cp2`'s two Period counters (`counter` and `slow`)",
     ),
     // --- not a stamp at all ----------------------------------------------
     (

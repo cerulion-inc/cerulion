@@ -86,10 +86,11 @@ use cerulion_bagd::{RecordCoverage, TapSource, RECORD_COVERAGE_ATTACHMENT};
 use cerulion_core::graph::{GraphConfig, GraphRuntime};
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
 use cerulion_core::state_restore::{
-    enforce_strict_state, plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics,
-    seed_publisher_sequence, AnchorBlob, BacklogAdmission, BacklogClaim, InputServiceCursor,
-    NodeFrameworkState, RestorePlan, RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung,
-    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters,
+    check_first_frame_covers_resume, enforce_strict_state, plan_backlog_admission, plan_restore,
+    refuse_lossy_reexecuted_topics, seed_publisher_sequence, AnchorBlob, BacklogAdmission,
+    BacklogClaim, InputServiceCursor, NodeFrameworkState, RestorePlan, RestoreRequest,
+    ResumeAnchor, SeedEvidence, SeedRung, StoppedAtAnchor, TopicFrameCount, TopicLoss,
+    TopicWriters,
 };
 use cerulion_core::trace_ring::{
     step_boundary_flags, unpack_read_outcome_meta, unpack_read_outcome_meta_full,
@@ -7805,6 +7806,9 @@ struct AnchorFrameScan {
     /// The `sequence` of the first frame stamped strictly ABOVE the anchor
     /// clock — rung (ii) when the tie band is empty or entirely pre-anchor.
     first_seq_above: Option<u32>,
+    /// The wire `timestamp_ns` of that same first frame strictly above the
+    /// anchor clock (`None` when no headered frame sits above it).
+    first_ts_above: Option<u64>,
 }
 
 /// Walk the recorded user frames ONCE and place each named topic's frames
@@ -8499,6 +8503,7 @@ fn scan_frames_around_anchor(
                 std::cmp::Ordering::Equal => entry.at_anchor.push(header.sequence),
                 std::cmp::Ordering::Greater => {
                     entry.first_seq_above = Some(header.sequence);
+                    entry.first_ts_above = Some(header.timestamp_ns);
                     break;
                 }
             }
@@ -8676,6 +8681,9 @@ struct SuffixFireScan {
     /// recording holds a FIRE record of it, discarded fires included (a
     /// discarded fire still ran the node's tick).
     first_fire: BTreeMap<String, u64>,
+    /// Per node id in [`Self::executed`], the lowest step at which the
+    /// recording holds a non-discarded FIRE record of it.
+    first_commit_step: BTreeMap<String, u64>,
     /// Per node id, FIRE records at the steps sharing the FIRST boundary's
     /// target that COMMITTED (the discard bit clear).
     tie_commits: BTreeMap<String, usize>,
@@ -8724,6 +8732,12 @@ fn scan_suffix_fires(
                 .entry(node.to_string())
                 .and_modify(|step| *step = (*step).min(rec.step))
                 .or_insert(rec.step);
+            if !rec.is_discarded() {
+                out.first_commit_step
+                    .entry(node.to_string())
+                    .and_modify(|step| *step = (*step).min(rec.step))
+                    .or_insert(rec.step);
+            }
         }
         if in_tie && !rec.is_discarded() {
             *out.tie_commits.entry(node.to_string()).or_insert(0) += 1;
@@ -8799,6 +8813,31 @@ fn last_replayed_step(
         last = Some(b.step);
     }
     Ok(last)
+}
+
+/// Map each requested rank-0 step to its recorded boundary target in one
+/// forward walk, stopping once every requested step is resolved or passed.
+fn boundary_targets_for_steps(
+    trace: &RecordedTrace,
+    steps: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, u64>, ReplayError> {
+    let Some(&max_step) = steps.iter().next_back() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut out = BTreeMap::new();
+    let mut cursor = BoundaryCursor::for_rank(trace, 0)?;
+    while let Some(b) = cursor.next()? {
+        if steps.contains(&b.step) {
+            out.entry(b.step).or_insert(b.target_ns);
+            if out.len() == steps.len() {
+                break;
+            }
+        }
+        if b.step > max_step {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Decide what this recording's replay must do before its first step.
@@ -9034,18 +9073,46 @@ fn resolve_resume(
         s.at_anchor.len().saturating_sub(committed)
     };
 
+    let mut needed_commit_steps = BTreeSet::new();
+    if !fires.unresolved_fire {
+        for topic in &reexecuted {
+            if config.is_multi_publisher(topic) {
+                continue;
+            }
+            let Some(s) = scan.get(topic) else {
+                continue;
+            };
+            if s.last_seq_below.is_some() || !s.at_anchor.is_empty() || s.first_ts_above.is_none() {
+                continue;
+            }
+            if let Some(&step) = producers
+                .get(topic)
+                .and_then(|p| fires.first_commit_step.get(p))
+            {
+                if step > first.step {
+                    needed_commit_steps.insert(step);
+                }
+            }
+        }
+    }
+    let commit_targets = if needed_commit_steps.is_empty() {
+        BTreeMap::new()
+    } else {
+        boundary_targets_for_steps(trace, &needed_commit_steps)?
+    };
+
     let mut seeds = BTreeMap::new();
     let mut seed_rungs = Vec::new();
     for topic in &reexecuted {
-        let evidence = scan
-            .get(topic)
+        let topic_scan = scan.get(topic);
+        let cut = topic_scan.map_or(0, |s| tie_deduction(topic, s));
+        let evidence = topic_scan
             .map(|s| {
                 // The seed reads the split, not the raw bands: a tie-band frame
                 // the deduction moved to the prefix is the LAST pre-anchor
                 // frame, and seeding from the one below it would start the
                 // re-executed publisher a whole band too low — a byte mismatch
                 // on every frame it goes on to publish.
-                let cut = tie_deduction(topic, s);
                 SeedEvidence {
                     last_at_or_before_anchor: if cut > 0 {
                         s.at_anchor.get(cut - 1).copied()
@@ -9068,6 +9135,34 @@ fn resolve_resume(
         } else {
             TopicWriters::SingleWriter
         };
+        if !fires.unresolved_fire {
+            let has_frame_at_or_before_resume = evidence.last_at_or_before_anchor.is_some()
+                || topic_scan.is_some_and(|s| s.at_anchor.get(cut).is_some());
+            let first_commit = producers
+                .get(topic)
+                .and_then(|p| fires.first_commit_step.get(p).copied())
+                .and_then(|step| {
+                    let target_ns = if step == first.step {
+                        Some(anchor_clock_ns)
+                    } else {
+                        commit_targets.get(&step).copied()
+                    };
+                    target_ns.map(|t| (step, t))
+                });
+            let first_recorded_frame =
+                topic_scan.and_then(|s| s.first_seq_above.zip(s.first_ts_above));
+            check_first_frame_covers_resume(
+                topic,
+                writers,
+                first.step,
+                first_commit,
+                first_recorded_frame,
+                has_frame_at_or_before_resume,
+            )
+            .map_err(|refusal| ReplayError::StateRestore {
+                reason: refusal.to_string(),
+            })?;
+        }
         let seed = seed_publisher_sequence(topic, writers, &evidence).map_err(|refusal| {
             ReplayError::StateRestore {
                 reason: refusal.to_string(),
