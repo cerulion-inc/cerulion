@@ -1145,9 +1145,10 @@ pub struct NodeDecl {
     pub throttle_ns: Option<u64>,
     /// The `block` edges in the node's rank that may hold its fire with no
     /// record in the bag ([`BlockHoldEdges`]). A `block` edge across ranks
-    /// reaches this module as [`Self::held_across_ranks`] on its producer and
-    /// as a [`BlockEdgeObservation`] on its consumer's rank; one inside the
-    /// rank reaches it only as this field. Where the node's drain is known (the bag
+    /// reaches this module as [`Self::held_across_ranks`] on its producer
+    /// and, where its conservation is judged, as a [`BlockEdgeObservation`]
+    /// on its consumer's rank; one inside the rank reaches it only as this
+    /// field. Where the node's drain is known (the bag
     /// states it, or a `block` or `sample(N)` declaration settles it), the FIFO
     /// rule lets such a node leave a popped frame or a signal unfired at a step
     /// where an edge's slot was full by the bag's own record
@@ -1993,32 +1994,47 @@ impl fmt::Display for StandDownReason {
     }
 }
 
-/// Every [`StandDownReason`], for the oracles that walk the closed set: its
-/// own token test, and the engine's check that no other token on a
-/// `stand_down` note collides with one of these.
-#[cfg(test)]
-pub(crate) const EVERY_STAND_DOWN_REASON: [StandDownReason; 20] = [
-    StandDownReason::BlockGated,
-    StandDownReason::NoPhaseAnchor,
-    StandDownReason::ZeroInterval,
-    StandDownReason::TruncatedReadLog,
-    StandDownReason::DecimatedRead,
-    StandDownReason::MissingWireStamp,
-    StandDownReason::SuppressibleFire,
-    StandDownReason::QueueExceedsVerifierRoom,
-    StandDownReason::AmbiguousReadSite,
-    StandDownReason::ImpossibleReadShape,
-    StandDownReason::UnattributableCredit,
-    StandDownReason::SyncHeadStampRegressed,
-    StandDownReason::CaptureTimeSync,
-    StandDownReason::LatestDrainUnrecorded,
-    StandDownReason::LatestWritersUncapped,
-    StandDownReason::LatestWritersUnnamed,
-    StandDownReason::LatestBlockHeld,
-    StandDownReason::LatestUnfiredSinceAnchor,
-    StandDownReason::FifoUnfiredSinceAnchor,
-    StandDownReason::SyncUnfiredSinceAnchor,
-];
+// Builds the test-only `EVERY_STAND_DOWN_REASON` and an exhaustive `match`
+// from ONE list, so the list is every `StandDownReason` by construction: a new
+// variant does not compile until it is listed, and a variant listed twice is
+// an unreachable pattern.
+macro_rules! every_stand_down_reason {
+    ($($reason:ident),+ $(,)?) => {
+        /// Every [`StandDownReason`], for the oracles that walk the closed
+        /// set: its own token test, and the engine's check that no
+        /// conservation cause's token collides with one of these.
+        #[cfg(test)]
+        pub(crate) const EVERY_STAND_DOWN_REASON: [StandDownReason;
+            [$(StandDownReason::$reason),+].len()] = [$(StandDownReason::$reason),+];
+        // The `match` with no wildcard arm that makes the list whole.
+        #[cfg(test)]
+        const _: fn(StandDownReason) = |reason| match reason {
+            $(StandDownReason::$reason)|+ => {}
+        };
+    };
+}
+every_stand_down_reason!(
+    BlockGated,
+    NoPhaseAnchor,
+    ZeroInterval,
+    TruncatedReadLog,
+    DecimatedRead,
+    MissingWireStamp,
+    SuppressibleFire,
+    QueueExceedsVerifierRoom,
+    AmbiguousReadSite,
+    ImpossibleReadShape,
+    UnattributableCredit,
+    SyncHeadStampRegressed,
+    CaptureTimeSync,
+    LatestDrainUnrecorded,
+    LatestWritersUncapped,
+    LatestWritersUnnamed,
+    LatestBlockHeld,
+    LatestUnfiredSinceAnchor,
+    FifoUnfiredSinceAnchor,
+    SyncUnfiredSinceAnchor,
+);
 
 /// A decider declined to judge, and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1042,10 +1042,12 @@ pub struct ReplayOutcome {
     /// (`latest_before_first_fire`), the hold a `period_ms` or Sync node
     /// was judged with (`hold_allowed_for`), and the block events a split
     /// `block` input's consumer is not delivered
-    /// (`block_event_not_reproduced`). A stand-down names a node as its
-    /// subject, or a topic where it is a `block` edge's conservation
-    /// ([`RederivationNote::subject`]). [`RederivationNoteKind`] is the
-    /// closed set of kinds. Additive + skipped when empty.
+    /// (`block_event_not_reproduced`). A stand-down's subject is a node (the
+    /// consumer, where the verifier stands a `block` edge's conservation down
+    /// on its read log), `rank N` for a whole-rank decline, or the topic where
+    /// a split `block` edge's conservation stands down by its cause or under
+    /// `--duration` ([`RederivationNote::subject`]). [`RederivationNoteKind`]
+    /// is the closed set of kinds. Additive + skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rederivation_notes: Vec<RederivationNote>,
     /// Every node whose trace-driven burst was UNDER-FED by the
@@ -2068,9 +2070,10 @@ pub struct RederivationNote {
     pub kind: RederivationNoteKind,
     /// What it is about: the node id for a node's stand-down, a read-site
     /// census, a carried-heads note, a before-first-fire note, a
-    /// hold-allowed-for note or a block-event note (the consumer); the topic
-    /// for a conservation breach, a `block` edge's conservation stand-down or
-    /// a producer-label note.
+    /// hold-allowed-for note or a block-event note (the consumer); `rank N`
+    /// for a whole-rank decline; the topic for a conservation breach, a split
+    /// `block` edge's conservation stand-down by its cause or under
+    /// `--duration`, or a producer-label note.
     pub subject: String,
     /// The rendered sentence, from the pure module's own `Display`.
     pub detail: String,
@@ -16582,9 +16585,9 @@ fn prepare_pass_verification(
         })
         .collect();
 
-    // The split `block` edges whose consumer this rank holds, judged here for
-    // their credit conservation on the consumer's recorded drains where the
-    // graph and the bag allow it.
+    // The split `block` edges whose consumer this rank holds, which the
+    // pass's re-derivation verdict judges for their credit conservation on
+    // the consumer's recorded drains where the graph and the bag allow it.
     let block_edges = split_block_edges
         .iter()
         .filter(|e| plan.members().contains(&e.consumer_node))
@@ -18206,8 +18209,10 @@ fn run_rank_pass(
     if !lockstep {
         // A split `block` edge the replay feeds from the bag has no credit
         // word in this runtime, so it has no entry here; the re-derived check
-        // after the pass judges it or stands it down by name, and where the
-        // rank's verifier declines, the rank's decline note covers it.
+        // after the pass judges it or stands it down by name. Where the rank's
+        // verifier declines the whole rank, nothing judges the edge's
+        // conservation and no note names it: the decline note names the
+        // rank's deciders only.
         for credit in runtime.block_credits() {
             if credit.conservation_broken() {
                 // Reported as well as warned — the SYMMETRY the re-derived twin

@@ -200,10 +200,9 @@ pub struct RemoteProducer {
 ///
 /// A `multi_publisher_topics:` topic split across ranks makes SOME of an edge's
 /// frames foreign and the rest local, but it is still ONE read stream on ONE
-/// `(topic, consumer_node, consumer_input)` key — that key is the read log's
-/// own, and emitting a second entry under it would make every consumer keyed on
-/// it (the injected-topic set, the enforced-topic set) see a topic twice. So
-/// the edge stays single and its blame anchor carries every foreign producer.
+/// `(topic, consumer_node, consumer_input)` key, the read log's own. So the
+/// list holds one entry per key, as the read log holds one stream per key, and
+/// the edge's blame anchor carries every foreign producer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossRankEdge {
     /// The resolved ABSOLUTE topic name.
