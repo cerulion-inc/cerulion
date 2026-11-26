@@ -983,6 +983,35 @@ pub mod mutants {
     pub(crate) fn batch_frame_keeps_annotation_armed() -> bool {
         BATCH_FRAME_KEEPS_ANNOTATION.with(std::cell::Cell::get)
     }
+
+    thread_local! {
+        static PEEK_FEEDS_NEXT_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A scope that arms the peek-next-frame mutant on its own thread until it
+    /// drops.
+    #[derive(Debug)]
+    pub struct PeekNextGuard(());
+
+    impl Drop for PeekNextGuard {
+        fn drop(&mut self) {
+            PEEK_FEEDS_NEXT_FRAME.with(|c| c.set(false));
+        }
+    }
+
+    /// Arm the PEEK-NEXT-FRAME mutant: every planned `DueRead::peek` admission
+    /// is fed the next frame in the topic's recorded file order (or the
+    /// preceding frame when the peek is at the end) instead of its recorded
+    /// frame.
+    #[must_use]
+    pub fn peek_feeds_next_frame() -> PeekNextGuard {
+        PEEK_FEEDS_NEXT_FRAME.with(|c| c.set(true));
+        PeekNextGuard(())
+    }
+
+    pub(super) fn peek_feeds_next_frame_armed() -> bool {
+        PEEK_FEEDS_NEXT_FRAME.with(std::cell::Cell::get)
+    }
 }
 
 /// Plan every fed read of a pass.
@@ -1192,7 +1221,28 @@ pub fn plan_feeds(
                     }
                     match topic.get(lookup) {
                         Some(Slot::One(span)) => {
-                            read.frames.push(*span);
+                            #[cfg(feature = "oracle-mutants")]
+                            let span = if due.is_peek() && mutants::peek_feeds_next_frame_armed() {
+                                if let Some(pos) =
+                                    topic.ordered.iter().position(|(_, s)| *s == *span)
+                                {
+                                    topic
+                                        .ordered
+                                        .get(pos + 1)
+                                        .or_else(|| {
+                                            pos.checked_sub(1).and_then(|p| topic.ordered.get(p))
+                                        })
+                                        .map(|(_, s)| *s)
+                                        .unwrap_or(*span)
+                                } else {
+                                    *span
+                                }
+                            } else {
+                                *span
+                            };
+                            #[cfg(not(feature = "oracle-mutants"))]
+                            let span = *span;
+                            read.frames.push(span);
                             read.ids.push((frame_writer, seq));
                         }
                         Some(Slot::Many(frames)) => {
@@ -2350,5 +2400,103 @@ mod tests {
         assert_eq!(r.writer_of(1), Some(Some(22)));
         assert_eq!(r.writer_of(2), Some(Some(33)));
         assert_eq!(r.writer_of(3), None);
+    }
+
+    /// A `DueRead::peek` admission is budgeted in `FeedNeed` and planned into
+    /// `FeedPlan`, a following `HandOff` (`DueShape::ServedWithoutPop`) is
+    /// skipped without double-claiming the same frame, a duplicate claim on a
+    /// peek is refused with `FrameClaimedTwice`, and missing-frame /
+    /// absent-identity errors on a peek name the peek's step, writer, and
+    /// sequence.
+    #[test]
+    fn plan_feeds_plans_peek_skips_handoff_and_rejects_duplicate_claim() {
+        let idx = index(vec![frame(10, 1), frame(20, 2), frame(30, 3)], vec![]);
+        let adm = StageAdmission {
+            key: key(),
+            mode: crate::replay_inject::ConsumeMode::EachFifo,
+            per_step: vec![StepAdmission {
+                step: 4,
+                due: vec![
+                    DueRead::pops(1, Some(1)),
+                    DueRead::peek(1, Some(2)),
+                    DueRead::served_without_pop(Some(2)),
+                ],
+                identity: vec![
+                    ReadIdentity {
+                        writer: Some(7),
+                        annotated: true,
+                        served_seq: Some(1),
+                        popped: 1,
+                        kind: Some(ReadKind::DrainedBatch),
+                        batch: Vec::new(),
+                    },
+                    ReadIdentity {
+                        writer: Some(7),
+                        annotated: false,
+                        served_seq: Some(2),
+                        popped: 1,
+                        kind: Some(ReadKind::DrainedBatch),
+                        batch: Vec::new(),
+                    },
+                    ReadIdentity {
+                        writer: Some(7),
+                        annotated: false,
+                        served_seq: Some(2),
+                        popped: 0,
+                        kind: None,
+                        batch: Vec::new(),
+                    },
+                ],
+            }],
+        };
+
+        // FeedNeed budgets both the Drain (seq 1) and the Peek (seq 2) and
+        // skips HandOff (no double-claim or extra entry).
+        let need = need_of(&adm, None);
+        assert_eq!(need.entries(), 2);
+        let p = plan(&adm, &idx).expect("peek + handoff plans cleanly");
+        assert_eq!((p.reads_planned(), p.frames_planned()), (2, 2));
+        let drain_read = p.read(&key(), 4, 0).expect("drain planned at ordinal 0");
+        assert_eq!(drain_read.frames, vec![span(10)]);
+        assert_eq!(drain_read.ids, vec![(7, 1)]);
+        let peek_read = p.read(&key(), 4, 1).expect("peek planned at ordinal 1");
+        assert_eq!(peek_read.frames, vec![span(20)]);
+        assert_eq!(peek_read.ids, vec![(7, 2)]);
+        assert!(
+            p.read(&key(), 4, 2).is_none(),
+            "HandOff occupies no feed slot"
+        );
+
+        // Duplicate claim: a Peek claiming the same frame as an earlier Drain
+        // is refused with FrameClaimedTwice.
+        let mut dup = adm.clone();
+        dup.per_step[0].due[1] = DueRead::peek(1, Some(1));
+        dup.per_step[0].identity[1].served_seq = Some(1);
+        let r = plan(&dup, &idx).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::FrameClaimedTwice { first_step: 4 }
+        );
+        assert_eq!((r.step, r.writer, r.sequence), (4, Some(7), Some(1)));
+
+        // Error arm: FrameMissing on a Peek names step, writer, and sequence.
+        let mut missing = adm.clone();
+        missing.per_step[0].due[1] = DueRead::peek(1, Some(99));
+        missing.per_step[0].identity[1].served_seq = Some(99);
+        let r = plan(&missing, &idx).unwrap_err();
+        assert_eq!(r.reason, FeedRefusalReason::FrameMissing);
+        assert_eq!((r.step, r.writer, r.sequence), (4, Some(7), Some(99)));
+
+        // Error arm: IdentityAbsent on a Peek names step and sequence.
+        let mut absent = adm;
+        absent.per_step[0].identity[1].writer = None;
+        let r = plan(&absent, &idx).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::IdentityAbsent {
+                cause: AbsentWriter::NotRecorded
+            }
+        );
+        assert_eq!((r.step, r.writer, r.sequence), (4, None, Some(2)));
     }
 }

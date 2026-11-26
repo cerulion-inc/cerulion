@@ -14568,7 +14568,7 @@ fn wiring_may_block_the_gate(
         Some(cerulion_core::graph::node::MacroPolicy::Sync { .. })
             | Some(cerulion_core::graph::node::MacroPolicy::UnboundedSync)
     );
-    per_set_policy
+    !fed && per_set_policy
         && per_set_capable
         && info
             .input_meta()
