@@ -14,6 +14,10 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::collections::BTreeSet;
 #[cfg(unix)]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::ops::Range;
+#[cfg(unix)]
 use std::time::Instant;
 
 use iceoryx2::config::Config;
@@ -373,61 +377,397 @@ fn log_passed_over_slot(
     }
 }
 
+/// Schema version for the owning-registry metadata stored inside a slot lock file.
+#[cfg(unix)]
+const SLOT_OWNER_RECORD_VERSION: u32 = 1;
+
+/// Maximum lock-file metadata size read when identifying a slot's owning registry.
+#[cfg(unix)]
+const MAX_SLOT_LOCK_BYTES: u64 = 16 * 1024;
+
+/// Owning iceoryx2 registry metadata persisted inside `cer_resim_<slot:08x>.lock`
+/// while holding its exclusive `flock`.
+///
+/// Lock files and shared-memory segment names live in host-wide directories
+/// (`/dev/shm` on Linux, `/tmp` on macOS) even when two processes use different
+/// iceoryx2 registry roots. Recording the claiming process's registry paths lets
+/// a later sweep or claim from another root inspect and reap that owning registry
+/// before unlinking any segment, so dead nodes in the original root are never
+/// stranded without their name mappings.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SlotOwnerRecord {
+    version: u32,
+    root_path: String,
+    node_dir: String,
+    service_dir: String,
+}
+
+/// Resolution of a recorded owning registry on disk.
+#[cfg(unix)]
+enum OwnerRegistry {
+    /// The recorded `root_path` no longer exists on disk, so it holds no nodes.
+    Absent,
+    /// Concrete iceoryx2 config targeting the recorded registry for one slot.
+    Config(Box<Config>),
+}
+
+#[cfg(unix)]
+impl SlotOwnerRecord {
+    fn from_config(base: &Config) -> Self {
+        Self {
+            version: SLOT_OWNER_RECORD_VERSION,
+            root_path: String::from(base.global.root_path()),
+            node_dir: String::from(&base.global.node.directory),
+            service_dir: String::from(&base.global.service.directory),
+        }
+    }
+
+    fn same_registry(&self, other: &Self) -> bool {
+        Path::new(&self.root_path)
+            .components()
+            .eq(Path::new(&other.root_path).components())
+            && Path::new(&self.node_dir)
+                .components()
+                .eq(Path::new(&other.node_dir).components())
+            && Path::new(&self.service_dir)
+                .components()
+                .eq(Path::new(&other.service_dir).components())
+    }
+
+    fn resolve_owner_registry(&self, base: &Config, slot: u32) -> Result<OwnerRegistry, String> {
+        use iceoryx2::prelude::{Path as IoxPath, SemanticString};
+        let root_path = Path::new(&self.root_path);
+        match std::fs::symlink_metadata(root_path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "recorded slot owner root '{}' is not a real directory",
+                    self.root_path
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(OwnerRegistry::Absent);
+            }
+            Err(err) => {
+                return Err(format!(
+                    "could not inspect recorded slot owner root '{}': {err}",
+                    self.root_path
+                ));
+            }
+        }
+        let node_dir_path = root_path.join(&self.node_dir);
+        match std::fs::symlink_metadata(&node_dir_path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "recorded slot owner node directory '{}' is not a real directory",
+                    node_dir_path.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "could not inspect recorded slot owner node directory '{}': {err}",
+                    node_dir_path.display()
+                ));
+            }
+        }
+        let mut cfg = resim_ix_config(base, slot)?;
+        let iox_root = IoxPath::new(self.root_path.as_bytes()).map_err(|e| {
+            format!(
+                "invalid recorded slot owner root '{}': {e:?}",
+                self.root_path
+            )
+        })?;
+        let iox_node = IoxPath::new(self.node_dir.as_bytes()).map_err(|e| {
+            format!(
+                "invalid recorded slot owner node_dir '{}': {e:?}",
+                self.node_dir
+            )
+        })?;
+        let iox_service = IoxPath::new(self.service_dir.as_bytes()).map_err(|e| {
+            format!(
+                "invalid recorded slot owner service_dir '{}': {e:?}",
+                self.service_dir
+            )
+        })?;
+        cfg.global.set_root_path(&iox_root);
+        cfg.global.node.directory = iox_node;
+        cfg.global.service.directory = iox_service;
+        Ok(OwnerRegistry::Config(Box::new(cfg)))
+    }
+}
+
+/// Ownership metadata parsed from an already-locked slot lock descriptor.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlotLockOwner {
+    /// Empty 0-byte lock file (newly created or created by an older binary).
+    LegacyEmpty,
+    /// Valid v1 owning-registry record.
+    Recorded(SlotOwnerRecord),
+    /// Non-empty lock file that could not be parsed or uses an unknown schema.
+    Unrecognized(String),
+}
+
+#[cfg(unix)]
+impl SlotLock {
+    fn read_owner(&self) -> SlotLockOwner {
+        let mut file = &self.0;
+        if let Err(err) = file.seek(SeekFrom::Start(0)) {
+            return SlotLockOwner::Unrecognized(format!("could not seek slot lock file: {err}"));
+        }
+        let mut buf = Vec::new();
+        if let Err(err) = file
+            .take(MAX_SLOT_LOCK_BYTES.saturating_add(1))
+            .read_to_end(&mut buf)
+        {
+            return SlotLockOwner::Unrecognized(format!("could not read slot lock file: {err}"));
+        }
+        if buf.is_empty() {
+            return SlotLockOwner::LegacyEmpty;
+        }
+        if buf.len() as u64 > MAX_SLOT_LOCK_BYTES {
+            return SlotLockOwner::Unrecognized(format!(
+                "slot lock metadata exceeds {MAX_SLOT_LOCK_BYTES} bytes"
+            ));
+        }
+        match serde_json::from_slice::<SlotOwnerRecord>(&buf) {
+            Ok(record) if record.version == SLOT_OWNER_RECORD_VERSION => {
+                SlotLockOwner::Recorded(record)
+            }
+            Ok(record) => SlotLockOwner::Unrecognized(format!(
+                "unsupported slot lock metadata version {}",
+                record.version
+            )),
+            Err(err) => {
+                SlotLockOwner::Unrecognized(format!("could not parse slot lock metadata: {err}"))
+            }
+        }
+    }
+
+    fn write_owner(&self, owner: &SlotOwnerRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(owner)
+            .map_err(|err| format!("could not encode slot lock metadata: {err}"))?;
+        let mut file = &self.0;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|err| format!("could not seek slot lock file for write: {err}"))?;
+        self.0
+            .set_len(0)
+            .map_err(|err| format!("could not truncate slot lock file: {err}"))?;
+        file.write_all(&bytes)
+            .map_err(|err| format!("could not write slot lock metadata: {err}"))?;
+        file.flush()
+            .map_err(|err| format!("could not flush slot lock metadata: {err}"))?;
+        Ok(())
+    }
+}
+
+/// Extract a readable message from a caught unwind payload.
+#[cfg(unix)]
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string())
+}
+
+/// Run an iceoryx2 registry operation inside a panic boundary so a stray or
+/// malformed registry entry turns into a reported error rather than crashing
+/// a cleanup pass or `ExitHygieneGuard::drop`.
+#[cfg(unix)]
+fn run_guarded_registry_walk<T>(walk: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(walk)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "iceoryx2 node registry walk panicked: {}",
+            panic_payload_message(payload)
+        )),
+    }
+}
+
+/// The single panic-guarded `Node::list` entry point for resim slot operations.
+#[cfg(unix)]
+fn list_nodes_guarded(
+    ix_config: &Config,
+    mut on_node: impl FnMut(NodeState<CerService>),
+) -> Result<(), String> {
+    run_guarded_registry_walk(|| {
+        Node::<CerService>::list(ix_config, |state| {
+            on_node(state);
+            CallbackProgression::Continue
+        })
+        .map_err(|error| format!("{error:?}"))
+    })
+}
+
+/// Panic-guarded wrapper around the unbounded dead-node sweep for one slot.
+#[cfg(unix)]
+fn sweep_dead_nodes_guarded(
+    ix_config: &Config,
+) -> Result<crate::ipc_cleanup::CleanupReport, String> {
+    run_guarded_registry_walk(|| {
+        Ok(crate::ipc_cleanup::sweep_dead_nodes_with_config(
+            ix_config,
+            SweepMode::Remove,
+        ))
+    })
+}
+
+/// Outcome of inspecting one slot's node registry in report-only mode.
+#[cfg(unix)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct NodeCounts {
+    dead: u64,
+    non_dead: u64,
+}
+
+/// Injectable registry operations so tests can drive panic-containment paths
+/// through the real `reclaim_resim_slot` and `sweep_resim_slots` logic.
+#[cfg(unix)]
+trait RegistryWalkOps {
+    fn count_nodes(&self, ix_config: &Config) -> Result<NodeCounts, String>;
+    fn list_node_count(&self, ix_config: &Config) -> Result<u64, String>;
+    fn sweep_bounded(
+        &self,
+        ix_config: &Config,
+        budget: Duration,
+    ) -> cerulion_core::transport::dead_node_sweep::BoundedCleanup;
+    fn sweep_unbounded(
+        &self,
+        ix_config: &Config,
+    ) -> Result<crate::ipc_cleanup::CleanupReport, String>;
+}
+
+#[cfg(unix)]
+struct RealRegistryWalkOps;
+
+#[cfg(unix)]
+impl RegistryWalkOps for RealRegistryWalkOps {
+    fn count_nodes(&self, ix_config: &Config) -> Result<NodeCounts, String> {
+        let mut counts = NodeCounts::default();
+        list_nodes_guarded(ix_config, |state| match state {
+            NodeState::Dead(_) => counts.dead += 1,
+            NodeState::Alive(_) | NodeState::Inaccessible(_) | NodeState::Undefined(_) => {
+                counts.non_dead += 1;
+            }
+        })?;
+        Ok(counts)
+    }
+
+    fn list_node_count(&self, ix_config: &Config) -> Result<u64, String> {
+        let mut nodes = 0u64;
+        list_nodes_guarded(ix_config, |_| {
+            nodes += 1;
+        })?;
+        Ok(nodes)
+    }
+
+    fn sweep_bounded(
+        &self,
+        ix_config: &Config,
+        budget: Duration,
+    ) -> cerulion_core::transport::dead_node_sweep::BoundedCleanup {
+        cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(ix_config, budget)
+    }
+
+    fn sweep_unbounded(
+        &self,
+        ix_config: &Config,
+    ) -> Result<crate::ipc_cleanup::CleanupReport, String> {
+        sweep_dead_nodes_guarded(ix_config)
+    }
+}
+
 /// Claim the lowest slot below `slots` whose lock file in `lock_dir`
 /// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
 /// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
 /// the lock is held.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(crate) fn claim_resim_slot(
     lock_dir: &Path,
     slots: u32,
     mut ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
 ) -> Result<ResimSlot, String> {
+    claim_resim_slot_in_range(lock_dir, 0..slots, |slot, _lock, _created_fresh| {
+        ready(slot)
+    })
+}
+
+/// Open or create a slot lock file without following symlinks or blocking on a
+/// FIFO, verify ownership, and take a non-blocking exclusive `flock`.
+/// Returns `(Option<SlotLock>, created_fresh)` where `None` means `WOULDBLOCK`.
+#[cfg(unix)]
+fn try_claim_slot_lock(
+    path: &Path,
+    expected_euid: u32,
+) -> Result<(Option<SlotLock>, bool), String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let (lock, created_fresh) = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => (file, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(false)
+                .truncate(false)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .map_err(|err| format!("{}: {err}", path.display()))?;
+            (file, false)
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let meta = lock
+        .metadata()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "{}: lock file is not a regular file",
+            path.display()
+        ));
+    }
+    check_slot_lock_owner(path, meta.uid(), expected_euid)?;
+    match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok((Some(SlotLock(lock)), created_fresh)),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok((None, created_fresh)),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn claim_resim_slot_in_range(
+    lock_dir: &Path,
+    slots: Range<u32>,
+    mut ready: impl FnMut(u32, &SlotLock, bool) -> Result<(), SlotPassedOver>,
+) -> Result<ResimSlot, String> {
     let expected_euid = cerulion_hygiene::euid();
+    let slot_count = slots.end.saturating_sub(slots.start);
     let mut latch = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
     let mut first_failure: Option<String> = None;
     let mut last_refusal: Option<(u32, SlotPassedOver)> = None;
-    for slot in 0..slots {
+    for slot in slots {
         let path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|lock| {
-                let meta = lock
-                    .metadata()
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                if !meta.file_type().is_file() {
-                    return Err(format!(
-                        "{}: lock file is not a regular file",
-                        path.display()
-                    ));
-                }
-                check_slot_lock_owner(&path, meta.uid(), expected_euid)?;
-                match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                {
-                    Ok(()) => Ok(Some(SlotLock(lock))),
-                    Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
-                    Err(e) => Err(format!("{}: {e}", path.display())),
-                }
-            });
-        let lock = match opened {
-            Ok(Some(lock)) => lock,
+        let (lock, created_fresh) = match try_claim_slot_lock(&path, expected_euid) {
+            Ok((Some(lock), created_fresh)) => (lock, created_fresh),
             // Held by a running resim.
-            Ok(None) => continue,
+            Ok((None, _)) => continue,
             Err(failure) => {
                 first_failure.get_or_insert_with(|| failure.clone());
                 log_passed_over_slot(&mut latch, slot, &SlotPassedOver::Lock(failure));
                 continue;
             }
         };
-        match ready(slot) {
+        match ready(slot, &lock, created_fresh) {
             Ok(()) => {
                 if let Some(suppressed) = latch.on_success() {
                     tracing::info!(
@@ -446,7 +786,7 @@ pub(crate) fn claim_resim_slot(
         }
     }
     Err(format!(
-        "no resim namespace slot is free: none of the {slots} slot locks in '{}' could be \
+        "no resim namespace slot is free: none of the {slot_count} slot locks in '{}' could be \
          taken by this process (each is held by a running resim, could not be opened or \
          locked, or its namespace did not reclaim clean){}{}",
         lock_dir.display(),
@@ -567,17 +907,23 @@ pub(crate) fn reclaim_resim_slot(
     segment_dir: Option<&Path>,
     budget: Duration,
 ) -> SlotReclaim {
+    reclaim_resim_slot_with_ops(ix_config, slot, segment_dir, budget, &RealRegistryWalkOps)
+}
+
+#[cfg(unix)]
+fn reclaim_resim_slot_with_ops(
+    ix_config: &Config,
+    slot: u32,
+    segment_dir: Option<&Path>,
+    budget: Duration,
+    ops: &dyn RegistryWalkOps,
+) -> SlotReclaim {
     let started = Instant::now();
-    let cleaned =
-        cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(ix_config, budget);
-    let mut nodes = 0u64;
-    let listed = Node::<CerService>::list(ix_config, |_| {
-        nodes += 1;
-        CallbackProgression::Continue
-    });
+    let cleaned = ops.sweep_bounded(ix_config, budget);
+    let nodes_left = ops.list_node_count(ix_config);
     let mut reclaim = SlotReclaim {
         cleaned,
-        nodes_left: listed.map(|()| nodes).map_err(|e| e.to_string()),
+        nodes_left,
         segments_removed: 0,
         segments_failed: 0,
         first_segment_error: None,
@@ -630,6 +976,31 @@ pub(crate) fn reclaim_resim_slot(
     reclaim
 }
 
+/// Count segment files belonging to `slot` in `segment_dir` without mutating them.
+/// Returns `Err` if the directory cannot be listed (except `NotFound`, which is 0).
+#[cfg(unix)]
+fn count_slot_segments(segment_dir: Option<&Path>, slot: u32) -> Result<u64, String> {
+    let Some(dir) = segment_dir else {
+        return Ok(0);
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("{}: {error}", dir.display())),
+    };
+    let mut count = 0u64;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
+            continue;
+        }
+        if is_segment_file(&entry.path()) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 /// Claim and reclaim a resim namespace slot against explicit `lock_dir` and
 /// `segment_dir` paths, bounded by `budget`.
 #[cfg(unix)]
@@ -640,25 +1011,119 @@ pub(crate) fn claim_and_reclaim_resim_slot(
     slots: u32,
     budget: Duration,
 ) -> Result<ResimSlot, String> {
+    claim_and_reclaim_resim_slot_in_range(base, lock_dir, segment_dir, 0..slots, budget)
+}
+
+#[cfg(unix)]
+fn claim_and_reclaim_resim_slot_in_range(
+    base: &Config,
+    lock_dir: &Path,
+    segment_dir: Option<&Path>,
+    slots: Range<u32>,
+    budget: Duration,
+) -> Result<ResimSlot, String> {
     let started = Instant::now();
     let _ = std::fs::create_dir_all(lock_dir);
+    let base_owner = SlotOwnerRecord::from_config(base);
     let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
-    let claimed = claim_resim_slot(lock_dir, slots, |slot| {
+    let claimed = claim_resim_slot_in_range(lock_dir, slots, |slot, lock, created_fresh| {
         let ix_config = resim_ix_config(base, slot).map_err(SlotPassedOver::Config)?;
-        let reclaim = reclaim_resim_slot(
+        let prior_owner = if created_fresh {
+            SlotLockOwner::LegacyEmpty
+        } else {
+            lock.read_owner()
+        };
+
+        let mut reclaim_segments = true;
+        match &prior_owner {
+            SlotLockOwner::Unrecognized(error) => {
+                return Err(SlotPassedOver::Lock(error.clone()));
+            }
+            SlotLockOwner::Recorded(owner_rec) if !owner_rec.same_registry(&base_owner) => {
+                let owner_registry = owner_rec
+                    .resolve_owner_registry(base, slot)
+                    .map_err(SlotPassedOver::Config)?;
+                if let OwnerRegistry::Config(owner_ix) = owner_registry {
+                    let owner_reclaim = reclaim_resim_slot(
+                        &owner_ix,
+                        slot,
+                        None,
+                        budget.saturating_sub(started.elapsed()),
+                    );
+                    cleanups += owner_reclaim.cleaned.cleanups;
+                    deferred += owner_reclaim.cleaned.deferred;
+                    total_failures += owner_reclaim.cleaned.failed_cleanups;
+                    if let Some(reason) = owner_reclaim.refusal() {
+                        return Err(SlotPassedOver::Reclaim {
+                            reclaim: owner_reclaim,
+                            reason,
+                        });
+                    }
+                }
+            }
+            SlotLockOwner::Recorded(_) => {}
+            SlotLockOwner::LegacyEmpty if !created_fresh => {
+                // Existing 0-byte lock file without owner metadata: sweep our own
+                // registry first without unlinking segments. If our registry had no
+                // dead nodes here and segments exist, we cannot prove another
+                // registry does not still need those mappings, so pass over the slot.
+                reclaim_segments = false;
+            }
+            SlotLockOwner::LegacyEmpty => {}
+        }
+
+        let target_segment_dir = if reclaim_segments { segment_dir } else { None };
+        let mut reclaim = reclaim_resim_slot(
             &ix_config,
             slot,
-            segment_dir,
+            target_segment_dir,
             budget.saturating_sub(started.elapsed()),
         );
+        if !reclaim_segments && reclaim.refusal().is_none() {
+            if reclaim.cleaned.cleanups > 0 {
+                let seg_reclaim = reclaim_resim_slot(
+                    &ix_config,
+                    slot,
+                    segment_dir,
+                    budget.saturating_sub(started.elapsed()),
+                );
+                reclaim.segments_removed += seg_reclaim.segments_removed;
+                reclaim.segments_failed += seg_reclaim.segments_failed;
+                if reclaim.first_segment_error.is_none() {
+                    reclaim.first_segment_error = seg_reclaim.first_segment_error;
+                }
+                reclaim.nodes_left = seg_reclaim.nodes_left;
+            } else {
+                match count_slot_segments(segment_dir, slot) {
+                    Ok(0) => {}
+                    Ok(leftover) => {
+                        let reason = format!(
+                            "legacy slot lock records no owning registry and {leftover} leftover \
+                             segment(s) remain; preserving mappings to avoid stranding another \
+                             registry"
+                        );
+                        return Err(SlotPassedOver::Reclaim { reclaim, reason });
+                    }
+                    Err(err) => {
+                        let reason = format!(
+                            "legacy slot lock records no owning registry and segment directory \
+                             could not be inspected ({err})"
+                        );
+                        return Err(SlotPassedOver::Reclaim { reclaim, reason });
+                    }
+                }
+            }
+        }
         cleanups += reclaim.cleaned.cleanups;
         deferred += reclaim.cleaned.deferred;
         segments += reclaim.segments_removed;
         total_failures += reclaim.cleaned.failed_cleanups + reclaim.segments_failed;
-        match reclaim.refusal() {
-            None => Ok(()),
-            Some(reason) => Err(SlotPassedOver::Reclaim { reclaim, reason }),
+        if let Some(reason) = reclaim.refusal() {
+            return Err(SlotPassedOver::Reclaim { reclaim, reason });
         }
+        lock.write_owner(&base_owner)
+            .map_err(SlotPassedOver::Lock)?;
+        Ok(())
     })?;
     tracing::debug!(
         slot = claimed.slot,
@@ -776,81 +1241,131 @@ pub fn sweep_resim_slots(
     }
     #[cfg(unix)]
     {
-        const SEGMENT_BATCH_LIMIT: usize = 32;
-        let started = Instant::now();
-        let mut report = ResimSweepReport::default();
-        if budget.is_some_and(|b| b.is_zero()) {
+        sweep_resim_slot_range_with_ops(
+            base,
+            lock_dir,
+            segment_dir,
+            0..RESIM_NAMESPACE_SLOTS,
+            mode,
+            budget,
+            &RealRegistryWalkOps,
+        )
+    }
+}
+
+#[cfg(unix)]
+fn sweep_resim_slot_range_with_ops(
+    base: &Config,
+    lock_dir: &Path,
+    segment_dir: Option<&Path>,
+    slots: Range<u32>,
+    mode: SweepMode,
+    budget: Option<Duration>,
+    ops: &dyn RegistryWalkOps,
+) -> ResimSweepReport {
+    const SEGMENT_BATCH_LIMIT: usize = 32;
+    let started = Instant::now();
+    let mut report = ResimSweepReport::default();
+    if budget.is_some_and(|b| b.is_zero()) {
+        report.truncated = true;
+        return report;
+    }
+    let expected_euid = cerulion_hygiene::euid();
+    let base_owner = SlotOwnerRecord::from_config(base);
+    let mut segment_batch: Vec<(u32, SlotLock)> = Vec::new();
+
+    for slot in slots {
+        if budget.is_some_and(|b| started.elapsed() >= b) {
             report.truncated = true;
-            return report;
+            break;
         }
-        let expected_euid = cerulion_hygiene::euid();
-        let mut segment_batch: Vec<(u32, SlotLock)> = Vec::new();
-
-        for slot in 0..RESIM_NAMESPACE_SLOTS {
-            if budget.is_some_and(|b| started.elapsed() >= b) {
-                report.truncated = true;
-                break;
+        let lock_path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+        let lock = match try_lock_existing_slot(&lock_path, expected_euid) {
+            Ok(ExistingLockAttempt::Absent) => continue,
+            Ok(ExistingLockAttempt::HeldByLiveResim) => {
+                report.slots_in_use += 1;
+                continue;
             }
-            let lock_path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
-            let lock = match try_lock_existing_slot(&lock_path, expected_euid) {
-                Ok(ExistingLockAttempt::Absent) => continue,
-                Ok(ExistingLockAttempt::HeldByLiveResim) => {
-                    report.slots_in_use += 1;
-                    continue;
-                }
-                Ok(ExistingLockAttempt::Acquired(lock)) => lock,
-                Err(error) => {
-                    report.errors.push(error);
-                    continue;
-                }
-            };
-            report.slots_checked += 1;
+            Ok(ExistingLockAttempt::Acquired(lock)) => lock,
+            Err(error) => {
+                report.errors.push(error);
+                continue;
+            }
+        };
+        report.slots_checked += 1;
 
-            let ix_config = match resim_ix_config(base, slot) {
-                Ok(cfg) => cfg,
-                Err(error) => {
-                    report.errors.push(error);
-                    continue;
-                }
-            };
+        let base_ix_config = match resim_ix_config(base, slot) {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                report.errors.push(error);
+                continue;
+            }
+        };
 
-            match mode {
-                SweepMode::ReportOnly => {
-                    let mut dead = 0u64;
-                    let mut non_dead = 0u64;
-                    let listed = Node::<CerService>::list(&ix_config, |state| {
-                        match state {
-                            NodeState::Dead(_) => dead += 1,
-                            NodeState::Alive(_)
-                            | NodeState::Inaccessible(_)
-                            | NodeState::Undefined(_) => non_dead += 1,
-                        }
-                        CallbackProgression::Continue
-                    });
-                    match listed {
-                        Ok(()) => {
-                            report.dead_nodes += dead;
-                            if non_dead == 0 {
-                                segment_batch.push((slot, lock));
-                            }
-                        }
+        let owner = lock.read_owner();
+        let (configs_to_check, require_base_dead_for_segments) = match &owner {
+            SlotLockOwner::Unrecognized(error) => {
+                report.registry_errors += 1;
+                report.errors.push(format!("slot {slot}: {error}"));
+                continue;
+            }
+            SlotLockOwner::Recorded(owner_rec) => {
+                let mut configs = Vec::with_capacity(2);
+                if !owner_rec.same_registry(&base_owner) {
+                    match owner_rec.resolve_owner_registry(base, slot) {
+                        Ok(OwnerRegistry::Config(owner_ix)) => configs.push(*owner_ix),
+                        Ok(OwnerRegistry::Absent) => {}
                         Err(error) => {
                             report.registry_errors += 1;
-                            report
-                                .errors
-                                .push(format!("slot {slot}: could not list nodes ({error:?})"));
+                            report.errors.push(format!("slot {slot}: {error}"));
+                            continue;
                         }
                     }
                 }
-                SweepMode::Remove => {
+                configs.push(base_ix_config);
+                (configs, false)
+            }
+            SlotLockOwner::LegacyEmpty => (vec![base_ix_config], true),
+        };
+
+        match mode {
+            SweepMode::ReportOnly => {
+                let mut dead = 0u64;
+                let mut non_dead = 0u64;
+                let mut all_ok = true;
+                for cfg in &configs_to_check {
+                    match ops.count_nodes(cfg) {
+                        Ok(counts) => {
+                            dead += counts.dead;
+                            non_dead += counts.non_dead;
+                        }
+                        Err(error) => {
+                            all_ok = false;
+                            report.registry_errors += 1;
+                            report
+                                .errors
+                                .push(format!("slot {slot}: could not list nodes ({error})"));
+                        }
+                    }
+                }
+                report.dead_nodes += dead;
+                let owner_verified = !require_base_dead_for_segments || dead > 0;
+                if all_ok && non_dead == 0 && owner_verified {
+                    segment_batch.push((slot, lock));
+                }
+            }
+            SweepMode::Remove => {
+                let mut saw_dead = 0u64;
+                let mut all_listed_ok = true;
+                let mut total_nodes_left = 0u64;
+                for cfg in &configs_to_check {
                     if let Some(total_budget) = budget {
                         let remaining = total_budget.saturating_sub(started.elapsed());
-                        let cleaned =
-                            cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(
-                                &ix_config, remaining,
-                            );
-                        report.dead_nodes +=
+                        let cleaned = ops.sweep_bounded(cfg, remaining);
+                        let cfg_dead =
                             cleaned.cleanups + cleaned.failed_cleanups + cleaned.deferred;
+                        saw_dead += cfg_dead;
+                        report.dead_nodes += cfg_dead;
                         report.cleaned_nodes += cleaned.cleanups;
                         report.failed_node_cleanups += cleaned.failed_cleanups;
                         report.deferred_nodes += cleaned.deferred;
@@ -858,69 +1373,105 @@ pub fn sweep_resim_slots(
                             report.truncated = true;
                         }
                     } else {
-                        let swept = crate::ipc_cleanup::sweep_dead_nodes_with_config(
-                            &ix_config,
-                            SweepMode::Remove,
-                        );
-                        report.dead_nodes += swept.dead_nodes.len() as u64;
-                        report.cleaned_nodes += swept.cleanups;
-                        report.failed_node_cleanups += swept.failed_cleanups;
-                        for err in swept.registry_errors {
-                            report.registry_errors += 1;
-                            report.errors.push(format!("slot {slot}: {err}"));
+                        match ops.sweep_unbounded(cfg) {
+                            Ok(swept) => {
+                                let cfg_dead = swept.dead_nodes.len() as u64;
+                                saw_dead += cfg_dead;
+                                report.dead_nodes += cfg_dead;
+                                report.cleaned_nodes += swept.cleanups;
+                                report.failed_node_cleanups += swept.failed_cleanups;
+                                for err in swept.registry_errors {
+                                    all_listed_ok = false;
+                                    report.registry_errors += 1;
+                                    report.errors.push(format!("slot {slot}: {err}"));
+                                }
+                            }
+                            Err(error) => {
+                                all_listed_ok = false;
+                                report.registry_errors += 1;
+                                report.errors.push(format!(
+                                    "slot {slot}: could not sweep dead nodes ({error})"
+                                ));
+                            }
                         }
                     }
-                    let mut nodes_left = 0u64;
-                    let listed = Node::<CerService>::list(&ix_config, |_| {
-                        nodes_left += 1;
-                        CallbackProgression::Continue
-                    });
-                    match listed {
-                        Ok(()) if nodes_left == 0 => {
-                            segment_batch.push((slot, lock));
+                    match ops.list_node_count(cfg) {
+                        Ok(nodes_left) => {
+                            total_nodes_left += nodes_left;
                         }
-                        Ok(()) => {}
                         Err(error) => {
+                            all_listed_ok = false;
                             report.registry_errors += 1;
                             report.errors.push(format!(
-                                "slot {slot}: could not list nodes after sweep ({error:?})"
+                                "slot {slot}: could not list nodes after sweep ({error})"
                             ));
                         }
                     }
                 }
-            }
-
-            if segment_batch.len() >= SEGMENT_BATCH_LIMIT {
-                process_segment_batch(
-                    &mut segment_batch,
-                    segment_dir,
-                    mode,
-                    started,
-                    budget,
-                    &mut report,
-                );
+                let owner_verified = !require_base_dead_for_segments || saw_dead > 0;
+                if all_listed_ok && total_nodes_left == 0 && owner_verified {
+                    segment_batch.push((slot, lock));
+                }
             }
         }
 
-        process_segment_batch(
-            &mut segment_batch,
-            segment_dir,
-            mode,
-            started,
-            budget,
-            &mut report,
-        );
-        report
+        if segment_batch.len() >= SEGMENT_BATCH_LIMIT {
+            process_segment_batch(
+                &mut segment_batch,
+                segment_dir,
+                mode,
+                started,
+                budget,
+                &mut report,
+            );
+        }
     }
+
+    process_segment_batch(
+        &mut segment_batch,
+        segment_dir,
+        mode,
+        started,
+        budget,
+        &mut report,
+    );
+    report
 }
 
 /// Sweep every lockable resim namespace slot on the host's resolved global
 /// iceoryx2 config.
 #[must_use]
 pub fn sweep_resim_slots_global(mode: SweepMode, budget: Option<Duration>) -> ResimSweepReport {
-    let base = Config::global_config();
-    let lock_dir = resim_slot_lock_dir(base);
-    sweep_resim_slots(base, &lock_dir, resim_segment_dir(), mode, budget)
+    #[cfg(not(unix))]
+    {
+        let _ = (mode, budget);
+        ResimSweepReport::default()
+    }
+    #[cfg(unix)]
+    {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let base = Config::global_config();
+            let lock_dir = resim_slot_lock_dir(base);
+            sweep_resim_slots(base, &lock_dir, resim_segment_dir(), mode, budget)
+        })) {
+            Ok(report) => report,
+            Err(payload) => {
+                let msg = format!(
+                    "global resim slot sweep panicked: {}",
+                    panic_payload_message(payload)
+                );
+                tracing::warn!(
+                    error = %msg,
+                    "resim slot sweep panicked while resolving global config or walking registry"
+                );
+                ResimSweepReport {
+                    registry_errors: 1,
+                    errors: vec![msg],
+                    ..ResimSweepReport::default()
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1053,5 +1604,391 @@ mod tests {
             ..ResimSweepReport::default()
         };
         assert_eq!(synthetic_no_errors.total_failures(), 3);
+    }
+
+    /// Test-only slot outside `0..RESIM_NAMESPACE_SLOTS`, distinct per process
+    /// and `offset`, so unit tests that mint real iceoryx2 nodes never collide
+    /// with production resim slots or concurrent test processes on the host.
+    fn test_only_slot(offset: u32) -> u32 {
+        RESIM_NAMESPACE_SLOTS + (std::process::id() & 0x00ff_ffff) * 8 + offset
+    }
+
+    /// Clean up any host `.global_mgmt` segment left by a unit test's real node
+    /// on a test-only slot outside `0..RESIM_NAMESPACE_SLOTS`.
+    fn remove_test_only_host_segments(slot: u32) {
+        assert!(
+            slot >= RESIM_NAMESPACE_SLOTS,
+            "only test-only slots may be cleaned up without a host lock"
+        );
+        let Some(dir) = resim_segment_dir() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_str().and_then(resim_namespace_slot) == Some(slot) {
+                let _ = remove_leftover_segment(&entry.path());
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_on_different_root_preserves_segments_for_owning_registry() {
+        let root_a = IsolatedRoot::mint("rslotcrossa");
+        let root_b = IsolatedRoot::mint("rslotcrossb");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let slot = test_only_slot(0);
+
+        // Root A claims the slot and registers a node on it.
+        let claimed = claim_and_reclaim_resim_slot_in_range(
+            &root_a.config(),
+            locks.path(),
+            Some(segments.path()),
+            slot..slot + 2,
+            Duration::from_secs(10),
+        )
+        .expect("root A claims test slot");
+        assert_eq!(claimed.slot, slot);
+
+        let ix_a = resim_ix_config(&root_a.config(), slot).expect("root A slot config");
+        let node_a = iceoryx2::node::NodeBuilder::new()
+            .config(&ix_a)
+            .create::<CerService>()
+            .expect("register node on root A slot");
+
+        let seg = segments
+            .path()
+            .join(format!("{}node.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&seg, b"").expect("plant slot segment");
+
+        // Release the lock while the node is still registered in root A.
+        drop(claimed);
+
+        // Sweeping from a DIFFERENT, empty root B must inspect root A and
+        // preserve the segment because root A still has a registered node.
+        let swept = sweep_resim_slot_range_with_ops(
+            &root_b.config(),
+            locks.path(),
+            Some(segments.path()),
+            slot..slot + 1,
+            SweepMode::Remove,
+            None,
+            &RealRegistryWalkOps,
+        );
+        assert!(
+            seg.exists(),
+            "root B must not delete slot's segment while root A still has a registered node: \
+             {swept:?}"
+        );
+        assert_eq!(swept.segments_removed, 0, "{swept:?}");
+
+        // Claiming from root B must pass over this slot (preserving root A's
+        // segment and lock record) and take the next slot instead.
+        let claimed_b = claim_and_reclaim_resim_slot_in_range(
+            &root_b.config(),
+            locks.path(),
+            Some(segments.path()),
+            slot..slot + 2,
+            Duration::from_secs(10),
+        )
+        .expect("root B passes over occupied slot and claims next");
+        assert_eq!(claimed_b.slot, slot + 1);
+        assert!(
+            seg.exists(),
+            "passing over the slot on claim must leave root A's segment intact"
+        );
+        drop(claimed_b);
+
+        // Once root A's node is gone, root B can safely remove the leftover segment.
+        drop(node_a);
+        let cleaned = sweep_resim_slot_range_with_ops(
+            &root_b.config(),
+            locks.path(),
+            Some(segments.path()),
+            slot..slot + 1,
+            SweepMode::Remove,
+            None,
+            &RealRegistryWalkOps,
+        );
+        assert!(
+            !seg.exists(),
+            "once root A is empty, root B removes the leftover segment: {cleaned:?}"
+        );
+        assert_eq!(cleaned.segments_removed, 1, "{cleaned:?}");
+        remove_test_only_host_segments(slot);
+    }
+
+    #[test]
+    fn sweep_on_different_root_preserves_segments_for_legacy_empty_lock_file() {
+        let root_a = IsolatedRoot::mint("rslotlega");
+        let root_b = IsolatedRoot::mint("rslotlegb");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let slot = test_only_slot(2);
+
+        // Legacy 0-byte lock file without owner metadata, while root A holds a node.
+        let lock_path = locks
+            .path()
+            .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+        std::fs::write(&lock_path, b"").expect("write legacy empty lock file");
+        let ix_a = resim_ix_config(&root_a.config(), slot).expect("root A slot config");
+        let node_a = iceoryx2::node::NodeBuilder::new()
+            .config(&ix_a)
+            .create::<CerService>()
+            .expect("register node on root A slot");
+
+        let seg = segments
+            .path()
+            .join(format!("{}legacy.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&seg, b"").expect("plant legacy slot segment");
+
+        // Root B sees 0 nodes in root B and no owner record in the lock file, so
+        // it must preserve the segment instead of stranding root A.
+        let swept = sweep_resim_slot_range_with_ops(
+            &root_b.config(),
+            locks.path(),
+            Some(segments.path()),
+            slot..slot + 1,
+            SweepMode::Remove,
+            None,
+            &RealRegistryWalkOps,
+        );
+        assert!(
+            seg.exists(),
+            "legacy 0-byte lock with empty base root must preserve mappings: {swept:?}"
+        );
+        assert_eq!(swept.segments_removed, 0, "{swept:?}");
+
+        // Claiming from root B also refuses the legacy slot with leftover
+        // segments and moves to the next slot instead of unlinking them.
+        let claimed_b = claim_and_reclaim_resim_slot_in_range(
+            &root_b.config(),
+            locks.path(),
+            Some(segments.path()),
+            slot..slot + 2,
+            Duration::from_secs(10),
+        )
+        .expect("root B skips legacy slot with leftover segments");
+        assert_eq!(claimed_b.slot, slot + 1);
+        assert!(
+            seg.exists(),
+            "legacy slot segment must stay intact on claim"
+        );
+        drop(claimed_b);
+        drop(node_a);
+        remove_test_only_host_segments(slot);
+    }
+
+    #[test]
+    fn corrupt_or_unknown_lock_metadata_fails_closed_without_removing_segments() {
+        let root = IsolatedRoot::mint("rslotcorrupt");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let lock_path = locks.path().join("cer_resim_00000000.lock");
+        std::fs::write(&lock_path, b"not-json-metadata").expect("write corrupt metadata");
+        let seg = segments
+            .path()
+            .join(format!("{}seg.shm_state", resim_namespace_prefix(0)));
+        std::fs::write(&seg, b"").expect("plant segment");
+
+        let swept = sweep_resim_slots(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            SweepMode::Remove,
+            None,
+        );
+        assert_eq!(swept.registry_errors, 1, "{swept:?}");
+        assert!(!swept.nodes_converged(), "{swept:?}");
+        assert!(seg.exists(), "corrupt lock metadata must preserve segments");
+    }
+
+    #[test]
+    fn registry_walk_panic_is_contained_in_report_only_remove_and_reclaim() {
+        struct PanickingOps;
+        impl RegistryWalkOps for PanickingOps {
+            fn count_nodes(&self, _ix_config: &Config) -> Result<NodeCounts, String> {
+                run_guarded_registry_walk(|| -> Result<NodeCounts, String> {
+                    panic!("stray filename in report-only walk");
+                })
+            }
+
+            fn list_node_count(&self, _ix_config: &Config) -> Result<u64, String> {
+                run_guarded_registry_walk(|| -> Result<u64, String> {
+                    panic!("stray filename in post-sweep walk");
+                })
+            }
+
+            fn sweep_bounded(
+                &self,
+                _ix_config: &Config,
+                _budget: Duration,
+            ) -> cerulion_core::transport::dead_node_sweep::BoundedCleanup {
+                cerulion_core::transport::dead_node_sweep::BoundedCleanup::default()
+            }
+
+            fn sweep_unbounded(
+                &self,
+                _ix_config: &Config,
+            ) -> Result<crate::ipc_cleanup::CleanupReport, String> {
+                run_guarded_registry_walk(
+                    || -> Result<crate::ipc_cleanup::CleanupReport, String> {
+                        panic!("stray filename in unbounded sweep");
+                    },
+                )
+            }
+        }
+
+        let root = IsolatedRoot::mint("rslotpanic");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let lock_path = locks.path().join("cer_resim_00000000.lock");
+        let owner = SlotOwnerRecord::from_config(&root.config());
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&owner).expect("encode owner"),
+        )
+        .expect("write owner lock");
+        let seg = segments
+            .path()
+            .join(format!("{}seg.shm_state", resim_namespace_prefix(0)));
+        std::fs::write(&seg, b"").expect("plant segment");
+
+        // ReportOnly catches the panic, records a registry error, and touches nothing.
+        let report_only = sweep_resim_slot_range_with_ops(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..1,
+            SweepMode::ReportOnly,
+            None,
+            &PanickingOps,
+        );
+        assert_eq!(report_only.registry_errors, 1, "{report_only:?}");
+        assert!(!report_only.nodes_converged());
+        assert!(
+            report_only
+                .errors
+                .iter()
+                .any(|e| e.contains("stray filename in report-only walk")),
+            "{:?}",
+            report_only.errors
+        );
+        assert!(seg.exists());
+
+        // Bounded Remove (ExitHygieneGuard path) catches the post-sweep walk panic.
+        let bounded_remove = sweep_resim_slot_range_with_ops(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..1,
+            SweepMode::Remove,
+            Some(Duration::from_secs(5)),
+            &PanickingOps,
+        );
+        assert_eq!(bounded_remove.registry_errors, 1, "{bounded_remove:?}");
+        assert!(!bounded_remove.nodes_converged());
+        assert!(
+            bounded_remove
+                .errors
+                .iter()
+                .any(|e| e.contains("stray filename in post-sweep walk")),
+            "{:?}",
+            bounded_remove.errors
+        );
+        assert!(seg.exists(), "panicked walk must not remove segments");
+
+        // Unbounded Remove (cerulion clean path) catches both sweep and post-sweep panics.
+        let unbounded_remove = sweep_resim_slot_range_with_ops(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..1,
+            SweepMode::Remove,
+            None,
+            &PanickingOps,
+        );
+        assert_eq!(unbounded_remove.registry_errors, 2, "{unbounded_remove:?}");
+        assert!(!unbounded_remove.nodes_converged());
+        assert!(
+            unbounded_remove
+                .errors
+                .iter()
+                .any(|e| e.contains("stray filename in unbounded sweep")),
+            "{:?}",
+            unbounded_remove.errors
+        );
+        assert!(
+            seg.exists(),
+            "panicked unbounded sweep must not remove segments"
+        );
+
+        // Reclaim catches the post-sweep walk panic and refuses the slot cleanly.
+        let ix = resim_ix_config(&root.config(), 0).expect("slot 0 config");
+        let reclaim = reclaim_resim_slot_with_ops(
+            &ix,
+            0,
+            Some(segments.path()),
+            Duration::from_secs(5),
+            &PanickingOps,
+        );
+        let refusal = reclaim.refusal().expect("panicked reclaim refuses slot");
+        assert!(
+            refusal.contains("stray filename in post-sweep walk"),
+            "{refusal}"
+        );
+        assert!(seg.exists(), "panicked reclaim must not remove segments");
+    }
+
+    #[test]
+    fn every_node_list_call_in_resim_slots_goes_through_guarded_helper() {
+        let src: String = include_str!("resim_slots.rs")
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let production_src = src
+            .split("mod tests {")
+            .next()
+            .expect("resim_slots production source");
+        assert_eq!(
+            production_src.matches("Node::<CerService>::list(").count(),
+            1,
+            "all Node::list walks in resim_slots.rs must route through the single guarded helper"
+        );
+        assert_eq!(
+            production_src
+                .matches("sweep_dead_nodes_with_config(")
+                .count(),
+            1,
+            "all unbounded dead-node sweeps in resim_slots.rs must route through the guarded helper"
+        );
+        assert!(
+            production_src.contains("fn list_nodes_guarded("),
+            "resim_slots.rs must define list_nodes_guarded"
+        );
+        assert!(
+            production_src.contains("fn sweep_dead_nodes_guarded("),
+            "resim_slots.rs must define sweep_dead_nodes_guarded"
+        );
+        let global_fn = production_src
+            .split("pub fn sweep_resim_slots_global(")
+            .nth(1)
+            .expect("sweep_resim_slots_global exists");
+        let catch_pos = global_fn
+            .find("catch_unwind(")
+            .expect("sweep_resim_slots_global wraps in catch_unwind");
+        let config_pos = global_fn
+            .find("Config::global_config()")
+            .expect("sweep_resim_slots_global resolves global config");
+        assert!(
+            catch_pos < config_pos,
+            "Config::global_config() must stay inside catch_unwind"
+        );
     }
 }

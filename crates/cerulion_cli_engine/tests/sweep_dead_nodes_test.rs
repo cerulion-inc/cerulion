@@ -63,8 +63,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use cerulion_cli_engine::ipc_cleanup::{
-    resim_namespace_prefix, resim_segment_dir, sweep_dead_nodes_with_config, sweep_resim_slots,
-    CleanupReport, FailedNodeCleanup, SweepMode, RESIM_NAMESPACE_MARKER,
+    resim_namespace_prefix, resim_namespace_slot, resim_segment_dir, resim_slot_lock_dir,
+    sweep_dead_nodes_with_config, sweep_resim_slots, CleanupReport, FailedNodeCleanup, SweepMode,
+    RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS,
 };
 use cerulion_cli_engine::shm_state::{creator_verdict, CreatorVerdict};
 use cerulion_core::prelude::MaxSliceLen;
@@ -702,6 +703,107 @@ fn a_sweep_reaches_only_the_root_it_is_handed() {
     std::fs::remove_dir_all(&elsewhere_dir).ok();
 }
 
+/// Exclusive reservation of one real host resim slot in `resim_slot_lock_dir`.
+///
+/// Holding the real host lock before spawning a child with that slot's prefix
+/// ensures no concurrent resim on the host can use the same slot, and lets
+/// `Drop` remove only the host segments this test's own child created while
+/// the real host lock is still held.
+struct RealHostSlotReservation {
+    slot: u32,
+    lock_file: std::fs::File,
+    preexisting_host_segments: std::collections::BTreeSet<std::ffi::OsString>,
+}
+
+impl RealHostSlotReservation {
+    fn acquire(base: &Config) -> Self {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let host_lock_dir = resim_slot_lock_dir(base);
+        let _ = std::fs::create_dir_all(&host_lock_dir);
+        let expected_euid = cerulion_hygiene::euid();
+        for slot in (0..RESIM_NAMESPACE_SLOTS).rev() {
+            let lock_path = host_lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+            let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&lock_path)
+            else {
+                continue;
+            };
+            let Ok(meta) = file.metadata() else {
+                continue;
+            };
+            if !meta.file_type().is_file() || meta.uid() != expected_euid {
+                continue;
+            }
+            if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .is_err()
+            {
+                continue;
+            }
+            let existing = Self::host_segments_for(slot);
+            if !existing.is_empty() {
+                let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+                continue;
+            }
+            return Self {
+                slot,
+                lock_file: file,
+                preexisting_host_segments: existing,
+            };
+        }
+        panic!("could not reserve any clean host resim slot in 0..{RESIM_NAMESPACE_SLOTS}");
+    }
+
+    fn host_segments_for(slot: u32) -> std::collections::BTreeSet<std::ffi::OsString> {
+        let Some(dir) = resim_segment_dir() else {
+            return std::collections::BTreeSet::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return std::collections::BTreeSet::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                (name.to_str().and_then(resim_namespace_slot) == Some(slot)).then_some(name)
+            })
+            .collect()
+    }
+}
+
+impl Drop for RealHostSlotReservation {
+    fn drop(&mut self) {
+        if let Some(dir) = resim_segment_dir() {
+            for name in Self::host_segments_for(self.slot) {
+                if self.preexisting_host_segments.contains(&name) {
+                    continue;
+                }
+                let path = dir.join(&name);
+                #[cfg(target_os = "macos")]
+                if name
+                    .to_str()
+                    .is_some_and(|n| n.ends_with(cerulion_cli_engine::shm_state::SHM_STATE_SUFFIX))
+                {
+                    let _ = cerulion_cli_engine::shm_state::remove_unused_state_file(
+                        &path,
+                        &cerulion_cli_engine::shm_state::LibcProbe,
+                    );
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        let _ = rustix::fs::flock(&self.lock_file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 #[test]
 #[serial]
 fn resim_slot_sweep_report_only_leaves_files_and_remove_reaps_killed_slot_while_skipping_live_locked_slot(
@@ -711,18 +813,31 @@ fn resim_slot_sweep_report_only_leaves_files_and_remove_reaps_killed_slot_while_
     let locks = tempfile::tempdir().expect("lock dir");
     let segments = tempfile::tempdir().expect("segment dir");
 
-    // Use high slots so real host segments created by the child on `resim_segment_dir()`
-    // never collide with slot 0 resims running elsewhere on the machine.
-    let killed_slot: u32 = 250;
-    let live_slot: u32 = 251;
+    // Reserve a real host slot before spawning the child so no live resim on
+    // the host can share its prefix, and teardown cleans only this test's own
+    // host segments while still holding the real host lock.
+    let host_reservation = RealHostSlotReservation::acquire(&root.config());
+    let killed_slot = host_reservation.slot;
+    let live_slot = if killed_slot > 0 { killed_slot - 1 } else { 1 };
     let killed_prefix = resim_namespace_prefix(killed_slot);
     let live_prefix = resim_namespace_prefix(live_slot);
 
-    // Plant slot lock files: killed_slot is unlocked; live_slot is exclusively locked.
+    // Plant slot lock files in the isolated lock dir: killed_slot is unlocked
+    // with root's owner metadata; live_slot is exclusively locked.
     let killed_lock_path = locks
         .path()
         .join(format!("{RESIM_NAMESPACE_MARKER}{killed_slot:08x}.lock"));
-    std::fs::write(&killed_lock_path, b"").expect("create killed slot lock file");
+    let owner_json = serde_json::json!({
+        "version": 1,
+        "root_path": String::from(root.config().global.root_path()),
+        "node_dir": String::from(&root.config().global.node.directory),
+        "service_dir": String::from(&root.config().global.service.directory),
+    });
+    std::fs::write(
+        &killed_lock_path,
+        serde_json::to_vec(&owner_json).expect("encode slot owner"),
+    )
+    .expect("create killed slot lock file");
 
     let live_lock_path = locks
         .path()
@@ -830,14 +945,92 @@ fn resim_slot_sweep_report_only_leaves_files_and_remove_reaps_killed_slot_while_
     assert_eq!(again.segments_removed, 0, "{again:?}");
     assert!(again.errors.is_empty(), "{again:?}");
 
-    // Clean up the child's real global_mgmt segment on the host segment dir so
-    // the test leaves no stray files behind in /tmp or /dev/shm.
-    let _ = sweep_resim_slots(
-        &root.config(),
+    drop(live_lock_file);
+    drop(host_reservation);
+}
+
+#[test]
+#[serial]
+fn resim_slot_sweep_from_other_root_reaps_owning_registry_before_removing_segments() {
+    let _use = RootUse::acquire();
+    let root = IsolatedRoot::get();
+    let other_root_dir = tempfile::tempdir().expect("other root dir");
+    let other_root_str = format!("{}/", other_root_dir.path().display());
+    let other_cfg = isolated_config(&other_root_str, &root.prefix);
+
+    let locks = tempfile::tempdir().expect("lock dir");
+    let segments = tempfile::tempdir().expect("segment dir");
+    let host_reservation = RealHostSlotReservation::acquire(&root.config());
+    let slot = host_reservation.slot;
+    let prefix = resim_namespace_prefix(slot);
+
+    // Spawn a real dead node in `root` on `slot`.
+    let before_dirs = node_dirs(root);
+    let topic = root.topic("resim_cross_root");
+    let status = child_command(root, &topic, "plain")
+        .env(ENV_PREFIX, &prefix)
+        .output()
+        .expect("spawn cross-root child");
+    assert!(
+        status.status.success(),
+        "cross-root child failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let dead_node_dir = new_node_dir(root, &before_dirs, "resim_cross_root");
+
+    let seg = segments.path().join(format!("{prefix}seg.shm_state"));
+    std::fs::write(&seg, b"").expect("plant segment");
+
+    // 1. Legacy 0-byte lock file: sweeping from the empty `other_cfg` must not
+    //    delete the segment while `root` still holds the dead node.
+    let lock_path = locks
+        .path()
+        .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+    std::fs::write(&lock_path, b"").expect("write legacy empty lock file");
+    let legacy_sweep = sweep_resim_slots(
+        &other_cfg,
         locks.path(),
-        resim_segment_dir(),
+        Some(segments.path()),
         SweepMode::Remove,
         None,
     );
-    drop(live_lock_file);
+    assert_eq!(legacy_sweep.segments_removed, 0, "{legacy_sweep:?}");
+    assert!(seg.exists(), "legacy lock must preserve segment");
+    assert!(dead_node_dir.exists(), "root's dead node still stands");
+
+    // 2. Recorded owner metadata pointing at `root`: sweeping from `other_cfg`
+    //    reaps `root`'s dead node under the slot lock first, then removes the
+    //    segment without stranding `root`.
+    let owner_json = serde_json::json!({
+        "version": 1,
+        "root_path": String::from(root.config().global.root_path()),
+        "node_dir": String::from(&root.config().global.node.directory),
+        "service_dir": String::from(&root.config().global.service.directory),
+    });
+    std::fs::write(
+        &lock_path,
+        serde_json::to_vec(&owner_json).expect("encode owner"),
+    )
+    .expect("write recorded owner lock");
+    let cross_sweep = sweep_resim_slots(
+        &other_cfg,
+        locks.path(),
+        Some(segments.path()),
+        SweepMode::Remove,
+        None,
+    );
+    assert_eq!(cross_sweep.dead_nodes, 1, "{cross_sweep:?}");
+    assert_eq!(cross_sweep.cleaned_nodes, 1, "{cross_sweep:?}");
+    assert_eq!(cross_sweep.segments_removed, 1, "{cross_sweep:?}");
+    assert!(cross_sweep.errors.is_empty(), "{cross_sweep:?}");
+    assert!(
+        !dead_node_dir.exists(),
+        "owning registry's dead node must be reaped before segment removal"
+    );
+    assert!(
+        !seg.exists(),
+        "leftover segment removed after reaping owner"
+    );
+
+    drop(host_reservation);
 }
