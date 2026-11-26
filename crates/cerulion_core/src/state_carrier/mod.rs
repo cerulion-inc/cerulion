@@ -62,6 +62,7 @@
 pub mod anchor;
 pub mod breadcrumb;
 pub mod child;
+pub mod direct;
 pub mod dontfork;
 pub mod fork;
 pub mod hook;
@@ -73,6 +74,10 @@ pub use breadcrumb::{ChildBreadcrumb, ChildPhase, MappedBreadcrumb, BREADCRUMB_B
 pub use child::{
     apply_child_discipline, child_main, push_with_backpressure_phase, resolve_fd_ceiling,
     ChildSetup, FdCeiling, FdCeilingSource, KeepFds, NodeCaptureOutcome, NodeEncoder,
+};
+pub use direct::{
+    direct_budget_records, direct_disposition, stream_deferred_direct, DirectCaptureTarget,
+    DirectCarrier, DirectDeferredNode, DirectDisposition, DirectStreamStats,
 };
 pub use dontfork::{
     exclude_at_birth, exclude_from_fork, sweep_birth_exclusions_at_arm, ExclusionOutcome,
