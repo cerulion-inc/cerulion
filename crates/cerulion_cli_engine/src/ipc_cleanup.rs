@@ -1302,7 +1302,7 @@ where
         );
     }
 
-    // PASS 3 — the state files, on what is LEFT of the one budget, and only
+    // PASS 3: the state files, on what is LEFT of the one budget, and only
     // over CONVERGED registries.
     if !registry_converged(&swept) || !resim.nodes_converged() {
         tracing::debug!(
@@ -1604,7 +1604,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The resim and file passes get what is LEFT of the ONE budget, never a fresh one —
+    /// The resim and file passes get what is LEFT of the ONE budget, never a fresh one:
     /// the same "a bound you can pay twice is not a bound" rule as the registry
     /// walk. Driven with a sweep that really does consume wall.
     #[test]

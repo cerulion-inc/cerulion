@@ -1136,7 +1136,7 @@ pub fn read_state_file(path: &Path) -> Result<StateFileRead, UnreadableReason> {
     }
     let mut file = options.open(path).map_err(|_| UnreadableReason::Io)?;
 
-    // The handle's OWN type, owner, and link count — closes the stat-to-open race.
+    // The handle's OWN type, owner, and link count; closes the stat-to-open race.
     let opened = file.metadata().map_err(|_| UnreadableReason::Io)?;
     if !opened.file_type().is_file() {
         return Err(UnreadableReason::NotARegularFile);
