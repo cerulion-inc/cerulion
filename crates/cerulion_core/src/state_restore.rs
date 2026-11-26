@@ -1353,26 +1353,28 @@ pub enum RestoreRefusal {
         topic: String,
     },
 
-    /// A re-executed topic's recorded frames start after its first resumed
-    /// commit, so seeding from the first held frame would start the publisher
-    /// at a later step's sequence.
+    /// A re-executed topic's recorded frames start after an earlier frame that
+    /// the resumed trace proves was published, so seeding from the first held
+    /// frame would start the publisher at a later step's sequence.
     #[error(
-        "topic '{topic}' has no recorded frame at or before its first resumed commit (step \
-         {first_commit_step}, resuming at step {resume_step}); its recorded frames begin at \
-         sequence {first_recorded_sequence} from a later step. Continuing the publisher's \
-         sequence from that later frame corrupts the replay and reports read and frame \
-         differences the candidate did not cause. Fix: take the capture more than one \
-         Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`), or record from step 0 \
-         with `cerulion graph run --record`"
+        "topic '{topic}' has no recorded frame at or before resume step {resume_step}, but the \
+         resumed trace reads sequence {missing_sequence} at step {observed_step} while recorded \
+         frames begin at sequence {first_recorded_sequence}. Replaying from that later frame \
+         corrupts the sequence and reports read and frame differences the candidate did not \
+         cause. Fix: take the capture more than one Flashback window into the run \
+         (`CERULION_FLASHBACK_WINDOW_MS`), or record from step 0 with `cerulion graph run --record`"
     )]
     FramesBeginAfterResume {
         /// The re-executed topic whose recorded frames begin late.
         topic: String,
         /// The first step the replay resumes at.
         resume_step: u64,
-        /// The first non-discarded step in the resumed range where the
-        /// topic's producer fires.
-        first_commit_step: u64,
+        /// The earliest step in the resumed range whose trace reads a frame
+        /// preceding `first_recorded_sequence`.
+        observed_step: u64,
+        /// The wire sequence proved by the resumed trace to precede
+        /// `first_recorded_sequence`.
+        missing_sequence: u32,
         /// The wire sequence of the first recorded frame held for the topic.
         first_recorded_sequence: u32,
     },
@@ -1857,17 +1859,26 @@ pub fn seed_publisher_sequence(
     })
 }
 
+/// True when wire sequence `seq` strictly precedes `first` in modulo-2^32
+/// serial space (forward distance in `1..2^31`), so wrapped counters near
+/// `u32::MAX -> 0` keep their chronological order.
+#[must_use]
+pub const fn wire_sequence_precedes(seq: u32, first: u32) -> bool {
+    (first.wrapping_sub(seq) as i32) > 0
+}
+
 /// Refuse a re-executed single-writer topic whose recorded frames begin after
-/// its producer's first resumed commit.
+/// an earlier frame that the resumed trace proves existed on that topic.
 ///
 /// When a recording carries no frame at or before the resumed step, rung (ii)
 /// ([`SeedRung::FirstFrameAfterAnchor`]) seeds the publisher from the first
-/// held frame verbatim. That is sound only when that frame IS the publisher's
-/// first resumed commit (for example a slow producer whose first resumed fire
-/// lands after the anchor step). When the recorder's taps attached after the
-/// producer's first resumed commit, the first held frame comes from a LATER
-/// step and seeding from it shifts every subsequent sequence, producing read
-/// and frame divergences the candidate did not cause.
+/// held frame verbatim. That is sound when that frame IS the publisher's
+/// first resumed commit (for example a slow producer or a sparse publisher
+/// whose earlier resumed ticks left the output unwritten without consuming a
+/// sequence). When the resumed trace proves an earlier wire sequence existed
+/// before `first_recorded_sequence`, seeding from the later frame shifts every
+/// subsequent sequence and reports read and frame divergences the candidate
+/// did not cause.
 ///
 /// `writers == TopicWriters::MultiPublisher` defers here so
 /// [`seed_publisher_sequence`] keeps owning
@@ -1876,23 +1887,22 @@ pub fn check_first_frame_covers_resume(
     topic: &str,
     writers: TopicWriters,
     resume_step: u64,
-    first_commit: Option<(u64, u64)>,
-    first_recorded_frame: Option<(u32, u64)>,
+    earliest_observed_read: Option<(u64, u32)>,
+    first_recorded_sequence: Option<u32>,
     has_frame_at_or_before_resume: bool,
 ) -> Result<(), RestoreRefusal> {
     if writers == TopicWriters::MultiPublisher || has_frame_at_or_before_resume {
         return Ok(());
     }
-    if let (
-        Some((first_commit_step, first_commit_target_ns)),
-        Some((first_recorded_sequence, first_frame_ts_ns)),
-    ) = (first_commit, first_recorded_frame)
+    if let (Some((observed_step, missing_sequence)), Some(first_recorded_sequence)) =
+        (earliest_observed_read, first_recorded_sequence)
     {
-        if first_frame_ts_ns > first_commit_target_ns {
+        if wire_sequence_precedes(missing_sequence, first_recorded_sequence) {
             return Err(RestoreRefusal::FramesBeginAfterResume {
                 topic: topic.to_string(),
                 resume_step,
-                first_commit_step,
+                observed_step,
+                missing_sequence,
                 first_recorded_sequence,
             });
         }

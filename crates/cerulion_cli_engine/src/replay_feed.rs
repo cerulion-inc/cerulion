@@ -116,8 +116,9 @@ struct TopicIndex {
     unattributed: usize,
     /// The distinct writers the labels name.
     writers: BTreeSet<u64>,
-    /// Lowest wire sequence seen for each writer key (`writer` when labeled,
-    /// `0` when unlabeled), across every attributed headered frame in the bag.
+    /// Earliest wire sequence seen in file order for each writer key (`writer`
+    /// when labeled, `0` when unlabeled), across every attributed headered
+    /// frame in the bag.
     first_seq_by_writer: HashMap<u64, u32>,
     /// Every headered frame in file order, for the timestamp-feed mutant.
     #[cfg(feature = "oracle-mutants")]
@@ -492,10 +493,7 @@ impl<'l> FrameIndexBuilder<'l> {
         } else {
             0
         };
-        idx.first_seq_by_writer
-            .entry(writer)
-            .and_modify(|first| *first = (*first).min(seq))
-            .or_insert(seq);
+        idx.first_seq_by_writer.entry(writer).or_insert(seq);
         #[cfg(feature = "oracle-mutants")]
         if let Some(ts) = frame.timestamp_ns {
             idx.ordered.push((ts, frame.span));
@@ -774,12 +772,16 @@ impl fmt::Display for FeedRefusal {
                 }
             }
             FeedRefusalReason::FrameMissing { first_held } => match (*first_held, self.sequence) {
-                (Some(first), Some(seq)) if seq < first => write!(
-                    f,
-                    "the bag's frames of that writer begin at sequence {first}, after sequence \
-                     {seq} (the recorder's taps attached after it, or the window dropped earlier \
-                     frames)"
-                ),
+                (Some(first), Some(seq))
+                    if cerulion_core::state_restore::wire_sequence_precedes(seq, first) =>
+                {
+                    write!(
+                        f,
+                        "the bag's frames of that writer begin at sequence {first}, after sequence \
+                         {seq} (the recorder's taps attached after it, or the window dropped \
+                         earlier frames)"
+                    )
+                }
                 _ => write!(
                     f,
                     "the bag holds no frame of that writer at that sequence (the recorder lost it)"
@@ -2053,6 +2055,92 @@ mod tests {
         assert!(a
             .to_string()
             .contains("begin at sequence 3, after sequence 1"));
+    }
+
+    #[test]
+    fn a_wrapped_writer_stream_reports_earliest_held_sequence_and_wrap_aware_order() {
+        // Held frames cross u32::MAX -> 0 in recorded file order:
+        // [u32::MAX - 1, u32::MAX, 0, 1]. The earliest held sequence is
+        // u32::MAX - 1 (4294967294), not the numerically smallest 0.
+        let held = vec![
+            frame(10, u32::MAX - 1),
+            frame(20, u32::MAX),
+            frame(30, 0),
+            frame(40, 1),
+        ];
+        let pre_window_adm = admission(&[(1, u32::MAX - 2, Some(7), 1, ReadKind::Served)]);
+        let unbudgeted = index(held.clone(), vec![]);
+        let need = need_of(&pre_window_adm, None);
+        let mut b = FrameIndexBuilder::new(["/t".to_string()], &NO_LABELS, Some(need));
+        for f in &held {
+            b.push("/t", *f);
+        }
+        let budgeted = b.finish();
+
+        for (label, idx) in [("unbudgeted", &unbudgeted), ("budgeted", &budgeted)] {
+            let r = plan(&pre_window_adm, idx).unwrap_err();
+            assert_eq!(
+                r.reason,
+                FeedRefusalReason::FrameMissing {
+                    first_held: Some(u32::MAX - 1),
+                },
+                "{label}"
+            );
+            assert_eq!(r.reason.code(), "read_identity_frame_missing", "{label}");
+            let text = r.to_string();
+            assert!(
+                text.contains("begin at sequence 4294967294, after sequence 4294967293"),
+                "{label}: {text}"
+            );
+            assert!(
+                !text.contains("(the recorder lost it)"),
+                "{label}: pre-window read before wrap must not blame recorder loss: {text}"
+            );
+        }
+
+        // Mid-window loss across the wrap: held [u32::MAX - 1, u32::MAX, 1],
+        // missing sequence 0 (which comes AFTER u32::MAX - 1 in wrap order).
+        let mid_loss_idx = index(
+            vec![frame(10, u32::MAX - 1), frame(20, u32::MAX), frame(40, 1)],
+            vec![],
+        );
+        let mid_loss_adm = admission(&[(2, 0, Some(7), 1, ReadKind::Served)]);
+        let mid_r = plan(&mid_loss_adm, &mid_loss_idx).unwrap_err();
+        assert_eq!(
+            mid_r.reason,
+            FeedRefusalReason::FrameMissing {
+                first_held: Some(u32::MAX - 1),
+            }
+        );
+        let mid_text = mid_r.to_string();
+        assert!(
+            mid_text.contains("(the recorder lost it)"),
+            "missing seq 0 after u32::MAX - 1 is mid-window loss: {mid_text}"
+        );
+        assert!(
+            !mid_text.contains("begin at sequence"),
+            "mid-window loss after wrap must not claim late start: {mid_text}"
+        );
+
+        // Exact wrap boundary: held [0, 1], missing pre-window u32::MAX.
+        let boundary_idx = index(vec![frame(10, 0), frame(20, 1)], vec![]);
+        let boundary_adm = admission(&[(1, u32::MAX, Some(7), 1, ReadKind::Served)]);
+        let boundary_r = plan(&boundary_adm, &boundary_idx).unwrap_err();
+        assert_eq!(
+            boundary_r.reason,
+            FeedRefusalReason::FrameMissing {
+                first_held: Some(0),
+            }
+        );
+        let boundary_text = boundary_r.to_string();
+        assert!(
+            boundary_text.contains("begin at sequence 0, after sequence 4294967295"),
+            "u32::MAX precedes 0 across wrap: {boundary_text}"
+        );
+        assert!(
+            !boundary_text.contains("(the recorder lost it)"),
+            "{boundary_text}"
+        );
     }
 
     #[test]

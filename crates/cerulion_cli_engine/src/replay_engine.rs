@@ -87,10 +87,10 @@ use cerulion_core::graph::{GraphConfig, GraphRuntime};
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
 use cerulion_core::state_restore::{
     check_first_frame_covers_resume, enforce_strict_state, plan_backlog_admission, plan_restore,
-    refuse_lossy_reexecuted_topics, seed_publisher_sequence, AnchorBlob, BacklogAdmission,
-    BacklogClaim, InputServiceCursor, NodeFrameworkState, RestorePlan, RestoreRequest,
-    ResumeAnchor, SeedEvidence, SeedRung, StoppedAtAnchor, TopicFrameCount, TopicLoss,
-    TopicWriters,
+    refuse_lossy_reexecuted_topics, seed_publisher_sequence, wire_sequence_precedes, AnchorBlob,
+    BacklogAdmission, BacklogClaim, InputServiceCursor, NodeFrameworkState, RestorePlan,
+    RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung, StoppedAtAnchor, TopicFrameCount,
+    TopicLoss, TopicWriters,
 };
 use cerulion_core::trace_ring::{
     step_boundary_flags, unpack_read_outcome_meta, unpack_read_outcome_meta_full,
@@ -5492,11 +5492,19 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         transport,
         clock,
         mut factories,
+        drivers,
+        drivers_declared_by,
         schema_hashes,
         verdict_schemas_dir,
         resume,
-    } = build_replay_context(&config, nodes, || {
-        resolve_resume(
+    } = build_replay_context(&config, nodes, |factories| {
+        let candidate_drivers = external_node_ids(factories);
+        let (drivers, drivers_declared_by) = resolve_driver_set(
+            recorder.as_ref().and_then(|r| r.driver_stamp.as_ref()),
+            &candidate_drivers,
+        )
+        .map_err(|drifts| ReplayError::DriverSetDrift { drifts })?;
+        let resume = resolve_resume(
             &config,
             &trace,
             &node_ids,
@@ -5506,7 +5514,10 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             duration_bound_ns,
             coordination,
             every_stop_flagged,
-        )
+            kind_width,
+            &drivers,
+        )?;
+        Ok((drivers, drivers_declared_by, resume))
     })?;
     let skipped_prefix = resume
         .as_ref()
@@ -5560,18 +5571,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         Some(read) => read, // the resume path already read it (one read, one warn).
         None => read_record_coverage(&recorded_messages.reader),
     };
-    // The driver set: the recording's stamp when it carries one, and the
-    //    replayed build must declare exactly those drivers (a node it runs
-    //    the other way is refused here, exit 2, before any pass runs). A
-    //    recording made before the stamp takes the build's own declaration,
-    //    with one warn when that declares a driver, since nothing in the bag
-    //    can confirm the build runs those nodes the way the recording did.
-    let candidate_drivers = external_node_ids(&factories);
-    let (drivers, drivers_declared_by) = resolve_driver_set(
-        recorder.as_ref().and_then(|r| r.driver_stamp.as_ref()),
-        &candidate_drivers,
-    )
-    .map_err(|drifts| ReplayError::DriverSetDrift { drifts })?;
+    // The driver set was resolved above (once factories loaded, before the
+    // resume check, so driver-only topics are treated as recorded inputs there
+    // too). On a recording made before the driver stamp, emit the one warn when
+    // the build declares a driver, since nothing in the bag can confirm the
+    // build runs those nodes the way the recording did.
     if drivers_declared_by == DriverSetSource::ReplayedBuild && !drivers.is_empty() {
         tracing::warn!(
             graph = %config.identity(),
@@ -7654,11 +7658,13 @@ pub(crate) fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
 
 /// The graph-produced topics a resumed replay re-executes: every topic of
 /// `produced` except one whose every in-graph producer the checkpoint states
-/// as stopped, since its publishers never publish again in the replay.
+/// as stopped or is an external (driver) node, since those publishers never
+/// publish again in the replay.
 fn reexecuted_topics(
     config: &GraphConfig,
     produced: &[String],
     stops: &AnchorStops,
+    drivers: &BTreeSet<String>,
 ) -> Vec<String> {
     produced
         .iter()
@@ -7669,7 +7675,7 @@ fn reexecuted_topics(
                         == **topic
                 })
             });
-            producers.any(|node| !stops.is_stopped(&node.id))
+            producers.any(|node| !stops.is_stopped(&node.id) && !drivers.contains(&node.id))
         })
         .cloned()
         .collect()
@@ -7806,9 +7812,10 @@ struct AnchorFrameScan {
     /// The `sequence` of the first frame stamped strictly ABOVE the anchor
     /// clock — rung (ii) when the tie band is empty or entirely pre-anchor.
     first_seq_above: Option<u32>,
-    /// The wire `timestamp_ns` of that same first frame strictly above the
-    /// anchor clock (`None` when no headered frame sits above it).
-    first_ts_above: Option<u64>,
+    /// The `sequence` of that first frame strictly above the anchor clock when
+    /// it carried a readable wire header (`None` when a headerless frame ended
+    /// the walk early, so headerless frames still reach consistency check 3).
+    first_headered_seq_above: Option<u32>,
 }
 
 /// Walk the recorded user frames ONCE and place each named topic's frames
@@ -8503,7 +8510,7 @@ fn scan_frames_around_anchor(
                 std::cmp::Ordering::Equal => entry.at_anchor.push(header.sequence),
                 std::cmp::Ordering::Greater => {
                     entry.first_seq_above = Some(header.sequence);
-                    entry.first_ts_above = Some(header.timestamp_ns);
+                    entry.first_headered_seq_above = Some(header.sequence);
                     break;
                 }
             }
@@ -8681,9 +8688,6 @@ struct SuffixFireScan {
     /// recording holds a FIRE record of it, discarded fires included (a
     /// discarded fire still ran the node's tick).
     first_fire: BTreeMap<String, u64>,
-    /// Per node id in [`Self::executed`], the lowest step at which the
-    /// recording holds a non-discarded FIRE record of it.
-    first_commit_step: BTreeMap<String, u64>,
     /// Per node id, FIRE records at the steps sharing the FIRST boundary's
     /// target that COMMITTED (the discard bit clear).
     tie_commits: BTreeMap<String, usize>,
@@ -8732,12 +8736,6 @@ fn scan_suffix_fires(
                 .entry(node.to_string())
                 .and_modify(|step| *step = (*step).min(rec.step))
                 .or_insert(rec.step);
-            if !rec.is_discarded() {
-                out.first_commit_step
-                    .entry(node.to_string())
-                    .and_modify(|step| *step = (*step).min(rec.step))
-                    .or_insert(rec.step);
-            }
         }
         if in_tie && !rec.is_discarded() {
             *out.tie_commits.entry(node.to_string()).or_insert(0) += 1;
@@ -8815,28 +8813,123 @@ fn last_replayed_step(
     Ok(last)
 }
 
-/// Map each requested rank-0 step to its recorded boundary target in one
-/// forward walk, stopping once every requested step is resolved or passed.
-fn boundary_targets_for_steps(
+/// For each candidate single-writer re-executed topic whose first held headered
+/// frame sits strictly above the anchor clock (with no frame at or before
+/// resume), scan `RECORD_TYPE_READ_OUTCOME` records in
+/// `[first_step ..= executed_through]` and return the earliest
+/// `(step, sequence)` that a consumer popped on that topic strictly preceding
+/// that topic's first held sequence (wrap-aware).
+///
+/// An unmarked `FIRE` record carries no per-output publish bit (a lazy output
+/// left unwritten or a tick returning an error before loaning leaves the
+/// discard bit clear and consumes no sequence), so only recording evidence of
+/// an actual earlier frame on that topic can establish a late start before
+/// step 1. When no candidate topic has a consumer or the trace manifest carries
+/// no input table, returns an empty map and defers.
+fn earliest_missing_reads_for_topics(
+    config: &GraphConfig,
     trace: &RecordedTrace,
-    steps: &BTreeSet<u64>,
-) -> Result<BTreeMap<u64, u64>, ReplayError> {
-    let Some(&max_step) = steps.iter().next_back() else {
+    rank_tables: &[Vec<Arc<str>>],
+    kind_width: KindFieldWidth,
+    first_step: u64,
+    executed_through: Option<u64>,
+    candidates: &BTreeMap<String, u32>,
+) -> Result<BTreeMap<String, (u64, u32)>, ReplayError> {
+    if candidates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let Some(last_step) = executed_through else {
         return Ok(BTreeMap::new());
     };
-    let mut out = BTreeMap::new();
-    let mut cursor = BoundaryCursor::for_rank(trace, 0)?;
-    while let Some(b) = cursor.next()? {
-        if steps.contains(&b.step) {
-            out.entry(b.step).or_insert(b.target_ns);
-            if out.len() == steps.len() {
-                break;
+    let Ok((recorded_inputs, _, _)) = load_recorded_input_tables(trace) else {
+        return Ok(BTreeMap::new());
+    };
+    if recorded_inputs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut edge_topic: std::collections::HashMap<(&str, &str), (&str, u32)> =
+        std::collections::HashMap::new();
+    for node in &config.nodes {
+        for input in &node.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if let Some((cand_topic, &first_seq)) = candidates.get_key_value(&topic) {
+                edge_topic.insert(
+                    (node.id.as_str(), input.name.as_str()),
+                    (cand_topic.as_str(), first_seq),
+                );
             }
         }
-        if b.step > max_step {
-            break;
-        }
     }
+    if edge_topic.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut out: BTreeMap<String, (u64, u32)> = BTreeMap::new();
+    trace.for_each(|rec| {
+        if rec.record_type != RECORD_TYPE_READ_OUTCOME
+            || rec.step < first_step
+            || rec.step > last_step
+        {
+            return Ok(());
+        }
+        let Some(node_id) = rank_tables
+            .get(rec.rank() as usize)
+            .and_then(|table| table.get(rec.node_idx as usize))
+        else {
+            return Ok(());
+        };
+        let (input_idx, kind_wire, _) = decode_read_outcome_meta(rec.global_level, kind_width);
+        let Some(input_name) = recorded_inputs
+            .get(node_id.as_ref())
+            .and_then(|names| names.get(input_idx as usize))
+        else {
+            return Ok(());
+        };
+        let Some(&(topic, first_seq)) = edge_topic.get(&(node_id.as_ref(), input_name.as_str()))
+        else {
+            return Ok(());
+        };
+        let candidate_seq = match read_outcome_kind_from_wire(kind_wire) {
+            Some(ReadOutcomeKind::Served | ReadOutcomeKind::BatchFrame) => {
+                if rec.fire_time_ns == READ_OUTCOME_NO_FRAME {
+                    return Ok(());
+                }
+                let Ok(seq) = u32::try_from(rec.fire_time_ns) else {
+                    return Ok(());
+                };
+                seq
+            }
+            Some(ReadOutcomeKind::DrainedBatch) => {
+                if rec.fire_time_ns == READ_OUTCOME_NO_FRAME {
+                    return Ok(());
+                }
+                let Ok(newest) = u32::try_from(rec.fire_time_ns) else {
+                    return Ok(());
+                };
+                let popped = unpack_read_outcome_popped(rec.duration_ns);
+                if popped > 1 && popped < (1u32 << 31) {
+                    newest.wrapping_sub(popped - 1)
+                } else {
+                    newest
+                }
+            }
+            _ => return Ok(()),
+        };
+        if wire_sequence_precedes(candidate_seq, first_seq) {
+            out.entry(topic.to_string())
+                .and_modify(|(prev_step, prev_seq)| {
+                    if rec.step < *prev_step
+                        || (rec.step == *prev_step
+                            && wire_sequence_precedes(candidate_seq, *prev_seq))
+                    {
+                        *prev_step = rec.step;
+                        *prev_seq = candidate_seq;
+                    }
+                })
+                .or_insert((rec.step, candidate_seq));
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -8880,6 +8973,8 @@ fn resolve_resume(
     duration_bound_ns: Option<u64>,
     coordination: CoordinationMode,
     every_stop_flagged: bool,
+    kind_width: KindFieldWidth,
+    drivers: &BTreeSet<String>,
 ) -> Result<Option<ResumePlan>, ReplayError> {
     let Some(first) = first_recorded_boundary(trace)? else {
         return Ok(None); // no boundaries at all — the existing refusal owns it.
@@ -8944,11 +9039,12 @@ fn resolve_resume(
     // records over their union: which nodes the replay EXECUTES (the
     // required set), and how many frames the steps sharing the first boundary's
     // target COMMITTED (the tie-band split below).
+    let executed_through = last_replayed_step(trace, duration_bound_ns)?;
     let fires = scan_suffix_fires(
         trace,
         &rank_tables,
         first.step,
-        last_replayed_step(trace, duration_bound_ns)?,
+        executed_through,
         last_step_at_target(trace, anchor_clock_ns)?,
     )?;
     let run_id = crate::replay_state::resolve_run_at(&anchors, anchor_step)
@@ -9003,10 +9099,11 @@ fn resolve_resume(
     // A re-executed topic whose recording is lossy cannot have its
     // sequence derived, and a seed off by one is a byte mismatch on EVERY
     // subsequent frame that reads to an operator as "my node changed". A
-    // topic only stopped nodes produce is not re-executed: its publishers
-    // never publish again, so it is neither refused for a loss nor seeded.
+    // topic only stopped or external (driver) nodes produce is not
+    // re-executed: its publishers never publish again, so it is neither
+    // refused for a loss nor seeded.
     let produced = graph_produced_topics(config);
-    let reexecuted = reexecuted_topics(config, &produced, &stops);
+    let reexecuted = reexecuted_topics(config, &produced, &stops, drivers);
     let losses = collect_topic_losses(record_health, coverage);
     refuse_lossy_reexecuted_topics(&reexecuted, &losses).map_err(|refusal| {
         ReplayError::StateRestore {
@@ -9073,7 +9170,7 @@ fn resolve_resume(
         s.at_anchor.len().saturating_sub(committed)
     };
 
-    let mut needed_commit_steps = BTreeSet::new();
+    let mut late_candidates = BTreeMap::new();
     if !fires.unresolved_fire {
         for topic in &reexecuted {
             if config.is_multi_publisher(topic) {
@@ -9082,24 +9179,23 @@ fn resolve_resume(
             let Some(s) = scan.get(topic) else {
                 continue;
             };
-            if s.last_seq_below.is_some() || !s.at_anchor.is_empty() || s.first_ts_above.is_none() {
+            if s.last_seq_below.is_some() || !s.at_anchor.is_empty() {
                 continue;
             }
-            if let Some(&step) = producers
-                .get(topic)
-                .and_then(|p| fires.first_commit_step.get(p))
-            {
-                if step > first.step {
-                    needed_commit_steps.insert(step);
-                }
+            if let Some(first_seq) = s.first_headered_seq_above {
+                late_candidates.insert(topic.clone(), first_seq);
             }
         }
     }
-    let commit_targets = if needed_commit_steps.is_empty() {
-        BTreeMap::new()
-    } else {
-        boundary_targets_for_steps(trace, &needed_commit_steps)?
-    };
+    let missing_reads = earliest_missing_reads_for_topics(
+        config,
+        trace,
+        &rank_tables,
+        kind_width,
+        first.step,
+        executed_through,
+        &late_candidates,
+    )?;
 
     let mut seeds = BTreeMap::new();
     let mut seed_rungs = Vec::new();
@@ -9138,25 +9234,13 @@ fn resolve_resume(
         if !fires.unresolved_fire {
             let has_frame_at_or_before_resume = evidence.last_at_or_before_anchor.is_some()
                 || topic_scan.is_some_and(|s| s.at_anchor.get(cut).is_some());
-            let first_commit = producers
-                .get(topic)
-                .and_then(|p| fires.first_commit_step.get(p).copied())
-                .and_then(|step| {
-                    let target_ns = if step == first.step {
-                        Some(anchor_clock_ns)
-                    } else {
-                        commit_targets.get(&step).copied()
-                    };
-                    target_ns.map(|t| (step, t))
-                });
-            let first_recorded_frame =
-                topic_scan.and_then(|s| s.first_seq_above.zip(s.first_ts_above));
+            let first_recorded_sequence = topic_scan.and_then(|s| s.first_headered_seq_above);
             check_first_frame_covers_resume(
                 topic,
                 writers,
                 first.step,
-                first_commit,
-                first_recorded_frame,
+                missing_reads.get(topic).copied(),
+                first_recorded_sequence,
                 has_frame_at_or_before_resume,
             )
             .map_err(|refusal| ReplayError::StateRestore {
@@ -10116,6 +10200,11 @@ struct ReplayContext {
     /// — `plan_ranks` refuses a bag that says otherwise), so the map partitions
     /// cleanly across the passes with no clone and no second load.
     factories: IndexMap<String, Box<dyn NodeEntry>>,
+    /// The graph's resolved `external` (driver) node ids.
+    drivers: BTreeSet<String>,
+    /// Where [`Self::drivers`] came from (the recording's stamp or the
+    /// replayed build's declarations).
+    drivers_declared_by: DriverSetSource,
     /// The workspace schema hashes on the CLI path; `None` on the test seam.
     schema_hashes: Option<std::collections::HashMap<String, u64>>,
     /// The workspace `schemas/` directory a byte-mismatch verdict decodes
@@ -10164,10 +10253,16 @@ fn replay_transport_init_error(e: cerulion_core::TransportError) -> ReplayError 
 /// transport state exists), then the resume plan resolves, then the transport
 /// is minted and seeded. The graph BUILD is not part of it: it happens
 /// per pass and strictly after the boundary gate.
+#[allow(clippy::type_complexity)]
 fn build_replay_context(
     config: &GraphConfig,
     nodes: ReplayNodes,
-    resolve_resume: impl FnOnce() -> Result<Option<ResumePlan>, ReplayError>,
+    resolve_drivers_and_resume: impl FnOnce(
+        &IndexMap<String, Box<dyn NodeEntry>>,
+    ) -> Result<
+        (BTreeSet<String>, DriverSetSource, Option<ResumePlan>),
+        ReplayError,
+    >,
 ) -> Result<ReplayContext, ReplayError> {
     match nodes {
         ReplayNodes::Cdylib {
@@ -10181,9 +10276,10 @@ fn build_replay_context(
             let factories =
                 crate::graph_cmd::load_node_factories(&workspace_root, config, prefer_release)
                     .map_err(node_load_error)?;
-            // The resume plan: after the load (so `NodeLoad` keeps precedence),
-            // before the transport (so its seeds reach publisher creation).
-            let resume = resolve_resume()?;
+            // Driver set and resume plan: after the load (so `NodeLoad` keeps
+            // precedence), before the transport (so seeds reach publisher
+            // creation and driver-only topics stay excluded from resume).
+            let (drivers, drivers_declared_by, resume) = resolve_drivers_and_resume(&factories)?;
             let clock = Arc::new(VirtualClock::new());
             // On the resim's PRIVATE namespace (`init_resim_transport`), so no
             // live graph, recorder or network daemon on this host receives
@@ -10212,6 +10308,8 @@ fn build_replay_context(
                 transport,
                 clock,
                 factories,
+                drivers,
+                drivers_declared_by,
                 schema_hashes: Some(schema_hashes),
                 verdict_schemas_dir: Some(workspace_root.join("schemas")),
                 resume,
@@ -10225,7 +10323,7 @@ fn build_replay_context(
             // The test seam has no load step, so there is no `NodeLoad` for the
             // resolution to pre-empt — the ordering constraint above is vacuous
             // here and only the before-the-build half applies.
-            let resume = resolve_resume()?;
+            let (drivers, drivers_declared_by, resume) = resolve_drivers_and_resume(&factories)?;
             if let Some(plan) = resume.as_ref() {
                 if !plan.seeds.is_empty() {
                     transport.set_replay_sequence_seeds(plan.seeds.clone());
@@ -10235,6 +10333,8 @@ fn build_replay_context(
                 transport,
                 clock,
                 factories,
+                drivers,
+                drivers_declared_by,
                 schema_hashes: None,
                 verdict_schemas_dir: None,
                 resume,
@@ -36017,6 +36117,7 @@ mod recorder_info_version_tests {
                 })
                 .collect(),
         };
+        let no_drivers = BTreeSet::new();
         for (nodes, kept) in [
             (&[][..], &["/mp/bus", "/mp/solo/out"][..]),
             (&["alpha"][..], &["/mp/bus", "/mp/solo/out"][..]),
@@ -36025,9 +36126,30 @@ mod recorder_info_version_tests {
             (&["alpha", "beta", "solo"][..], &[][..]),
         ] {
             assert_eq!(
-                reexecuted_topics(&config, &produced, &stopped(nodes)),
+                reexecuted_topics(&config, &produced, &stopped(nodes), &no_drivers),
                 kept.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
                 "stopped {nodes:?}"
+            );
+        }
+        let drivers_of = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|s| (*s).to_string()).collect()
+        };
+        for (stopped_nodes, driver_nodes, kept) in [
+            (&[][..], &["solo"][..], &["/mp/bus"][..]),
+            (&[][..], &["alpha"][..], &["/mp/bus", "/mp/solo/out"][..]),
+            (&[][..], &["alpha", "beta"][..], &["/mp/solo/out"][..]),
+            (&["beta"][..], &["alpha"][..], &["/mp/solo/out"][..]),
+            (&[][..], &["alpha", "beta", "solo"][..], &[][..]),
+        ] {
+            assert_eq!(
+                reexecuted_topics(
+                    &config,
+                    &produced,
+                    &stopped(stopped_nodes),
+                    &drivers_of(driver_nodes),
+                ),
+                kept.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                "stopped {stopped_nodes:?}, drivers {driver_nodes:?}"
             );
         }
     }

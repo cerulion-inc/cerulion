@@ -35,12 +35,12 @@ use cerulion_core::state::{CerulionState, SkipCause, StateCursor, VecSink};
 use cerulion_core::state_restore::{
     capture_anchor_blob, capture_anchor_blob_with_framework, check_first_frame_covers_resume,
     classify_shape, enforce_strict_state, plan_backlog_admission, plan_restore,
-    refuse_lossy_reexecuted_topics, seed_publisher_sequence, AnchorBlob, AnchorFact, AnchorOutcome,
-    BacklogClaim, InputServiceCursor, NodeAnchorProblem, NodeFrameworkState, RestorePlan,
-    RestoreRefusal, RestoreRequest, SeedEvidence, SeedRung, StoppedAtAnchor, TopicFrameCount,
-    TopicLoss, TopicWriters, ANCHOR_BLOB_HEADER_SIZE, ANCHOR_BLOB_MAGIC, ANCHOR_BLOB_MAGIC_V2,
-    ANCHOR_BLOB_V2_HEADER_SIZE, FRAMEWORK_SECTION_MIN_READABLE, FRAMEWORK_SECTION_WRITE_VERSION,
-    NODE_FLAG_STOPPED,
+    refuse_lossy_reexecuted_topics, seed_publisher_sequence, wire_sequence_precedes, AnchorBlob,
+    AnchorFact, AnchorOutcome, BacklogClaim, InputServiceCursor, NodeAnchorProblem,
+    NodeFrameworkState, RestorePlan, RestoreRefusal, RestoreRequest, SeedEvidence, SeedRung,
+    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters, ANCHOR_BLOB_HEADER_SIZE,
+    ANCHOR_BLOB_MAGIC, ANCHOR_BLOB_MAGIC_V2, ANCHOR_BLOB_V2_HEADER_SIZE,
+    FRAMEWORK_SECTION_MIN_READABLE, FRAMEWORK_SECTION_WRITE_VERSION, NODE_FLAG_STOPPED,
 };
 
 // ---------------------------------------------------------------------------
@@ -2095,28 +2095,50 @@ fn the_seed_wraps_with_the_wire_counter_rather_than_saturating() {
 }
 
 #[test]
-fn late_first_frame_after_first_commit_is_refused_by_name() {
+fn wire_sequence_precedes_handles_wrap_and_half_range_boundaries() {
+    // Ordinary ordering.
+    assert!(wire_sequence_precedes(1, 3));
+    assert!(!wire_sequence_precedes(3, 3));
+    assert!(!wire_sequence_precedes(4, 3));
+
+    // Across u32::MAX -> 0 wrap.
+    assert!(wire_sequence_precedes(u32::MAX - 2, u32::MAX - 1));
+    assert!(wire_sequence_precedes(u32::MAX, 0));
+    assert!(wire_sequence_precedes(u32::MAX - 1, 1));
+    assert!(!wire_sequence_precedes(0, u32::MAX - 1));
+    assert!(!wire_sequence_precedes(1, u32::MAX - 1));
+
+    // Half-range boundary: distance 2^31 - 1 precedes; distance 2^31 does not.
+    assert!(wire_sequence_precedes(0, i32::MAX as u32));
+    assert!(!wire_sequence_precedes(0, 1u32 << 31));
+}
+
+#[test]
+fn late_first_frame_after_observed_read_is_refused_by_name() {
     let err = check_first_frame_covers_resume(
         "/ticker/out",
         TopicWriters::SingleWriter,
         1,
-        Some((1, 100)),
-        Some((3, 200)),
+        Some((1, 1)),
+        Some(3),
         false,
     )
-    .expect_err("frames starting after first resumed commit must be refused");
+    .expect_err("frames starting after an observed read must be refused");
     assert_eq!(
         err,
         RestoreRefusal::FramesBeginAfterResume {
             topic: "/ticker/out".to_string(),
             resume_step: 1,
-            first_commit_step: 1,
+            observed_step: 1,
+            missing_sequence: 1,
             first_recorded_sequence: 3,
         }
     );
     let text = err.to_string();
     for needle in [
         "/ticker/out",
+        "resume step 1",
+        "sequence 1",
         "step 1",
         "sequence 3",
         "CERULION_FLASHBACK_WINDOW_MS",
@@ -2127,26 +2149,35 @@ fn late_first_frame_after_first_commit_is_refused_by_name() {
 }
 
 #[test]
-fn slow_producer_whose_first_frame_matches_its_first_commit_is_admitted() {
+fn observed_read_at_or_after_first_held_frame_is_admitted() {
     check_first_frame_covers_resume(
         "/slow/out",
         TopicWriters::SingleWriter,
         1,
-        Some((5, 500)),
-        Some((1, 500)),
+        Some((5, 1)),
+        Some(1),
         false,
     )
-    .expect("first frame landing on first commit target is sound for rung (ii)");
+    .expect("first frame matching earliest observed read is sound for rung (ii)");
+    check_first_frame_covers_resume(
+        "/slow/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((6, 2)),
+        Some(1),
+        false,
+    )
+    .expect("observed read after first held frame is sound for rung (ii)");
 }
 
 #[test]
-fn frame_at_or_before_resume_admits_regardless_of_later_timestamps() {
+fn frame_at_or_before_resume_admits_regardless_of_observed_reads() {
     check_first_frame_covers_resume(
         "/ticker/out",
         TopicWriters::SingleWriter,
         1,
-        Some((1, 100)),
-        Some((3, 200)),
+        Some((1, 0)),
+        Some(3),
         true,
     )
     .expect("pre-anchor or in-band frame covers resume");
@@ -2158,29 +2189,29 @@ fn multi_publisher_defers_to_seed_ladder_refusal() {
         "/tf",
         TopicWriters::MultiPublisher,
         1,
-        Some((1, 100)),
-        Some((3, 200)),
+        Some((1, 1)),
+        Some(3),
         false,
     )
     .expect("multi-publisher defers to seed_publisher_sequence");
 }
 
 #[test]
-fn missing_first_commit_or_missing_frame_defers_to_seed_ladder() {
+fn missing_read_evidence_or_missing_frame_defers_to_seed_ladder() {
     check_first_frame_covers_resume(
-        "/silent/out",
+        "/sparse/out",
         TopicWriters::SingleWriter,
         1,
         None,
-        Some((3, 200)),
+        Some(3),
         false,
     )
-    .expect("no commit in resumed suffix defers");
+    .expect("no read evidence proving an earlier commit defers");
     check_first_frame_covers_resume(
         "/silent/out",
         TopicWriters::SingleWriter,
         1,
-        Some((1, 100)),
+        Some((1, 1)),
         None,
         false,
     )
@@ -2188,29 +2219,40 @@ fn missing_first_commit_or_missing_frame_defers_to_seed_ladder() {
 }
 
 #[test]
-fn late_frame_with_commit_later_than_resume_step_still_refuses_gap() {
+fn late_frame_across_u32_wrap_uses_wrap_aware_comparison() {
+    // Held frames begin at sequence 1 after wrapping past u32::MAX; trace read
+    // sequence u32::MAX at step 2 -> refused.
     let err = check_first_frame_covers_resume(
-        "/slow/out",
+        "/wrapped/out",
         TopicWriters::SingleWriter,
         1,
-        Some((3, 300)),
-        Some((7, 500)),
+        Some((2, u32::MAX)),
+        Some(1),
         false,
     )
-    .expect_err("frames starting after a later first commit step must still refuse");
+    .expect_err("u32::MAX precedes 1 across wrap");
     assert_eq!(
         err,
         RestoreRefusal::FramesBeginAfterResume {
-            topic: "/slow/out".to_string(),
+            topic: "/wrapped/out".to_string(),
             resume_step: 1,
-            first_commit_step: 3,
-            first_recorded_sequence: 7,
+            observed_step: 2,
+            missing_sequence: u32::MAX,
+            first_recorded_sequence: 1,
         }
     );
-    let text = err.to_string();
-    assert!(text.contains("step 3"), "{text}");
-    assert!(text.contains("resuming at step 1"), "{text}");
-    assert!(text.contains("sequence 7"), "{text}");
+
+    // Held frames begin at u32::MAX - 1; trace reads 0 (after the wrap) ->
+    // admitted, not refused.
+    check_first_frame_covers_resume(
+        "/wrapped/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((3, 0)),
+        Some(u32::MAX - 1),
+        false,
+    )
+    .expect("sequence 0 follows u32::MAX - 1 across wrap");
 }
 
 #[test]
@@ -2219,16 +2261,16 @@ fn first_frame_check_is_deterministic() {
         "/ticker/out",
         TopicWriters::SingleWriter,
         1,
-        Some((1, 100)),
-        Some((3, 200)),
+        Some((1, 1)),
+        Some(3),
         false,
     );
     let b = check_first_frame_covers_resume(
         "/ticker/out",
         TopicWriters::SingleWriter,
         1,
-        Some((1, 100)),
-        Some((3, 200)),
+        Some((1, 1)),
+        Some(3),
         false,
     );
     assert_eq!(a, b);
