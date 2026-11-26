@@ -409,14 +409,19 @@ same name, rustdoc writes both to `target/doc/cerulion`, and the two outputs rac
 
 ## The login gate in CI
 
-Every `cerulion` command runs under an account, in every build. CI machines have
-no account, so this repository's own runs set `CERULION_LOGIN_GATE=off`, matched
-byte for byte. It lives in the workspace `.cargo/config.toml`, which covers every
-job that goes through cargo, and in a workflow level `env:` for the jobs that run
-the binary outside cargo: the release install smoke and the perception replay
-demo. A container gets it from the script that runs inside the container, because
-a workflow `env:` does not cross `docker run`. Same for the shell and python
-harnesses under `tools/` and `benches/` that launch the binary themselves.
+Commands that call the Cerulion account service or authenticate to remote robots
+(`account *`, `connect`, `rcp <robot>`, `viz --robot`, `graph live`, `graph fires`,
+`topic echo`/`hz`/`info`/`pub`/`snapshot` with `--robot`, `service call --robot`)
+run under an account in every build; local and offline verbs do not enter the
+gate. CI machines have no account, so this repository's own runs still set
+`CERULION_LOGIN_GATE=off`, matched byte for byte, so gated commands exercised by
+tests and harnesses do not stop on the gate. It lives in the workspace
+`.cargo/config.toml`, which covers every job that goes through cargo, and in a
+workflow level `env:` for the jobs that run the binary outside cargo: the
+release install smoke and the perception replay demo. A container gets it from
+the script that runs inside the container, because a workflow `env:` does not
+cross `docker run`. Same for the shell and python harnesses under `tools/` and
+`benches/` that launch the binary themselves.
 
 That list used to live only in this paragraph.
 `crates/cerulion_hygiene/tests/shipped_surface_structure_test.rs` now holds it as
@@ -429,21 +434,26 @@ string, the public-surface gate's own fixture) is recorded in `NOT_AN_INVOCATION
 its reason, and a line there that stops matching fails too. `cerulion --version` is not
 an invocation for this purpose: clap answers it above the gate.
 
-`CERULION_LOGIN_GATE=off` switches off the command-wide check and nothing else.
-Serving the network is a second rule the variable does not reach. These need a
-saved login on the machine (an expired one counts):
+`CERULION_LOGIN_GATE=off` switches off the command-level login gate and nothing
+else. Serving the network is a second rule the variable does not reach:
 
-- a real-clock `graph run` or `node run` that offers topics to the network: under
-  the permissive default (no `network:` block, or one with `mode: disabled` or no
-  `mode:`), any graph with a producer or a `ros2:` node; under an enabled
-  `network:` block (`mode: peer` or `mode: client`), one that lists egress topics;
-- a `ros2 attach` that is not a dry run;
-- a `cerulion-netd` started with `CERULION_NETD_LISTEN`.
+- a real-clock `graph run` or `node run` under the permissive default (no
+  `network:` block, or `mode: disabled` / omitted `mode:`) degrades to
+  `RunNetwork::Off` with one loud warning when this machine has no saved login
+  or robot pairing, so local offline runs succeed without opening a network
+  listener;
+- a real-clock `graph run` with an enabled `network:` block (`mode: peer` or
+  `mode: client`) that lists `egress:` topics, or that lists `ingress:` topics
+  under explicit `CERULION_LAN_ACCESS=open`, a `ros2 attach` that is not a
+  dry run, `graph run-gateway`, and a `cerulion-netd` started with
+  `CERULION_NETD_LISTEN` still refuse without a saved login (an expired one
+  counts) with `` serving the network requires a prior login; run `cerulion login` ``.
+  A real-clock `graph run` with declared `network: ingress:` under paired access
+  without saved explicit robot pairings enters the login gate (which
+  `CERULION_LOGIN_GATE=off` switches off in CI). The runs and `ros2 attach` also
+  accept a saved robot pairing; the netd listener does not.
 
-Without one they refuse with
-`` serving the network requires a prior login; run `cerulion login` ``. The runs
-and `ros2 attach` also accept a saved robot pairing; the netd listener does not.
-A job with no account keeps a `graph run` or `node run` on the runner with
+A job with no account keeps a `graph run` or `node run` explicitly local with
 `--network off` (also spelled `--local`) or `CERULION_NETWORK=off`, and a
 `ros2 attach` with `CERULION_NETWORK=off` (it has no `--network` flag); a
 `graph run` under `--time-source virtual` or `external` is inert too. The release
@@ -453,8 +463,8 @@ real. The workspace latency harness runs its real-clock legs under the permissiv
 default (its backtoback leg passes `--time-source virtual` and stays inert), and the
 cross-host harness's `cerulion-tcp` and `cerulion-quic` stacks give each machine a
 `network:` block that lists egress topics. Both harnesses therefore need a
-signed-in machine for those legs, and the cross-host harness needs a login on each
-of its two machines.
+signed-in machine to serve over the network, and the cross-host harness needs a
+login on each of its two machines.
 
 A job that wants a machine WITH an account instead seeds one:
 `tools/ci/seed_test_login.sh <dir>` writes the `auth.json` a real sign-in writes,

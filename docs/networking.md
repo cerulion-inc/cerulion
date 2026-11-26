@@ -109,9 +109,13 @@ resolves to exactly one of these, in evaluation order:
 | Enabled `network:` block (egress-only under `--record`, or any non-record) | **Strict export/import scope**: declared egress and ingress use authenticated producer selection under paired access; explicit open LAN access retains verbatim zenoh locators. |
 | No / disabled block (incl. `--record`) | **All produced topics eligible for paired export** through the shared daemon. The legacy zenoh announcements, scouting and fallback listen port apply only with explicit open LAN access. |
 
-`graph profile` is the one deliberate exception: a bounded MEASUREMENT run,
-not a deployment, so it stays LOCAL-ONLY by design (its transport is built
-`network: None`; it never resolves a network). Re-execution
+`graph profile` is a bounded MEASUREMENT run, not a deployment, so it opens no
+network session of its own (its transport is built `network: None`; it never
+resolves a network). Its nodes still publish onto this machine's shared-memory
+namespace under their declared topic names, so while a `cerulion-netd` (or
+another gateway on this machine) exports one of those topics for another run,
+the profile run's live frames can leave the machine too (the same
+shared-namespace caveat as plain `cerulion bag play`). Re-execution
 (`cerulion bag play <bag> --resim all`) is likewise network-inert by
 construction (the bag is the input, and a replay must match the live run):
 it runs on a private shared-memory namespace, so neither `cerulion-netd` nor

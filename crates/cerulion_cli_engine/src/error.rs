@@ -62,6 +62,11 @@ pub enum CliError {
     /// (`cerulion login`) where the failure is a missing/expired identity.
     #[error("{0}")]
     Login(String),
+    /// The runtime login gate refused the command before execution because the
+    /// machine has never signed in or is signed out. Mapped by the CLI binary
+    /// to [`crate::login_cmd::EXIT_AUTH_REQUIRED`] (exit 7).
+    #[error("{0}")]
+    AuthRequired(String),
     /// A remote operation refused by the network kill switch.
     #[error("{0}")]
     RemoteShellNetworkRefused(String),

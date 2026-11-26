@@ -66,7 +66,9 @@ DDS inputs. Use plain playback to view an attached ROS 2 recording without the
 robot.
 Re-simulation is also unpaced: its loop never reads the wall clock, which is
 what makes it deterministic: a replay matches the live run. Together those two properties mean
-`--resim` cannot drive a viewer.
+`--resim` cannot drive a viewer. To watch a resim's output with `cerulion viz` or
+`cerulion topic echo`, run with `--record-out FILE` and then play it back with
+`cerulion bag play FILE`.
 
 ### `--resim` is NEUTRAL; `--verify` is the verdict
 
@@ -1372,7 +1374,7 @@ node, the input, the writer and the sequence:
 
 | Cause (`--report` code) | Meaning |
 |---|---|
-| `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
+| `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: either the bag's frames of that writer begin at a later sequence (the recorder's taps attached after it, or the window dropped earlier frames), or the recorder lost a frame between held sequences |
 | `read_identity_absent` | A read popped frames and no annotation named their writer, or a read or a `batch_frame` record on a multi-writer edge carries no annotation of its own. On a bag recorded below format 11 that begins mid-run, the message says the read continues a writer run the bag does not hold and to record the run again |
 | `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
 | `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9, or a batch deeper than its read stage's window, names only the newest |
@@ -1410,7 +1412,13 @@ fed:
   record the run again. From format 11 a bag that begins at a checkpoint names
   the writer of every read in it and is fed. A free-run bag with several worker
   ranks is refused by every replay, `--resim all` included, since per-rank
-  resume anchors are not supported.
+  resume anchors are not supported. On any mid-run replay (lockstep or free-run,
+  with or without `--verify`), a re-executed single-writer topic whose recorded
+  frames begin after an earlier frame that the resumed trace reads is refused by
+  name before step 1 (exit 2), naming the topic, the resumed step, the missing
+  read sequence and step, and the first recorded sequence, instead of seeding
+  the publisher from a later frame. Topics written only by external (driver)
+  nodes are recorded inputs and are excluded from this check.
 
  Replay such a bag with `--resim all` and no
 `--verify`, which re-creates each consumer's queue and labels its reads best
@@ -1703,7 +1711,7 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 
 | Limit | Why | Remedy |
 |---|---|---|
-| Playback is not confined to this machine: its frames reach every consumer of those topics here, and while `cerulion-netd` exports one of those topics for another run, every machine netd serves receives that topic's frames too | Playback publishes onto this machine's shared-memory namespace under the recorded topic names, so whatever reads those topics on this machine receives the frames, netd's egress included; under the open LAN posture netd also serves any live topic a peer demands by name, and `cerulion-remoted` streams any topic a paired desk with observe access demands; a `cerulion graph run` with an enabled `network:` block runs its own gateway, which serves the topics its `egress:` marks `external: true`, and a `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach` that cannot use `cerulion-netd` runs its own permissive gateway, which serves any live topic a peer demands by name | To keep a bag's frames on this machine, play it while no Cerulion process here serves topics to the network: no `cerulion-vizd` unless it was started with exactly `CERULION_NETD_NETWORK=off`, no `cerulion-netd` unless it was started that way, no `cerulion-remoted`, and every `cerulion graph run`, `cerulion node run` and `cerulion ros2 attach` here running local-only (`--local` on `graph run` and `node run`, or `CERULION_NETWORK=off` for any of them). `cerulion viz` starts vizd; it runs until it is sent SIGINT or SIGTERM and starts `cerulion-netd` again within seconds of netd stopping, so stop vizd before netd. With neither daemon running, `CERULION_NETD_NETWORK=off CERULION_VIZD_NETWORK=off cerulion viz <TOPIC>` starts both local-only, and `cerulion topic echo --local` starts no daemon. A networked `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach`, `cerulion viz`, and `cerulion topic` and `cerulion schema info` commands that reach the network start netd when it is not running; it then stays up until nothing has been connected to it for its idle grace (30 s by default; each `daemon.netd` check of `cerulion doctor` restarts that wait), and never exits on its own if it was started with `CERULION_NETD_LISTEN` set |
+| Playback is not confined to this machine: its frames reach every consumer of those topics here, and while `cerulion-netd` exports one of those topics for another run, every machine netd serves receives that topic's frames too | Playback publishes onto this machine's shared-memory namespace under the recorded topic names, so whatever reads those topics on this machine receives the frames, netd's egress included; under `CERULION_LAN_ACCESS=open` netd also serves any live topic a peer demands by name, and `cerulion-remoted` streams any topic a paired desk with observe access demands; a `cerulion graph run` with an enabled `network:` block runs its own gateway, which serves the topics its `egress:` marks `external: true`, and a `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach` that cannot use `cerulion-netd` runs its own permissive gateway, which serves any live topic a peer demands by name | To keep a bag's frames on this machine, play it while no Cerulion process here serves topics to the network: no `cerulion-vizd` unless it was started with exactly `CERULION_NETD_NETWORK=off`, no `cerulion-netd` unless it was started that way, no `cerulion-remoted`, and every `cerulion graph run`, `cerulion node run` and `cerulion ros2 attach` here running local-only (`--local` on `graph run` and `node run`, or `CERULION_NETWORK=off` for any of them). `cerulion viz` starts vizd; it runs until it is sent SIGINT or SIGTERM and starts `cerulion-netd` again within seconds of netd stopping, so stop vizd before netd. With neither daemon running, `CERULION_NETD_NETWORK=off CERULION_VIZD_NETWORK=off cerulion viz <TOPIC>` starts both local-only, and `cerulion topic echo --local` starts no daemon. A networked `cerulion graph run`, `cerulion node run` or `cerulion ros2 attach`, `cerulion viz`, and `cerulion topic` and `cerulion schema info` commands that reach the network start netd when it is not running; it then stays up until nothing has been connected to it for its idle grace (30 s by default; each `daemon.netd` check of `cerulion doctor` restarts that wait), and never exits on its own if it was started with `CERULION_NETD_LISTEN` set |
 | Inter-topic alignment comes from file position, so it is accurate to the recorder's flush window (~100 ms), not better | Cross-channel stamp comparison is the forbidden operation: stamps from different producers share no number line | None: inherent to the design |
 | A channel behind by more than 16 of its own deltas fast-forwards at up to 4x its recorded rate until it catches up | The deficit is carried in full so alignment is preserved; only the RATE is bounded, using the channel's own cadence. Routine write-batching deficits fall inside the free window and cost no wall time | None: inherent to the trade-off (the alternative is an unbounded backlog dump) |
 | The 4x bound does not apply to a channel whose consecutive stamps are identical | There is no recorded cadence to divide; such frames publish as fast as the loop runs | None: faithful to the recording (it says those frames were simultaneous) |

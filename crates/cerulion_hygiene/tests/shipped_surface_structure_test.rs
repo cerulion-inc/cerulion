@@ -1519,13 +1519,8 @@ fn collect_harness_files(dir: &Path, f: &mut impl FnMut(&Path)) {
 }
 
 // ---------------------------------------------------------------------------
-// (d) The documented login exemptions are the ones the code exempts.
+// (d) The documented login-gated commands match the code's identity gate.
 // ---------------------------------------------------------------------------
-
-/// The two exemptions in the sentence that are NOT `Commands` variants: clap
-/// answers them while parsing, above the gate. They are asserted present, so
-/// they cannot quietly vanish from the sentence either.
-const CLAP_ANSWERED: &[&str] = &["--help", "--version"];
 
 /// `RunWorker` -> `run-worker`.
 fn kebab(camel: &str) -> String {
@@ -1539,6 +1534,24 @@ fn kebab(camel: &str) -> String {
         } else {
             out.push(ch);
         }
+    }
+    out
+}
+
+/// Extract variant names after `marker` in `chunk`, kebab-cased.
+fn variants_after(chunk: &str, marker: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = chunk;
+    while let Some(at) = rest.find(marker) {
+        let tail = &rest[at + marker.len()..];
+        let name: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            out.push(kebab(&name));
+        }
+        rest = &tail[name.len()..];
     }
     out
 }
@@ -1587,10 +1600,12 @@ fn rust_code_only(src: &str) -> String {
 }
 
 #[test]
-fn the_documented_login_exemptions_are_the_ones_the_code_exempts() {
+fn the_documented_login_gated_commands_match_the_code() {
     let root = repo_root();
 
-    // The code half: the `!matches!` body of `command_needs_identity`.
+    // The code half (1): arms in `command_needs_identity` that return `true` or
+    // `robot.is_some()`. Split each arm at `=>`; keep only arms whose RHS is not
+    // literally `false` (and not a nested `match`).
     let src = rust_code_only(&read(&root.join("crates/cerulion_cli/src/main.rs")));
     let at = src
         .find("fn command_needs_identity")
@@ -1600,70 +1615,115 @@ fn the_documented_login_exemptions_are_the_ones_the_code_exempts() {
         .find("\n}")
         .expect("the function body is closed at column 0");
     let body = &body[..end];
-    let mut from_code: BTreeSet<String> = BTreeSet::new();
-    for marker in ["Commands::", "GraphAction::"] {
-        let mut rest = body;
-        while let Some(at) = rest.find(marker) {
-            let tail = &rest[at + marker.len()..];
-            let name: String = tail
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                from_code.insert(kebab(&name));
-            }
-            rest = &tail[name.len()..];
-        }
-    }
     assert!(
-        from_code.len() >= 3,
-        "only {from_code:?} was read out of command_needs_identity; the function's shape \
-         moved and this test is comparing almost nothing"
+        !body.contains("_ =>"),
+        "command_needs_identity must stay an exhaustive match without a wildcard arm"
     );
 
-    // The document half: the backticked spans of the exemption sentence.
+    let mut from_code: BTreeSet<String> = BTreeSet::new();
+    let bytes = body.as_bytes();
+    let mut search = 0usize;
+    while let Some(rel) = body[search..].find("=>") {
+        let arrow = search + rel;
+        search = arrow + 2;
+        let rhs = body[arrow + 2..].trim_start();
+        if !(rhs.starts_with("true") || rhs.starts_with("robot.is_some()")) {
+            continue;
+        }
+        // Walk backwards across balanced `{ ... }` struct patterns to the start
+        // of this arm's pattern (the previous `,` or enclosing `match {`).
+        let mut depth = 0usize;
+        let mut start = arrow;
+        while start > 0 {
+            start -= 1;
+            match bytes[start] {
+                b'}' => depth += 1,
+                b'{' if depth > 0 => depth -= 1,
+                b'{' | b',' if depth == 0 => {
+                    start += 1;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let lhs = &body[start..arrow];
+        for marker in ["Commands::", "GraphAction::", "TopicAction::"] {
+            for name in variants_after(lhs, marker) {
+                from_code.insert(name);
+            }
+        }
+    }
+
+    // The code half (2): verb families and nested verbs whose `needs_identity`
+    // does not unconditionally return `false`.
+    for (rel, names) in [
+        ("crates/cerulion_cli/src/families/rcp.rs", &["rcp"][..]),
+        (
+            "crates/cerulion_cli/src/families/service.rs",
+            &["service", "call"][..],
+        ),
+        (
+            "crates/cerulion_cli/src/families/nested/topic_message.rs",
+            &["pub", "snapshot"][..],
+        ),
+    ] {
+        let fam_src = rust_code_only(&read(&root.join(rel)));
+        let fn_at = fam_src
+            .find("fn needs_identity")
+            .unwrap_or_else(|| panic!("{rel} defines needs_identity"));
+        let fn_body = &fam_src[fn_at..];
+        let fn_end = fn_body
+            .find("\n    }")
+            .unwrap_or_else(|| panic!("{rel} closes needs_identity"));
+        let fn_body = &fn_body[..fn_end];
+        let unconditional_false = fn_body
+            .split_once('{')
+            .is_some_and(|(_, inner)| inner.trim() == "false");
+        if !unconditional_false {
+            for name in names {
+                from_code.insert((*name).to_string());
+            }
+        }
+    }
+
+    assert!(
+        from_code.len() >= 8,
+        "only {from_code:?} was read out of the login gate; the function shape moved"
+    );
+
+    // The document half: the gated-command clause in the `cerulion login` row
+    // of `docs/user-api.md`.
     let doc = read(&root.join("docs/user-api.md"));
-    let sentence = doc
+    let row = doc
         .lines()
-        .find(|l| l.contains("Exempt: `login`"))
-        .unwrap_or_else(|| {
-            panic!(
-                "docs/user-api.md no longer carries the login exemption sentence \
-                 (\"Exempt: `login` …\"), which is where a user reads which commands run \
-                 without an account"
-            )
-        });
-    let sentence = &sentence[sentence
-        .find("Exempt:")
-        .expect("the sentence starts at its own word")..];
+        .find(|l| l.starts_with("| `cerulion login` |"))
+        .expect("docs/user-api.md carries the `cerulion login` row");
+    let start = row
+        .find("Only commands that call the Cerulion account service")
+        .expect("`cerulion login` row names the gated commands");
+    let end = row[start..]
+        .find("require a signed-in machine")
+        .expect("`cerulion login` row closes the gated-commands clause");
+    let clause = &row[start..start + end];
+
     let mut from_doc: BTreeSet<String> = BTreeSet::new();
-    let mut rest = sentence;
+    let mut rest = clause;
     while let Some(open) = rest.find('`') {
         let after = &rest[open + 1..];
         let Some(close) = after.find('`') else { break };
         let span = &after[..close];
         rest = &after[close + 1..];
-        if CLAP_ANSWERED.contains(&span) {
-            continue;
-        }
         for word in span.split_whitespace() {
+            if matches!(word, "*" | "<robot>" | "--robot" | "graph" | "topic") {
+                continue;
+            }
             from_doc.insert(word.to_string());
         }
-    }
-    for flag in CLAP_ANSWERED {
-        assert!(
-            sentence.contains(&format!("`{flag}`")),
-            "the exemption sentence no longer names `{flag}`, which clap answers above the \
-             gate: a user reading it would expect `cerulion {flag}` to need an account"
-        );
     }
 
     assert_eq!(
         from_doc, from_code,
-        "docs/user-api.md's login exemption sentence and \
-         crates/cerulion_cli/src/main.rs's `command_needs_identity` disagree. The sentence \
-         says {from_doc:?}; the code exempts {from_code:?}. Whichever moved, the other has to \
-         move with it: this sentence is where a user learns which commands run on a machine \
-         that has never signed in."
+        "docs/user-api.md's login-gated command list and the code's identity gate disagree. \
+         The doc lists {from_doc:?}; the code gates {from_code:?}."
     );
 }

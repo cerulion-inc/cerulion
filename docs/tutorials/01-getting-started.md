@@ -43,17 +43,17 @@ Three nodes forming a reactive pipeline:
   with `xcode-select --install`. The installer above says so too when it finds
   no C linker on the machine.
 
-- A Cerulion account. Almost every `cerulion` command runs under one (`ros2 run`,
-  `ros2 launch` and `doctor` are among those that do not), and signing in is a
-  once-per-machine step that later commands read locally, so they keep working
-  offline:
+- A Cerulion account (optional for local offline work). Local workspace, node,
+  graph, topic, and bag commands run without signing in. Sign in once per
+  machine when you want to serve topics across machines, connect to remote
+  robots, or manage your account:
 
   ```bash
   cerulion login
   ```
 
-  A robot or a headless box prints a short code to approve from a browser on any
-  machine.
+  Later runs read that state locally, so they keep working offline. A robot or
+  a headless box prints a short code to approve from a browser on any machine.
 
 - Rust from [rustup.rs](https://rustup.rs) (the distro `cargo` package is
   usually too old). `cerulion node build` compiles your nodes with your

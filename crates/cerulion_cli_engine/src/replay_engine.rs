@@ -86,10 +86,11 @@ use cerulion_bagd::{RecordCoverage, TapSource, RECORD_COVERAGE_ATTACHMENT};
 use cerulion_core::graph::{GraphConfig, GraphRuntime};
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
 use cerulion_core::state_restore::{
-    enforce_strict_state, plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics,
-    seed_publisher_sequence, AnchorBlob, BacklogAdmission, BacklogClaim, InputServiceCursor,
-    NodeFrameworkState, RestorePlan, RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung,
-    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters,
+    check_first_frame_covers_resume, enforce_strict_state, plan_backlog_admission, plan_restore,
+    refuse_lossy_reexecuted_topics, seed_publisher_sequence, wire_sequence_precedes, AnchorBlob,
+    BacklogAdmission, BacklogClaim, InputServiceCursor, NodeFrameworkState, RestorePlan,
+    RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung, StoppedAtAnchor, TopicFrameCount,
+    TopicLoss, TopicWriters,
 };
 use cerulion_core::trace_ring::{
     step_boundary_flags, unpack_read_outcome_meta, unpack_read_outcome_meta_full,
@@ -145,456 +146,30 @@ const REPLAY_SUBSCRIBER_BUFFER: usize = 16;
 /// `TransportManager::init`'s conversion became fallible, a PANIC one rename away).
 pub const REPLAY_NODE_NAME_PREFIX: &str = "cerulion_replay_";
 
-/// The fixed head of every resim's PRIVATE iceoryx2 prefix
-/// (`{RESIM_NAMESPACE_MARKER}{slot:08x}_`, see [`resim_namespace_prefix`]).
-///
-/// A resim publishes the frames it re-executes and the recorded external
-/// inputs it re-injects under the recording's own topic names, and its
-/// transport runs under this prefix. iceoryx2 names every node, service and
-/// shared-memory segment `{prefix}{name}` and opens only files carrying its own
-/// prefix, so a process on the shared namespace (iceoryx2's default `iox2_`,
-/// the one `graph run`, `cerulion-netd`, `bagd` and `topic echo` use) cannot
-/// open a service a resim creates, and a resim cannot open theirs.
-///
-/// It diverges from `iox2_` at its first character and from the multi-process
-/// planning namespace's `cer_p_` at its fifth, so iceoryx2's string-prefix
-/// listing of one namespace never reaches another's files.
-pub const RESIM_NAMESPACE_MARKER: &str = "cer_resim_";
+use crate::resim_slots::{
+    claim_and_reclaim_resim_slot as claim_and_reclaim_resim_slot_inner,
+    resim_ix_config as resim_ix_config_inner, resim_segment_dir, resim_slot_lock_dir, ResimSlot,
+};
+pub use crate::resim_slots::{
+    resim_namespace_prefix, resim_namespace_slot, RESIM_NAMESPACE_MARKER,
+};
 
-/// How many resim namespaces a machine has. A resim runs on the slot it holds
-/// ([`claim_resim_slot`]), so at most this many resims run at once, and the
-/// files resims leave behind belong to at most this many namespaces.
-const RESIM_NAMESPACE_SLOTS: u32 = 256;
-
-/// The private iceoryx2 prefix of resim namespace slot `slot`.
-///
-/// The slot is rendered as exactly eight lowercase hex digits (every `u32`
-/// fits), so every resim prefix has the same length and none is a strict
-/// prefix of another: iceoryx2 lists a namespace's nodes by string-prefix
-/// match, and prefixes of different lengths would let one slot's listing reach
-/// another's files. One process at a time holds a slot, so two resims running
-/// at once never share a namespace.
-///
-/// Nothing the run records or reports carries this prefix: it names files, and
-/// a topic's iceoryx2 service identity is derived from the topic alone.
-#[must_use]
-pub fn resim_namespace_prefix(slot: u32) -> String {
-    format!("{RESIM_NAMESPACE_MARKER}{slot:08x}_")
-}
-
-/// The resim namespace slot whose [`resim_namespace_prefix`] `file_name`
-/// begins with.
-///
-/// `None` for every other name: other namespaces' files, and a slot's lock
-/// file (`cer_resim_{slot:08x}.lock`, no `_` after the digits).
-#[must_use]
-pub fn resim_namespace_slot(file_name: &str) -> Option<u32> {
-    let rest = file_name.strip_prefix(RESIM_NAMESPACE_MARKER)?;
-    let hex = rest.get(..8)?;
-    if !rest.get(8..)?.starts_with('_')
-        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return None;
-    }
-    u32::from_str_radix(hex, 16).ok()
-}
-
-/// The iceoryx2 config of resim namespace slot `slot`: `base` with the private
-/// [`resim_namespace_prefix`]. A resim passes the host's RESOLVED config
-/// (`Config::global_config()`), so an operator's iceoryx2 config file, its root
-/// path included, applies exactly as it does to a live run.
 fn resim_ix_config(
     base: &iceoryx2::config::Config,
     slot: u32,
 ) -> Result<iceoryx2::config::Config, ReplayError> {
-    use iceoryx2::prelude::{FileName, SemanticString};
-    let prefix = resim_namespace_prefix(slot);
-    let file_name = FileName::new(prefix.as_bytes()).map_err(|e| ReplayError::Internal {
-        reason: format!(
-            "cannot build the resim's private iceoryx2 prefix '{prefix}': iceoryx2 rejects it \
-             ({e:?})"
-        ),
-    })?;
-    let mut ix_config = base.clone();
-    ix_config.global.prefix = file_name;
-    Ok(ix_config)
+    resim_ix_config_inner(base, slot).map_err(|reason| ReplayError::Internal { reason })
 }
 
-/// The directory that holds this machine's shared-memory segment names:
-/// `/dev/shm` on Linux, and on macOS the directory of the state files iceoryx2
-/// keeps one per segment. Segment names do not depend on the iceoryx2 root, so
-/// every namespace with one prefix shares its segment names here, whatever root
-/// its config names. `None` where a resim does not walk segment names.
-#[cfg(target_os = "linux")]
-const SEGMENT_NAME_DIR: Option<&str> = Some("/dev/shm/");
-#[cfg(target_os = "macos")]
-const SEGMENT_NAME_DIR: Option<&str> = Some(crate::shm_state::SHM_STATE_DIRECTORY);
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const SEGMENT_NAME_DIR: Option<&str> = None;
-
-/// The directory a resim takes its slot lock in: [`SEGMENT_NAME_DIR`], or
-/// `base`'s iceoryx2 root where there is none.
-///
-/// The lock sits where a slot's segment names collide, so its exclusion covers
-/// every process that could share them: two resims whose iceoryx2 configs name
-/// different roots, and two containers that share `/dev/shm` but not `/tmp`,
-/// still take different slots, and a slot's reclaim never removes a segment a
-/// running resim uses.
-fn resim_slot_lock_dir(base: &iceoryx2::config::Config) -> PathBuf {
-    SEGMENT_NAME_DIR.map_or_else(
-        || PathBuf::from(String::from(base.global.root_path())),
-        PathBuf::from,
-    )
-}
-
-/// A resim namespace slot this process holds: its lock file stays open, and
-/// its exclusive `flock` held, until the value is dropped or the process
-/// ends, a crash included (the kernel releases the lock with the descriptor).
-#[derive(Debug)]
-struct ResimSlot {
-    slot: u32,
-    /// Kept only to hold the lock.
-    _lock: SlotLock,
-}
-
-/// A slot's lock file with its exclusive `flock` held, released on drop.
-///
-/// A `flock` lock belongs to the open file description, not to one
-/// descriptor. A child this process forks holds a copy of every descriptor
-/// until it execs, so closing the file alone would leave the lock held for as
-/// long as such a copy lives. Drop therefore unlocks the description first,
-/// which releases the lock whatever copies exist, and then closes the file.
-#[derive(Debug)]
-struct SlotLock(std::fs::File);
-
-impl Drop for SlotLock {
-    fn drop(&mut self) {
-        if let Err(error) = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock) {
-            tracing::warn!(
-                error = %error,
-                "replay: could not unlock a resim namespace slot before closing its lock file; \
-                 the slot stays held until every copy of the descriptor is closed"
-            );
-        }
-    }
-}
-
-/// Why a claim passed over a slot whose lock a running resim does not hold.
-#[derive(Debug)]
-enum SlotPassedOver {
-    /// Its lock file could not be opened or locked: the path and the error.
-    Lock(String),
-    /// The slot's private iceoryx2 config could not be built.
-    Config(String),
-    /// Its namespace did not reclaim clean: what the reclaim found, and
-    /// [`SlotReclaim::refusal`].
-    Reclaim {
-        reclaim: SlotReclaim,
-        reason: String,
-    },
-}
-
-impl std::fmt::Display for SlotPassedOver {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Lock(failure) => {
-                write!(f, "its lock file could not be opened or locked: {failure}")
-            }
-            Self::Config(reason) | Self::Reclaim { reason, .. } => f.write_str(reason),
-        }
-    }
-}
-
-/// Log one slot a claim passed over, through the claim's `latch`: the first
-/// at warn, the repeats at debug, and the slot that takes the count across a
-/// power of ten at warn again.
-fn log_passed_over_slot(
-    latch: &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
-    slot: u32,
-    passed: &SlotPassedOver,
-) {
-    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
-    let reclaim = match passed {
-        SlotPassedOver::Reclaim { reclaim, .. } => Some(reclaim),
-        SlotPassedOver::Lock(_) | SlotPassedOver::Config(_) => None,
-    };
-    let nodes_left = reclaim.and_then(|r| r.nodes_left.as_ref().ok().copied());
-    let cleanups = reclaim.map(|r| r.cleaned.cleanups);
-    let failed_cleanups = reclaim.map(|r| r.cleaned.failed_cleanups);
-    let deferred = reclaim.map(|r| r.cleaned.deferred);
-    let segments_failed = reclaim.map(|r| r.segments_failed);
-    match latch.on_failure() {
-        RegimeDecision::Loud => tracing::warn!(
-            slot,
-            nodes_left,
-            cleanups,
-            failed_cleanups,
-            deferred,
-            segments_failed,
-            error = %passed,
-            "replay: passed over a resim namespace slot whose lock could not be taken or whose \
-             namespace did not reclaim clean; the slot keeps its files and the resim tries the \
-             next one"
-        ),
-        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
-            slot,
-            nodes_left,
-            cleanups,
-            failed_cleanups,
-            deferred,
-            segments_failed,
-            total_failures = total,
-            suppressed,
-            error = %passed,
-            "replay: still passing over resim namespace slots"
-        ),
-        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
-            slot,
-            nodes_left,
-            cleanups,
-            failed_cleanups,
-            deferred,
-            segments_failed,
-            suppressed,
-            error = %passed,
-            "replay: passed over another resim namespace slot (suppressed)"
-        ),
-    }
-}
-
-/// Claim the lowest slot below `slots` whose lock file in `lock_dir`
-/// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
-/// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
-/// the lock is held.
-///
-/// A slot whose lock another process holds is skipped. A slot whose lock file
-/// cannot be opened or locked (another user's, say) or that `ready` refuses
-/// is passed over, its lock released (unlocked, then closed, see
-/// [`SlotLock`]), and logged through one
-/// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
-/// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
-/// suppressed repeats logs how many. With no slot left the claim is
-/// [`ReplayError::Internal`] (exit 5), naming the directory, the first failure
-/// to open or lock a file and the last slot `ready` refused, with its reason.
-fn claim_resim_slot(
+fn claim_and_reclaim_resim_slot(
+    base: &iceoryx2::config::Config,
     lock_dir: &Path,
-    slots: u32,
-    mut ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
-) -> Result<ResimSlot, ReplayError> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut latch = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
-    let mut first_failure: Option<String> = None;
-    let mut last_refusal: Option<(u32, SlotPassedOver)> = None;
-    for slot in 0..slots {
-        let path = lock_dir.join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|lock| {
-                match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-                {
-                    Ok(()) => Ok(Some(SlotLock(lock))),
-                    Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
-                    Err(e) => Err(format!("{}: {e}", path.display())),
-                }
-            });
-        let lock = match opened {
-            Ok(Some(lock)) => lock,
-            // Held by a running resim.
-            Ok(None) => continue,
-            Err(failure) => {
-                first_failure.get_or_insert_with(|| failure.clone());
-                log_passed_over_slot(&mut latch, slot, &SlotPassedOver::Lock(failure));
-                continue;
-            }
-        };
-        match ready(slot) {
-            Ok(()) => {
-                if let Some(suppressed) = latch.on_success() {
-                    tracing::info!(
-                        slot,
-                        suppressed,
-                        total_failures = latch.total_failures(),
-                        "replay: claimed a resim namespace slot after passing over others"
-                    );
-                }
-                return Ok(ResimSlot { slot, _lock: lock });
-            }
-            Err(passed) => {
-                log_passed_over_slot(&mut latch, slot, &passed);
-                last_refusal = Some((slot, passed));
-            }
-        }
-    }
-    Err(ReplayError::Internal {
-        reason: format!(
-            "no resim namespace slot is free: none of the {slots} slot locks in '{}' could be \
-             taken by this process (each is held by a running resim, could not be opened or \
-             locked, or its namespace did not reclaim clean){}{}",
-            lock_dir.display(),
-            first_failure
-                .map(|failure| format!("; the first that could not be opened or locked: {failure}"))
-                .unwrap_or_default(),
-            last_refusal
-                .map(|(slot, passed)| format!(
-                    "; the last whose namespace was refused: slot {slot}, {passed}"
-                ))
-                .unwrap_or_default()
-        ),
-    })
-}
-
-/// What reclaiming one slot's namespace found and did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SlotReclaim {
-    /// The dead-node sweep's counts.
-    cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup,
-    /// Nodes still registered after the sweep, or why the registry could not
-    /// be listed.
-    nodes_left: Result<u64, String>,
-    /// Leftover segments removed.
-    segments_removed: u64,
-    /// Leftover segments that could not be removed.
-    segments_failed: u64,
-}
-
-impl SlotReclaim {
-    /// Why a resim may not start on the slot, or `None` when it may: its
-    /// namespace holds no node, and every leftover segment the walk reached
-    /// was removed.
-    fn refusal(&self) -> Option<String> {
-        let cleaned = &self.cleaned;
-        match &self.nodes_left {
-            Err(error) => Some(format!(
-                "its namespace's node registry could not be listed after the dead-node sweep \
-                 ({error})"
-            )),
-            Ok(0) if self.segments_failed == 0 => None,
-            Ok(0) => Some(format!(
-                "leftover segments of its namespace that could not be removed: {}",
-                self.segments_failed
-            )),
-            Ok(left) => Some(format!(
-                "nodes still registered in its namespace after the dead-node sweep: {left} (the \
-                 sweep removed {}, failed on {} and deferred {}; it removes only the nodes of \
-                 processes that have ended and that this user can inspect)",
-                cleaned.cleanups, cleaned.failed_cleanups, cleaned.deferred
-            )),
-        }
-    }
-}
-
-/// Reclaim the namespace of a slot this process holds, within `budget`,
-/// before a resim starts on it.
-///
-/// A resim's iceoryx2 node lives as long as its process, so every resim
-/// leaves its node registered, and a killed one also leaves the services it
-/// held. The dead-node sweep removes those: their process is gone, so iceoryx2
-/// reads them dead, and only dead nodes are removed. Once no node is left,
-/// every segment in `segment_dir` named with the slot's prefix is removed too:
-/// whatever the sweep did not reach, and the namespace's iceoryx2 management
-/// segment, which iceoryx2 itself never removes. The caller holds the slot's
-/// lock, so no running resim uses any of them. A namespace that still holds a
-/// node keeps its segments. A walk the budget cuts short leaves the rest for
-/// the next resim on the slot.
-fn reclaim_resim_slot(
-    ix_config: &iceoryx2::config::Config,
-    slot: u32,
     segment_dir: Option<&Path>,
+    slots: u32,
     budget: Duration,
-) -> SlotReclaim {
-    // Startup hygiene only: the elapsed time bounds how long the reclaim may
-    // delay the resim and never reaches anything the run executes or reports.
-    let started = std::time::Instant::now();
-    let cleaned =
-        cerulion_core::transport::dead_node_sweep::cleanup_dead_nodes_bounded(ix_config, budget);
-    let mut nodes = 0u64;
-    let listed =
-        iceoryx2::node::Node::<iceoryx2::service::ipc_threadsafe::Service>::list(ix_config, |_| {
-            nodes += 1;
-            iceoryx2::prelude::CallbackProgression::Continue
-        });
-    let mut reclaim = SlotReclaim {
-        cleaned,
-        nodes_left: listed.map(|()| nodes).map_err(|e| e.to_string()),
-        segments_removed: 0,
-        segments_failed: 0,
-    };
-    if reclaim.nodes_left != Ok(0) {
-        return reclaim;
-    }
-    let Some(dir) = segment_dir else {
-        return reclaim;
-    };
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::warn!(
-                slot,
-                error = %error,
-                "replay: could not list the shared-memory segment names to reclaim a resim \
-                 namespace slot; its leftover segments stay until a later resim on the slot \
-                 lists them"
-            );
-            return reclaim;
-        }
-    };
-    for entry in entries.flatten() {
-        if started.elapsed() >= budget {
-            break;
-        }
-        if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
-            continue;
-        }
-        match remove_leftover_segment(&entry.path()) {
-            SegmentRemoval::Removed => reclaim.segments_removed += 1,
-            SegmentRemoval::NotASegment => {}
-            SegmentRemoval::Failed => reclaim.segments_failed += 1,
-        }
-    }
-    reclaim
-}
-
-/// What [`remove_leftover_segment`] did with one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentRemoval {
-    Removed,
-    /// Not a segment (a directory or a link, or on macOS anything but a state
-    /// file), so it was left alone.
-    NotASegment,
-    Failed,
-}
-
-/// Remove one leftover segment of a reclaimed namespace: a regular file, which
-/// on macOS is a state file and goes with the object it names
-/// ([`crate::shm_state::remove_unused_state_file`]).
-fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
-    let is_file = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
-    #[cfg(target_os = "macos")]
-    let is_segment = is_file
-        && path
-            .to_str()
-            .is_some_and(|p| p.ends_with(crate::shm_state::SHM_STATE_SUFFIX));
-    #[cfg(not(target_os = "macos"))]
-    let is_segment = is_file;
-    if !is_segment {
-        return SegmentRemoval::NotASegment;
-    }
-    #[cfg(target_os = "macos")]
-    let removed =
-        crate::shm_state::remove_unused_state_file(path, &crate::shm_state::LibcProbe).is_ok();
-    #[cfg(not(target_os = "macos"))]
-    let removed = std::fs::remove_file(path).is_ok();
-    if removed {
-        SegmentRemoval::Removed
-    } else {
-        SegmentRemoval::Failed
-    }
+) -> Result<ResimSlot, ReplayError> {
+    claim_and_reclaim_resim_slot_inner(base, lock_dir, segment_dir, slots, budget)
+        .map_err(|reason| ReplayError::Internal { reason })
 }
 
 /// The slot this process's resims run on: claimed, and its namespace
@@ -603,7 +178,7 @@ fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
 /// that one namespace, and a later resim never reclaims the namespace the
 /// transport is running on.
 ///
-/// A static is never dropped, so the claimed slot's [`SlotLock`] never runs its
+/// A static is never dropped, so the claimed slot's `SlotLock` never runs its
 /// unlock: the kernel releases the lock when the last copy of the descriptor
 /// closes, at process exit, or at the exec of a child forked just before it.
 static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
@@ -619,43 +194,58 @@ fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayErro
         return Ok(running.slot);
     }
     let budget = cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET;
-    // Startup hygiene only, as in `reclaim_resim_slot`.
-    let started = std::time::Instant::now();
     let lock_dir = resim_slot_lock_dir(base);
-    // The iceoryx2 root a fallback names may not exist before the first node;
-    // a directory that cannot be made fails the claim's first open, by name.
-    let _ = std::fs::create_dir_all(&lock_dir);
-    // Summed over every slot whose namespace the claim reclaimed.
-    let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
-    let claimed = claim_resim_slot(&lock_dir, RESIM_NAMESPACE_SLOTS, |slot| {
-        let ix_config =
-            resim_ix_config(base, slot).map_err(|e| SlotPassedOver::Config(e.to_string()))?;
-        let reclaim = reclaim_resim_slot(
-            &ix_config,
-            slot,
-            SEGMENT_NAME_DIR.map(Path::new),
-            budget.saturating_sub(started.elapsed()),
-        );
-        cleanups += reclaim.cleaned.cleanups;
-        deferred += reclaim.cleaned.deferred;
-        segments += reclaim.segments_removed;
-        total_failures += reclaim.cleaned.failed_cleanups + reclaim.segments_failed;
-        match reclaim.refusal() {
-            None => Ok(()),
-            Some(reason) => Err(SlotPassedOver::Reclaim { reclaim, reason }),
-        }
-    })?;
-    tracing::debug!(
-        slot = claimed.slot,
-        cleanups,
-        deferred,
-        segments,
-        total_failures,
-        "replay: claimed and reclaimed a resim namespace slot"
-    );
+    let claimed = claim_and_reclaim_resim_slot(
+        base,
+        &lock_dir,
+        resim_segment_dir(),
+        crate::resim_slots::RESIM_NAMESPACE_SLOTS,
+        budget,
+    )?;
     let slot = claimed.slot;
     *held = Some(claimed);
     Ok(slot)
+}
+
+/// Verify that the active replay transport is running on `expected` rather
+/// than another namespace (such as the shared `iox2_` namespace or a different
+/// resim slot).
+fn verify_resim_transport_prefix(running: &str, expected: &str) -> Result<(), ReplayError> {
+    if running != expected {
+        return Err(ReplayError::Internal {
+            reason: format!(
+                "the replay transport was already running on the iceoryx2 namespace '{running}' \
+                 instead of the resim's private '{expected}'; refusing to re-execute onto a \
+                 namespace other processes attach to"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn init_resim_transport_with_slot(
+    config: cerulion_core::TransportConfig,
+    base: &iceoryx2::config::Config,
+    slot: u32,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    let ix_config = resim_ix_config(base, slot)?;
+    let transport = TransportManager::init_with_config(config, ix_config)
+        .map_err(replay_transport_init_error)?;
+    let expected = resim_namespace_prefix(slot);
+    let running = transport.iox_config().global.prefix.to_string();
+    verify_resim_transport_prefix(&running, &expected)?;
+    Ok(transport)
+}
+
+/// Test seam for exercising the real `TransportManager` singleton prefix
+/// guard on an isolated iceoryx2 config without touching host slot locks.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn init_resim_transport_with_slot_for_test(
+    config: cerulion_core::TransportConfig,
+    base: &iceoryx2::config::Config,
+    slot: u32,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    init_resim_transport_with_slot(config, base, slot)
 }
 
 /// Start the process transport of a resim on the resim's private namespace.
@@ -680,21 +270,7 @@ fn init_resim_transport(
         cerulion_core::transport::TransportKind::CrossProcess => {
             let base = iceoryx2::config::Config::global_config();
             let slot = process_resim_slot(base)?;
-            let ix_config = resim_ix_config(base, slot)?;
-            let transport = TransportManager::init_with_config(config, ix_config)
-                .map_err(replay_transport_init_error)?;
-            let expected = resim_namespace_prefix(slot);
-            let running = transport.iox_config().global.prefix.to_string();
-            if running != expected {
-                return Err(ReplayError::Internal {
-                    reason: format!(
-                        "the replay transport was already running on the iceoryx2 namespace \
-                         '{running}' instead of the resim's private '{expected}'; refusing to \
-                         re-execute onto a namespace other processes attach to"
-                    ),
-                });
-            }
-            Ok(transport)
+            init_resim_transport_with_slot(config, base, slot)
         }
     }
 }
@@ -5503,11 +5079,19 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         transport,
         clock,
         mut factories,
+        drivers,
+        drivers_declared_by,
         schema_hashes,
         verdict_schemas_dir,
         resume,
-    } = build_replay_context(&config, nodes, || {
-        resolve_resume(
+    } = build_replay_context(&config, nodes, |factories| {
+        let candidate_drivers = external_node_ids(factories);
+        let (drivers, drivers_declared_by) = resolve_driver_set(
+            recorder.as_ref().and_then(|r| r.driver_stamp.as_ref()),
+            &candidate_drivers,
+        )
+        .map_err(|drifts| ReplayError::DriverSetDrift { drifts })?;
+        let resume = resolve_resume(
             &config,
             &trace,
             &node_ids,
@@ -5517,7 +5101,10 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             duration_bound_ns,
             coordination,
             every_stop_flagged,
-        )
+            kind_width,
+            &drivers,
+        )?;
+        Ok((drivers, drivers_declared_by, resume))
     })?;
     let skipped_prefix = resume
         .as_ref()
@@ -5571,18 +5158,11 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         Some(read) => read, // the resume path already read it (one read, one warn).
         None => read_record_coverage(&recorded_messages.reader),
     };
-    // The driver set: the recording's stamp when it carries one, and the
-    //    replayed build must declare exactly those drivers (a node it runs
-    //    the other way is refused here, exit 2, before any pass runs). A
-    //    recording made before the stamp takes the build's own declaration,
-    //    with one warn when that declares a driver, since nothing in the bag
-    //    can confirm the build runs those nodes the way the recording did.
-    let candidate_drivers = external_node_ids(&factories);
-    let (drivers, drivers_declared_by) = resolve_driver_set(
-        recorder.as_ref().and_then(|r| r.driver_stamp.as_ref()),
-        &candidate_drivers,
-    )
-    .map_err(|drifts| ReplayError::DriverSetDrift { drifts })?;
+    // The driver set was resolved above (once factories loaded, before the
+    // resume check, so driver-only topics are treated as recorded inputs there
+    // too). On a recording made before the driver stamp, emit the one warn when
+    // the build declares a driver, since nothing in the bag can confirm the
+    // build runs those nodes the way the recording did.
     if drivers_declared_by == DriverSetSource::ReplayedBuild && !drivers.is_empty() {
         tracing::warn!(
             graph = %config.identity(),
@@ -7665,11 +7245,13 @@ pub(crate) fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
 
 /// The graph-produced topics a resumed replay re-executes: every topic of
 /// `produced` except one whose every in-graph producer the checkpoint states
-/// as stopped, since its publishers never publish again in the replay.
+/// as stopped or is an external (driver) node, since those publishers never
+/// publish again in the replay.
 fn reexecuted_topics(
     config: &GraphConfig,
     produced: &[String],
     stops: &AnchorStops,
+    drivers: &BTreeSet<String>,
 ) -> Vec<String> {
     produced
         .iter()
@@ -7680,7 +7262,7 @@ fn reexecuted_topics(
                         == **topic
                 })
             });
-            producers.any(|node| !stops.is_stopped(&node.id))
+            producers.any(|node| !stops.is_stopped(&node.id) && !drivers.contains(&node.id))
         })
         .cloned()
         .collect()
@@ -7817,6 +7399,10 @@ struct AnchorFrameScan {
     /// The `sequence` of the first frame stamped strictly ABOVE the anchor
     /// clock — rung (ii) when the tie band is empty or entirely pre-anchor.
     first_seq_above: Option<u32>,
+    /// The `sequence` of that first frame strictly above the anchor clock when
+    /// it carried a readable wire header (`None` when a headerless frame ended
+    /// the walk early, so headerless frames still reach consistency check 3).
+    first_headered_seq_above: Option<u32>,
 }
 
 /// Walk the recorded user frames ONCE and place each named topic's frames
@@ -8511,6 +8097,7 @@ fn scan_frames_around_anchor(
                 std::cmp::Ordering::Equal => entry.at_anchor.push(header.sequence),
                 std::cmp::Ordering::Greater => {
                     entry.first_seq_above = Some(header.sequence);
+                    entry.first_headered_seq_above = Some(header.sequence);
                     break;
                 }
             }
@@ -8813,6 +8400,126 @@ fn last_replayed_step(
     Ok(last)
 }
 
+/// For each candidate single-writer re-executed topic whose first held headered
+/// frame sits strictly above the anchor clock (with no frame at or before
+/// resume), scan `RECORD_TYPE_READ_OUTCOME` records in
+/// `[first_step ..= executed_through]` and return the earliest
+/// `(step, sequence)` that a consumer popped on that topic strictly preceding
+/// that topic's first held sequence (wrap-aware).
+///
+/// An unmarked `FIRE` record carries no per-output publish bit (a lazy output
+/// left unwritten or a tick returning an error before loaning leaves the
+/// discard bit clear and consumes no sequence), so only recording evidence of
+/// an actual earlier frame on that topic can establish a late start before
+/// step 1. When no candidate topic has a consumer or the trace manifest carries
+/// no input table, returns an empty map and defers.
+fn earliest_missing_reads_for_topics(
+    config: &GraphConfig,
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    kind_width: KindFieldWidth,
+    first_step: u64,
+    executed_through: Option<u64>,
+    candidates: &BTreeMap<String, u32>,
+) -> Result<BTreeMap<String, (u64, u32)>, ReplayError> {
+    if candidates.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let Some(last_step) = executed_through else {
+        return Ok(BTreeMap::new());
+    };
+    let Ok((recorded_inputs, _, _)) = load_recorded_input_tables(trace) else {
+        return Ok(BTreeMap::new());
+    };
+    if recorded_inputs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut edge_topic: std::collections::HashMap<(&str, &str), (&str, u32)> =
+        std::collections::HashMap::new();
+    for node in &config.nodes {
+        for input in &node.inputs {
+            let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
+            if let Some((cand_topic, &first_seq)) = candidates.get_key_value(&topic) {
+                edge_topic.insert(
+                    (node.id.as_str(), input.name.as_str()),
+                    (cand_topic.as_str(), first_seq),
+                );
+            }
+        }
+    }
+    if edge_topic.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut out: BTreeMap<String, (u64, u32)> = BTreeMap::new();
+    trace.for_each(|rec| {
+        if rec.record_type != RECORD_TYPE_READ_OUTCOME
+            || rec.step < first_step
+            || rec.step > last_step
+        {
+            return Ok(());
+        }
+        let Some(node_id) = rank_tables
+            .get(rec.rank() as usize)
+            .and_then(|table| table.get(rec.node_idx as usize))
+        else {
+            return Ok(());
+        };
+        let (input_idx, kind_wire, _) = decode_read_outcome_meta(rec.global_level, kind_width);
+        let Some(input_name) = recorded_inputs
+            .get(node_id.as_ref())
+            .and_then(|names| names.get(input_idx as usize))
+        else {
+            return Ok(());
+        };
+        let Some(&(topic, first_seq)) = edge_topic.get(&(node_id.as_ref(), input_name.as_str()))
+        else {
+            return Ok(());
+        };
+        let candidate_seq = match read_outcome_kind_from_wire(kind_wire) {
+            Some(ReadOutcomeKind::Served | ReadOutcomeKind::BatchFrame) => {
+                if rec.fire_time_ns == READ_OUTCOME_NO_FRAME {
+                    return Ok(());
+                }
+                let Ok(seq) = u32::try_from(rec.fire_time_ns) else {
+                    return Ok(());
+                };
+                seq
+            }
+            Some(ReadOutcomeKind::DrainedBatch) => {
+                if rec.fire_time_ns == READ_OUTCOME_NO_FRAME {
+                    return Ok(());
+                }
+                let Ok(newest) = u32::try_from(rec.fire_time_ns) else {
+                    return Ok(());
+                };
+                let popped = unpack_read_outcome_popped(rec.duration_ns);
+                if popped > 1 && popped < (1u32 << 31) {
+                    newest.wrapping_sub(popped - 1)
+                } else {
+                    newest
+                }
+            }
+            _ => return Ok(()),
+        };
+        if wire_sequence_precedes(candidate_seq, first_seq) {
+            out.entry(topic.to_string())
+                .and_modify(|(prev_step, prev_seq)| {
+                    if rec.step < *prev_step
+                        || (rec.step == *prev_step
+                            && wire_sequence_precedes(candidate_seq, *prev_seq))
+                    {
+                        *prev_step = rec.step;
+                        *prev_seq = candidate_seq;
+                    }
+                })
+                .or_insert((rec.step, candidate_seq));
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// Decide what this recording's replay must do before its first step.
 ///
 /// `Ok(None)` is the from-start answer and the overwhelmingly common one.
@@ -8853,6 +8560,8 @@ fn resolve_resume(
     duration_bound_ns: Option<u64>,
     coordination: CoordinationMode,
     every_stop_flagged: bool,
+    kind_width: KindFieldWidth,
+    drivers: &BTreeSet<String>,
 ) -> Result<Option<ResumePlan>, ReplayError> {
     let Some(first) = first_recorded_boundary(trace)? else {
         return Ok(None); // no boundaries at all — the existing refusal owns it.
@@ -8917,11 +8626,12 @@ fn resolve_resume(
     // records over their union: which nodes the replay EXECUTES (the
     // required set), and how many frames the steps sharing the first boundary's
     // target COMMITTED (the tie-band split below).
+    let executed_through = last_replayed_step(trace, duration_bound_ns)?;
     let fires = scan_suffix_fires(
         trace,
         &rank_tables,
         first.step,
-        last_replayed_step(trace, duration_bound_ns)?,
+        executed_through,
         last_step_at_target(trace, anchor_clock_ns)?,
     )?;
     let run_id = crate::replay_state::resolve_run_at(&anchors, anchor_step)
@@ -8976,10 +8686,11 @@ fn resolve_resume(
     // A re-executed topic whose recording is lossy cannot have its
     // sequence derived, and a seed off by one is a byte mismatch on EVERY
     // subsequent frame that reads to an operator as "my node changed". A
-    // topic only stopped nodes produce is not re-executed: its publishers
-    // never publish again, so it is neither refused for a loss nor seeded.
+    // topic only stopped or external (driver) nodes produce is not
+    // re-executed: its publishers never publish again, so it is neither
+    // refused for a loss nor seeded.
     let produced = graph_produced_topics(config);
-    let reexecuted = reexecuted_topics(config, &produced, &stops);
+    let reexecuted = reexecuted_topics(config, &produced, &stops, drivers);
     let losses = collect_topic_losses(record_health, coverage);
     refuse_lossy_reexecuted_topics(&reexecuted, &losses).map_err(|refusal| {
         ReplayError::StateRestore {
@@ -9046,18 +8757,45 @@ fn resolve_resume(
         s.at_anchor.len().saturating_sub(committed)
     };
 
+    let mut late_candidates = BTreeMap::new();
+    if !fires.unresolved_fire {
+        for topic in &reexecuted {
+            if config.is_multi_publisher(topic) {
+                continue;
+            }
+            let Some(s) = scan.get(topic) else {
+                continue;
+            };
+            if s.last_seq_below.is_some() || !s.at_anchor.is_empty() {
+                continue;
+            }
+            if let Some(first_seq) = s.first_headered_seq_above {
+                late_candidates.insert(topic.clone(), first_seq);
+            }
+        }
+    }
+    let missing_reads = earliest_missing_reads_for_topics(
+        config,
+        trace,
+        &rank_tables,
+        kind_width,
+        first.step,
+        executed_through,
+        &late_candidates,
+    )?;
+
     let mut seeds = BTreeMap::new();
     let mut seed_rungs = Vec::new();
     for topic in &reexecuted {
-        let evidence = scan
-            .get(topic)
+        let topic_scan = scan.get(topic);
+        let cut = topic_scan.map_or(0, |s| tie_deduction(topic, s));
+        let evidence = topic_scan
             .map(|s| {
                 // The seed reads the split, not the raw bands: a tie-band frame
                 // the deduction moved to the prefix is the LAST pre-anchor
                 // frame, and seeding from the one below it would start the
                 // re-executed publisher a whole band too low — a byte mismatch
                 // on every frame it goes on to publish.
-                let cut = tie_deduction(topic, s);
                 SeedEvidence {
                     last_at_or_before_anchor: if cut > 0 {
                         s.at_anchor.get(cut - 1).copied()
@@ -9080,6 +8818,22 @@ fn resolve_resume(
         } else {
             TopicWriters::SingleWriter
         };
+        if !fires.unresolved_fire {
+            let has_frame_at_or_before_resume = evidence.last_at_or_before_anchor.is_some()
+                || topic_scan.is_some_and(|s| s.at_anchor.get(cut).is_some());
+            let first_recorded_sequence = topic_scan.and_then(|s| s.first_headered_seq_above);
+            check_first_frame_covers_resume(
+                topic,
+                writers,
+                first.step,
+                missing_reads.get(topic).copied(),
+                first_recorded_sequence,
+                has_frame_at_or_before_resume,
+            )
+            .map_err(|refusal| ReplayError::StateRestore {
+                reason: refusal.to_string(),
+            })?;
+        }
         let seed = seed_publisher_sequence(topic, writers, &evidence).map_err(|refusal| {
             ReplayError::StateRestore {
                 reason: refusal.to_string(),
@@ -10033,6 +9787,11 @@ struct ReplayContext {
     /// — `plan_ranks` refuses a bag that says otherwise), so the map partitions
     /// cleanly across the passes with no clone and no second load.
     factories: IndexMap<String, Box<dyn NodeEntry>>,
+    /// The graph's resolved `external` (driver) node ids.
+    drivers: BTreeSet<String>,
+    /// Where [`Self::drivers`] came from (the recording's stamp or the
+    /// replayed build's declarations).
+    drivers_declared_by: DriverSetSource,
     /// The workspace schema hashes on the CLI path; `None` on the test seam.
     schema_hashes: Option<std::collections::HashMap<String, u64>>,
     /// The workspace `schemas/` directory a byte-mismatch verdict decodes
@@ -10081,10 +9840,16 @@ fn replay_transport_init_error(e: cerulion_core::TransportError) -> ReplayError 
 /// transport state exists), then the resume plan resolves, then the transport
 /// is minted and seeded. The graph BUILD is not part of it: it happens
 /// per pass and strictly after the boundary gate.
+#[allow(clippy::type_complexity)]
 fn build_replay_context(
     config: &GraphConfig,
     nodes: ReplayNodes,
-    resolve_resume: impl FnOnce() -> Result<Option<ResumePlan>, ReplayError>,
+    resolve_drivers_and_resume: impl FnOnce(
+        &IndexMap<String, Box<dyn NodeEntry>>,
+    ) -> Result<
+        (BTreeSet<String>, DriverSetSource, Option<ResumePlan>),
+        ReplayError,
+    >,
 ) -> Result<ReplayContext, ReplayError> {
     match nodes {
         ReplayNodes::Cdylib {
@@ -10098,9 +9863,10 @@ fn build_replay_context(
             let factories =
                 crate::graph_cmd::load_node_factories(&workspace_root, config, prefer_release)
                     .map_err(node_load_error)?;
-            // The resume plan: after the load (so `NodeLoad` keeps precedence),
-            // before the transport (so its seeds reach publisher creation).
-            let resume = resolve_resume()?;
+            // Driver set and resume plan: after the load (so `NodeLoad` keeps
+            // precedence), before the transport (so seeds reach publisher
+            // creation and driver-only topics stay excluded from resume).
+            let (drivers, drivers_declared_by, resume) = resolve_drivers_and_resume(&factories)?;
             let clock = Arc::new(VirtualClock::new());
             // On the resim's PRIVATE namespace (`init_resim_transport`), so no
             // live graph, recorder or network daemon on this host receives
@@ -10129,6 +9895,8 @@ fn build_replay_context(
                 transport,
                 clock,
                 factories,
+                drivers,
+                drivers_declared_by,
                 schema_hashes: Some(schema_hashes),
                 verdict_schemas_dir: Some(workspace_root.join("schemas")),
                 resume,
@@ -10142,7 +9910,7 @@ fn build_replay_context(
             // The test seam has no load step, so there is no `NodeLoad` for the
             // resolution to pre-empt — the ordering constraint above is vacuous
             // here and only the before-the-build half applies.
-            let resume = resolve_resume()?;
+            let (drivers, drivers_declared_by, resume) = resolve_drivers_and_resume(&factories)?;
             if let Some(plan) = resume.as_ref() {
                 if !plan.seeds.is_empty() {
                     transport.set_replay_sequence_seeds(plan.seeds.clone());
@@ -10152,6 +9920,8 @@ fn build_replay_context(
                 transport,
                 clock,
                 factories,
+                drivers,
+                drivers_declared_by,
                 schema_hashes: None,
                 verdict_schemas_dir: None,
                 resume,
@@ -35934,6 +35704,7 @@ mod recorder_info_version_tests {
                 })
                 .collect(),
         };
+        let no_drivers = BTreeSet::new();
         for (nodes, kept) in [
             (&[][..], &["/mp/bus", "/mp/solo/out"][..]),
             (&["alpha"][..], &["/mp/bus", "/mp/solo/out"][..]),
@@ -35942,9 +35713,30 @@ mod recorder_info_version_tests {
             (&["alpha", "beta", "solo"][..], &[][..]),
         ] {
             assert_eq!(
-                reexecuted_topics(&config, &produced, &stopped(nodes)),
+                reexecuted_topics(&config, &produced, &stopped(nodes), &no_drivers),
                 kept.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
                 "stopped {nodes:?}"
+            );
+        }
+        let drivers_of = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|s| (*s).to_string()).collect()
+        };
+        for (stopped_nodes, driver_nodes, kept) in [
+            (&[][..], &["solo"][..], &["/mp/bus"][..]),
+            (&[][..], &["alpha"][..], &["/mp/bus", "/mp/solo/out"][..]),
+            (&[][..], &["alpha", "beta"][..], &["/mp/solo/out"][..]),
+            (&["beta"][..], &["alpha"][..], &["/mp/solo/out"][..]),
+            (&[][..], &["alpha", "beta", "solo"][..], &[][..]),
+        ] {
+            assert_eq!(
+                reexecuted_topics(
+                    &config,
+                    &produced,
+                    &stopped(stopped_nodes),
+                    &drivers_of(driver_nodes),
+                ),
+                kept.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                "stopped {stopped_nodes:?}, drivers {driver_nodes:?}"
             );
         }
     }
@@ -43270,9 +43062,13 @@ mod unlisted_macro_output_tests {
 #[cfg(test)]
 mod resim_namespace_tests {
     use super::{
-        claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
-        resim_namespace_slot, ResimSlot, SlotLock, SlotPassedOver, SlotReclaim,
-        RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+        claim_and_reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
+        resim_namespace_slot, verify_resim_transport_prefix, ReplayError, ResimSlot,
+        RESIM_NAMESPACE_MARKER,
+    };
+    use crate::resim_slots::{
+        check_slot_lock_owner, reclaim_resim_slot, SlotLock, SlotPassedOver, SlotReclaim,
+        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
@@ -43282,6 +43078,15 @@ mod resim_namespace_tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    fn claim_resim_slot(
+        lock_dir: &Path,
+        slots: u32,
+        ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
+    ) -> Result<ResimSlot, ReplayError> {
+        crate::resim_slots::claim_resim_slot(lock_dir, slots, ready)
+            .map_err(|reason| ReplayError::Internal { reason })
+    }
 
     /// What the child below prints once it holds its node and publisher.
     const CHILD_READY: &str = "resim slot child holds a publisher";
@@ -43532,6 +43337,7 @@ mod resim_namespace_tests {
             nodes_left: Ok(left),
             segments_removed: 0,
             segments_failed: 0,
+            first_segment_error: None,
         }
     }
 
@@ -43574,11 +43380,25 @@ mod resim_namespace_tests {
         let stuck = SlotReclaim {
             segments_removed: 1,
             segments_failed: 2,
-            ..clean
+            ..clean.clone()
         };
         assert_eq!(
             stuck.refusal().as_deref(),
             Some("leftover segments of its namespace that could not be removed: 2")
+        );
+
+        let stuck_with_cause = SlotReclaim {
+            segments_removed: 1,
+            segments_failed: 2,
+            first_segment_error: Some("/tmp/seg.shm_state: EACCES".to_string()),
+            ..clean
+        };
+        assert_eq!(
+            stuck_with_cause.refusal().as_deref(),
+            Some(
+                "leftover segments of its namespace that could not be removed: 2 (first error: \
+                 /tmp/seg.shm_state: EACCES)"
+            )
         );
     }
 
@@ -44006,6 +43826,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(0),
                 segments_removed: 0,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert_eq!(untouched.refusal(), None);
@@ -44028,6 +43849,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(0),
                 segments_removed: 2,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert_eq!(reclaimed.refusal(), None);
@@ -44054,6 +43876,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(0),
                 segments_removed: 0,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert_eq!(reclaimed.refusal(), None);
@@ -44111,6 +43934,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(1),
                 segments_removed: 0,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert!(held.refusal().is_some());
@@ -44200,6 +44024,170 @@ mod resim_namespace_tests {
         assert_eq!(reclaimed.nodes_left, Ok(0));
         assert_eq!(reclaimed.refusal(), None);
         assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+
+    #[test]
+    fn claim_refuses_symlink_lock_file_and_moves_to_next_slot() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, b"untouched").expect("write victim");
+        let link = dir.path().join("cer_resim_00000000.lock");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink at slot 0");
+
+        // With 1 slot, the refusal names the symlink path.
+        let err = claim_resim_slot(dir.path(), 1, |_| Ok(())).expect_err("symlink refuses slot 0");
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string().contains(&link.display().to_string()),
+            "error must name the symlink lock path: {err}"
+        );
+
+        // With >1 slot, slot 0 is passed over and slot 1 is claimed.
+        let claimed = claim_resim_slot(dir.path(), 4, |_| Ok(())).expect("slot 1 is claimed");
+        assert_eq!(claimed.slot, 1, "symlink at slot 0 must be passed over");
+        assert_eq!(
+            std::fs::read(&target).expect("read victim"),
+            b"untouched",
+            "victim file must not be touched"
+        );
+    }
+
+    #[test]
+    fn claim_refuses_foreign_owned_lock_file() {
+        let path = Path::new("/tmp/cer_resim_00000000.lock");
+        assert_eq!(check_slot_lock_owner(path, 1000, 1000), Ok(()));
+        let err = check_slot_lock_owner(path, 0, 1000).expect_err("foreign uid refused");
+        assert!(err.contains("/tmp/cer_resim_00000000.lock"), "{err}");
+        assert!(err.contains("uid 0"), "{err}");
+        assert!(err.contains("uid 1000"), "{err}");
+        // Determinism: repeated calls produce identical error text.
+        assert_eq!(
+            check_slot_lock_owner(path, 0, 1000),
+            Err(err),
+            "owner predicate must be deterministic"
+        );
+    }
+
+    #[test]
+    fn reclaim_preserves_first_segment_removal_error_text() {
+        let root = IsolatedRoot::mint("rslotsegerr");
+        let slot = unclaimable_slot(4);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let bad = segments
+            .path()
+            .join(format!("{}bad.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&bad, b"../not-four-segments").expect("write unparsable state file");
+
+        #[cfg(not(target_os = "macos"))]
+        let _restore_perms = {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_path = segments.path().to_path_buf();
+            std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o555))
+                .expect("make segment dir read-only");
+            struct Restore(PathBuf);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            Restore(dir_path)
+        };
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(reclaimed.segments_failed, 1);
+            let refusal = reclaimed.refusal().expect("failed segment refuses slot");
+            assert!(
+                refusal.contains("NotFourSegments"),
+                "refusal must quote the first segment removal error: {refusal}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        if cerulion_hygiene::euid() != 0 {
+            assert_eq!(reclaimed.segments_failed, 1);
+            let refusal = reclaimed.refusal().expect("failed segment refuses slot");
+            assert!(
+                refusal.contains("first error:") && refusal.contains(&bad.display().to_string()),
+                "refusal must quote the first segment removal error: {refusal}"
+            );
+        }
+        let _ = reclaimed;
+    }
+
+    #[test]
+    fn claim_and_reclaim_composition_works_with_injected_dirs() {
+        let root = IsolatedRoot::mint("rslotcomp");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let prefix0 = resim_namespace_prefix(0);
+        let leftover = segments.path().join(format!("{prefix0}leftover.shm_state"));
+        std::fs::write(&leftover, b"").expect("plant leftover slot 0 segment");
+
+        let first = claim_and_reclaim_resim_slot(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            4,
+            Duration::from_secs(10),
+        )
+        .expect("first claim succeeds");
+        assert_eq!(first.slot, 0);
+        assert!(
+            !leftover.exists(),
+            "first claim must reclaim slot 0's leftover segment"
+        );
+        drop(first);
+
+        // Second claim deterministically reuses slot 0 and reclaims a new leftover.
+        let leftover2 = segments
+            .path()
+            .join(format!("{prefix0}leftover2.shm_state"));
+        std::fs::write(&leftover2, b"").expect("plant second leftover slot 0 segment");
+        let second = claim_and_reclaim_resim_slot(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            4,
+            Duration::from_secs(10),
+        )
+        .expect("second claim succeeds");
+        assert_eq!(second.slot, 0);
+        assert!(
+            !leftover2.exists(),
+            "second claim must reclaim slot 0's leftover segment"
+        );
+    }
+
+    #[test]
+    fn init_resim_transport_refuses_wrong_running_prefix() {
+        let expected = resim_namespace_prefix(0);
+        assert!(verify_resim_transport_prefix(&expected, &expected).is_ok());
+
+        for wrong in ["iox2_", &resim_namespace_prefix(1)] {
+            let err = verify_resim_transport_prefix(wrong, &expected)
+                .expect_err("wrong running prefix must be refused");
+            assert_eq!(err.exit_code(), 5);
+            let text = err.to_string();
+            assert!(
+                text.contains(wrong) && text.contains(&expected),
+                "refusal must name both prefixes; got: {text}"
+            );
+            assert_eq!(
+                verify_resim_transport_prefix(wrong, &expected)
+                    .unwrap_err()
+                    .to_string(),
+                text,
+                "prefix refusal must be deterministic"
+            );
+        }
     }
 }
 

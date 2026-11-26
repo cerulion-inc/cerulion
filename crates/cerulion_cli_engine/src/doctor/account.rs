@@ -3,18 +3,20 @@
 //!
 //! Reads `auth.json` under the Cerulion config directory with
 //! [`crate::auth::load_from`] and classifies it with [`crate::auth::local_gate`],
-//! the same classification the login gate in front of every command makes.
-//! Reaches no network and refreshes nothing. The account id is not printed.
+//! the same classification the login gate in front of account and remote-robot
+//! commands makes. Reaches no network and refreshes nothing. The account id is
+//! not printed.
 
 use super::{Check, Context, Outcome, Reading, Status};
 use crate::auth::{LoadedAuth, LocalGate};
 
 pub(super) const LOGIN: Check = Check {
     id: "account.login",
-    why: "every cerulion command except login, logout, clean, completions, telemetry and \
-          doctor runs only on a machine that has signed in; on a machine that never has, or \
-          that signed out, a command started from a terminal first runs the sign-in and one \
-          started elsewhere is refused with exit 7.",
+    why: "commands that call the Cerulion account service or authenticate to remote robots \
+          require a signed-in machine; local and offline commands work without signing in. \
+          On a machine that never signed in, or that signed out, an account or remote-robot \
+          command started from a terminal first runs the sign-in and one started elsewhere is \
+          refused with exit 7.",
     network: false,
     run,
 };
@@ -36,15 +38,19 @@ pub(super) fn decide(path: Option<&str>, loaded: &LoadedAuth, now_ns: u64) -> Ou
     }
     let outcome = match crate::auth::local_gate(loaded, now_ns) {
         LocalGate::RefuseNeverLoggedIn => Outcome::new(
-            Status::Fail,
-            format!("this machine has never signed in (no session in {path})"),
-        )
-        .with_fix("run `cerulion login`"),
+            Status::Info,
+            format!(
+                "this machine has never signed in (no session in {path}); local commands work \
+                 offline, run `cerulion login` for account and remote-robot commands"
+            ),
+        ),
         LocalGate::RefuseSignedOut => Outcome::new(
-            Status::Fail,
-            format!("this machine is signed out ({path} keeps no session)"),
-        )
-        .with_fix("run `cerulion login`"),
+            Status::Info,
+            format!(
+                "this machine is signed out ({path} keeps no session); local commands work \
+                 offline, run `cerulion login` for account and remote-robot commands"
+            ),
+        ),
         LocalGate::ProceedValidSession => {
             let left_s = loaded.state().map_or(0, |s| {
                 s.expires_at_ns.saturating_sub(now_ns) / 1_000_000_000
@@ -187,16 +193,18 @@ mod tests {
     }
 
     #[test]
-    fn never_signed_in_fails_with_login() {
+    fn never_signed_in_reports_info_and_names_login() {
         for loaded in [LoadedAuth::Absent, state(NOW + 1, false)] {
             let o = decide(Some(PATH), &loaded, NOW);
-            assert_eq!(o.status, Status::Fail);
-            assert_eq!(o.fix.as_deref(), Some("run `cerulion login`"));
+            assert_eq!(o.status, Status::Info);
+            assert!(o.summary.contains("never signed in"), "{}", o.summary);
+            assert!(o.summary.contains("cerulion login"), "{}", o.summary);
+            assert_eq!(o.fix, None);
         }
     }
 
     #[test]
-    fn signed_out_fails_with_its_own_line() {
+    fn signed_out_reports_info_with_its_own_line() {
         let o = decide(
             Some(PATH),
             &LoadedAuth::SignedOut {
@@ -205,8 +213,10 @@ mod tests {
             },
             NOW,
         );
-        assert_eq!(o.status, Status::Fail);
-        assert!(o.summary.contains("signed out"));
+        assert_eq!(o.status, Status::Info);
+        assert!(o.summary.contains("signed out"), "{}", o.summary);
+        assert!(o.summary.contains("cerulion login"), "{}", o.summary);
+        assert_eq!(o.fix, None);
     }
 
     #[test]

@@ -101,4 +101,3 @@ Built-in ROS 2 messages: 254 in 22 packages
     UVCoordinate
 
 --- stderr
-<TS> DEBUG ThreadId(01) cerulion_cli_engine::login_cmd: crates/cerulion_cli_engine/src/login_cmd.rs:<LINE>: the login gate is switched off for this run env="CERULION_LOGIN_GATE"

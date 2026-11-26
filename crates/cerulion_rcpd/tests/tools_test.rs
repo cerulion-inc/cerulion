@@ -1,167 +1,123 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The tool surface through an in-process MCP client, against a stand-in graph
-//! thread that answers the journaled calls.
+//! thread that answers the journaled calls: the hand-written event/effect
+//! vectors of [`oracle`] run against the `ToolHost` daemon, beside plain tests
+//! of the state, audit and scope paths.
 //!
 //! Transport isolation is per test (`init_for_test` SHM roots, unique topics),
 //! so the tests run in parallel.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+mod oracle;
 
-use cerulion_core::message::ShmMessage;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
+
 use cerulion_core::wire::MaxSliceLen;
-use cerulion_core::{TransportConfig, TransportManager};
+use cerulion_core::TransportManager;
 use cerulion_rcpd::journal::Journal;
-use cerulion_rcpd::manifest::{LoadedManifest, RcpManifest};
+use cerulion_rcpd::manifest::LoadedManifest;
 use cerulion_rcpd::observer::GraphSource;
 use cerulion_rcpd::server::RcpServer;
-use cerulion_rcpd::tools::{latch_path, ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL, ESTOP_TOOL};
+use cerulion_rcpd::tools::{ReceiptLock, ToolHost, ESTOP_CLEAR_TOOL, ESTOP_TOOL};
 use cerulion_rcpd::RcpdError;
-use native_ros2_messages::std_msgs::String as RosString;
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ResourceContents,
-};
-use rmcp::service::RunningService;
-use rmcp::{RoleClient, ServiceExt};
+use oracle::{manager, manifest, publish_json, unique};
+use rmcp::model::{ReadResourceRequestParams, ResourceContents};
+use rmcp::ServiceExt;
 use serde_json::{json, Value};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
 static REMOTE_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn unique(tag: &str) -> String {
-    format!(
-        "rcpd_tools_{tag}_{}_{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+/// The `ToolHost` daemon for the vectors: a `ToolHost` behind `RcpServer`,
+/// built as the binary builds it.
+struct ToolHostDaemon {
+    receipts: PathBuf,
 }
 
-fn manager(tag: &str) -> Arc<TransportManager> {
-    TransportManager::init_for_test(
-        TransportConfig {
-            node_name: unique(tag),
-            ..Default::default()
-        },
-        cerulion_core::testing::iceoryx_test_config(),
-    )
-    .expect("init isolated transport manager")
-}
-
-/// A manifest on topics private to this test: three reversible tools
-/// (`arm.slow` is answered late, `arm.mute` never), one read tool, one
-/// irreversible tool, one state topic.
-fn manifest(dir: &Path, prefix: &str) -> LoadedManifest {
-    manifest_with(dir, prefix, "")
-}
-
-/// [`manifest`] with `extra` (top-level YAML, such as a `limits` section)
-/// appended.
-fn manifest_with(dir: &Path, prefix: &str, extra: &str) -> LoadedManifest {
-    let step = |name: &str, timeout_ms: u32| {
-        format!(
-            "  - name: {name}
-    description: one period
-    safety_class: reversible
-    timeout_ms: {timeout_ms}
-    input_schema:
-      type: object
-      properties:
-        q: {{ type: array, items: {{ type: number }}, minItems: 2, maxItems: 2 }}
-      required: [q]
-"
-        )
-    };
-    let yaml = format!(
-        "robot: tools_fixture
-journal:
-  calls_topic: /{prefix}/calls
-  results_topic: /{prefix}/results
-state:
-  - name: arm
-    topic: /{prefix}/state
-tools:
-{}{}{}  - name: arm.peek
-    description: read only
-    safety_class: read
-    input_schema: {{ type: object, properties: {{}} }}
-  - name: arm.cut
-    description: cut the cable
-    safety_class: irreversible
-    input_schema: {{ type: object, properties: {{}} }}
-{extra}",
-        step("arm.step", 3000),
-        step("arm.slow", 3000),
-        step("arm.mute", 300),
-    );
-    let path = dir.join("rcp.yaml");
-    std::fs::write(&path, yaml).expect("write manifest");
-    RcpManifest::load_full(&path).expect("load manifest")
-}
-
-fn publish_json(publisher: &mut cerulion_core::CerulionPublisher, value: &Value) {
-    let mut proxy = publisher.loan_proxy::<RosString>().expect("loan");
-    proxy.set_data(&value.to_string()).expect("set");
-}
-
-/// Answers every call frame, oldest first, with `{call_id, tool, ok, n}` on
-/// the results topic followed by a decoy answer to no call (`call_id` 0), and
-/// publishes `{"n": n}` on the state topic. `arm.slow` is answered after
-/// 1.5 s; `arm.mute` never. Returns the calls seen once `stop` is set.
-fn spawn_graph(
-    mgr: Arc<TransportManager>,
-    prefix: String,
-    stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<Vec<Value>> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let calls = mgr
-            .create_subscriber(&format!("/{prefix}/calls"))
-            .expect("calls subscriber");
-        let mut results = mgr
-            .create_publisher_simple(&format!("/{prefix}/results"), MaxSliceLen::const_new(4096))
-            .expect("results publisher");
-        let mut state = mgr
-            .create_publisher_simple(&format!("/{prefix}/state"), MaxSliceLen::const_new(4096))
-            .expect("state publisher");
-        ready_tx.send(()).expect("ready");
-        let mut seen: Vec<Value> = Vec::new();
-        while !stop.load(Ordering::Relaxed) {
-            let mut batch = Vec::new();
-            calls
-                .try_receive(|m| {
-                    let text = RosString::build_reader(m.payload())
-                        .data()
-                        .expect("utf-8")
-                        .to_owned();
-                    batch.push(serde_json::from_str::<Value>(&text).expect("call is JSON"));
-                })
-                .expect("receive");
-            if batch.is_empty() {
-                std::thread::sleep(Duration::from_millis(1));
-                continue;
+impl oracle::Daemon for ToolHostDaemon {
+    fn boot(
+        mgr: &Arc<TransportManager>,
+        manifest: &LoadedManifest,
+        receipts: &Path,
+    ) -> (Self, tokio::io::DuplexStream) {
+        let host = open_host_as_configured(mgr, manifest, receipts).expect("host");
+        let feed = GraphSource::new(mgr.clone(), manifest.identity.clone()).feed();
+        let server = RcpServer::with_tools(feed, host, manifest.state.clone());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(server) = server.serve(server_io).await {
+                let _ = server.waiting().await;
             }
-            for call in batch {
-                seen.push(call.clone());
-                let n = seen.len();
-                if call["tool"] == json!("arm.mute") {
-                    continue;
-                }
-                if call["tool"] == json!("arm.slow") {
-                    std::thread::sleep(Duration::from_millis(1500));
-                }
-                let answer =
-                    json!({ "call_id": call["call_id"], "tool": call["tool"], "ok": true, "n": n });
-                publish_json(&mut results, &answer);
-                publish_json(&mut results, &json!({ "call_id": 0, "decoy": true }));
-                publish_json(&mut state, &json!({ "n": n }));
-            }
+        });
+        let daemon = Self {
+            receipts: receipts.to_path_buf(),
+        };
+        (daemon, client_io)
+    }
+
+    fn entries(&self) -> Vec<(String, String)> {
+        receipt_pairs(&self.receipts)
+    }
+}
+
+/// The receipt log at `path` as `(verb, outcome)`, `error:<detail>` for an
+/// error outcome, after checking its chain. A log with no lines has no chain
+/// to check (the audit refuses an empty log).
+fn receipt_pairs(path: &Path) -> Vec<(String, String)> {
+    let entries = cerud::receipt::read_all(path).expect("read receipts");
+    if !entries.is_empty() {
+        let report = cerulion_rcpd::audit::verify_log(path).expect("chain intact");
+        assert_eq!(report.entries, entries.len());
+    }
+    entries
+        .iter()
+        .map(|r| {
+            let outcome = serde_json::to_value(&r.outcome).expect("outcome");
+            let tag = match outcome.get("detail").and_then(Value::as_str) {
+                Some(detail) => format!("error:{detail}"),
+                None => outcome["outcome"].as_str().unwrap_or("").to_string(),
+            };
+            (r.verb.clone(), tag)
+        })
+        .collect()
+}
+
+/// One test per vector, each against a fresh `ToolHost`.
+macro_rules! vectors {
+    ($($name:ident),* $(,)?) => {$(
+        #[tokio::test(flavor = "multi_thread")]
+        async fn $name() {
+            oracle::run::<ToolHostDaemon>(oracle::vectors::$name()).await;
         }
-        seen
-    });
-    ready_rx.recv().expect("graph thread ready");
-    handle
+    )*};
+}
+
+vectors!(
+    the_tool_list_is_the_manifest_then_estop_then_estop_clear,
+    each_call_is_published_once_answered_by_its_call_id_and_receipted,
+    an_undeclared_tool_and_bad_arguments_never_reach_the_graph,
+    a_name_no_tool_can_have_is_receipted_under_a_fixed_verb,
+    a_silent_graph_times_out_and_the_call_may_have_run,
+    estop_refuses_motion_and_lets_reads_run,
+    a_latch_left_by_an_earlier_daemon_refuses_motion,
+    an_irreversible_tool_is_receipted_labelled_and_latch_gated,
+    a_clear_reopens_motion_and_a_later_estop_closes_it_again,
+    a_clear_with_nothing_latched_is_receipted_and_publishes_nothing,
+    a_clear_opens_a_latch_left_by_an_earlier_daemon,
+    an_undeletable_latch_file_keeps_the_estop_engaged,
+    under_operator_clearing_the_agent_cannot_clear,
+    estop_does_not_wait_behind_a_call_in_flight,
+    an_estop_during_a_waiting_clear_is_not_cleared_by_it,
+);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreeing() {
+    oracle::properties::racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreeing::<
+        ToolHostDaemon,
+    >()
+    .await;
 }
 
 fn open_host(
@@ -178,108 +134,6 @@ fn open_host(
         latch.clone(),
     )?;
     ToolHost::open(loaded.tools.clone(), journal, latch, receipts, lock).map(Arc::new)
-}
-
-struct Fixture {
-    client: Arc<RunningService<RoleClient, ()>>,
-    mgr: Arc<TransportManager>,
-    prefix: String,
-    receipts: PathBuf,
-    stop: Arc<AtomicBool>,
-    graph: Option<std::thread::JoinHandle<Vec<Value>>>,
-    _dir: tempfile::TempDir,
-}
-
-impl Fixture {
-    async fn new(tag: &str, with_graph: bool) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        Self::in_dir(tag, with_graph, dir, "").await
-    }
-
-    /// A fixture whose manifest ends with `extra` (a `limits` section).
-    async fn with_extra(tag: &str, extra: &str) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        Self::in_dir(tag, true, dir, extra).await
-    }
-
-    async fn in_dir(tag: &str, with_graph: bool, dir: tempfile::TempDir, extra: &str) -> Self {
-        let prefix = unique(tag);
-        let loaded = manifest_with(dir.path(), &prefix, extra);
-        let mgr = manager(tag);
-        let stop = Arc::new(AtomicBool::new(false));
-        let graph = with_graph.then(|| spawn_graph(mgr.clone(), prefix.clone(), stop.clone()));
-        let receipts = dir.path().join("receipts/log.jsonl");
-        let host = open_host_as_configured(&mgr, &loaded, &receipts).expect("host");
-        let feed = GraphSource::new(mgr.clone(), loaded.identity.clone()).feed();
-        let server = RcpServer::with_tools(feed, host, loaded.state.clone());
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let (server, client) = tokio::join!(server.serve(server_io), ().serve(client_io));
-        let server = server.expect("server session");
-        tokio::spawn(async move {
-            let _ = server.waiting().await;
-        });
-        Self {
-            client: Arc::new(client.expect("client session")),
-            mgr,
-            prefix,
-            receipts,
-            stop,
-            graph,
-            _dir: dir,
-        }
-    }
-
-    async fn call(&self, tool: &str, args: Value) -> (bool, Value) {
-        call(&self.client, tool, args).await
-    }
-
-    fn receipts(&self) -> Vec<(String, String)> {
-        let report = cerulion_rcpd::audit::verify_log(&self.receipts).expect("chain intact");
-        let entries = cerud::receipt::read_all(&self.receipts).expect("read receipts");
-        assert_eq!(report.entries, entries.len());
-        entries
-            .iter()
-            .map(|r| {
-                let outcome = serde_json::to_value(&r.outcome).expect("outcome");
-                let tag = match outcome.get("detail").and_then(Value::as_str) {
-                    Some(detail) => format!("error:{detail}"),
-                    None => outcome["outcome"].as_str().unwrap_or("").to_string(),
-                };
-                (r.verb.clone(), tag)
-            })
-            .collect()
-    }
-
-    fn stop_graph(&mut self) -> Vec<Value> {
-        self.stop.store(true, Ordering::Relaxed);
-        self.graph
-            .take()
-            .map(|h| h.join().expect("graph thread"))
-            .unwrap_or_default()
-    }
-}
-
-async fn call(client: &RunningService<RoleClient, ()>, tool: &str, args: Value) -> (bool, Value) {
-    let params = CallToolRequestParams::new(tool.to_string())
-        .with_arguments(args.as_object().cloned().expect("object args"));
-    let result: CallToolResult = client.call_tool(params).await.expect("call_tool");
-    let text = result
-        .content
-        .first()
-        .and_then(|c| c.as_text())
-        .map(|t| t.text.clone())
-        .expect("one text block");
-    (
-        result.is_error == Some(true),
-        serde_json::from_str(&text).expect("JSON body"),
-    )
-}
-
-fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
-    items
-        .iter()
-        .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
-        .collect()
 }
 
 /// [`open_host`] with the manifest's `limits.estop_clear` applied, as the
@@ -299,218 +153,6 @@ fn open_host_as_configured(
     )?;
     ToolHost::open(loaded.tools.clone(), journal, latch, receipts, lock)
         .map(|host| Arc::new(host.with_estop_clear(loaded.limits.estop_clear)))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn tools_list_is_the_manifest_plus_estop() {
-    let f = Fixture::new("list", false).await;
-    let names: Vec<String> = f
-        .client
-        .list_all_tools()
-        .await
-        .expect("list")
-        .into_iter()
-        .map(|t| t.name.to_string())
-        .collect();
-    assert_eq!(
-        names,
-        [
-            "arm.step",
-            "arm.slow",
-            "arm.mute",
-            "arm.peek",
-            "arm.cut",
-            ESTOP_TOOL,
-            ESTOP_CLEAR_TOOL
-        ]
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_call_is_receipted_journaled_and_answered_past_a_decoy() {
-    let mut f = Fixture::new("happy", true).await;
-    for i in 0..3 {
-        let (is_error, body) = f.call("arm.step", json!({ "q": [0.1, -0.2] })).await;
-        assert!(!is_error, "call {i}: {body}");
-        assert_eq!(body["result"]["ok"], json!(true));
-        assert_eq!(body["result"]["call_id"], body["call_id"]);
-        assert!(body["call_id"].as_u64().is_some_and(|id| id < (1 << 52)));
-    }
-    let seen = f.stop_graph();
-    assert_eq!(seen.len(), 3, "exactly one journaled frame per call");
-    assert_eq!(seen[0]["tool"], json!("arm.step"));
-    assert_eq!(seen[0]["args"], json!({ "q": [0.1, -0.2] }));
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn undeclared_tools_and_bad_args_never_reach_the_graph() {
-    let mut f = Fixture::new("deny", true).await;
-    let (is_error, body) = f.call("arm.fly", json!({})).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("not_in_manifest"));
-    let (is_error, _) = f.call(&"x".repeat(300), json!({})).await;
-    assert!(is_error);
-    let (is_error, body) = f.call("arm.step", json!({ "q": [1.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("invalid_args"));
-    let (is_error, body) = f
-        .call("arm.step", json!({ "q": [1.0, 2.0], "speed": 3 }))
-        .await;
-    assert!(is_error);
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("speed"),
-        "{body}"
-    );
-
-    assert!(f.stop_graph().is_empty(), "nothing was journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.fly", "denied"),
-            ("<invalid-tool-name>", "denied"),
-            ("arm.step", "error:invalid_args"),
-            ("arm.step", "error:invalid_args"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn estop_latches_and_refuses_later_motion_but_not_reads() {
-    let mut f = Fixture::new("estop", true).await;
-    let (is_error, body) = f
-        .call(ESTOP_TOOL, json!({ "reason": "x".repeat(500) }))
-        .await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["estopped"], json!(true));
-    assert_eq!(body["graph_acknowledged"], json!(true));
-    assert_eq!(
-        body["result"]["tool"],
-        json!(ESTOP_TOOL),
-        "the graph was told"
-    );
-
-    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    let (is_error, _) = f.call("arm.peek", json!({})).await;
-    assert!(!is_error, "a read tool still runs while e-stopped");
-
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        [ESTOP_TOOL, "arm.peek"],
-        "the refused step was never journaled"
-    );
-    let reason = seen[0]["args"]["reason"].as_str().expect("reason");
-    assert_eq!(reason.chars().count(), 200, "the reason is truncated");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.step", "denied"),
-            ("arm.peek", "ok"),
-        ])
-    );
-}
-
-/// Records when each call frame is published, on a subscriber of its own.
-fn spawn_tap(
-    mgr: Arc<TransportManager>,
-    prefix: String,
-    stop: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<Vec<(String, Instant)>> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let calls = mgr
-            .create_subscriber(&format!("/{prefix}/calls"))
-            .expect("tap subscriber");
-        ready_tx.send(()).expect("ready");
-        let mut seen = Vec::new();
-        while !stop.load(Ordering::Relaxed) {
-            calls
-                .try_receive(|m| {
-                    let text = RosString::build_reader(m.payload())
-                        .data()
-                        .expect("utf-8")
-                        .to_owned();
-                    let call: Value = serde_json::from_str(&text).expect("JSON");
-                    let tool = call["tool"].as_str().unwrap_or("").to_string();
-                    seen.push((tool, Instant::now()));
-                })
-                .expect("receive");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        seen
-    });
-    ready_rx.recv().expect("tap ready");
-    handle
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn estop_does_not_wait_behind_a_call_in_flight() {
-    let mut f = Fixture::new("estop_inflight", true).await;
-    let tap_stop = Arc::new(AtomicBool::new(false));
-    let tap = spawn_tap(f.mgr.clone(), f.prefix.clone(), tap_stop.clone());
-    let client = Arc::clone(&f.client);
-    let slow =
-        tokio::spawn(async move { call(&client, "arm.slow", json!({ "q": [0.0, 0.0] })).await });
-    // Let the slow call reach the graph, which then sleeps 1.5 s before answering.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let (is_error, body) = f.call(ESTOP_TOOL, json!({ "reason": "now" })).await;
-    assert!(!is_error, "{body}");
-    // A call made while the slow one may still be in flight is refused by the
-    // latch, which `estop` closed without waiting for it.
-    let (queued_error, queued) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(queued_error);
-    assert_eq!(queued["error"]["code"], json!("estopped"));
-    let (slow_error, slow_body) = slow.await.expect("slow call task");
-    assert!(!slow_error, "the call in flight completes: {slow_body}");
-    tap_stop.store(true, Ordering::Relaxed);
-    let published = tap.join().expect("tap thread");
-    let at = |tool: &str| {
-        published
-            .iter()
-            .find(|(t, _)| t == tool)
-            .map(|(_, at)| *at)
-            .unwrap_or_else(|| panic!("{tool} was never published: {published:?}"))
-    };
-    let gap = at(ESTOP_TOOL).duration_since(at("arm.slow"));
-    assert!(
-        gap < Duration::from_millis(1000),
-        "the e-stop was published {gap:?} after the slow call, while that call was still \
-         unanswered (the graph answers it after 1.5 s)"
-    );
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(tools, ["arm.slow", ESTOP_TOOL]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_latch_survives_a_restart() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let receipts = dir.path().join("receipts/log.jsonl");
-    std::fs::create_dir_all(receipts.parent().expect("parent")).expect("mkdir");
-    std::fs::write(latch_path(&receipts), "earlier stop\n").expect("write latch");
-    let f = Fixture::in_dir("latch", true, dir, "").await;
-    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("estopped"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -535,31 +177,17 @@ async fn a_second_daemon_on_the_same_receipt_log_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_silent_graph_times_out_and_says_the_call_may_have_run() {
-    let mut f = Fixture::new("timeout", true).await;
-    let (is_error, body) = f.call("arm.mute", json!({ "q": [0.0, 0.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("timeout"));
-    assert_eq!(body["may_have_executed"], json!(true));
-    assert_eq!(f.stop_graph().len(), 1, "the call was published");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[("arm.mute", "intent"), ("arm.mute", "error:timeout")])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn the_state_resource_serves_the_newest_frame() {
-    let mut f = Fixture::new("state", true).await;
+    let session = oracle::Session::<ToolHostDaemon>::open(&oracle::Given::fresh()).await;
     for _ in 0..3 {
-        let (is_error, _) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
+        let (is_error, _) = session.call("arm.step", &json!({ "q": [0.0, 0.0] })).await;
         assert!(!is_error);
     }
     // The state frame follows its answer by microseconds; poll briefly.
     let mut newest = Value::Null;
     for _ in 0..200 {
-        let result = f
-            .client
+        let result = session
+            .client()
             .read_resource(ReadResourceRequestParams::new("robot://state/arm"))
             .await
             .expect("read state");
@@ -573,15 +201,15 @@ async fn the_state_resource_serves_the_newest_frame() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(newest, json!({ "n": 3 }));
-    let missing = f
-        .client
+    let missing = session
+        .client()
         .read_resource(ReadResourceRequestParams::new("robot://state/ghost"))
         .await;
     assert!(
         missing.is_err(),
         "an undeclared state resource does not exist"
     );
-    f.stop_graph();
+    session.stop();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -712,11 +340,11 @@ fn the_audit_refuses_a_cut_head_and_a_missing_rotated_file() {
     assert!(err.contains("is missing"), "{err}");
 }
 
-const OPERATOR_CLEARS: &str = "limits:\n  estop_clear: operator\n";
-
-/// The `tools/list` entries as JSON, keyed by name.
-async fn listed(f: &Fixture) -> std::collections::BTreeMap<String, Value> {
-    f.client
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_list_labels_every_safety_class() {
+    let session = oracle::Session::<ToolHostDaemon>::open(&oracle::Given::fresh()).await;
+    let tools: BTreeMap<String, Value> = session
+        .client()
         .list_all_tools()
         .await
         .expect("list")
@@ -725,13 +353,7 @@ async fn listed(f: &Fixture) -> std::collections::BTreeMap<String, Value> {
             let json = serde_json::to_value(&t).expect("tool JSON");
             (t.name.to_string(), json)
         })
-        .collect()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn tools_list_labels_every_safety_class() {
-    let f = Fixture::new("labels", false).await;
-    let tools = listed(&f).await;
+        .collect();
     // (name, description, readOnlyHint, destructiveHint)
     let expected = [
         (
@@ -774,353 +396,7 @@ async fn tools_list_labels_every_safety_class() {
     }
     let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
     assert!(estop.contains("estop_clear"), "{estop}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_irreversible_tool_runs_receipted_labelled_and_latch_gated() {
-    let mut f = Fixture::new("irreversible", true).await;
-    let (is_error, body) = f.call("arm.cut", json!({})).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["safety_class"], json!("irreversible"));
-    assert_eq!(body["result"]["tool"], json!("arm.cut"));
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({})).await;
-    assert!(!is_error);
-    let (is_error, body) = f.call("arm.cut", json!({})).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    assert_eq!(body["safety_class"], json!("irreversible"));
-    let (_, body) = f.call("arm.peek", json!({})).await;
-    assert_eq!(body["safety_class"], json!("read"));
-    let tools: Vec<Value> = f
-        .stop_graph()
-        .into_iter()
-        .map(|c| c["tool"].clone())
-        .collect();
-    assert_eq!(
-        tools,
-        [json!("arm.cut"), json!(ESTOP_TOOL), json!("arm.peek")]
-    );
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.cut", "intent"),
-            ("arm.cut", "ok"),
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.cut", "denied"),
-            ("arm.peek", "ok"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_agent_clears_the_estop_and_a_later_estop_latches_again() {
-    let mut f = Fixture::new("clear", true).await;
-    let latch = latch_path(&f.receipts);
-    let step = json!({ "q": [0.0, 0.0] });
-
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "first" })).await;
-    assert!(!is_error);
-    assert!(latch.exists(), "the latch file is written on engage");
-    let (_, body) = f.call("arm.step", step.clone()).await;
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("estop_clear"),
-        "{body}"
-    );
-
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({ "reason": "safe" })).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["estopped"], json!(false));
-    assert_eq!(body["was_estopped"], json!(true));
-    assert_eq!(body["graph_acknowledged"], json!(true));
-    assert_eq!(
-        body["result"]["tool"],
-        json!(ESTOP_CLEAR_TOOL),
-        "the graph was told"
-    );
-    assert!(body["receipt"]["seq"].is_u64(), "{body}");
-    assert!(!latch.exists(), "the clear deletes the latch file");
-
-    let (is_error, body) = f.call("arm.step", step.clone()).await;
-    assert!(!is_error, "motion runs after the clear: {body}");
-
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "second" })).await;
-    assert!(!is_error);
-    assert!(
-        latch.exists(),
-        "an engage after a clear writes the file again"
-    );
-    assert_eq!(std::fs::read_to_string(&latch).expect("latch"), "second\n");
-    let (_, body) = f.call("arm.step", step.clone()).await;
-    assert_eq!(
-        body["error"]["code"],
-        json!("estopped"),
-        "an engage after a clear latches"
-    );
-
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        [ESTOP_TOOL, ESTOP_CLEAR_TOOL, "arm.step", ESTOP_TOOL]
-    );
-    assert_eq!(
-        seen[1]["args"],
-        json!({ "reason": "safe" }),
-        "the clear is journaled"
-    );
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.step", "denied"),
-            (ESTOP_CLEAR_TOOL, "intent"),
-            (ESTOP_CLEAR_TOOL, "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.step", "denied"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_clear_while_not_estopped_is_receipted_and_changes_nothing() {
-    let mut f = Fixture::new("clear_idle", true).await;
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({ "speed": 1 })).await;
-    assert!(is_error, "arguments outside the schema are refused: {body}");
-    assert_eq!(body["error"]["code"], json!("invalid_args"));
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["was_estopped"], json!(false));
-    assert_eq!(body["estopped"], json!(false));
-    let (is_error, _) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(!is_error);
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        ["arm.step"],
-        "a clear with nothing latched is not journaled"
-    );
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_CLEAR_TOOL, "error:invalid_args"),
-            (ESTOP_CLEAR_TOOL, "intent"),
-            (ESTOP_CLEAR_TOOL, "ok"),
-            ("arm.step", "intent"),
-            ("arm.step", "ok"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_agent_clears_a_latch_left_by_an_earlier_daemon() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let receipts = dir.path().join("receipts/log.jsonl");
-    std::fs::create_dir_all(receipts.parent().expect("parent")).expect("mkdir");
-    std::fs::write(latch_path(&receipts), "earlier stop\n").expect("write latch");
-    let mut f = Fixture::in_dir("clear_restart", true, dir, "").await;
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["was_estopped"], json!(true));
-    assert!(!latch_path(&receipts).exists());
-    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(!is_error, "{body}");
-    f.stop_graph();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_latch_file_that_cannot_be_deleted_keeps_the_estop_engaged() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let receipts = dir.path().join("receipts/log.jsonl");
-    // A non-empty directory where the latch file goes: it exists, so the
-    // daemon starts latched, and `remove_file` cannot delete it.
-    std::fs::create_dir_all(latch_path(&receipts).join("pinned")).expect("mkdir");
-    let mut f = Fixture::in_dir("clear_fails", true, dir, "").await;
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(is_error, "{body}");
-    assert_eq!(body["error"]["code"], json!("clear_failed"));
-    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert_eq!(
-        body["error"]["code"],
-        json!("estopped"),
-        "the latch stays closed"
-    );
-    assert!(f.stop_graph().is_empty(), "nothing was journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_CLEAR_TOOL, "intent"),
-            (ESTOP_CLEAR_TOOL, "error:clear_failed"),
-            ("arm.step", "denied"),
-        ])
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn under_operator_clearing_the_agent_cannot_clear_the_estop() {
-    let mut f = Fixture::with_extra("operator", OPERATOR_CLEARS).await;
-    let tools = listed(&f).await;
-    assert!(
-        !tools.contains_key(ESTOP_CLEAR_TOOL),
-        "estop_clear is not listed"
-    );
-    let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
-    assert!(!estop.contains("estop_clear"), "{estop}");
-
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({})).await;
-    assert!(!is_error);
-    let (is_error, body) = f.call(ESTOP_CLEAR_TOOL, json!({})).await;
-    assert!(is_error, "{body}");
-    assert_eq!(body["error"]["code"], json!("estop_clear_disabled"));
-    assert!(latch_path(&f.receipts).exists(), "the latch file stays");
-    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    assert!(
-        !body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("estop_clear"),
-        "{body}"
-    );
-
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(tools, [ESTOP_TOOL], "the refused clear was never journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            (ESTOP_CLEAR_TOOL, "denied"),
-            ("arm.step", "denied"),
-        ])
-    );
-}
-
-/// The latch state the receipt log implies: an `estop` intent closes it; an
-/// `estop_clear` intent opens it unless that clear's closing receipt is
-/// `error:clear_failed`, since every other clear outcome is written after the
-/// latch opened. Clears are serialized, so a clear's closing receipt is the
-/// next `estop_clear` line after its intent.
-fn replay_latch(receipts: &[(String, String)], initially: bool) -> bool {
-    let mut closed = initially;
-    for (i, (verb, outcome)) in receipts.iter().enumerate() {
-        match (verb.as_str(), outcome.as_str()) {
-            (ESTOP_TOOL, "intent") => closed = true,
-            (ESTOP_CLEAR_TOOL, "intent") => {
-                let closing = receipts[i + 1..]
-                    .iter()
-                    .find(|(v, _)| v == ESTOP_CLEAR_TOOL)
-                    .map(|(_, o)| o.as_str());
-                if closing != Some("error:clear_failed") {
-                    closed = false;
-                }
-            }
-            _ => {}
-        }
-    }
-    closed
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn racing_engages_and_clears_leave_the_latch_the_log_and_the_graph_agreeing() {
-    let mut f = Fixture::new("race", true).await;
-    let mut tasks = Vec::new();
-    for i in 0..24 {
-        let client = Arc::clone(&f.client);
-        let tool = if i % 2 == 0 {
-            ESTOP_TOOL
-        } else {
-            ESTOP_CLEAR_TOOL
-        };
-        tasks.push(tokio::spawn(async move {
-            call(&client, tool, json!({ "reason": format!("r{i}") })).await
-        }));
-    }
-    for task in tasks {
-        let (is_error, body) = task.await.expect("task");
-        if is_error {
-            assert_eq!(body["error"]["code"], json!("estop_overtaken"), "{body}");
-        }
-    }
-    // The settled state, read through a motion call.
-    let (refused, _) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    let receipts = f.receipts();
-    let seen = f.stop_graph();
-    let latched = replay_latch(&receipts, false);
-    assert_eq!(
-        refused, latched,
-        "the latch matches the receipt log: {receipts:?}"
-    );
-    assert_eq!(
-        latch_path(&f.receipts).exists(),
-        latched,
-        "the latch file matches the latch"
-    );
-    let last_builtin = seen
-        .iter()
-        .filter_map(|c| c["tool"].as_str())
-        .rfind(|t| *t == ESTOP_TOOL || *t == ESTOP_CLEAR_TOOL);
-    if latched {
-        assert_eq!(
-            last_builtin,
-            Some(ESTOP_TOOL),
-            "the graph's last word is the estop"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_estop_while_a_clear_waits_behind_a_call_is_not_cleared_by_it() {
-    let mut f = Fixture::new("clear_queued", true).await;
-    let client = Arc::clone(&f.client);
-    // The graph answers arm.slow after 1.5 s; the clear queues behind it.
-    let slow =
-        tokio::spawn(async move { call(&client, "arm.slow", json!({ "q": [0.0, 0.0] })).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let client = Arc::clone(&f.client);
-    let clear = tokio::spawn(async move { call(&client, ESTOP_CLEAR_TOOL, json!({})).await });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({ "reason": "late" })).await;
-    assert!(!is_error);
-    let (clear_error, body) = clear.await.expect("clear task");
-    assert!(clear_error, "{body}");
-    assert_eq!(body["error"]["code"], json!("estop_overtaken"));
-    assert_eq!(body["estopped"], json!(true));
-    let (slow_error, _) = slow.await.expect("slow task");
-    assert!(!slow_error);
-    let (_, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert_eq!(
-        body["error"]["code"],
-        json!("estopped"),
-        "the later estop holds"
-    );
-    assert!(latch_path(&f.receipts).exists());
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        ["arm.slow", ESTOP_TOOL],
-        "the refused clear was never journaled"
-    );
-    let clears: Vec<(String, String)> = f
-        .receipts()
-        .into_iter()
-        .filter(|(verb, _)| verb == ESTOP_CLEAR_TOOL)
-        .collect();
-    assert_eq!(
-        clears,
-        pairs(&[(ESTOP_CLEAR_TOOL, "error:estop_overtaken")])
-    );
+    session.stop();
 }
 
 #[tokio::test]
@@ -1133,8 +409,7 @@ async fn local_only_journal_refuses_remote_tools_but_delivers_local_calls_and_em
     let _scope = mgr
         .exclude_remote_topic(&loaded.journal.calls_topic)
         .unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let graph = spawn_graph(mgr.clone(), prefix, stop.clone());
+    let graph = oracle::graph::Graph::spawn(mgr.clone(), &prefix);
     let host = open_host(&mgr, &loaded, &dir.path().join("receipts/log.jsonl")).unwrap();
     let args = json!({"q":[1.25,-2.5]}).as_object().unwrap().clone();
     let before = mgr.remote_access_refusals();
@@ -1161,8 +436,7 @@ async fn local_only_journal_refuses_remote_tools_but_delivers_local_calls_and_em
     )
     .await;
     assert_ne!(stopped.is_error, Some(true));
-    stop.store(true, Ordering::Relaxed);
-    let delivered = graph.join().unwrap();
+    let delivered = graph.stop();
     assert_eq!(delivered.len(), 2);
     assert_eq!(delivered[0]["tool"], "arm.step");
     assert_eq!(delivered[0]["args"], json!({"q":[1.25,-2.5]}));

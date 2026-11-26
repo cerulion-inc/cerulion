@@ -44,7 +44,7 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn graph_serving_refuses_without_login_and_preserves_yaml() {
+fn graph_serving_refuses_explicit_egress_and_degrades_permissive_without_login() {
     let root = tempfile::tempdir().unwrap();
     workspace(root.path());
     let home = root.path().join("never-logged-in");
@@ -55,24 +55,44 @@ fn graph_serving_refuses_without_login_and_preserves_yaml() {
         "--single-process",
         "--no-validate",
     ];
-    for network in [
-        "",
-        "network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n  egress: [/serving/absent/out]\n",
-    ] {
-        let yaml = format!("{GRAPH}{network}");
-        std::fs::write(root.path().join("graphs/serving.yaml"), &yaml).unwrap();
-        let out = run(root.path(), &home, &args, false);
-        assert!(stderr(&out).contains(REFUSAL), "{}", stderr(&out));
-        assert!(
-            !home.exists(),
-            "the refusal must not initiate a login transaction"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
-            yaml
-        );
-        assert!(!root.path().join(".cerulion/runs").exists());
-    }
+
+    // Explicit `network: egress:` stays refused before touching the home or run dir.
+    let explicit_yaml = format!(
+        "{GRAPH}network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n  egress: [/serving/absent/out]\n"
+    );
+    std::fs::write(root.path().join("graphs/serving.yaml"), &explicit_yaml).unwrap();
+    let out = run(root.path(), &home, &args, false);
+    assert!(stderr(&out).contains(REFUSAL), "{}", stderr(&out));
+    assert!(
+        !home.exists(),
+        "the refusal must not initiate a login transaction"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
+        explicit_yaml
+    );
+    assert!(!root.path().join(".cerulion/runs").exists());
+
+    // Blockless permissive default degrades to local-only with one loud warning
+    // and reaches the missing-cdylib sentinel without writing auth.json.
+    std::fs::write(root.path().join("graphs/serving.yaml"), GRAPH).unwrap();
+    let degraded = stderr(&run(root.path(), &home, &args, false));
+    assert!(!degraded.contains(REFUSAL), "{degraded}");
+    assert!(
+        degraded.contains("running local-only")
+            && degraded.contains("no prior login or robot pairing")
+            && degraded.contains("cerulion login"),
+        "permissive degradation must log one loud warning; stderr={degraded}"
+    );
+    assert!(
+        degraded.contains("cdylib for node 'absent' not found"),
+        "degraded run must proceed past the serving gate to node loading; stderr={degraded}"
+    );
+    assert!(!home.join("auth.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
+        GRAPH
+    );
 }
 
 #[test]
@@ -216,4 +236,132 @@ fn direct_hidden_gateway_cannot_bypass_login_and_expired_login_reaches_config_va
     let error = stderr(&run(root.path(), &prior, &args, false));
     assert!(!error.contains(REFUSAL), "{error}");
     assert!(error.contains("not a valid iceoryx2 Config"), "{error}");
+}
+
+#[test]
+fn ingress_only_graph_refuses_open_lan_without_authority_and_gates_paired_without_pairing() {
+    let root = tempfile::tempdir().unwrap();
+    workspace(root.path());
+    let ingress_yaml = "name: serving\nprefix: serving\nnodes:\n- id: absent\n  type: absent\n  inputs:\n  - name: cam\n    source: /remote/cam\n  outputs: []\nnetwork:\n  mode: peer\n  ingress: [/remote/cam]\n";
+    std::fs::write(root.path().join("graphs/serving.yaml"), ingress_yaml).unwrap();
+    let args = [
+        "graph",
+        "run",
+        "serving",
+        "--single-process",
+        "--no-validate",
+    ];
+
+    // 1. Open LAN ingress-only graph refuses before node load or YAML mutation
+    //    when this machine has no prior login or robot pairing (even when
+    //    CERULION_LOGIN_GATE=off, matching graph run-gateway).
+    let open_home = root.path().join("open-never-logged-in");
+    let open_out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .args(args)
+        .current_dir(root.path())
+        .env("CERULION_HOME", &open_home)
+        .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+        .env("CERULION_LAN_ACCESS", "open")
+        .env("CERULION_LOGIN_GATE", "off")
+        .env("NO_COLOR", "1")
+        .env_remove("CERULION_NETWORK")
+        .env_remove("CARGO_TARGET_DIR")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let open_err = stderr(&open_out);
+    assert!(
+        open_err.contains(REFUSAL),
+        "Open LAN ingress-only graph must refuse without authority before startup; stderr={open_err}"
+    );
+    assert!(
+        !open_home.exists(),
+        "Open LAN refusal must not write auth state"
+    );
+    assert!(!root.path().join(".cerulion/runs").exists());
+
+    // 2. Paired default ingress-only graph on a fresh unpaired host enters the
+    //    login gate and exits 7 naming the account service before node load.
+    let paired_home = root.path().join("paired-never-logged-in");
+    let paired_out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .args(args)
+        .current_dir(root.path())
+        .env("CERULION_HOME", &paired_home)
+        .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+        .env("NO_COLOR", "1")
+        .env_remove("CERULION_LAN_ACCESS")
+        .env_remove("CERULION_LOGIN_GATE")
+        .env_remove("CERULION_NETWORK")
+        .env_remove("CARGO_TARGET_DIR")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        paired_out.status.code(),
+        Some(i32::from(
+            cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED
+        )),
+        "paired ingress-only graph without login or pairing must exit 7; stderr={}",
+        String::from_utf8_lossy(&paired_out.stderr)
+    );
+    let paired_err = String::from_utf8_lossy(&paired_out.stderr);
+    assert!(
+        paired_err.contains("Cerulion account service (http://127.0.0.1:1)")
+            && paired_err.contains("never signed in"),
+        "paired ingress-only refusal must name the account service; stderr={paired_err}"
+    );
+    assert!(
+        !paired_home.exists(),
+        "paired refusal must not write auth state"
+    );
+    assert!(!root.path().join(".cerulion/runs").exists());
+
+    // 3. Paired default ingress-only graph WITH a saved peer pin in robots.toml
+    //    and a local machine key needs no account sign-in and proceeds past the
+    //    gate to node loading.
+    let pinned_home = root.path().join("paired-with-pin");
+    std::fs::create_dir_all(pinned_home.join("identity")).unwrap();
+    let key_path = pinned_home.join("identity/device.key");
+    std::fs::write(&key_path, [0x22u8; 32]).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let valid_hex_key = "11".repeat(32);
+    std::fs::write(
+        pinned_home.join("robots.toml"),
+        format!("[robots]\ncam-bot = \"{valid_hex_key}\"\n"),
+    )
+    .unwrap();
+    let pinned_out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+        .args(args)
+        .current_dir(root.path())
+        .env("CERULION_HOME", &pinned_home)
+        .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+        .env("NO_COLOR", "1")
+        .env_remove("CERULION_LAN_ACCESS")
+        .env_remove("CERULION_LOGIN_GATE")
+        .env_remove("CERULION_NETWORK")
+        .env_remove("CARGO_TARGET_DIR")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let pinned_err = stderr(&pinned_out);
+    assert_ne!(
+        pinned_out.status.code(),
+        Some(i32::from(
+            cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED
+        )),
+        "paired ingress-only graph with saved robots.toml pin must bypass login gate; stderr={pinned_err}"
+    );
+    assert!(
+        pinned_err.contains("cdylib for node 'absent' not found"),
+        "pinned paired ingress-only graph must proceed to node loading; stderr={pinned_err}"
+    );
+    assert!(!pinned_home.join("auth.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
+        ingress_yaml
+    );
 }

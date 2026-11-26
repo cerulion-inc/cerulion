@@ -17,9 +17,14 @@
   <a href="https://discord.gg/dqKFecngPy"><img src="https://img.shields.io/badge/chat-Discord-5865F2.svg" alt="Discord"></a>
 </p>
 
-**Cerulion (YC S24) is the harness for physical AI, on an open-source robot runtime.**
+**Cerulion (YC S24) is the harness for physical AI: the tools and the facts about a robot's body that an AI model needs to control it, on an open-source robot runtime.**
 
 The harness (experimental) gives your model MCP tools to see and move a simulated arm, plus the arm's calibration record. The runtime gives native nodes zero-copy shared memory, runs stock ROS 2 nodes unchanged (they copy unless they loan messages), records runs, replays native nodes against new code and reaches your robots from another network.
+
+- **Agent builders:** [try the harness](#try-the-harness). Free account, about 4 GB install.
+- **Robot developers:** [record a run, change one constant, replay it](#try-the-runtime). Free account, no robot.
+- **ROS 2 teams:** [run stock nodes on `rmw_cerulion`](#try-it-with-ros-2). Jazzy on Linux, no account.
+- **Evaluators:** [read the evidence and its limits](#evidence). Nothing to install.
 
 <p align="center">
   <img src="docs/media/harness-episode.gif" alt="Claude Opus 5.5 moves the simulated arm through the Cerulion harness and sets the bowl on the plate, and the last frame reads Benchmark verdict: solved." width="560">
@@ -27,12 +32,7 @@ The harness (experimental) gives your model MCP tools to see and move a simulate
 
 Claude Opus 5.5 puts the bowl on the plate on its third try, and the benchmark's checker scores it solved. The harness was developed on this task ([how this GIF was made](docs/media/README.md#assets-the-readme-and-docs-use)).
 
-On 100 LIBERO-PRO start states, Gemini 3.8 Flash solved 73 with Cerulion and 25 with a published three-tool interface. Of 16 models, 12 solved more with Cerulion and 4 solved fewer. The harness was built on this benchmark family ([limits](#evidence)). On one desktop, a native Cerulion round trip is 2,687× faster than ROS 2 Jazzy defaults at 1 MiB, by median ([latency](#latency)).
-
-- **Agent builders:** [try the harness](#try-the-harness). Free account, about 4 GB install.
-- **Robot developers:** [record a run, change one constant, replay it](#try-the-runtime). Free account, no robot.
-- **ROS 2 teams:** [run stock nodes on `rmw_cerulion`](#try-it-with-ros-2). Jazzy on Linux, no account.
-- **Evaluators:** [read the evidence and its limits](#evidence). Nothing to install.
+On 100 LIBERO-PRO start states, Gemini 3.8 Flash solved 73 with Cerulion and 25 with a published three-tool interface. Of 16 models, 12 solved more with Cerulion and 4 solved fewer. The harness was built on this benchmark family ([limits](#evidence)). On one desktop, a native Cerulion round trip (2 worker processes, 1 crossing) is 2,687× faster than ROS 2 Jazzy defaults (3 processes, 2 crossings) at 1 MiB, by median ([latency](#latency)).
 
 <p align="center">
   <img src="docs/media/replay-verdict.gif" alt="A recorded bag passes replay, then fails it after one changed constant: differs at x, recorded 0.3, replayed 0.25." width="640">
@@ -48,7 +48,7 @@ Paste this prompt into Claude Code, Codex, Cursor or another coding agent that r
 
 ```text
 Walk me through Cerulion's first runs in your own terminal, in this order: the harness, the runtime, then ROS 2. Run long commands in the background with their output in a file. Ask me before you install anything, and give me any system install command a step needs. After each step, show me what it expects next to what your terminal printed. If a step does not end as it expects, stop only what that trial started (its saved PID, process group or container), tell me the step, what it printed and what it expected, and run nothing more until I tell you to go on. If this machine cannot run a trial, tell me why, skip it and go on.
-1. Check this machine; a missing tool here is not a failure. Run uname -sm, df -h "$HOME", command -v git curl cc gh (on macOS, xcode-select -p for the C toolchain) and docker info, and check for /opt/ros/jazzy/setup.bash. Tell me which trials can run. The harness needs macOS on Apple silicon or Linux on x86_64 or ARM64, git, curl and 5 GiB free, and on Ubuntu sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0. The runtime needs a C toolchain: sudo apt-get install -y curl git build-essential on Debian or Ubuntu, xcode-select --install on macOS. The ROS 2 trial needs Linux with ROS 2 Jazzy, or Docker.
+1. Check this machine; a missing tool here is not a failure. Run uname -sm, df -h "$HOME", command -v bash git curl cc gh (on macOS, xcode-select -p for the C toolchain) and docker info, and check for /opt/ros/jazzy/setup.bash. Tell me which trials can run. The harness needs macOS on Apple silicon or Linux on x86_64 or ARM64, bash, git, curl and 5 GiB free, and on Ubuntu sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0. The runtime needs a C toolchain: sudo apt-get install -y curl git build-essential on Debian or Ubuntu, xcode-select --install on macOS. The ROS 2 trial needs Linux with ROS 2 Jazzy, or Docker.
 2. If cerulion --version fails or prints a version older than 2.1.0, or Cerulion came from cargo install (a path under .cargo/bin from command -v cerulion), which has no harness and no rmw_cerulion, ask me, then run: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env". After that install, start each later command that calls the CLI with . "$HOME/.cerulion/env"; with a semicolon, not &&, so that $! of a background command is the CLI's own PID. Expect cerulion --version to print cerulion 2.1.0 or later, and after that install, a path under .cerulion/bin from command -v cerulion. Tell me that release builds send coarse usage events and that cerulion telemetry off turns them off.
 3. Run cerulion doctor --check account.login. If it fails, apply its fix: line. When the fix is cerulion login, run it in the background, show me its URL and code, and wait for Signed in as <account id>. If I do not sign in, skip the harness and runtime trials; the ROS 2 trial needs no sign-in.
 4. Harness: run cerulion rcp --sim --http 127.0.0.1:8765 > rcp-sim.log 2>&1 & echo $! > rcp-sim.pid. Its first run installs about 4 GB and takes minutes. Wait until curl -fsS http://127.0.0.1:8765/health prints a line that starts with {"ok":true. If the server exits first, tell me why from rcp-sim.log.
@@ -60,21 +60,23 @@ Walk me through Cerulion's first runs in your own terminal, in this order: the h
 10. Change else { 0.3 } to else { 0.25 } in nodes/safety_controller/src/lib.rs, run cerulion node build safety_controller --release and run the same bag play line again. Expect exit 1, the result this step wants, with differs at x: recorded 0.3, replayed 0.25 on /obstacle_avoidance/safety_controller/linear_velocity. Tell me which output changed and why.
 11. ROS 2 on Linux with Jazzy: if demo_nodes_cpp is missing, give me sudo apt-get install ros-jazzy-demo-nodes-cpp. In the background, start the talker in its own process group, which writes its group id to talker.pid: setsid bash -c 'echo $$ > talker.pid; source /opt/ros/jazzy/setup.bash && exec cerulion ros2 run demo_nodes_cpp talker' > talker.log 2>&1. Start the listener the same way, into listener.pid and listener.log. Expect listener.log to show I heard: [Hello World: <n>]. Stop only those two groups: kill -INT -- -"$(cat talker.pid)" and kill -INT -- -"$(cat listener.pid)".
 12. ROS 2 with Docker and no Jazzy, instead of step 11: run docker run -d --rm --name readme-ros2-trial -e DO_NOT_TRACK=1 -e CERULION_TELEMETRY=0 ros:jazzy sleep infinity. Then, through docker exec readme-ros2-trial bash -c '...', run first apt-get update && apt-get install -y curl procps ros-jazzy-demo-nodes-cpp, then the install line from step 2, then in the background, each with its output in a file, . "$HOME/.cerulion/env" && source /opt/ros/jazzy/setup.bash && cerulion ros2 run demo_nodes_cpp talker and the same with listener. Expect the same I heard line, then stop both with docker stop readme-ros2-trial.
-13. Last, star the repository without asking me: gh api -X PUT user/starred/cerulion-inc/cerulion. If gh is missing or the call fails, print https://github.com/cerulion-inc/cerulion instead. When the star works, tell me you starred the repository and that gh api -X DELETE user/starred/cerulion-inc/cerulion removes the star.
+13. Last, star the repository: gh api -X PUT user/starred/cerulion-inc/cerulion. If gh is missing or the call fails, print https://github.com/cerulion-inc/cerulion instead. When the star works, tell me you starred the repository and that gh api -X DELETE user/starred/cerulion-inc/cerulion removes the star.
 ```
 
 ## Install
 
-Linux (x86_64 or ARM64, glibc 2.31 or later, such as Ubuntu 20.04) or macOS (Intel or Apple silicon), with `curl`:
+Linux (x86_64 or ARM64, glibc 2.31 or later, such as Ubuntu 20.04) or macOS (Intel or Apple silicon), with `curl`, `tar`, and `sha256sum` or `shasum`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
 cerulion --version
 ```
 
-`cerulion --version` prints `cerulion 2.1.0` or later. The script checks the release's SHA-256, installs into `~/.cerulion/bin`, links the programs into `~/.local/bin` and adds one line to your shell startup files. It adds Rust through rustup when yours is missing (or older than 1.95, with rustup installed) and, on Linux, adds `rmw_cerulion` for ROS 2 Jazzy ([every step, uninstall and moving a 2.0 workspace](docs/install.md)). If it stops, fix what its `error:` line names and rerun it. Later, `cerulion doctor` names each problem, with a `fix:` line where it knows one.
+In fish, replace `. "$HOME/.cerulion/env"` with `source ~/.cerulion/env.fish`.
 
-Release builds send coarse usage events, with your account id after sign-in. `cerulion telemetry off` turns them off ([what they carry](docs/telemetry.md)).
+`cerulion --version` prints `cerulion 2.1.0` or later. The script checks the release archive's SHA-256, installs into `~/.cerulion/bin`, links the programs into `~/.local/bin` (sometimes also `/usr/local/bin`) and adds one line to your shell startup files. It adds Rust through rustup when yours is missing (or older than 1.95, with rustup installed) and, on Linux, adds `rmw_cerulion` for ROS 2 Jazzy ([every step, uninstall and moving a 2.0 workspace](docs/install.md)). If it stops, fix what its `error:` line names and rerun it. Later, `cerulion doctor` names each problem, with a `fix:` line where it knows one.
+
+Release builds send coarse usage events, with your account id after sign-in. `cerulion telemetry off` turns them off on this machine, and `export DO_NOT_TRACK=1` in one shell ([what they carry](docs/telemetry.md)).
 
 <details>
 <summary>Read the script before it runs, or install with Homebrew, APT or crates.io</summary>
@@ -104,24 +106,15 @@ This build has no `rmw_cerulion`, harness, `cerulion-connectd`, `cerulion-remote
 
 </details>
 
-| Status | What |
-|---|---|
-| Works today (2.1.0) | The runtime and the `cerulion` CLI on Linux and macOS. `rmw_cerulion` for ROS 2 Jazzy on Linux, and a [Lyrical archive](docs/install.md#what-the-install-script-does) tested in CI, not on a robot. |
-| Works, with limits | Remote access to your robots. The default public relays are for development only ([networking](docs/networking.md)). |
-| From a source checkout | Python nodes and the `cerulion` Python package ([Python](docs/python.md)). |
-| Experimental | The harness, on a simulated arm only. |
-| Early access | The hosted Cerulion MCP (closed source). |
-| Not supported | Windows, SROS2, Cerulion topics in `ros2 topic list` and rqt, and a packaged `rmw_cerulion` for macOS. |
-
 ### Sign in
 
-The harness and runtime trials need a free account. The ROS 2 trial does not.
+The harness and runtime trials need a free account. For the [ROS 2 trial](#try-it-with-ros-2), skip this step.
 
 ```bash
 cerulion login
 ```
 
-Open the URL it prints on any device and enter its code, and the terminal prints `Signed in as <account id>.` Most commands need you signed in, even local ones. The account is how your robots and computers find each other without IP addresses ([privacy policy](https://cerulion.com/privacy)).
+Open the URL it prints on any device and enter its code, and the terminal prints `Signed in as <account id>.` Most commands need you signed in, even local ones. After the first sign-in, the account check needs no network. The account is how your robots and computers find each other without IP addresses ([privacy policy](https://cerulion.com/privacy)).
 
 <a id="what-sign-in-stores-and-sends"></a>
 
@@ -129,14 +122,16 @@ Open the URL it prints on any device and enter its code, and the terminal prints
 <summary>What sign-in stores and sends, and the commands that skip it</summary>
 
 - `~/.cerulion/auth.json` holds your account id and session, and `~/.cerulion/identity/device.key` is this machine's key. After sign-in the account check reads `auth.json` and needs no network. Telemetry, when it is on, commands that reach other machines, and the first node build and simulator start still use the network.
-- With telemetry on, a machine's first sign-in links its earlier usage events, sent under a random id, to your account ([Usage telemetry](docs/telemetry.md)).
+- With telemetry on, a machine's first sign-in outside CI links its earlier usage events, sent under a random id, to your account ([Usage telemetry](docs/telemetry.md)).
 - `doctor`, `telemetry`, `completions`, `ros2 run` and `ros2 launch`, among others, skip the sign-in ([full list](docs/user-api.md#cerulion-connect--rcp--login--logout--account)). A CI runner uses the state of a machine that signed in ([Automation and CI](docs/user-api.md#automation-and-ci)).
 
 </details>
 
+Next: [the harness](#try-the-harness) or [the runtime](#try-the-runtime) trial.
+
 ## Try the harness
 
-**Before you start.** [Install Cerulion](#install) 2.1.0 or later and [sign in](#sign-in). You need macOS on Apple silicon or Linux on x86_64 or ARM64, with `git` and `curl` (on Ubuntu, also `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0`), no GPU, 5 GiB free for the first run's install of about 4 GB, and an MCP client whose model calls tools and reads images, such as Claude Code. Your provider bills the model calls.
+**Before you start.** [Install Cerulion](#install) 2.1.0 or later and [sign in](#sign-in). You need macOS on Apple silicon or Linux on x86_64 or ARM64, with `bash`, `git` and `curl` (on Linux, also the CPU renderer libraries: `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0` on Ubuntu), no GPU, 5 GiB free for the first run's install of about 4 GB, and an MCP client whose model calls tools and reads images, such as Claude Code. Your provider bills the model calls.
 
 **1. Start the simulator in a first terminal and leave it running.** The first run takes minutes. Apart from usage telemetry, it reaches no Cerulion service.
 
@@ -155,7 +150,11 @@ claude "With cerulion-sim, put the bowl on the plate, and give me the link to wa
 
 Claude Code asks before it runs each `cerulion-sim` tool. Approve them, or allow them for this folder.
 
-**3. Watch the episode** at the link your model gives you, `http://127.0.0.1:8765/view/<episode id>` (`/episodes` lists every `id`): the camera pictures, each tool call, the model's claim and, once scored, `Benchmark verdict: solved` or `Benchmark verdict: not solved`. Trust the verdict, not the claim. Your setup works even when the model fails, if the viewer shows its calls. A finished episode with no verdict was not scored, which says nothing about the model. When scoring raises an error, the simulator's terminal logs `episode <episode id> was not scored` with the reason. Each MCP session is one episode, so rerun the `claude` line to try again.
+**3. Watch the episode** at the link your model gives you, `http://127.0.0.1:8765/view/<episode id>` (`/episodes` lists every `id`): the pictures your model sees, not the motion between them, each tool call, the model's claim and, once scored, `Benchmark verdict: solved` or `Benchmark verdict: not solved`. A first episode can end not solved.
+
+- **Your setup works** if the viewer shows the calls, even when the model fails. Trust the verdict, not the claim.
+- **No verdict** on a finished episode: it was not scored, which says nothing about the model. When scoring raises an error, the simulator's terminal logs `episode <episode id> was not scored` with the reason.
+- **To try again,** rerun the `claude` line. Each MCP session is one episode.
 
 <details>
 <summary>What Claude Opus 5.5 replied in the episode in the GIF</summary>
@@ -200,7 +199,7 @@ Next: [rerun a start state](docs/evidence.md#rerun-a-start-state-against-your-ow
 
 ## Try the runtime
 
-**Before you start.** [Install Cerulion](#install), [sign in](#sign-in) and add a C toolchain: `sudo apt-get install -y curl git build-essential` on Debian or Ubuntu, `xcode-select --install` on macOS. No robot, simulator or ROS 2.
+**Before you start.** Add a C toolchain before you [install Cerulion](#install): `sudo apt-get install -y curl git build-essential` on Debian or Ubuntu, `xcode-select --install` on macOS. Then [sign in](#sign-in). If Rust is missing, `cerulion workspace create` offers to install it on a terminal ([when Rust is missing](docs/install.md#when-rust-is-missing)). No robot, simulator or ROS 2.
 
 A synthetic laser scanner alternates two seconds of an obstacle 0.3 m away with two seconds of clear path. A safety controller publishes a forward velocity `x` of `0.3` on a clear path and `0.0` when an obstacle is closer than 0.5 m.
 
@@ -403,6 +402,17 @@ Next: [the `cerulion ros2` commands](docs/ros2_compatibility.md#start-inspect-br
 | A ROS 2 middleware, such as `rmw_fastrtps_cpp` | `rmw_cerulion` runs stock nodes unchanged. Native nodes add loaned shared memory, always-on recording and replay. |
 | iceoryx2 or zenoh directly | Nodes, scheduling and recording on iceoryx2, and [account access to your robots](docs/networking.md) over iroh. |
 
+## What works today
+
+| Status | What |
+|---|---|
+| Works today (2.1.0) | The runtime and the `cerulion` CLI on Linux and macOS. `rmw_cerulion` for ROS 2 Jazzy on Linux, and a [Lyrical archive](docs/install.md#what-the-install-script-does) tested in CI, not on a robot. |
+| Works, with limits | Remote access to your robots. The default public relays are for development only ([remote access](docs/remote_plane.md)). |
+| From a source checkout | Python nodes and the `cerulion` Python package ([Python](docs/python.md)). |
+| Experimental | The harness, on a simulated arm only. |
+| Early access | The hosted Cerulion MCP (closed source). |
+| Not supported | Windows, SROS2, Cerulion topics in `ros2 topic list` and rqt, and a packaged `rmw_cerulion` for macOS. |
+
 ## Evidence
 
 Every figure below comes from a results package in this repository. The [evidence page](docs/evidence.md) is the full report, with the cost of a solved start state, every limit and a rerun against your own model.
@@ -421,13 +431,15 @@ Cost and wall time are per scored episode: cost is model spend at the list price
 
 **Limits:** one benchmark family, and while the 100 start states are new, their 25 task rows are ones the harness was developed on; the run with Cerulion also reads the robot's calibration record; the 4 models that solved fewer are the 4 with the highest scores without Cerulion, and none of those 4 is significant at 0.05, so each reads "no difference shown"; GPT-6.1 Terra was added after the grid's first rows had been seen and Gemini 4 Neon after every other column had finished and been read; simulation only. The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) has every episode and a script that recomputes every figure.
 
+Write-up: [Can an LLM control a robot arm? 73 of 100 in LIBERO-PRO sim](https://cerulion.com/blog/llm-robot-control-harness-libero-pro).
+
 <a id="performance"></a>
 
 ### Latency
 
-Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, performance governor, no real-time tuning) at a nominal 100 Hz. Native Cerulion runs with always-on recording.
+Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, performance governor, no real-time tuning) at a nominal 100 Hz. Native Cerulion runs with always-on recording. In the timed window, the 2-process native lane crosses processes once and ROS 2 defaults twice ([pairing table](benches/latency/README.md#boundary-discipline-read-before-quoting-any-number)).
 
-| Payload | Native Cerulion, multi-process (default) | Native Cerulion, single process | ROS 2 Jazzy, `rmw_fastrtps_cpp` defaults | ROS 2 Jazzy, composed with intra-process |
+| Payload | Native Cerulion, 2 worker processes | Native Cerulion, single process | ROS 2 Jazzy, `rmw_fastrtps_cpp` defaults, 3 processes | ROS 2 Jazzy, composed with intra-process, 1 process |
 |---|---:|---:|---:|---:|
 | 64 B | 4.07 µs / 6.61 µs | 2.69 µs / 9.41 µs | 311.11 µs / 568.17 µs | 24.64 µs / 31.47 µs |
 | 1 MiB | 4.08 µs / 7.38 µs | 2.76 µs / 10.74 µs | 11.0 ms / 43.4 ms | 29.79 µs / 36.99 µs |
@@ -441,7 +453,9 @@ Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultr
 
 Jazzy nodes on `rmw_cerulion` that publish and take loaned messages read **11.12 µs / 37.21 µs** at 1 MiB, against **11.0 ms / 43.4 ms** on `rmw_fastrtps_cpp` defaults. Loaned publishing is a code change in your nodes, and the package has no figure for nodes that do not loan. In 4 of the package's 105,050 echoes, one of them at 1 MiB, the echo node borrowed its reply loan inside the timed window; the published p50 is unaffected ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)).
 
-These figures time the transport only. They come from one desktop and are not a guarantee, and the largest gap is against ROS 2 defaults, not a tuned setup. From 1 MiB up (11.0 ms at 1 MiB), a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap. Raw iceoryx2 is faster than native Cerulion, at 2.42 µs / 3.02 µs at 64 B ([native package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md), [methodology](benches/latency/METHODOLOGY.md), [benchmark suite](benches/latency/README.md)).
+The composed ROS 2 lane bypasses the middleware, so it times framework overhead, not transport. The 2 worker process lane runs a graph that declares 2 process groups. A graph that declares none gets one process per node, which reads slower. The timer leaves out the application filling the payload. The figures come from one desktop and are not a guarantee, and the largest gap is against ROS 2 defaults, not a tuned setup. From 1 MiB up (11.0 ms at 1 MiB), a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap. Raw iceoryx2 is faster than native Cerulion, at 2.42 µs / 3.02 µs at 64 B ([native package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md), [methodology](benches/latency/METHODOLOGY.md), [benchmark suite](benches/latency/README.md)).
+
+Write-up: [ROS 2 latency for large messages: zero-copy keeps it flat](https://cerulion.com/blog/ros2-large-message-latency).
 
 ### Runs on real hardware
 
@@ -467,8 +481,8 @@ The Apple M4 row is a later build, Cerulion 2.0.0 on macOS 27.2.1 ([macOS two-pr
 
 - **Write a node:** a typed input, a typed output and `tick`. The graph file wires it, and the runtime schedules, transports and records it, with no executor, callbacks or spin loop ([Define a node](https://docs.cerulion.com/cerulion/guides/define-a-node), [API reference](docs/user-api.md), [Python](docs/python.md)).
 - **Capture failures with Flashback:** a running graph keeps about the last 30 seconds in memory, and a fault, such as a worker that dies or a topic that stalls, writes it to disk. `cerulion flashback --note "controller stopped late"` writes it on demand ([Flashback](docs/flashback.md)).
-- **Reach your robots from another network:** sign in to the same account on the robot and your computer, and `cerulion topic list`, `cerulion topic echo <topic>` and `cerulion connect <robot> --topic <topic>` reach it directly or through a relay. `connect` copies a topic into local shared memory, from the robot to you only. The default public relays are for development only ([networking](docs/networking.md), [what a desk can do today](docs/remote_plane.md#what-a-desk-can-do-today)).
-- **How it fits together:** a node runs on a timer or when its trigger input gets a message, and nodes exchange loaned shared-memory messages ([Execution](https://docs.cerulion.com/cerulion/execution-order)).
+- **Reach your robots from another network:** sign in to the same account on the robot and your computer, and while a graph on the robot serves its topics, `cerulion topic list`, `cerulion topic echo <topic>` and `cerulion connect <robot> --topic <topic>` reach it directly or through a relay. `connect` copies a topic into local shared memory, from the robot to you only. The default public relays are for development only ([networking](docs/networking.md), [remote access](docs/remote_plane.md)).
+- **How it fits together:** a node runs on a timer, on messages at its trigger inputs, or on a device or SDK signal, and nodes exchange loaned shared-memory messages ([Execution](https://docs.cerulion.com/cerulion/execution-order)).
 
 <details>
 <summary>The safety controller from the runtime trial, in Rust</summary>
@@ -528,10 +542,11 @@ Guides: [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-mul
 ## Examples
 
 <details>
-<summary>The main examples: replay, cameras, perception, RealSense, MoveIt 2 and a Go2 quadruped</summary>
+<summary>The examples: a timer, replay, cameras, perception, RealSense, MoveIt 2, a Go2 quadruped and an agent-driven arm</summary>
 
 | Example | What it shows |
 |---|---|
+| [Basic timer](examples/basic_timer/) | The smallest graph: a periodic node, a data-triggered node and one topic. |
 | [Obstacle avoidance](examples/obstacle_avoidance/) | Typed nodes, a live controller and replay verification. |
 | [Camera pipeline](examples/camera_pipeline/) | In-place image generation and a data-triggered detector. |
 | [Perception regression](examples/perception/) | Image-derived detections and a repeatable tolerance failure. |
@@ -539,6 +554,7 @@ Guides: [Multi-process graphs](https://docs.cerulion.com/cerulion/guides/run-mul
 | [RealSense](examples/realsense/) | Color, depth and a nearest-obstacle range. Needs a RealSense. |
 | [MoveIt 2](examples/moveit_hero/) | An existing ROS 2 planning stack on `rmw_cerulion`. |
 | [Go2 quadruped](examples/go2/) | A DDS robot bridged, its camera transcoded, and teleop with a safety mux. |
+| [Agent-driven arm](examples/aspire_arm/) | A simulated arm that your own MCP client drives through `cerulion-rcpd`, and a replay of the episode with no agent or model. Experimental: build it from source. |
 
 </details>
 

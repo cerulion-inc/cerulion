@@ -88,6 +88,9 @@ pub mod graph_params_check;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
 pub mod ipc_cleanup;
+// Resim private namespace slot allocation, locking, and cleanup sweep.
+// Shared between `replay_engine`, `ipc_cleanup`, `doctor`, and `cerulion clean`.
+pub(crate) mod resim_slots;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
 /// Messages as JSON or YAML text for `topic pub` and `service call`.
