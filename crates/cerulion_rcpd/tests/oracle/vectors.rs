@@ -5,7 +5,10 @@
 
 use serde_json::json;
 
-use super::{call, entry, frame, reply, Effect, Event, Outcome, Stage, Vector};
+use super::{
+    call, entry, frame, latch_holds, no_latch_file, reply, Clearing, Effect, Event, Given, Latch,
+    Outcome, Says, Stage, Vector,
+};
 
 /// `tools/list` is the manifest's tools in the order it declares them, then
 /// `estop`, then `estop_clear`.
@@ -15,6 +18,7 @@ use super::{call, entry, frame, reply, Effect, Event, Outcome, Stage, Vector};
 /// `limits.estop_clear: agent`, the built-in `estop_clear`."
 pub fn the_tool_list_is_the_manifest_then_estop_then_estop_clear() -> Vector {
     Vector {
+        given: Given::fresh(),
         events: vec![Event::List],
         expect: vec![Effect::Listed(vec![
             "arm.step",
@@ -45,6 +49,7 @@ pub fn the_tool_list_is_the_manifest_then_estop_then_estop_clear() -> Vector {
 pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Vector {
     let q = || json!({ "q": [0.1, -0.2] });
     Vector {
+        given: Given::fresh(),
         events: vec![
             call(1, "arm.step", q()),
             call(2, "arm.step", q()),
@@ -89,6 +94,7 @@ pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Ve
 /// never reaches the graph".
 pub fn an_undeclared_tool_and_bad_arguments_never_reach_the_graph() -> Vector {
     Vector {
+        given: Given::fresh(),
         events: vec![
             call(1, "arm.fly", json!({})),
             call(2, "arm.step", json!({ "q": [1.0] })),
@@ -119,6 +125,7 @@ pub fn an_undeclared_tool_and_bad_arguments_never_reach_the_graph() -> Vector {
 /// (`not_in_manifest`, receipted `denied`).
 pub fn a_name_no_tool_can_have_is_receipted_under_a_fixed_verb() -> Vector {
     Vector {
+        given: Given::fresh(),
         events: vec![
             call(1, "x".repeat(300), json!({})),
             call(2, "arm/step", json!({})),
@@ -144,12 +151,364 @@ pub fn a_name_no_tool_can_have_is_receipted_under_a_fixed_verb() -> Vector {
 pub fn a_silent_graph_times_out_and_the_call_may_have_run() -> Vector {
     let q = || json!({ "q": [0.0, 0.0] });
     Vector {
+        given: Given::fresh(),
         events: vec![call(1, "arm.mute", q())],
         expect: vec![
             entry("arm.mute", Stage::Intent),
             frame("arm.mute", q()),
             entry("arm.mute", Stage::Error("timeout")),
             reply(1, Outcome::TimedOut).carrying("/safety_class", json!("reversible")),
+        ],
+    }
+}
+
+/// `estop` closes the latch and writes its file; a motion call is then
+/// refused and never published, while a read tool still runs.
+///
+/// docs/rcp.md, E-stop: `estop` "takes an optional `reason` (cut to 200
+/// characters)", "publishes its own frame, `{"call_id": N, "tool": "estop",
+/// "args": {"reason": ...}}`", "returns `estopped: true`,
+/// `graph_acknowledged` saying whether the graph answered, `call_id` (its
+/// frame's), `receipt` (its `intent` receipt, `{"seq", "hash", "prev"}`) and
+/// `result` (the graph's answer ...)", and "Its `intent` receipt is closed by
+/// `ok` when the graph answered"; "Its description in `tools/list` names
+/// `estop_clear` under `limits.estop_clear: agent`"; "The latch is also
+/// written to `<receipts>.estop`, a file holding the `reason` of the `estop`
+/// that wrote it (cut to 200 characters), then a newline". Tools, step 4: "While the e-stop is engaged a `reversible` or
+/// `irreversible` tool is refused (`estopped`) and receipted `denied`; the
+/// message says how the latch clears: with `estop_clear` under
+/// `limits.estop_clear: agent`"; "`read` tools skip this step." Safety
+/// classes: `read` writes no intent receipt and "runs" while e-stopped.
+pub fn estop_refuses_motion_and_lets_reads_run() -> Vector {
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            Event::Describe("estop"),
+            call(1, "estop", json!({ "reason": "x".repeat(500) })),
+            call(2, "arm.step", json!({ "q": [0.0, 0.0] })),
+            call(3, "arm.peek", json!({})),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            Effect::Described(vec![Says::Mentions("estop_clear")]),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "x".repeat(200) })),
+            entry("estop", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .answering(0)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("arm.step", Stage::Denied),
+            reply(2, Outcome::Refused("estopped"))
+                .carrying("/safety_class", json!("reversible"))
+                .mentioning("/error/message", "estop_clear"),
+            frame("arm.peek", json!({})),
+            entry("arm.peek", Stage::Ok),
+            reply(3, Outcome::Ran)
+                .answering(1)
+                .carrying("/safety_class", json!("read")),
+            latch_holds(format!("{}\n", "x".repeat(200))),
+        ],
+    }
+}
+
+/// A daemon that starts and finds the latch file an earlier one left starts
+/// with the e-stop engaged.
+///
+/// docs/rcp.md, E-stop: "a daemon that starts and finds that file starts with
+/// the latch closed", and the file holds "the `reason` of the `estop` that
+/// wrote it", here the earlier daemon's. Tools, step 4: refused
+/// "(`estopped`) and receipted `denied`; the message says how the latch
+/// clears: with `estop_clear` under `limits.estop_clear: agent`". AGENTS.md:
+/// "a daemon that finds the file starts latched".
+pub fn a_latch_left_by_an_earlier_daemon_refuses_motion() -> Vector {
+    Vector {
+        given: Given {
+            clearing: Clearing::Agent,
+            latch: Latch::LeftClosed,
+        },
+        events: vec![
+            call(1, "arm.step", json!({ "q": [0.0, 0.0] })),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            entry("arm.step", Stage::Denied),
+            reply(1, Outcome::Refused("estopped"))
+                .carrying("/safety_class", json!("reversible"))
+                .mentioning("/error/message", "estop_clear"),
+            latch_holds("earlier stop\n"),
+        ],
+    }
+}
+
+/// An `irreversible` tool runs with an intent receipt, is labelled in every
+/// result, and is refused while e-stopped like any motion call.
+///
+/// docs/rcp.md, Safety classes: `irreversible` has an intent receipt and is
+/// "refused" while e-stopped; "Every result of a manifest tool call after the
+/// name lookup, success or refusal, carries `"safety_class"`"; "Receipt lines
+/// record the tool name as `verb`". E-stop and Tools, step 4, as in
+/// [`estop_refuses_motion_and_lets_reads_run`].
+pub fn an_irreversible_tool_is_receipted_labelled_and_latch_gated() -> Vector {
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            call(1, "arm.cut", json!({})),
+            call(2, "estop", json!({ "reason": "stop" })),
+            call(3, "arm.cut", json!({})),
+            call(4, "arm.peek", json!({})),
+        ],
+        expect: vec![
+            entry("arm.cut", Stage::Intent),
+            frame("arm.cut", json!({})),
+            entry("arm.cut", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .answering(0)
+                .carrying("/safety_class", json!("irreversible")),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "stop" })),
+            entry("estop", Stage::Ok),
+            reply(2, Outcome::Ran)
+                .answering(1)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("arm.cut", Stage::Denied),
+            reply(3, Outcome::Refused("estopped")).carrying("/safety_class", json!("irreversible")),
+            frame("arm.peek", json!({})),
+            entry("arm.peek", Stage::Ok),
+            reply(4, Outcome::Ran)
+                .answering(2)
+                .carrying("/safety_class", json!("read")),
+        ],
+    }
+}
+
+/// `estop_clear` writes its intent, deletes the latch file, opens the latch
+/// and tells the graph; motion runs again; a later `estop` closes the latch
+/// and writes the file again.
+///
+/// docs/rcp.md, E-stop: `estop_clear` "appends an `intent` receipt", "deletes
+/// `<receipts>.estop` and opens the latch", "when the latch was closed,
+/// publishes `{"call_id": N, "tool": "estop_clear", "args": {"reason":
+/// ...}}` on the calls topic", "appends `ok`", and "returns `estopped` (the
+/// latch after the clear), `was_estopped`, `graph_acknowledged`, `receipt`
+/// (its `intent` receipt) and, when it published its frame, that frame's
+/// `call_id` and the graph's answer as `result`". "A later `estop` closes the
+/// latch and writes the file again." The estops, their latch file and the
+/// refused motion calls as in [`estop_refuses_motion_and_lets_reads_run`].
+pub fn a_clear_reopens_motion_and_a_later_estop_closes_it_again() -> Vector {
+    let q = || json!({ "q": [0.0, 0.0] });
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            call(1, "estop", json!({ "reason": "first" })),
+            Event::ProbeLatchFile,
+            call(2, "arm.step", q()),
+            call(3, "estop_clear", json!({ "reason": "safe" })),
+            Event::ProbeLatchFile,
+            call(4, "arm.step", q()),
+            call(5, "estop", json!({ "reason": "second" })),
+            Event::ProbeLatchFile,
+            call(6, "arm.step", q()),
+        ],
+        expect: vec![
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "first" })),
+            entry("estop", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .answering(0)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            latch_holds("first\n"),
+            entry("arm.step", Stage::Denied),
+            reply(2, Outcome::Refused("estopped")).mentioning("/error/message", "estop_clear"),
+            entry("estop_clear", Stage::Intent),
+            frame("estop_clear", json!({ "reason": "safe" })),
+            entry("estop_clear", Stage::Ok),
+            reply(3, Outcome::Ran)
+                .answering(1)
+                .receipted()
+                .carrying("/estopped", json!(false))
+                .carrying("/was_estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            no_latch_file(),
+            entry("arm.step", Stage::Intent),
+            frame("arm.step", q()),
+            entry("arm.step", Stage::Ok),
+            reply(4, Outcome::Ran).answering(2),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "second" })),
+            entry("estop", Stage::Ok),
+            reply(5, Outcome::Ran)
+                .answering(3)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            latch_holds("second\n"),
+            entry("arm.step", Stage::Denied),
+            reply(6, Outcome::Refused("estopped")),
+        ],
+    }
+}
+
+/// A clear with arguments outside its schema is refused; a clear with nothing
+/// latched writes its receipts and publishes nothing.
+///
+/// docs/rcp.md, E-stop: `estop_clear` takes "the same optional `reason` (at
+/// most 200 characters; any other argument is refused as `invalid_args`,
+/// receipted `error:invalid_args`)"; it "appends an `intent` receipt", "when
+/// it was open, publishes nothing", "appends `ok`", and returns `estopped`,
+/// `was_estopped`, `receipt` (its `intent` receipt), and `call_id` and
+/// `result` "both `null` when it published nothing".
+pub fn a_clear_with_nothing_latched_is_receipted_and_publishes_nothing() -> Vector {
+    let q = || json!({ "q": [0.0, 0.0] });
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            call(1, "estop_clear", json!({ "speed": 1 })),
+            call(2, "estop_clear", json!({ "reason": "idle" })),
+            call(3, "arm.step", q()),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            entry("estop_clear", Stage::Error("invalid_args")),
+            reply(1, Outcome::Refused("invalid_args")),
+            entry("estop_clear", Stage::Intent),
+            entry("estop_clear", Stage::Ok),
+            reply(2, Outcome::Ran)
+                .receipted()
+                .carrying("/estopped", json!(false))
+                .carrying("/was_estopped", json!(false))
+                .carrying("/call_id", json!(null))
+                .carrying("/result", json!(null)),
+            entry("arm.step", Stage::Intent),
+            frame("arm.step", q()),
+            entry("arm.step", Stage::Ok),
+            reply(3, Outcome::Ran).answering(0),
+            no_latch_file(),
+        ],
+    }
+}
+
+/// A clear opens a latch an earlier daemon left, and motion runs.
+///
+/// docs/rcp.md, E-stop: "a daemon that starts and finds that file starts with
+/// the latch closed"; `estop_clear` "deletes `<receipts>.estop` and opens the
+/// latch" and, "when the latch was closed", publishes its frame; it returns
+/// `receipt` (its `intent` receipt) and "that frame's `call_id` and the
+/// graph's answer as `result`", as in
+/// [`a_clear_reopens_motion_and_a_later_estop_closes_it_again`].
+pub fn a_clear_opens_a_latch_left_by_an_earlier_daemon() -> Vector {
+    let q = || json!({ "q": [0.0, 0.0] });
+    Vector {
+        given: Given {
+            clearing: Clearing::Agent,
+            latch: Latch::LeftClosed,
+        },
+        events: vec![
+            call(1, "estop_clear", json!({ "reason": "restart" })),
+            Event::ProbeLatchFile,
+            call(2, "arm.step", q()),
+        ],
+        expect: vec![
+            entry("estop_clear", Stage::Intent),
+            frame("estop_clear", json!({ "reason": "restart" })),
+            entry("estop_clear", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .answering(0)
+                .receipted()
+                .carrying("/estopped", json!(false))
+                .carrying("/was_estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            no_latch_file(),
+            entry("arm.step", Stage::Intent),
+            frame("arm.step", q()),
+            entry("arm.step", Stage::Ok),
+            reply(2, Outcome::Ran).answering(1),
+        ],
+    }
+}
+
+/// A latch file that cannot be deleted keeps the e-stop engaged.
+///
+/// docs/rcp.md, E-stop: `estop_clear` "appends an `intent` receipt", then "a
+/// file that cannot be deleted leaves the latch closed and returns
+/// `clear_failed`, receipted `error:clear_failed`". AGENTS.md: "An undeletable
+/// file leaves the latch closed (`clear_failed`)". A daemon that finds the
+/// file at start starts latched and refuses motion with a message naming
+/// `estop_clear`, as in [`a_latch_left_by_an_earlier_daemon_refuses_motion`].
+/// The undeletable latch file here is a directory, which has no text to
+/// probe, so the closed latch is seen through the refused motion call.
+pub fn an_undeletable_latch_file_keeps_the_estop_engaged() -> Vector {
+    Vector {
+        given: Given {
+            clearing: Clearing::Agent,
+            latch: Latch::Undeletable,
+        },
+        events: vec![
+            call(1, "estop_clear", json!({ "reason": "try" })),
+            call(2, "arm.step", json!({ "q": [0.0, 0.0] })),
+        ],
+        expect: vec![
+            entry("estop_clear", Stage::Intent),
+            entry("estop_clear", Stage::Error("clear_failed")),
+            reply(1, Outcome::Refused("clear_failed")),
+            entry("arm.step", Stage::Denied),
+            reply(2, Outcome::Refused("estopped")).mentioning("/error/message", "estop_clear"),
+        ],
+    }
+}
+
+/// Under `limits.estop_clear: operator` the agent cannot clear the e-stop:
+/// `estop_clear` is not listed, a call to it is refused, and the latch file
+/// stays.
+///
+/// docs/rcp.md, The manifest, `limits`: "`operator`: `estop_clear` is not
+/// listed, a call to it is refused (`estop_clear_disabled`), and only deleting
+/// the latch file and restarting the daemon clears the e-stop". AGENTS.md:
+/// "`limits.estop_clear: operator` unlists `estop_clear` and refuses it
+/// (`estop_clear_disabled`, receipted `denied`)". E-stop: the description of
+/// `estop` under `operator` "says an operator clears the latch and does not
+/// name `estop_clear`"; Tools, step 4: the `estopped` message says the latch
+/// clears "by an operator under `operator`, where it does not name
+/// `estop_clear`".
+pub fn under_operator_clearing_the_agent_cannot_clear() -> Vector {
+    Vector {
+        given: Given {
+            clearing: Clearing::Operator,
+            latch: Latch::Absent,
+        },
+        events: vec![
+            Event::List,
+            Event::Describe("estop"),
+            call(1, "estop", json!({ "reason": "stop" })),
+            call(2, "estop_clear", json!({ "reason": "try" })),
+            call(3, "arm.step", json!({ "q": [0.0, 0.0] })),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            Effect::Listed(vec![
+                "arm.step", "arm.slow", "arm.mute", "arm.peek", "arm.cut", "estop",
+            ]),
+            Effect::Described(vec![Says::Mentions("operator"), Says::Omits("estop_clear")]),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "stop" })),
+            entry("estop", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .answering(0)
+                .receipted()
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("estop_clear", Stage::Denied),
+            reply(2, Outcome::Refused("estop_clear_disabled")),
+            entry("arm.step", Stage::Denied),
+            reply(3, Outcome::Refused("estopped"))
+                .mentioning("/error/message", "operator")
+                .omitting("/error/message", "estop_clear"),
+            latch_holds("stop\n"),
         ],
     }
 }

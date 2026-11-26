@@ -6,12 +6,14 @@
 //! the doc line its vector names; none is copied from a run.
 //!
 //! The effects are what is visible from outside the daemon: the reply the
-//! client reads, the frames the graph receives on the calls topic, and the
-//! receipt log's lines. The daemon sits behind [`Daemon`], so any host that
-//! serves the tools over MCP runs the same vectors.
+//! client reads, the frames the graph receives on the calls topic, the
+//! receipt log's lines, the `tools/list` answers and the text of the latch
+//! file `<receipts>.estop`. The daemon sits behind [`Daemon`], so any host
+//! that serves the tools over MCP runs the same vectors.
 //!
-//! Effects are checked per channel: replies by request, frames and receipt
-//! lines in order. No vector writes a `call_id` as a number: a reply names the
+//! Effects are checked per channel: replies by request; frames, receipt
+//! lines, `tools/list` answers, tool descriptions and latch file probes in
+//! order. No vector writes a `call_id` as a number: a reply names the
 //! frame whose `call_id` it carries.
 
 pub mod graph;
@@ -135,6 +137,10 @@ pub enum Event {
     Call { req: Req, tool: String, args: Value },
     /// `tools/list`.
     List,
+    /// `tools/list`, keeping the description of this tool.
+    Describe(&'static str),
+    /// Read the latch file `<receipts>.estop`, if it exists.
+    ProbeLatchFile,
 }
 
 /// `tools/call` of `tool` with `args` as request `req`.
@@ -183,15 +189,17 @@ impl Stage {
 pub enum Effect {
     /// The reply to `req`. When `frame` is set, the reply's `call_id` is the
     /// `call_id` of that frame (counted from 0 on the calls topic), and its
-    /// `result` is the stand-in graph's answer to that frame. Each of
+    /// `result` is the stand-in graph's answer to that frame. When
+    /// `receipted` is set, its `receipt` is `{"seq", "hash", "prev"}`. Each of
     /// `carries` is a JSON pointer into the reply body and the value there;
-    /// each of `mentions` a pointer to a string and text it contains.
+    /// each of `says` a pointer to a string and what that string says.
     Reply {
         req: Req,
         outcome: Outcome,
         frame: Option<usize>,
+        receipted: bool,
         carries: Vec<(&'static str, Value)>,
-        mentions: Vec<(&'static str, &'static str)>,
+        says: Vec<(&'static str, Says)>,
     },
     /// The next frame on the calls topic.
     Frame { tool: &'static str, args: Value },
@@ -199,6 +207,40 @@ pub enum Effect {
     Entry { verb: &'static str, stage: Stage },
     /// The next `tools/list` answer: the tool names, in order.
     Listed(Vec<&'static str>),
+    /// The next latch file probe: the file's text, `None` when it does not
+    /// exist.
+    LatchFile(Option<String>),
+    /// The next [`Event::Describe`]: what that tool's description says.
+    Described(Vec<Says>),
+}
+
+/// What a piece of text says.
+#[derive(Debug)]
+pub enum Says {
+    /// It contains this text.
+    Mentions(&'static str),
+    /// It does not contain this text.
+    Omits(&'static str),
+}
+
+impl Says {
+    /// Whether `text` says it.
+    fn holds(&self, text: &str) -> bool {
+        match self {
+            Self::Mentions(part) => text.contains(part),
+            Self::Omits(part) => !text.contains(part),
+        }
+    }
+}
+
+/// The next latch file probe finds the file holding `text`.
+pub fn latch_holds(text: impl Into<String>) -> Effect {
+    Effect::LatchFile(Some(text.into()))
+}
+
+/// The next latch file probe finds no file.
+pub fn no_latch_file() -> Effect {
+    Effect::LatchFile(None)
 }
 
 /// The reply to `req` ends with `outcome`.
@@ -207,8 +249,9 @@ pub fn reply(req: Req, outcome: Outcome) -> Effect {
         req,
         outcome,
         frame: None,
+        receipted: false,
         carries: Vec::new(),
-        mentions: Vec::new(),
+        says: Vec::new(),
     }
 }
 
@@ -241,22 +284,83 @@ impl Effect {
         self
     }
 
+    /// This reply carries its `receipt` as `{"seq", "hash", "prev"}`.
+    pub fn receipted(mut self) -> Self {
+        let Self::Reply { receipted, .. } = &mut self else {
+            panic!("only a reply carries a receipt");
+        };
+        *receipted = true;
+        self
+    }
+
     /// This reply's body holds a string containing `text` at the JSON
     /// `pointer`.
-    pub fn mentioning(mut self, pointer: &'static str, text: &'static str) -> Self {
-        let Self::Reply { mentions, .. } = &mut self else {
-            panic!("only a reply mentions text");
+    pub fn mentioning(self, pointer: &'static str, text: &'static str) -> Self {
+        self.saying(pointer, Says::Mentions(text))
+    }
+
+    /// This reply's body holds a string at the JSON `pointer` that does not
+    /// contain `text`.
+    pub fn omitting(self, pointer: &'static str, text: &'static str) -> Self {
+        self.saying(pointer, Says::Omits(text))
+    }
+
+    fn saying(mut self, pointer: &'static str, said: Says) -> Self {
+        let Self::Reply { says, .. } = &mut self else {
+            panic!("only a reply holds text");
         };
-        mentions.push((pointer, text));
+        says.push((pointer, said));
         self
+    }
+}
+
+/// What is on disk before the daemon starts.
+pub enum Latch {
+    /// No latch file.
+    Absent,
+    /// A latch file an earlier daemon left.
+    LeftClosed,
+    /// A latch file that cannot be deleted: a non-empty directory at its path.
+    Undeletable,
+}
+
+/// Who clears the e-stop: the manifest's `limits.estop_clear`.
+pub enum Clearing {
+    /// `agent`, the default.
+    Agent,
+    /// `operator`.
+    Operator,
+}
+
+/// The state a vector starts from.
+pub struct Given {
+    pub clearing: Clearing,
+    pub latch: Latch,
+}
+
+impl Given {
+    /// A first start under the default limits: no latch file.
+    pub fn fresh() -> Self {
+        Self {
+            clearing: Clearing::Agent,
+            latch: Latch::Absent,
+        }
     }
 }
 
 /// One scenario. `expect` lists the effects in the order `docs/rcp.md`
 /// gives them; only the order within each channel is checked.
 pub struct Vector {
+    pub given: Given,
     pub events: Vec<Event>,
     pub expect: Vec<Effect>,
+}
+
+/// The latch file for the receipt log at `receipts`, by its documented name.
+fn latch_path_of(receipts: &Path) -> PathBuf {
+    let mut name = receipts.as_os_str().to_owned();
+    name.push(".estop");
+    PathBuf::from(name)
 }
 
 /// What one vector's events produced, per channel.
@@ -269,6 +373,10 @@ pub struct Trace {
     pub entries: Vec<(String, String)>,
     /// The tool names of each `tools/list`, in order.
     pub listed: Vec<Vec<String>>,
+    /// Each latch file probe, in order: the file's text, if it exists.
+    pub latch: Vec<Option<String>>,
+    /// The description each [`Event::Describe`] kept, in order.
+    pub described: Vec<String>,
 }
 
 /// A daemon serving the vector manifest, the stand-in graph, and one MCP
@@ -277,24 +385,42 @@ pub struct Session<D> {
     client: RunningService<RoleClient, ()>,
     daemon: D,
     graph: graph::Graph,
+    latch_file: PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl<D: Daemon> Session<D> {
-    /// Boot `D` on the vector manifest with the stand-in graph answering.
-    pub async fn open() -> Self {
+    /// Boot `D` from `given` on the vector manifest, with the stand-in
+    /// graph answering.
+    pub async fn open(given: &Given) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let prefix = unique("vector");
-        let loaded = manifest(dir.path(), &prefix);
+        let limits = match given.clearing {
+            Clearing::Agent => "",
+            Clearing::Operator => "limits:\n  estop_clear: operator\n",
+        };
+        let loaded = manifest_with(dir.path(), &prefix, limits);
         let mgr = manager("vector");
         let graph = graph::Graph::spawn(mgr.clone(), &prefix);
         let receipts: PathBuf = dir.path().join("receipts/log.jsonl");
+        let latch_file = latch_path_of(&receipts);
+        match given.latch {
+            Latch::Absent => {}
+            Latch::LeftClosed => {
+                std::fs::create_dir_all(dir.path().join("receipts")).expect("mkdir");
+                std::fs::write(&latch_file, "earlier stop\n").expect("write latch file");
+            }
+            Latch::Undeletable => {
+                std::fs::create_dir_all(latch_file.join("pinned")).expect("mkdir");
+            }
+        }
         let (daemon, stream) = D::boot(&mgr, &loaded, &receipts);
         let client = ().serve(stream).await.expect("client session");
         Self {
             client,
             daemon,
             graph,
+            latch_file,
             _dir: dir,
         }
     }
@@ -316,23 +442,38 @@ impl<D: Daemon> Session<D> {
         )
     }
 
-    /// `tools/list`: the tool names, in order.
-    pub async fn list(&self) -> Vec<String> {
+    /// `tools/list`: each tool's name and description, in order.
+    pub async fn list(&self) -> Vec<(String, String)> {
         self.client
             .list_all_tools()
             .await
             .expect("list")
             .into_iter()
-            .map(|t| t.name.to_string())
+            .map(|t| {
+                let description = t.description.as_deref().unwrap_or_default().to_string();
+                (t.name.to_string(), description)
+            })
             .collect()
+    }
+
+    /// The latch file's text, `None` when it does not exist.
+    fn read_latch_file(&self) -> Option<String> {
+        match std::fs::read_to_string(&self.latch_file) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => panic!("the latch file cannot be read: {e}"),
+        }
     }
 }
 
-/// Run `events` against a fresh `D` and record what each channel saw.
-pub async fn play<D: Daemon>(events: &[Event]) -> Trace {
-    let session = Session::<D>::open().await;
+/// Run `events` against a `D` started from `given` and record what each
+/// channel saw.
+pub async fn play<D: Daemon>(given: &Given, events: &[Event]) -> Trace {
+    let session = Session::<D>::open(given).await;
     let mut replies = BTreeMap::new();
     let mut listed = Vec::new();
+    let mut described = Vec::new();
+    let mut latch = Vec::new();
     for event in events {
         match event {
             Event::Call { req, tool, args } => {
@@ -342,7 +483,17 @@ pub async fn play<D: Daemon>(events: &[Event]) -> Trace {
                     "request {req} is sent twice"
                 );
             }
-            Event::List => listed.push(session.list().await),
+            Event::List => {
+                let names = session.list().await.into_iter().map(|(name, _)| name);
+                listed.push(names.collect());
+            }
+            Event::Describe(tool) => {
+                let tools = session.list().await;
+                let found = tools.into_iter().find(|(name, _)| name == tool);
+                let (_, description) = found.unwrap_or_else(|| panic!("{tool} is not listed"));
+                described.push(description);
+            }
+            Event::ProbeLatchFile => latch.push(session.read_latch_file()),
         }
     }
     let frames = session.graph.stop();
@@ -352,12 +503,14 @@ pub async fn play<D: Daemon>(events: &[Event]) -> Trace {
         frames,
         entries,
         listed,
+        latch,
+        described,
     }
 }
 
 /// Run `vector` against a fresh `D` and check every channel.
 pub async fn run<D: Daemon>(vector: Vector) {
-    let trace = play::<D>(&vector.events).await;
+    let trace = play::<D>(&vector.given, &vector.events).await;
     check(&vector.expect, &trace);
 }
 
@@ -367,18 +520,21 @@ fn check(expect: &[Effect], trace: &Trace) {
     let mut frames: Vec<(String, Value)> = Vec::new();
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut listed: Vec<Vec<String>> = Vec::new();
+    let mut latch = Vec::new();
+    let mut described = Vec::new();
     for effect in expect {
         match effect {
             Effect::Reply {
                 req,
                 outcome,
                 frame,
+                receipted,
                 carries,
-                mentions,
+                says,
             } => {
                 assert!(
                     replies
-                        .insert(*req, (outcome, frame, carries, mentions))
+                        .insert(*req, (outcome, frame, receipted, carries, says))
                         .is_none(),
                     "request {req} has two expected replies"
                 );
@@ -386,6 +542,8 @@ fn check(expect: &[Effect], trace: &Trace) {
             Effect::Frame { tool, args } => frames.push((tool.to_string(), args.clone())),
             Effect::Entry { verb, stage } => entries.push((verb.to_string(), stage.word())),
             Effect::Listed(names) => listed.push(names.iter().map(|n| n.to_string()).collect()),
+            Effect::LatchFile(text) => latch.push(text.clone()),
+            Effect::Described(says) => described.push(says),
         }
     }
 
@@ -409,13 +567,24 @@ fn check(expect: &[Effect], trace: &Trace) {
     }
     assert_eq!(trace.entries, entries, "the receipt log");
     assert_eq!(trace.listed, listed, "the tools/list answers");
+    assert_eq!(trace.latch, latch, "the latch file probes");
+    assert_eq!(
+        trace.described.len(),
+        described.len(),
+        "every described tool has its expected description"
+    );
+    for (text, says) in trace.described.iter().zip(described) {
+        for said in says {
+            assert!(said.holds(text), "the description {said:?}: {text}");
+        }
+    }
 
     assert_eq!(
         trace.replies.keys().collect::<Vec<_>>(),
         replies.keys().collect::<Vec<_>>(),
         "every request has exactly one expected reply"
     );
-    for (req, (outcome, frame, carries, mentions)) in replies {
+    for (req, (outcome, frame, receipted, carries, says)) in replies {
         let (is_error, body) = &trace.replies[&req];
         match outcome {
             Outcome::Ran => assert!(!is_error, "request {req} ran: {body}"),
@@ -446,11 +615,18 @@ fn check(expect: &[Effect], trace: &Trace) {
                 "request {req} at {pointer}: {body}"
             );
         }
-        for (pointer, text) in mentions {
+        if *receipted {
+            let receipt = &body["receipt"];
+            let shaped = receipt["seq"].is_u64()
+                && receipt["hash"].is_string()
+                && receipt["prev"].is_string();
+            assert!(shaped, "request {req} carries its receipt: {body}");
+        }
+        for (pointer, said) in says {
             let found = body.pointer(pointer).and_then(Value::as_str);
             assert!(
-                found.is_some_and(|found| found.contains(text)),
-                "request {req} at {pointer} mentions {text:?}: {body}"
+                found.is_some_and(|found| said.holds(found)),
+                "request {req} at {pointer} {said:?}: {body}"
             );
         }
     }
