@@ -471,9 +471,16 @@ replay mode and the bag's `trace_format`:
 - Under `cerulion bag play <bag> --resim all --verify` on a free-run recording
   at `trace_format` 8 or later, every read stage is served through a **private
   per-input feed** by recorded `(writer, sequence)` identity (see `docs/bag.md`).
-  Popping reads receive the exact recorded batch and served frames, and
-  non-popping `Held(body)` reads receive nothing, so live `drop_oldest` queue
-  evictions reproduce read for read with no `join_mismatch`.
+  Single-frame popping reads (`popped == 1`) receive their recorded served
+  frame from `trace_format` 8 on. Multi-frame popping reads (`popped > 1`, such
+  as a `depth >= 2` queue popping several frames at once) require `trace_format`
+  9 or later with complete `batch_frame` records fitting in the read stage's
+  window; on a `trace_format` 8 bag (which records only the served frame), or
+  when a batch exceeds the read stage's window, `--verify` refuses the read up
+  front at exit 2 (`read_identity_batch_unattributed`). Non-popping
+  `Held(body)` reads receive nothing. When every read's frames are attributed,
+  live `drop_oldest` queue evictions reproduce read for read with no
+  `join_mismatch`.
 - Under neutral `--resim all` without `--verify`, or on a free-run bag recorded
   below `trace_format` 8, cross-rank topics use read-log-steered shared-queue
   injection (`BestEffort`). Because frames evicted on `drop_oldest` overflow
@@ -483,9 +490,11 @@ replay mode and the bag's `trace_format`:
 
 So:
 
-- **A cross-rank edge-read divergence is impossible by construction** under
-  `--verify` on recordings at `trace_format` 8 or later. The input side of
-  every cross-rank edge is the bag, not a co-replaying candidate.
+- **A cross-rank edge-read divergence is impossible by construction** on any
+  fed `--verify` run (`trace_format` 8 or later for single-frame reads, and
+  `trace_format` 9 or later with complete `batch_frame` records when reads pop
+  more than one frame). The input side of every cross-rank edge is the bag, not
+  a co-replaying candidate.
 - **A changed producer reads as "rank A produced different bytes"**, not as a
   cascade of consumer-side symptoms downstream of it. That is sharper blame, not
   weaker: the verdict names the rank that changed instead of everything that
