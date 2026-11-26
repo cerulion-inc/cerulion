@@ -569,12 +569,20 @@ snapshot (`topic-snapshot`).
 - **E-stop is not serialized behind other sessions at the transport layer**: ops sessions are served
   CONCURRENTLY over one `Arc<cerud::OpsServer>` whose receipt sink is a
   brief-append mutex; a stalled/hostile session parks on a blocking read holding
-  no lock; a paired `engage-estop` reaches the lease immediately, its safety
-  EFFECT running BEFORE its audit receipt (e-stop is non-mutating, so no intent
-  receipt precedes it; see `crates/cerud/src/server.rs`). Each session is bounded by
+  no lock. Unpaired `OpsBootstrapOnly`, refused, and skeleton connections share a
+  64-permit concurrency cap (`MAX_UNPAIRED_SESSIONS` in `daemon.rs`), and
+  unpaired bootstrap sessions must deliver their opening `cerud` frame
+  asynchronously within `OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE` (5 s, `ops.rs`)
+  before entering `spawn_blocking`. Paired `OpsAdmit` sessions are exempt from
+  the 64-permit cap so throwaway peers cannot saturate the runtime's 512-thread
+  blocking pool ahead of a paired `engage-estop`; paired sessions still share
+  that 512-thread blocking pool with one another. Once admitted to the ops
+  server, a paired `engage-estop` runs its safety EFFECT BEFORE its audit
+  receipt (e-stop is non-mutating, so no intent receipt precedes it; see
+  `crates/cerud/src/server.rs`). Each session is bounded by
   `OPS_SESSION_DEADLINE` (120 s, `ops.rs`; a resource guard, not a
   serialization point). Pinned by `estop_starvation_test.rs`, which also
-  doc-pins the 120 s value. Engaging the e-stop additionally publishes ONE
+  doc-pins the 120 s and 5 s values. Engaging the e-stop additionally publishes ONE
   incident capture request onto the machine-local flashback channel
   (`remoted/src/flashback.rs`), best-effort by design: a failed ask never
   fails the e-stop, and the verb type cannot be built without a real ask in a
@@ -1286,7 +1294,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 | `crates/cerulion_remoted/tests/loopback_test.rs` | Accept-gate routing over real endpoints (wire refuses unpaired; ops bootstraps) |
 | `crates/cerulion_remoted/tests/ops_loopback_test.rs` | The real ops plane over iroh: verbs, receipts, pair-then-allowed |
 | `crates/cerulion_remoted/tests/wire_plane_test.rs` | Wire plane e2e: catalog/demand/schema/status, byte-exact frames, demand gate |
-| `crates/cerulion_remoted/tests/estop_starvation_test.rs` | E-stop bounded latency under hostile concurrent sessions; the 120 s doc pin |
+| `crates/cerulion_remoted/tests/estop_starvation_test.rs` | E-stop bounded latency under 600 stalled bootstrap sessions and shared 64-permit unpaired/refused/skeleton cap; 5 s bootstrap first-frame deadline and error arms; 120 s and 5 s doc pins |
 | `crates/cerulion_remoted/tests/offline_connect_test.rs` | Established pairing connects with issuer down + relay unreachable |
 | `crates/cerulion_remoted/tests/epoch_push_e2e_test.rs` | Desk-push epoch through production plane/sink/gate/sweep |
 | `crates/cerulion_remoted/tests/daemon_epoch_sink_test.rs` / `daemon_demand_gate_test.rs` | Inert-wiring pins: the sink/authorizer wired by `serve_endpoint` itself |
