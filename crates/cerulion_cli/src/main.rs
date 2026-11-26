@@ -3831,44 +3831,6 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
-/// Whether a command must run under a logged-in-ever identity (the
-/// runtime login gate — "every command requires a logged-in-ever
-/// identity"). Everything a user invokes gates, `account` and its sub-verbs
-/// included: those talk to the account service and need a session anyway, so
-/// exempting them would only move the failure later and word it worse.
-///
-/// Two more things answer above this gate and therefore need no exemption here:
-/// clap's own `--help` and `--version`, which exit inside the clap parse
-/// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
-/// refusals `main` performs before the gate call (a moved verb, the hidden
-/// `pair` stub, a malformed resim invocation). You do not have to
-/// prove who you are to be told a command line is wrong.
-///
-/// The exemptions are:
-///
-/// - **`login`** itself — it IS the login (gating it would auto-trigger a device
-///   flow BEFORE the real login runs — a doubled/confusing login).
-/// - **`graph run-worker` / `graph run-gateway`** — the internal subprocess
-///   verbs the multi-process supervisor / monolith parent spawns. **Why exempt
-///   is safe:** the PARENT already passed this gate, and it spawns these children
-///   with the parent's env (the cached auth is visible); gating them would make
-///   each spawned worker re-hit the gate and — on a child env without a visible
-///   auth cache — auto-trigger an interactive device-code login MID-SPAWN,
-///   wedging the whole run. (`bagd` is also internal but is dispatched away in
-///   `main` BEFORE this hook, so it never reaches here.)
-/// - **`clean`** — it sweeps the iceoryx2 bookkeeping that provably dead
-///   processes left behind on THIS machine: it reads no account, sends nothing
-///   anywhere and reaches no network. The desks that need it most have never
-///   signed in — a CI runner, a fresh install a `kill -9` left wedged — and a
-///   machine must be able to clear its own state. Gating it would also make the
-///   remedy for a wedged desk depend on a device-code flow that the wedge is
-///   perfectly capable of outliving.
-///
-/// The enforcement boundary: `run-worker` and `run-gateway` are hidden from
-/// help but still reachable as standalone `cerulion graph run-worker`
-/// invocations, so a machine that has never signed in can run them ungated.
-/// The local gate is a convenience check on a user's own machine; access to
-/// an account and its robots is enforced by the account service.
 /// Whether `command` calls the Cerulion account service or authenticates to a
 /// remote robot, and therefore enters the runtime login gate before dispatch.
 ///

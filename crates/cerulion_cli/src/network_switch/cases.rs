@@ -10,7 +10,8 @@
 //!
 //! The tree check forces a row for every verb, but which [`Expect`] a row
 //! carries is the author's call: a verb that reaches the network some other
-//! way than `--robot` and is listed as [`Expect::Gated`] passes both tests.
+//! way than `--robot` and is listed as [`Expect::Runs`] or
+//! [`Expect::LocalNoGate`] passes the in-process check.
 
 /// One invocation.
 pub(crate) struct Case {

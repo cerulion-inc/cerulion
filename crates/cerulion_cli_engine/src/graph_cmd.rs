@@ -6402,17 +6402,16 @@ pub fn graph_run(
         cerulion_netd::serving_login::require_serving_authority,
     )?;
     // The permissive default applies to every normal real-clock live run
-    // reaching this function — `graph run`, `node run`'s temp single-node
+    // reaching this function: `graph run`, `node run`'s temp single-node
     // graph, AND `ros2 attach` (which checks `require_serving_authority` before
     // entering `graph_run`). Under `RunNetwork::Permissive`, a machine with no
     // prior login or robot pairing degrades to `RunNetwork::Off` with one loud
     // warning so offline runs work without ever opening a network listener;
     // explicit `network: egress:` stays refused. Network suppressors are
     // `--network off` / `CERULION_NETWORK=off`, the virtual/external clocks,
-    // and the record+declared-ingress refusal — all already folded into
-    // `run_network` above. (`graph profile` never routes through this function
-    // — see the explicit local-only profile arm in `resolve_run_network`'s
-    // docs.)
+    // and the record+declared-ingress refusal, all already folded into
+    // `run_network` above. (`graph profile` never routes through this function:
+    // see the explicit local-only profile arm in `resolve_run_network`'s docs.)
 
     // The execution mode is read from the environment exactly once per run,
     // HERE, and the result threaded to every reader below.
