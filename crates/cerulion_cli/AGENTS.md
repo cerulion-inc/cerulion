@@ -7,21 +7,11 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
-- `command_needs_identity` and `VerbFamily::needs_identity` gate ONLY commands that call the
-  account service or authenticate to remote robots (`account *`, `connect`, `rcp <robot>`,
-  `viz --robot`, `graph live`, `graph fires`, `topic echo|hz|info|pub|snapshot --robot`,
-  `service call --robot`). Keep `command_needs_identity` exhaustive; local/offline verbs
-  run without sign-in (`tests/login_gate_e2e_test.rs`, `tests/offline_graph_run_e2e_test.rs`).
-- Serving uses netd `require_serving_authority` for explicit `network: egress:`,
-  explicit `network: ingress:` under `CERULION_LAN_ACCESS=open`, `ros2 attach`,
-  `graph run-gateway`, and `cerulion-netd`; explicit `network: ingress:` under paired
-  access without saved `robots.toml` pairings enters `ensure_login_gate` (exit 7
-  non-interactively); permissive-default `graph run` / `node run` degrades to
-  `RunNetwork::Off` with one loud warning when unsigned-in and never opens a network listener.
+- Login gate: account/remote only; exhaustive `command_needs_identity` (cli.md §12).
+- Serving/ingress: strict & attach gated; permissive degrades to Off.
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
-  telemetry, logging and the login gate.
-  Paired LAN skip: INFO.
+  telemetry, logging and the login gate. Paired LAN skip: INFO.
 - Multi-value flags use exact `num_args = N`, never a range (clap's Append flattens repeats
   into one Vec). Length guards run BEFORE any positional access.
 - Optional-value flags (`--record`, `--run`) use `require_equals`: a bare flag takes its
@@ -29,8 +19,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
 - A `String`-typed path arg completes NOTHING without a `value_hint` (`PathBuf` gets
   `AnyPath`). Every new value arg needs a completer/hint or an inventory entry
   (`src/completion_wiring_tests.rs`); for a path the fix is the hint.
-- New top-level verb: a `src/families/` module + a `FAMILIES` entry, not a
-  `Commands` variant (cli.md §14)
+- New top-level verb: a `src/families/` module + a `FAMILIES` entry, not a `Commands` variant (cli.md §14)
 - Create verbs (`node|graph|schema create`) complete nothing.
 
 ## Tests

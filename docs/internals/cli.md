@@ -1393,7 +1393,7 @@ For network serving and declared ingress during `graph run` / `node run`,
 `apply_serving_authority_with` in `crates/cerulion_cli_engine/src/graph_cmd.rs`
 splits `RunNetwork::Strict` from `RunNetwork::Permissive`: an explicit
 `network: egress:` block still refuses without `require_serving_authority()`;
-an explicit `network: ingress:` block under `LanAccess::Open` also requires
+an explicit `network: ingress:` block under `LanAccess::Open` (`CERULION_LAN_ACCESS=open`) also requires
 `require_serving_authority()` before startup (so the gateway child does not exit
 leaving declared inputs absent), and under `LanAccess::Paired` checks saved
 explicit robot pairings (`robots.toml` plus the machine key) first and otherwise
@@ -1501,8 +1501,8 @@ at a time, each against a byte capture like `tests/verb_family_golden_test.rs`.
      has no default, so a new family decides it; add the family's verbs to
      `src/network_switch/cases.rs`, which `network_switch::tests` holds against the
      command tree.
-   - `needs_identity`: `true` unless the verb must work on a machine that never signed
-     in (the `Completions`/`Clean` rule in `crates/cerulion_cli/AGENTS.md`).
+   - `needs_identity`: `true` only when the verb calls the Cerulion account service or
+     authenticates to a remote robot; `false` for local/offline verbs (section 12).
    - `run`: parse the action with `FromArgMatches`, run it, return the exit code;
      `exit_code_of` gives the generic `Error: ...` mapping: exit 3 for a run that
      stopped a node on a fatal error, exit 1 for every other error.
