@@ -12,6 +12,8 @@ memory: there is no serialize, no deserialize, and no copy on the receive path.
 > the ceilings that test enforces, not run outputs. Absolute microseconds are
 > platform-dependent; the **flatness** (the zero-copy claim itself) is not.
 
+Write-up: [ROS 2 latency for large messages: zero-copy keeps it flat](https://cerulion.com/blog/ros2-large-message-latency).
+
 ## The public fixed100 benchmark
 
 In the fixed100 campaign, the Cerulion multi-process cell, measured with free run

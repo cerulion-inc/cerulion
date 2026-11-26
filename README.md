@@ -431,6 +431,8 @@ Cost and wall time are per scored episode: cost is model spend at the list price
 
 **Limits:** one benchmark family, and while the 100 start states are new, their 25 task rows are ones the harness was developed on; the run with Cerulion also reads the robot's calibration record; the 4 models that solved fewer are the 4 with the highest scores without Cerulion, and none of those 4 is significant at 0.05, so each reads "no difference shown"; GPT-6.1 Terra was added after the grid's first rows had been seen and Gemini 4 Neon after every other column had finished and been read; simulation only. The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) has every episode and a script that recomputes every figure.
 
+Write-up: [Can an LLM control a robot arm? 73 of 100 in LIBERO-PRO sim](https://cerulion.com/blog/llm-robot-control-harness-libero-pro).
+
 <a id="performance"></a>
 
 ### Latency
@@ -452,6 +454,8 @@ Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultr
 Jazzy nodes on `rmw_cerulion` that publish and take loaned messages read **11.12 µs / 37.21 µs** at 1 MiB, against **11.0 ms / 43.4 ms** on `rmw_fastrtps_cpp` defaults. Loaned publishing is a code change in your nodes, and the package has no figure for nodes that do not loan. In 4 of the package's 105,050 echoes, one of them at 1 MiB, the echo node borrowed its reply loan inside the timed window; the published p50 is unaffected ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)).
 
 The composed ROS 2 lane bypasses the middleware, so it times framework overhead, not transport. The 2 worker process lane runs a graph that declares 2 process groups. A graph that declares none gets one process per node, which reads slower. The timer leaves out the application filling the payload. The figures come from one desktop and are not a guarantee, and the largest gap is against ROS 2 defaults, not a tuned setup. From 1 MiB up (11.0 ms at 1 MiB), a stock ROS 2 round trip outlasts the 10 ms pacing interval, so requests overlap. Raw iceoryx2 is faster than native Cerulion, at 2.42 µs / 3.02 µs at 64 B ([native package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md), [methodology](benches/latency/METHODOLOGY.md), [benchmark suite](benches/latency/README.md)).
+
+Write-up: [ROS 2 latency for large messages: zero-copy keeps it flat](https://cerulion.com/blog/ros2-large-message-latency).
 
 ### Runs on real hardware
 
