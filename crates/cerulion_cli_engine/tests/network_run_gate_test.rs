@@ -927,8 +927,20 @@ fn netd_network_switch_matches_the_daemon() {
 }
 
 // ==========================================================================
-// Serving authority degradation for permissive-default vs strict egress.
+// Serving authority degradation for permissive-default vs strict egress/ingress.
 // ==========================================================================
+
+fn ingress_only_block() -> NetworkBlock {
+    NetworkBlock {
+        mode: NetworkMode::Peer,
+        connect: vec![],
+        listen: vec![],
+        egress: vec![],
+        ingress: vec!["/remote/cam".to_string()],
+        tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
+    }
+}
 
 #[test]
 #[traced_test]
@@ -939,10 +951,18 @@ fn permissive_without_authority_degrades_to_off_with_loud_warn() {
     assert!(matches!(initial, RunNetwork::Permissive(_)));
 
     let mut checked = 0;
-    let degraded = apply_serving_authority_with("demo_graph", &config, initial, || {
-        checked += 1;
-        Err("serving the network requires a prior login; run `cerulion login`")
-    })
+    let degraded = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        initial,
+        cerulion_core::LanAccess::Paired,
+        || false,
+        || {
+            checked += 1;
+            Err("serving the network requires a prior login; run `cerulion login`")
+        },
+        || panic!("permissive mode must not run login gate"),
+    )
     .expect("permissive without authority degrades instead of refusing");
     assert_eq!(checked, 1);
     assert!(matches!(degraded, RunNetwork::Off));
@@ -962,10 +982,18 @@ fn permissive_with_authority_stays_permissive_without_local_only_warn() {
     let config = graph_with(None);
     let initial = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
     let mut checked = 0;
-    let kept = apply_serving_authority_with("demo_graph", &config, initial, || {
-        checked += 1;
-        Ok(())
-    })
+    let kept = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        initial,
+        cerulion_core::LanAccess::Paired,
+        || false,
+        || {
+            checked += 1;
+            Ok(())
+        },
+        || panic!("permissive mode must not run login gate"),
+    )
     .expect("permissive with authority stays permissive");
     assert_eq!(checked, 1);
     assert!(matches!(kept, RunNetwork::Permissive(_)));
@@ -978,18 +1006,127 @@ fn strict_with_egress_refuses_without_authority_and_allows_with_it() {
     let config = graph_with(Some(egress_only_block()));
     let strict_err = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
     let refusal = "serving the network requires a prior login; run `cerulion login`";
-    let err = apply_serving_authority_with("demo_graph", &config, strict_err, || Err(refusal))
-        .expect_err("explicit egress must refuse without authority");
+    let err = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_err,
+        cerulion_core::LanAccess::Paired,
+        || false,
+        || Err(refusal),
+        || panic!("egress-only must not run login gate"),
+    )
+    .expect_err("explicit egress must refuse without authority");
     assert_eq!(err.to_string(), refusal);
 
     let strict_ok = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
-    let kept = apply_serving_authority_with("demo_graph", &config, strict_ok, || Ok(()))
-        .expect("explicit egress with authority proceeds");
+    let kept = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_ok,
+        cerulion_core::LanAccess::Paired,
+        || false,
+        || Ok(()),
+        || panic!("egress-only must not run login gate"),
+    )
+    .expect("explicit egress with authority proceeds");
     assert!(matches!(kept, RunNetwork::Strict(_)));
 }
 
 #[test]
-fn strict_without_egress_and_off_and_inert_skip_authority_check() {
+fn strict_ingress_only_open_lan_refuses_without_authority_and_allows_with_it() {
+    let _lock = env_lock();
+    let config = graph_with(Some(ingress_only_block()));
+    let refusal = "serving the network requires a prior login; run `cerulion login`";
+
+    let strict_err = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let err = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_err,
+        cerulion_core::LanAccess::Open,
+        || false,
+        || Err(refusal),
+        || panic!("Open LAN ingress checks serving authority, not paired login gate"),
+    )
+    .expect_err("Open LAN ingress-only must refuse without authority before launch");
+    assert_eq!(err.to_string(), refusal);
+
+    let strict_ok = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let kept = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_ok,
+        cerulion_core::LanAccess::Open,
+        || false,
+        || Ok(()),
+        || panic!("Open LAN ingress checks serving authority, not paired login gate"),
+    )
+    .expect("Open LAN ingress-only with authority proceeds");
+    assert!(matches!(kept, RunNetwork::Strict(_)));
+}
+
+#[test]
+fn strict_ingress_only_paired_gates_without_pins_and_allows_with_pins_or_login() {
+    let _lock = env_lock();
+    let config = graph_with(Some(ingress_only_block()));
+
+    // Without saved robot pins, paired ingress invokes the login gate and maps
+    // CliError::Login refusals to CliError::AuthRequired (exit 7).
+    let strict_refused = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let mut login_calls = 0;
+    let err = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_refused,
+        cerulion_core::LanAccess::Paired,
+        || false,
+        || panic!("paired ingress-only must not require serving authority"),
+        || {
+            login_calls += 1;
+            Err(cerulion_cli_engine::error::CliError::Login(
+                "login required".into(),
+            ))
+        },
+    )
+    .expect_err("paired ingress without pins or login must fail");
+    assert_eq!(login_calls, 1);
+    assert!(matches!(
+        err,
+        cerulion_cli_engine::error::CliError::AuthRequired(ref msg) if msg == "login required"
+    ));
+
+    // When the login gate succeeds (signed-in machine or interactive sign-in),
+    // the graph stays Strict.
+    let strict_signed_in = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let kept = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_signed_in,
+        cerulion_core::LanAccess::Paired,
+        || false,
+        || panic!("paired ingress-only must not require serving authority"),
+        || Ok(()),
+    )
+    .expect("paired ingress with login succeeds");
+    assert!(matches!(kept, RunNetwork::Strict(_)));
+
+    // With saved paired robot pins, paired ingress bypasses the login gate.
+    let strict_pinned = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let kept_pinned = apply_serving_authority_with(
+        "demo_graph",
+        &config,
+        strict_pinned,
+        cerulion_core::LanAccess::Paired,
+        || true,
+        || panic!("paired ingress-only must not require serving authority"),
+        || panic!("saved robot pins satisfy paired ingress without login"),
+    )
+    .expect("paired ingress with saved pins succeeds");
+    assert!(matches!(kept_pinned, RunNetwork::Strict(_)));
+}
+
+#[test]
+fn strict_without_egress_or_ingress_and_off_and_inert_skip_all_gates() {
     let _lock = env_lock();
     let no_egress = NetworkBlock {
         mode: NetworkMode::Peer,
@@ -1001,24 +1138,59 @@ fn strict_without_egress_and_off_and_inert_skip_authority_check() {
         default_reliability: cerulion_core::EgressReliability::Reliable,
     };
     let strict_cfg = graph_with(Some(no_egress));
-    let strict = resolve_run_network(&strict_cfg, false, TimeSource::Real, false).unwrap();
-    let mut calls = 0;
-    let strict_out = apply_serving_authority_with("demo_graph", &strict_cfg, strict, || {
-        calls += 1;
-        Err("must not be called")
-    })
-    .unwrap();
-    assert!(matches!(strict_out, RunNetwork::Strict(_)));
-    assert_eq!(calls, 0);
+    for access in [
+        cerulion_core::LanAccess::Paired,
+        cerulion_core::LanAccess::Open,
+    ] {
+        let strict = resolve_run_network(&strict_cfg, false, TimeSource::Real, false).unwrap();
+        let mut authority_calls = 0;
+        let mut login_calls = 0;
+        let strict_out = apply_serving_authority_with(
+            "demo_graph",
+            &strict_cfg,
+            strict,
+            access,
+            || false,
+            || {
+                authority_calls += 1;
+                Err("must not be called")
+            },
+            || {
+                login_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(strict_out, RunNetwork::Strict(_)));
+        assert_eq!(authority_calls, 0);
+        assert_eq!(login_calls, 0);
+    }
 
-    let plain = graph_with(None);
-    for mode in [RunNetwork::Off, RunNetwork::Inert] {
-        let out = apply_serving_authority_with("demo_graph", &plain, mode, || {
-            calls += 1;
-            Err("must not be called")
-        })
+    // Even an ingress-only graph skips all gates under --network off / virtual clock.
+    let ingress_cfg = graph_with(Some(ingress_only_block()));
+    for (network_off, clock) in [(true, TimeSource::Real), (false, TimeSource::Virtual)] {
+        let mode = resolve_run_network(&ingress_cfg, network_off, clock, false).unwrap();
+        assert!(matches!(mode, RunNetwork::Off | RunNetwork::Inert));
+        let mut authority_calls = 0;
+        let mut login_calls = 0;
+        let out = apply_serving_authority_with(
+            "demo_graph",
+            &ingress_cfg,
+            mode,
+            cerulion_core::LanAccess::Paired,
+            || false,
+            || {
+                authority_calls += 1;
+                Err("must not be called")
+            },
+            || {
+                login_calls += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(matches!(out, RunNetwork::Off | RunNetwork::Inert));
-        assert_eq!(calls, 0);
+        assert_eq!(authority_calls, 0);
+        assert_eq!(login_calls, 0);
     }
 }

@@ -412,6 +412,7 @@ fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
         CliError::AmbiguousTopic(_) => 2,
+        CliError::AuthRequired(_) => cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED,
         CliError::NodeFatal { .. }
         | CliError::WorkerNodeFatal { .. }
         | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,

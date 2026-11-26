@@ -4222,32 +4222,66 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
-/// Apply the local serving-authority rule to a resolved [`RunNetwork`].
+/// Whether this machine already holds at least one saved explicit robot pairing
+/// in `robots.toml` (which can satisfy paired graph ingress without an account
+/// sign-in). Local file read only, zero network.
+fn has_saved_paired_robots() -> bool {
+    #[cfg(unix)]
+    {
+        crate::account_robot_access::automatic::paired_robots().is_ok_and(|pins| !pins.is_empty())
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Apply the local serving-authority and paired-ingress login rules to a
+/// resolved [`RunNetwork`].
 ///
 /// - [`RunNetwork::Strict`] with declared `egress:` requires a prior login or
 ///   robot pairing and returns `Err(CliError::Validation)` when absent.
-/// - [`RunNetwork::Strict`] with no declared `egress:` does not check serving
-///   authority and stays `Strict`.
+/// - [`RunNetwork::Strict`] with declared `ingress:` under explicit Open LAN
+///   access (`LanAccess::Open`) requires serving authority before startup so
+///   the gateway child does not exit mid-run leaving declared inputs absent.
+/// - [`RunNetwork::Strict`] with declared `ingress:` under paired access
+///   (`LanAccess::Paired`) checks saved explicit robot pairings (`robots.toml`)
+///   first; when none exist, it runs the login gate (`ensure_login`) so an
+///   interactive terminal can sign in and a non-interactive run fails with
+///   [`CliError::AuthRequired`] (exit 7) before touching workspace files or
+///   starting nodes.
+/// - [`RunNetwork::Strict`] with neither `egress:` nor `ingress:` skips both
+///   checks and stays `Strict`.
 /// - [`RunNetwork::Permissive`] keeps serving when authority is present, and
 ///   degrades to [`RunNetwork::Off`] with one loud warning when absent so an
 ///   offline or never-signed-in machine runs local-only and never opens a
 ///   network listener without a sign-in.
-/// - [`RunNetwork::Off`] and [`RunNetwork::Inert`] skip the authority check
-///   and return unchanged.
+/// - [`RunNetwork::Off`] and [`RunNetwork::Inert`] skip both checks and return
+///   unchanged.
 pub fn apply_serving_authority_with(
     graph_identity: &str,
     config: &GraphConfig,
     run_network: RunNetwork,
+    lan_access: cerulion_core::LanAccess,
+    has_paired_robots: impl FnOnce() -> bool,
     check_authority: impl FnOnce() -> Result<(), &'static str>,
+    ensure_login: impl FnOnce() -> CliResult<()>,
 ) -> CliResult<RunNetwork> {
     match run_network {
         RunNetwork::Strict(net) => {
-            let has_egress = config
-                .network
-                .as_ref()
-                .is_some_and(|network| !network.egress.is_empty());
-            if has_egress {
+            let (has_egress, has_ingress) =
+                config.network.as_ref().map_or((false, false), |network| {
+                    (!network.egress.is_empty(), !network.ingress.is_empty())
+                });
+            if has_egress || (has_ingress && lan_access == cerulion_core::LanAccess::Open) {
                 check_authority().map_err(|error| CliError::Validation(error.into()))?;
+            }
+            if has_ingress && lan_access == cerulion_core::LanAccess::Paired && !has_paired_robots()
+            {
+                ensure_login().map_err(|err| match err {
+                    CliError::Login(msg) => CliError::AuthRequired(msg),
+                    other => other,
+                })?;
             }
             Ok(RunNetwork::Strict(net))
         }
@@ -6399,7 +6433,10 @@ pub fn graph_run(
         config.identity(),
         &config,
         run_network,
+        cerulion_core::LanAccess::from_env(),
+        has_saved_paired_robots,
         cerulion_netd::serving_login::require_serving_authority,
+        || crate::login_cmd::ensure_login_gate(&mut std::io::stderr()),
     )?;
     // The permissive default applies to every normal real-clock live run
     // reaching this function: `graph run`, `node run`'s temp single-node
