@@ -60,6 +60,7 @@ pub mod output_proxy;
 pub mod plugin_lease;
 pub mod publisher;
 pub mod reg_channel;
+pub mod rmw_graph_registry;
 pub mod run_artifacts;
 pub mod run_registry;
 pub mod service;
