@@ -38,7 +38,8 @@ pub fn the_tool_list_is_the_manifest_then_estop_then_estop_clear() -> Vector {
 /// the same `call_id`", and "frames that answer no pending call are dropped";
 /// "An `ok` or `error:<class>` receipt closes the call". A success returns
 /// `{"call_id": N, "receipt": ..., "result": <the graph's answer>,
-/// "safety_class": "..."}`. Safety classes: "Every result of a manifest tool
+/// "safety_class": "..."}`, and "`N` is an integer below 2^53, so a JSON
+/// number holds it exactly". Safety classes: "Every result of a manifest tool
 /// call after the name lookup, success or refusal, carries
 /// `"safety_class"`".
 pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Vector {
@@ -78,7 +79,9 @@ pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Ve
 /// docs/rcp.md, Tools, step 1: "A name the manifest does not declare is
 /// refused (`not_in_manifest`) and receipted `denied`"; step 2: "The arguments
 /// are checked against `input_schema` (`invalid_args`, receipted
-/// `error:invalid_args`)". The manifest: `minItems` holds the array length,
+/// `error:invalid_args`); the error message names the argument that failed,
+/// in double quotes".
+/// The manifest: `minItems` holds the array length,
 /// and `additionalProperties` is `false` by default. The page's opening:
 /// "refused calls are in the receipt log only". Safety classes: "Every result
 /// of a manifest tool call after the name lookup, success or refusal, carries
@@ -96,10 +99,12 @@ pub fn an_undeclared_tool_and_bad_arguments_never_reach_the_graph() -> Vector {
             reply(1, Outcome::Refused("not_in_manifest")),
             entry("arm.step", Stage::Error("invalid_args")),
             reply(2, Outcome::Refused("invalid_args"))
-                .carrying("/safety_class", json!("reversible")),
+                .carrying("/safety_class", json!("reversible"))
+                .mentioning("/error/message", "\"q\""),
             entry("arm.step", Stage::Error("invalid_args")),
             reply(3, Outcome::Refused("invalid_args"))
-                .carrying("/safety_class", json!("reversible")),
+                .carrying("/safety_class", json!("reversible"))
+                .mentioning("/error/message", "\"speed\""),
         ],
     }
 }

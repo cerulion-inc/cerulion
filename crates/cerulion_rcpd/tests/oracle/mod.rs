@@ -181,15 +181,17 @@ impl Stage {
 
 /// What the client, the graph and the receipt log see.
 pub enum Effect {
-    /// The reply to `req`. When `frame` is set, the reply's `call_id`, and
-    /// the `call_id` of the graph's answer it carries in `result`, are the
-    /// `call_id` of that frame (counted from 0 on the calls topic). Each of
-    /// `carries` is a JSON pointer into the reply body and the value there.
+    /// The reply to `req`. When `frame` is set, the reply's `call_id` is the
+    /// `call_id` of that frame (counted from 0 on the calls topic), and its
+    /// `result` is the stand-in graph's answer to that frame. Each of
+    /// `carries` is a JSON pointer into the reply body and the value there;
+    /// each of `mentions` a pointer to a string and text it contains.
     Reply {
         req: Req,
         outcome: Outcome,
         frame: Option<usize>,
         carries: Vec<(&'static str, Value)>,
+        mentions: Vec<(&'static str, &'static str)>,
     },
     /// The next frame on the calls topic.
     Frame { tool: &'static str, args: Value },
@@ -206,6 +208,7 @@ pub fn reply(req: Req, outcome: Outcome) -> Effect {
         outcome,
         frame: None,
         carries: Vec::new(),
+        mentions: Vec::new(),
     }
 }
 
@@ -235,6 +238,16 @@ impl Effect {
             panic!("only a reply carries fields");
         };
         carries.push((pointer, value));
+        self
+    }
+
+    /// This reply's body holds a string containing `text` at the JSON
+    /// `pointer`.
+    pub fn mentioning(mut self, pointer: &'static str, text: &'static str) -> Self {
+        let Self::Reply { mentions, .. } = &mut self else {
+            panic!("only a reply mentions text");
+        };
+        mentions.push((pointer, text));
         self
     }
 }
@@ -361,9 +374,12 @@ fn check(expect: &[Effect], trace: &Trace) {
                 outcome,
                 frame,
                 carries,
+                mentions,
             } => {
                 assert!(
-                    replies.insert(*req, (outcome, frame, carries)).is_none(),
+                    replies
+                        .insert(*req, (outcome, frame, carries, mentions))
+                        .is_none(),
                     "request {req} has two expected replies"
                 );
             }
@@ -384,7 +400,11 @@ fn check(expect: &[Effect], trace: &Trace) {
     assert_eq!(seen, frames, "the frames on the calls topic");
     let ids: Vec<&Value> = trace.frames.iter().map(|f| &f["call_id"]).collect();
     for (i, id) in ids.iter().enumerate() {
-        assert!(id.is_u64(), "frame {i} has no numeric call_id: {id}");
+        let exact = id.as_u64().is_some_and(|id| id < 1 << 53);
+        assert!(
+            exact,
+            "frame {i} has no call_id a JSON number holds exactly: {id}"
+        );
         assert!(!ids[..i].contains(id), "frame {i} reuses call_id {id}");
     }
     assert_eq!(trace.entries, entries, "the receipt log");
@@ -395,7 +415,7 @@ fn check(expect: &[Effect], trace: &Trace) {
         replies.keys().collect::<Vec<_>>(),
         "every request has exactly one expected reply"
     );
-    for (req, (outcome, frame, carries)) in replies {
+    for (req, (outcome, frame, carries, mentions)) in replies {
         let (is_error, body) = &trace.replies[&req];
         match outcome {
             Outcome::Ran => assert!(!is_error, "request {req} ran: {body}"),
@@ -410,10 +430,12 @@ fn check(expect: &[Effect], trace: &Trace) {
             }
         }
         if let Some(n) = frame {
-            let id = &trace.frames[*n]["call_id"];
+            let answered = &trace.frames[*n];
+            let id = &answered["call_id"];
             assert_eq!(&body["call_id"], id, "request {req} answers frame {n}");
             assert_eq!(
-                &body["result"]["call_id"], id,
+                body["result"],
+                graph::answer(answered),
                 "request {req} carries the graph's answer to frame {n}"
             );
         }
@@ -422,6 +444,13 @@ fn check(expect: &[Effect], trace: &Trace) {
                 body.pointer(pointer),
                 Some(value),
                 "request {req} at {pointer}: {body}"
+            );
+        }
+        for (pointer, text) in mentions {
+            let found = body.pointer(pointer).and_then(Value::as_str);
+            assert!(
+                found.is_some_and(|found| found.contains(text)),
+                "request {req} at {pointer} mentions {text:?}: {body}"
             );
         }
     }
