@@ -1354,28 +1354,49 @@ scans; CI runs both canonical node crates serially.
 
 ## 12. The login gate
 
-Every command runs under a logged-in-ever identity. `command_needs_identity` in
-`crates/cerulion_cli/src/main.rs` exempts `login`, `logout`, `completions`, `clean` and the
-two internal `graph run-worker` / `run-gateway` subprocess verbs; clap's `--help`
-and `--version` and the usage refusals `main` performs before the gate call answer
-above it and need no exemption. The `clean` exemption is scoped to what the verb
-is: a sweep of this machine's own iceoryx2 bookkeeping that reads no account and
-opens no socket, and the remedy a machine that has never signed in needs most.
-It exempts the VERB, both flag forms, and it is not a precedent for a verb that
-reaches an account or a robot. The `doctor` verb family returns `false`
-from `needs_identity` on the same ground: it reads this machine's own state,
-the local sign-in file included, refreshes nothing and is the diagnosis a
-machine that never signed in needs; a check marked as a network check is
-skipped under `--local` and under any non-empty
-`CERULION_NETWORK` (`off`, or another value, which fails closed). `ensure_login_gate` in
-`crates/cerulion_cli_engine/src/login_cmd.rs` reads local state only: a machine
-that signed in once proceeds with zero network, offline and on an expired
-session. A machine that never signed in runs the device-code flow inline when
-stderr and stdin are both terminals, and otherwise refuses at once with exit 7
-rather than starting a ten minute poll nobody is watching. A signed-out
-store (`cerulion logout` or Studio's "Sign out": `logged_in_ever` kept, no
-tokens) loads as `LoadedAuth::SignedOut` and the gate treats it like a machine
-that never signed in, with its own refusal text.
+Only commands that call the Cerulion account service or authenticate to remote
+robots enter the login gate. `command_needs_identity` in
+`crates/cerulion_cli/src/main.rs` is an exhaustive match over `Commands`,
+`GraphAction`, and `TopicAction` (no wildcard arm, so every new verb requires a
+compile-time decision), and each verb family and nested verb declares
+`needs_identity(&ArgMatches) -> bool`. The gated set is:
+
+- `account *` (`account devices list`, `account devices revoke`)
+- `connect`
+- `rcp <robot>` (`!matches.get_flag("sim")`; `rcp --sim` and `rcp bench` are local)
+- `viz --robot` (local `viz` is ungated)
+- `graph live` and `graph fires`
+- `topic echo`, `topic hz`, `topic info`, `topic pub`, and `topic snapshot` with `--robot`
+- `service call --robot`
+
+Every other verb (`workspace`, `node`, local `graph` verbs including `validate`
+and `run`, local `topic` / `service`, `schema`, `bag`, `trace`, `flashback`,
+`tui`, local `viz`, `rcp --sim`, `rcp bench`, `ros2`, `doctor`, `clean`,
+`completions`, `telemetry`, `login`, `logout`, and internal subprocess verbs)
+returns `false` and runs offline with no sign-in.
+
+`ensure_login_gate` in `crates/cerulion_cli_engine/src/login_cmd.rs` reads local
+state only: a machine that signed in once (or a validated claimed/paired robot)
+proceeds with zero network, offline and on an expired session. On a machine that
+never signed in, a gated command runs the device-code flow inline when stderr
+and stdin are both terminals, and otherwise refuses at once with exit 7 naming
+the resolved Cerulion account service (`CERULION_ACCOUNT_SERVICE`, default
+`https://app.cerulion.com`). A signed-out store (`cerulion logout` or Studio's
+"Sign out": `logged_in_ever` kept, no tokens) loads as `LoadedAuth::SignedOut`
+and receives its own refusal naming the Cerulion account service. In
+`cerulion doctor`, `account.login` reports `Status::Info` when never signed in
+or signed out (so offline hosts exit 0) and `Status::Fail` only for a corrupt
+file or missing config directory.
+
+For network serving during `graph run` / `node run`, `apply_serving_authority_with`
+in `crates/cerulion_cli_engine/src/graph_cmd.rs` splits `RunNetwork::Strict`
+from `RunNetwork::Permissive`: an explicit `network: egress:` block still
+refuses without `require_serving_authority()`, while a permissive-default
+(blockless) run without a prior login or robot pairing degrades to
+`RunNetwork::Off` with one loud `tracing::warn!` naming the graph and
+`cerulion login`, never opening a network listener without a sign-in. Explicit
+`ros2 attach` (non-dry-run), `graph run-gateway`, and `cerulion-netd` listening
+still enforce `require_serving_authority()`.
 
 The network kill switch answers BEFORE the gate. A verb that would reach a robot
 or a daemon over the network refuses while `CERULION_NETWORK` (or its own
@@ -1386,74 +1407,54 @@ the one function the gate is called from: `families::route` hands it the family'
 or nested verb's `network_refusal` and `dispatch` hands it
 `command_network_refusal`, an exhaustive match over `Commands`. Each refusal is built
 from the engine function the verb's own path refuses with, so its text and exit code
-are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
-`service call`, and `rcp` (exit 2), and `viz --robot` (exit 1). The `rcp`
-family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
-does. `rcp --sim` and the nested `rcp bench` (`families/nested/rcp_bench.rs`) are not
-refused, because they reach no robot and no Cerulion service, and they need an
-identity like every other `rcp` form; both run the harness launcher that
-`harness_cmd::find_harness_dir` finds and `harness_cmd::plan` spells, through
-`connect_cmd::spawn_child_and_wait`. The hidden `pair` stub never reaches this check: `dispatch` answers it
-beside the removed `ros` family, above the switch and the gate, with
-`PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling, because no robot-side verb
-arms a pairing code (`SharedCodePairSessions::arm` has no caller outside tests);
-its table row is `Expect::Runs`. `connect` prints a
-`warning:` line of its own and exits 0, as its helper does, on the exact value `off`
-the helper reads, without resolving the robot or spawning the helper. A refusal now
-comes before the verb's other argument checks; `viz --robot` with no TOPIC is the one
-usage refusal hoisted above it (`viz_refusal`, beside the Android refusal). The
-engine's own checks stay where they are.
-A verb the switch does not refuse returns `None` and meets the gate as
-before; the gate itself is unchanged, so a local verb on a never-signed-in machine
-at a terminal still starts the sign-in. That is the rule, not a gap: the switch
-covers Cerulion service traffic (robots, relays, hosted Cerulion services and
-telemetry) and not account sign-in, which the user asks for. The table pins it:
-`Expect::SignIn` rows hold the gate's sign-in, `login`, `logout` and `account` as
-allowed, and the sweep checks that each one still reaches the account service. The
-LOCAL-ONLY notices of a run and the fail-closed warns of a run or a query end with `graph_cmd::KILL_SWITCH_SCOPE`, which says so; the refusals, `connect`'s warning and the replay-class notice do not. `telemetry::CommandRun::start` sends
-nothing while `network_switch::engaged`: `CERULION_NETWORK`, or the invocation's
-own `--network` value, under the run and query parse, or `--local` on `graph run`
-and `node run`, read from the verb path, so the answer is the same in every build
-profile. A first login in such a run carries no id and leaves the join to the next
-run that sends, as the notice run does.
+are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot`,
+`topic echo`, `topic hz`, `topic info`, and `service call`, and `rcp` (exit 2),
+and `viz --robot`, `graph live`, and `graph fires` (exit 1). `rcp --sim` and
+`rcp bench` (`families/nested/rcp_bench.rs`) are neither refused by the switch
+nor gated by login; both run the harness launcher through
+`connect_cmd::spawn_child_and_wait`. The hidden `pair` stub never reaches this
+check: `dispatch` answers it beside the removed `ros` family, above the switch
+and the gate, with `PAIR_UNAVAILABLE_MSG` and exit 2; its table row is
+`Expect::Runs`. `connect` prints a `warning:` line of its own and exits 0 on the
+exact value `off`, without resolving the robot or spawning the helper. `viz --robot`
+with no TOPIC is answered with its usage refusal above the switch and gate
+(`viz_refusal`, beside the Android refusal).
+
+A verb the switch does not refuse returns `None`: account verbs still meet the
+login gate (and at a terminal on a fresh home start the sign-in against the
+account service, which the switch does not cover), while local verbs run without
+signing in. The table pins this: `Expect::SignIn` rows hold the gate's sign-in
+(`account devices list` on `Home::Fresh` with `terminal: true`), `login`,
+`logout` and `account` as allowed, and the sweep checks that each one still
+reaches the account service. The LOCAL-ONLY notices of a run and the fail-closed
+warns of a run or a query end with `graph_cmd::KILL_SWITCH_SCOPE`; the refusals,
+`connect`'s warning and the replay-class notice do not.
+`telemetry::CommandRun::start` sends nothing while `network_switch::engaged`:
+`CERULION_NETWORK`, or the invocation's own `--network` value, under the run and
+query parse, or `--local` on `graph run` and `node run`.
 
 The gate is on in every build, released or built from source. One escape exists
 for this repository's own runs: `CERULION_LOGIN_GATE` set to exactly `off`. The
 match is byte for byte, so `0`, `false` and `OFF` leave the gate on. It is set
-in two places and nowhere else: the workspace `.cargo/config.toml`, which covers
-everything cargo starts including the binaries tests spawn, and a workflow `env:`
-in the few jobs that run the binary outside cargo. The handful of shell and
-python harnesses that launch the binary themselves export it at the top. No user
-documentation names it.
+in `.cargo/config.toml` and in workflow/harness `env:` blocks for jobs that run
+the binary outside cargo. No user documentation names it.
 
 A test whose subject is the gate removes the variable on the command it spawns
 and points `CERULION_ACCOUNT_SERVICE` at a closed loopback port, so it meets the
 gate the way a user's machine does and reaches no network:
-`crates/cerulion_cli/tests/login_gate_e2e_test.rs` is the whole contract over the
-real binary, and `a_malformed_resim_is_refused_before_the_login_gate` in
-`replay_cli_test.rs` pins the one ordering property. The `clean` exemption is
-pinned there in both directions: `cerulion clean --report-only` under an empty
-home exits 0 and prints its report, and `cerulion topic list` under the same home
-prints the whole refusal and exits 7. The family dispatch is pinned the same way:
-`cerulion schema list` (a verb family) under an empty home prints the whole refusal,
-exits 7 and writes nothing to stdout, and under a seeded home it runs. The kill-switch
-order is pinned for every verb of the command tree: `src/network_switch/cases.rs`
-holds one invocation per verb and per `--robot` form, `network_switch::tests` fails
-when the command tree has a verb or a `--robot` flag the table does not name and
-checks the in-process decision for every row under each spelling of the switch, and
-`tests/network_switch_sweep_test.rs` runs each row it can spawn over the real binary
-(the `ros2` pass-throughs and the internal processes are not spawned, and their
-rows name why) with the account service, the telemetry host and the relay
-pointed at a listener that records each connection. A refused row (on a
-pseudo-terminal, where the gate would sign in) exits with its own refusal, prints no
-sign-in text and connects to none of the three. A gated row shows that the gate
-runs and that no usage event is sent; it does not run the verb. A sign-in row
-reaches the account service under the switch and sends no usage event. The
-listener sees only those three, not mDNS, DDS or zenoh traffic. A test that needs
-an identity rather than an absent one provisions it:
-`cerulion_cli_engine::auth::seed_logged_in_at` from Rust, or
-`tools/ci/seed_test_login.sh <dir>` from a shell, both writing the `auth.json`
-a real sign-in writes, with `CERULION_HOME` pointed at the directory.
+`crates/cerulion_cli/tests/login_gate_e2e_test.rs` and
+`crates/cerulion_cli/tests/offline_graph_run_e2e_test.rs` pin the contract over
+the real binary (local/offline verbs including `graph validate`, permissive
+`graph run`, `topic`, `bag`, `schema`, `rcp --sim`/`bench` succeed without sign-in;
+account and `--robot` verbs exit 7 naming the account service).
+`src/network_switch/cases.rs` holds one invocation per verb and per `--robot`
+form, `network_switch::tests` asserts exhaustiveness, switch decisions, and the
+exact `needs_identity` partition (`Expect::Refused`/`Expect::Gated` require
+identity; `Expect::Runs`/`Expect::LocalNoGate` do not), and
+`tests/network_switch_sweep_test.rs` runs every spawnable row over the real
+binary with the account service, telemetry host, and relay pointed at a loopback
+recorder. A test that needs an identity provisions it with
+`cerulion_cli_engine::auth::seed_logged_in_at` or `tools/ci/seed_test_login.sh <dir>`.
 
 ## 13. Python node scaffolding
 

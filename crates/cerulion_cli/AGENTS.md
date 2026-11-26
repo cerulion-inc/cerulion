@@ -7,9 +7,14 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   statement of `main()` - it owns stdout for a completion invocation. Nothing may print
   before it, and completion output must stay bare candidates with zero stderr bytes
   (pinned by `tests/completions_cli_test.rs` under a hostile logging env).
-- Never gate `Completions`, `Clean` or the `doctor` family behind `command_needs_identity` -
-  a shell rc file and a signed-out desk must meet no auth prompt (`tests/login_gate_e2e_test.rs`).
-- Serving uses netd require_serving_authority, including ROS 2 attach; graph gates producers only.
+- `command_needs_identity` and `VerbFamily::needs_identity` gate ONLY commands that call the
+  account service or authenticate to remote robots (`account *`, `connect`, `rcp <robot>`,
+  `viz --robot`, `graph live`, `graph fires`, `topic echo|hz|info|pub|snapshot --robot`,
+  `service call --robot`). Keep `command_needs_identity` exhaustive; local/offline verbs
+  run without sign-in (`tests/login_gate_e2e_test.rs`, `tests/offline_graph_run_e2e_test.rs`).
+- Serving uses netd `require_serving_authority` for explicit `network: egress:`, `ros2 attach`,
+  `graph run-gateway`, and `cerulion-netd`; permissive-default `graph run` / `node run` degrades
+  to `RunNetwork::Off` with one loud warning when unsigned-in and never opens a network listener.
 - Account robot lookup lives in the engine; `--no-network` and completions never fetch it.
   `viz --robot` resolves BEFORE vizd starts. Hidden `bootstrap-robot` dispatches before
   telemetry, logging and the login gate.
