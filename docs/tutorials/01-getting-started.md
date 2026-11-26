@@ -751,8 +751,8 @@ graph YAML carries topology only):
 |--------|-----------------|----------|
 | **Period** | `#[cerulion_node(period_ms = N)]` | Fire every N ms regardless of data |
 | **Data** | `#[input(trigger)]` on a field | Fire when that input port has new data |
-| **Sync (bounded)** | `#[cerulion_node(sync_window_ms = N)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete aligned set**: one message from each trigger port, all within an N-ms window of each other. Each message is used by at most one set, so a burst holding three complete sets fires three times, each tick reading its own set. |
-| **Sync (unbounded)** | `#[cerulion_node(unbounded_sync)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete set, as soon as every trigger port has an unconsumed message**. No timing bound; not recommended for control loops because worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops. |
+| **Sync (bounded)** | `#[cerulion_node(sync_window_ms = N)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete aligned set**: one message from each trigger port, all within an N-ms window of each other. Each message is used by at most one set, so a burst holding three complete sets fires three times, each tick reading its own set. Keep `N` strictly below `input_period - skew`: a window at or above that bound can silently pair every sample after a dropped frame with the previous period. |
+| **Sync (unbounded)** | `#[cerulion_node(unbounded_sync)]` + `#[input(trigger)]` on two or more ports | Fire **once per complete set, as soon as every trigger port has an unconsumed message**. No timing bound; not recommended for control loops because worst-case fire latency is the slowest publisher's inter-arrival interval (unbounded if it stops), and after a single dropped frame on an earlier-arriving periodic stream it can silently pair every subsequent sample with the previous period. |
 | **Data + deadline watchdog** | `#[input(trigger, expect_within_ms = N)]` | Fire on data arrival AND record a miss if no fresh data lands within N ms (the timeout records a miss, it does **not** fire the node). Replaces the removed `deadline_ms` trigger. |
 | **External** | `#[cerulion_node(external)]` + an `external_source()` method | A **driver** node: it watches something outside Cerulion (a device file descriptor, a blocking SDK call) and fires itself when that signals. See "External nodes" in `docs/user-api.md`. |
 
@@ -1211,9 +1211,12 @@ contributes name-only, and a layout change inside such a target is not caught.
   ports receive a message within a time window. Declare `sync_window_ms`
   on the macro plus a `(trigger)` marker on every input that must
   participate (two or more of them); the graph YAML wires each input's
-  `source:` as usual.
+  `source:` as usual. Keep `sync_window_ms` strictly below `input_period - skew`
+  (for example `15` ms stays well below a 30 Hz camera's ~33 ms frame period
+  minus arrival skew) so a dropped frame is discarded instead of pairing every
+  subsequent sample with the previous period.
   ```rust
-  #[cerulion_node(sync_window_ms = 50)]
+  #[cerulion_node(sync_window_ms = 15)]
   #[derive(Default)]
   struct FusionNode {
       #[input(trigger)] image: sensor_msgs::Image,
