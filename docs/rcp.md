@@ -179,8 +179,11 @@ are handled one at a time, in the order they arrive.
 
 `estop` takes an optional `reason` (cut to 200 characters). It closes the
 latch before anything else, without waiting for a call in flight; publishes
-its own frame ahead of anything queued; and returns `estopped: true` with
-`graph_acknowledged` saying whether the graph answered. While the latch is
+its own frame, `{"call_id": N, "tool": "estop", "args": {"reason": ...}}`,
+ahead of anything queued; and returns `estopped: true` with
+`graph_acknowledged` saying whether the graph answered. Its `intent` receipt
+is closed by `ok` when the graph answered, otherwise by
+`error:graph_unacknowledged`. While the latch is
 closed, `reversible` and `irreversible` calls are refused, including one
 already accepted but not yet published. A `reversible` or `irreversible`
 call whose MCP request is cancelled before it is published is never
@@ -189,8 +192,8 @@ that starts and finds that file starts with the latch closed (so does one
 that cannot tell whether the file exists).
 
 `estop_clear` takes the same optional `reason` (at most 200 characters; any
-other argument is refused as `invalid_args`). It waits behind a call in
-flight, then:
+other argument is refused as `invalid_args`, receipted
+`error:invalid_args`). It waits behind a call in flight, then:
 
 1. refuses with `estop_overtaken`, receipted `error:estop_overtaken` with
    nothing changed, when an `estop` was called after the clear was
