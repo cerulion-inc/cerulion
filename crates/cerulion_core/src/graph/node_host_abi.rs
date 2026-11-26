@@ -553,9 +553,14 @@ impl HostContext {
             bound.observed_frames.fill(false);
             if bound.committed_this_fire && !bound.duplicate_block_commit_this_fire {
                 if let Some(suppressed) = bound.duplicate_block_commits.on_success() {
+                    let topic = match self.native.publisher(&bound.spec.name) {
+                        Some(AnyPublisher::Ipc(publisher)) => publisher.topic(),
+                        None => bound.spec.name.as_str(),
+                    };
                     tracing::info!(
                         node_id = %node_id,
                         output = %bound.spec.name,
+                        topic = %topic,
                         suppressed_count = suppressed,
                         "duplicate block commit refusal recovered"
                     );
@@ -1469,7 +1474,7 @@ impl HostContext {
         let (topic, consumer_node, consumer_input) = {
             let publisher = self.output_publisher(index)?;
             let Some((consumer_node, consumer_input)) = publisher.block_consumer() else {
-                return Err(HostServiceError::InvalidState);
+                return Err(HostServiceError::InvalidDescriptor);
             };
             (
                 publisher.topic().to_owned(),
@@ -3125,6 +3130,12 @@ mod tests {
         assert_eq!(
             with_context(handle, |host| Ok(host.invariant_failures())),
             Ok(0)
+        );
+        assert_eq!(
+            with_context(handle, |host| Ok(host.ports[0]
+                .duplicate_block_commits
+                .total_failures())),
+            Ok(3)
         );
         remove_context(handle).unwrap();
     }
