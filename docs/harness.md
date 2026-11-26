@@ -152,6 +152,8 @@ Every count, cost and episode is in the [results package](https://github.com/cer
 with the reading rules, each frozen before the rows of its own lists, and a script that computes every figure
 again from the rows.
 
+Write-up: [Can an LLM control a robot arm? 73 of 100 in LIBERO-PRO sim](https://cerulion.com/blog/llm-robot-control-harness-libero-pro).
+
 ## How `cerulion rcp bench` reproduces it
 
 `cerulion rcp bench --model YOUR_MODEL` runs one cell (one task at one start state) twice, once in each setup the

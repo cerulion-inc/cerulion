@@ -27,6 +27,8 @@ Each of 16 models ran the same 100 LIBERO-PRO start states twice. A start state 
 
 </details>
 
+Write-up: [Can an LLM control a robot arm? 73 of 100 in LIBERO-PRO sim](https://cerulion.com/blog/llm-robot-control-harness-libero-pro).
+
 ## Latency
 
 Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, performance governor, no real-time tuning), 2026-09-16, at a nominal 100 Hz offered load. This is transport only: no payload byte is written inside the timed window, so a node's own work adds to it. The Cerulion columns include always-on Flashback, the default recorder.
@@ -47,6 +49,8 @@ Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultr
   <source media="(prefers-color-scheme: light)" srcset="media/native-rtt-light.svg">
   <img src="media/native-rtt.svg" alt="Native round-trip latency, with median lines and p50-to-p99 bands, from 64 B to 16 MiB.">
 </picture>
+
+Write-up: [ROS 2 latency for large messages: zero-copy keeps it flat](https://cerulion.com/blog/ros2-large-message-latency).
 
 ### Across platforms: Linux x86_64, NVIDIA Jetson and Apple Silicon
 
