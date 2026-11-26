@@ -521,7 +521,7 @@ impl StateChunker {
         self.next_part
     }
 
-    /// Bytes currently held in the inline partial-record buffer.
+    /// Bytes currently held in the inline buffer of the record not yet emitted.
     pub(crate) fn filled(&self) -> usize {
         self.filled
     }
