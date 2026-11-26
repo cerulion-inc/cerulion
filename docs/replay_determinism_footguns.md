@@ -263,15 +263,21 @@ different passes, so the replay feeds the edge from the bag: the consumer's
 pass builds its `block` input with no producer in its rank, no credit word and
 no backpressure probe, and the producer's pass marks the producer as held by
 the edge. For the split edge the verdict is exit 0, or 1 or 6 on a real
-divergence; every other hold in the bag gets the verdict a bag of the same
-graph in one process gets, by the rules below.
+divergence, and the replay stands its producer down (as `block_gated`, or
+`suppressible_fire` for a Sync producer), so that producer's own fire
+schedule is not judged, even where a consumer in its own process also holds
+it; every other hold in the bag gets the verdict a bag of the same graph in
+one process gets, by the rules below.
 
-- **The held producer stands down.** The consumer's credit word in another
-  process can defer it at any step, and the bag records neither the word nor
-  its readings. Held Period, FIFO and `consume = latest` producers stand down
-  as `block_gated`; a held Sync producer as `suppressible_fire`. A held FIFO
-  producer's trailing refills are still planned from its recorded pops and
-  fires, so the replay serves the frame a hold froze.
+- **The held producer's fire rules stand down.** The consumer's credit word
+  in another process can defer it at any step, and the bag records neither
+  the word nor its readings. Held Period, FIFO and `consume = latest`
+  producers stand down as `block_gated`; a held Sync producer as
+  `suppressible_fire`. A held Sync producer's owed fires go unjudged while
+  the fires the bag records are still judged, and a held producer's
+  `throttle_ms` is still judged. A held FIFO producer's trailing refills are
+  still planned from its recorded pops and fires, so the replay serves the
+  frame a hold froze.
 - **Credit conservation** is judged on the consumer's recorded drains: the
   frames the bag records on the topic, less those the consumer drained, must
   stay within the input's depth, and a breach is a report-only
@@ -284,9 +290,9 @@ graph in one process gets, by the rules below.
   does not show every frame of the topic recorded), `credit_unknown_at_anchor`
   (the producer's or the consumer's rank begins past step 0) and
   `consumer_stopped` (the consumer stopped with a stop that releases its slot).
-  Under `--duration`, an edge judged otherwise stands down with a
-  `stand_down` note that carries no code: the bound cuts the drains short and
-  leaves the publish count whole.
+  Where `--duration` stops the pass short, an edge judged otherwise stands
+  down with a `stand_down` note that carries no code: the bound cuts the
+  drains short and leaves the publish count whole.
 - **The consumer's block events are not reproduced.** The bag does not record
   when the input's block events fired, so the replay delivers none. Each such
   input carries a `block_event_not_reproduced` note (its subject is the
@@ -303,7 +309,9 @@ re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
 clock, `Sync` alignment, FIFO pop counts from the read log, and a
 `consume = latest` node's one fire per step from the read log's drains) are
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
-The producer of a split `block` edge is the exception: it stands down, as above.
+The producer of a split `block` edge is the exception: its Period, FIFO and
+`consume = latest` rules and a Sync rule's owed fires stand down, as above,
+and its `throttle_ms` is still judged.
 
 **A node held by a `block` input in its own rank.** When a `block` input reads
 a topic that a node in the same rank produces, that edge's pre-fire check can
