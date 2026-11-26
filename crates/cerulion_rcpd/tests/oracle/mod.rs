@@ -487,6 +487,11 @@ impl<D: Daemon> Session<D> {
             Err(e) => panic!("the latch file cannot be read: {e}"),
         }
     }
+
+    /// Stop the stand-in graph; every frame it received, in order.
+    pub fn stop(self) -> Vec<Value> {
+        self.graph.stop()
+    }
 }
 
 /// `tools/call` through `client`: `(isError, body)`; the body is the one

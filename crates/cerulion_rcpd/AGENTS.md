@@ -55,6 +55,6 @@ User reference: docs/rcp.md.
   manifests names journal topics unique to the test and process.
 - `eye_*_test.rs` run against a local stand-in route (no key, no network);
   `eye_graph_test.rs` installs the log subscriber, so one test per binary.
-- `tools_test.rs` drives the MCP surface against a stand-in graph thread and
-  asserts the exact receipt sequence of each scenario; `binary_smoke_test.rs`
+- `tools_test.rs` plays the hand-written vectors in `tests/oracle/` over MCP
+  (each cites the `docs/rcp.md` line it pins); `binary_smoke_test.rs`
   checks the manifest switches reach the shipped binary.

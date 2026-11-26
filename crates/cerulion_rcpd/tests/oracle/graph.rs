@@ -4,8 +4,9 @@
 //! It reads every frame on the calls topic, oldest first, and records it
 //! before it answers. It answers on the results topic with
 //! `{"call_id", "tool"}`, between two decoy answers to no call
-//! (`"call_id": 0`). It never answers `arm.mute`, and holds its answer to
-//! `arm.slow` until [`Graph::release`].
+//! (`"call_id": 0`), then publishes `{"n": n}` on the state topic, `n` being
+//! the frame's place among those received, from 1. It never answers
+//! `arm.mute`, and holds its answer to `arm.slow` until [`Graph::release`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,30 +37,35 @@ pub struct Graph {
 struct Ports {
     calls: CerulionSubscriber,
     results: CerulionPublisher,
+    state: CerulionPublisher,
     frames: watch::Sender<Vec<Value>>,
-    /// `arm.slow` frames not yet answered.
-    held: Vec<Value>,
+    /// `arm.slow` frames not yet answered, with their place.
+    held: Vec<(Value, usize)>,
 }
 
 impl Graph {
-    /// Open the graph's ports on `/{prefix}/calls` and `/{prefix}/results`
-    /// and start answering; returns once the ports exist.
+    /// Open the graph's ports on `/{prefix}/calls`, `/{prefix}/results` and
+    /// `/{prefix}/state` and start answering; returns once the ports exist.
     pub fn spawn(mgr: Arc<TransportManager>, prefix: &str) -> Self {
         let topic = |name: &str| format!("/{prefix}/{name}");
-        let (calls_topic, results_topic) = (topic("calls"), topic("results"));
+        let (calls_topic, results_topic, state_topic) =
+            (topic("calls"), topic("results"), topic("state"));
         let stop = Arc::new(AtomicBool::new(false));
         let release = Arc::new(AtomicBool::new(false));
         let (frames_tx, frames) = watch::channel(Vec::new());
         let (stopping, released) = (Arc::clone(&stop), Arc::clone(&release));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
+            let publisher = |topic: &str| {
+                mgr.create_publisher_simple(topic, MaxSliceLen::const_new(4096))
+                    .expect("graph publisher")
+            };
             let mut ports = Ports {
                 calls: mgr
                     .create_subscriber(&calls_topic)
                     .expect("calls subscriber"),
-                results: mgr
-                    .create_publisher_simple(&results_topic, MaxSliceLen::const_new(4096))
-                    .expect("results publisher"),
+                results: publisher(&results_topic),
+                state: publisher(&state_topic),
                 frames: frames_tx,
                 held: Vec::new(),
             };
@@ -120,31 +126,37 @@ impl Ports {
             .expect("receive");
         let mut any = !batch.is_empty();
         for call in batch {
-            self.frames.send_modify(|frames| frames.push(call.clone()));
+            let mut n = 0;
+            self.frames.send_modify(|frames| {
+                frames.push(call.clone());
+                n = frames.len();
+            });
             if call["tool"] == "arm.mute" {
                 continue;
             }
             if call["tool"] == "arm.slow" && !released {
-                self.held.push(call);
+                self.held.push((call, n));
                 continue;
             }
-            self.answer(&call);
+            self.answer(&call, n);
         }
         if released && !self.held.is_empty() {
             any = true;
-            for call in std::mem::take(&mut self.held) {
-                self.answer(&call);
+            for (call, n) in std::mem::take(&mut self.held) {
+                self.answer(&call, n);
             }
         }
         any
     }
 
-    /// Answer `call` between two decoys.
-    fn answer(&mut self, call: &Value) {
+    /// Answer `call`, the `n`-th frame received, between two decoys, then
+    /// publish the state frame.
+    fn answer(&mut self, call: &Value, n: usize) {
         let decoy = json!({ "call_id": 0, "decoy": true });
         publish_json(&mut self.results, &decoy);
         publish_json(&mut self.results, &answer(call));
         publish_json(&mut self.results, &decoy);
+        publish_json(&mut self.state, &json!({ "n": n }));
     }
 }
 
