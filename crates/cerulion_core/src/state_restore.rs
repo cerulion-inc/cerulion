@@ -1353,6 +1353,30 @@ pub enum RestoreRefusal {
         topic: String,
     },
 
+    /// A re-executed topic's recorded frames start after its first resumed
+    /// commit, so seeding from the first held frame would start the publisher
+    /// at a later step's sequence.
+    #[error(
+        "topic '{topic}' has no recorded frame at or before its first resumed commit (step \
+         {first_commit_step}, resuming at step {resume_step}); its recorded frames begin at \
+         sequence {first_recorded_sequence} from a later step. Continuing the publisher's \
+         sequence from that later frame corrupts the replay and reports read and frame \
+         differences the candidate did not cause. Fix: take the capture more than one \
+         Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`), or record from step 0 \
+         with `cerulion graph run --record`"
+    )]
+    FramesBeginAfterResume {
+        /// The re-executed topic whose recorded frames begin late.
+        topic: String,
+        /// The first step the replay resumes at.
+        resume_step: u64,
+        /// The first non-discarded step in the resumed range where the
+        /// topic's producer fires.
+        first_commit_step: u64,
+        /// The wire sequence of the first recorded frame held for the topic.
+        first_recorded_sequence: u32,
+    },
+
     /// `--strict-state` was asked for and some executed node cannot restore.
     #[error(
         "--strict-state requires every executed node to restore its recorded state, but {} \
@@ -1831,6 +1855,49 @@ pub fn seed_publisher_sequence(
     Err(RestoreRefusal::SequenceSeedUnavailable {
         topic: topic.to_string(),
     })
+}
+
+/// Refuse a re-executed single-writer topic whose recorded frames begin after
+/// its producer's first resumed commit.
+///
+/// When a recording carries no frame at or before the resumed step, rung (ii)
+/// ([`SeedRung::FirstFrameAfterAnchor`]) seeds the publisher from the first
+/// held frame verbatim. That is sound only when that frame IS the publisher's
+/// first resumed commit (for example a slow producer whose first resumed fire
+/// lands after the anchor step). When the recorder's taps attached after the
+/// producer's first resumed commit, the first held frame comes from a LATER
+/// step and seeding from it shifts every subsequent sequence, producing read
+/// and frame divergences the candidate did not cause.
+///
+/// `writers == TopicWriters::MultiPublisher` defers here so
+/// [`seed_publisher_sequence`] keeps owning
+/// [`RestoreRefusal::MultiPublisherTopicNotSeedable`] first.
+pub fn check_first_frame_covers_resume(
+    topic: &str,
+    writers: TopicWriters,
+    resume_step: u64,
+    first_commit: Option<(u64, u64)>,
+    first_recorded_frame: Option<(u32, u64)>,
+    has_frame_at_or_before_resume: bool,
+) -> Result<(), RestoreRefusal> {
+    if writers == TopicWriters::MultiPublisher || has_frame_at_or_before_resume {
+        return Ok(());
+    }
+    if let (
+        Some((first_commit_step, first_commit_target_ns)),
+        Some((first_recorded_sequence, first_frame_ts_ns)),
+    ) = (first_commit, first_recorded_frame)
+    {
+        if first_frame_ts_ns > first_commit_target_ns {
+            return Err(RestoreRefusal::FramesBeginAfterResume {
+                topic: topic.to_string(),
+                resume_step,
+                first_commit_step,
+                first_recorded_sequence,
+            });
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================

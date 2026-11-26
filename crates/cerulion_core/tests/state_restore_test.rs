@@ -33,13 +33,14 @@
 
 use cerulion_core::state::{CerulionState, SkipCause, StateCursor, VecSink};
 use cerulion_core::state_restore::{
-    capture_anchor_blob, capture_anchor_blob_with_framework, classify_shape, enforce_strict_state,
-    plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics, seed_publisher_sequence,
-    AnchorBlob, AnchorFact, AnchorOutcome, BacklogClaim, InputServiceCursor, NodeAnchorProblem,
-    NodeFrameworkState, RestorePlan, RestoreRefusal, RestoreRequest, SeedEvidence, SeedRung,
-    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters, ANCHOR_BLOB_HEADER_SIZE,
-    ANCHOR_BLOB_MAGIC, ANCHOR_BLOB_MAGIC_V2, ANCHOR_BLOB_V2_HEADER_SIZE,
-    FRAMEWORK_SECTION_MIN_READABLE, FRAMEWORK_SECTION_WRITE_VERSION, NODE_FLAG_STOPPED,
+    capture_anchor_blob, capture_anchor_blob_with_framework, check_first_frame_covers_resume,
+    classify_shape, enforce_strict_state, plan_backlog_admission, plan_restore,
+    refuse_lossy_reexecuted_topics, seed_publisher_sequence, AnchorBlob, AnchorFact, AnchorOutcome,
+    BacklogClaim, InputServiceCursor, NodeAnchorProblem, NodeFrameworkState, RestorePlan,
+    RestoreRefusal, RestoreRequest, SeedEvidence, SeedRung, StoppedAtAnchor, TopicFrameCount,
+    TopicLoss, TopicWriters, ANCHOR_BLOB_HEADER_SIZE, ANCHOR_BLOB_MAGIC, ANCHOR_BLOB_MAGIC_V2,
+    ANCHOR_BLOB_V2_HEADER_SIZE, FRAMEWORK_SECTION_MIN_READABLE, FRAMEWORK_SECTION_WRITE_VERSION,
+    NODE_FLAG_STOPPED,
 };
 
 // ---------------------------------------------------------------------------
@@ -2091,6 +2092,147 @@ fn the_seed_wraps_with_the_wire_counter_rather_than_saturating() {
     )
     .expect("rung iii");
     assert_eq!(wrapped_commit.seed, 0);
+}
+
+#[test]
+fn late_first_frame_after_first_commit_is_refused_by_name() {
+    let err = check_first_frame_covers_resume(
+        "/ticker/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((1, 100)),
+        Some((3, 200)),
+        false,
+    )
+    .expect_err("frames starting after first resumed commit must be refused");
+    assert_eq!(
+        err,
+        RestoreRefusal::FramesBeginAfterResume {
+            topic: "/ticker/out".to_string(),
+            resume_step: 1,
+            first_commit_step: 1,
+            first_recorded_sequence: 3,
+        }
+    );
+    let text = err.to_string();
+    for needle in [
+        "/ticker/out",
+        "step 1",
+        "sequence 3",
+        "CERULION_FLASHBACK_WINDOW_MS",
+        "cerulion graph run --record",
+    ] {
+        assert!(text.contains(needle), "missing '{needle}' in: {text}");
+    }
+}
+
+#[test]
+fn slow_producer_whose_first_frame_matches_its_first_commit_is_admitted() {
+    check_first_frame_covers_resume(
+        "/slow/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((5, 500)),
+        Some((1, 500)),
+        false,
+    )
+    .expect("first frame landing on first commit target is sound for rung (ii)");
+}
+
+#[test]
+fn frame_at_or_before_resume_admits_regardless_of_later_timestamps() {
+    check_first_frame_covers_resume(
+        "/ticker/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((1, 100)),
+        Some((3, 200)),
+        true,
+    )
+    .expect("pre-anchor or in-band frame covers resume");
+}
+
+#[test]
+fn multi_publisher_defers_to_seed_ladder_refusal() {
+    check_first_frame_covers_resume(
+        "/tf",
+        TopicWriters::MultiPublisher,
+        1,
+        Some((1, 100)),
+        Some((3, 200)),
+        false,
+    )
+    .expect("multi-publisher defers to seed_publisher_sequence");
+}
+
+#[test]
+fn missing_first_commit_or_missing_frame_defers_to_seed_ladder() {
+    check_first_frame_covers_resume(
+        "/silent/out",
+        TopicWriters::SingleWriter,
+        1,
+        None,
+        Some((3, 200)),
+        false,
+    )
+    .expect("no commit in resumed suffix defers");
+    check_first_frame_covers_resume(
+        "/silent/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((1, 100)),
+        None,
+        false,
+    )
+    .expect("no recorded frame defers to SequenceSeedUnavailable");
+}
+
+#[test]
+fn late_frame_with_commit_later_than_resume_step_still_refuses_gap() {
+    let err = check_first_frame_covers_resume(
+        "/slow/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((3, 300)),
+        Some((7, 500)),
+        false,
+    )
+    .expect_err("frames starting after a later first commit step must still refuse");
+    assert_eq!(
+        err,
+        RestoreRefusal::FramesBeginAfterResume {
+            topic: "/slow/out".to_string(),
+            resume_step: 1,
+            first_commit_step: 3,
+            first_recorded_sequence: 7,
+        }
+    );
+    let text = err.to_string();
+    assert!(text.contains("step 3"), "{text}");
+    assert!(text.contains("resuming at step 1"), "{text}");
+    assert!(text.contains("sequence 7"), "{text}");
+}
+
+#[test]
+fn first_frame_check_is_deterministic() {
+    let a = check_first_frame_covers_resume(
+        "/ticker/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((1, 100)),
+        Some((3, 200)),
+        false,
+    );
+    let b = check_first_frame_covers_resume(
+        "/ticker/out",
+        TopicWriters::SingleWriter,
+        1,
+        Some((1, 100)),
+        Some((3, 200)),
+        false,
+    );
+    assert_eq!(a, b);
+    assert_eq!(a.unwrap_err().to_string(), b.unwrap_err().to_string());
 }
 
 // ===========================================================================
