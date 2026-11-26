@@ -589,26 +589,31 @@ in prepare_pass_verification
 # (`pass_fed_block_edges`), why a split edge's credit conservation cannot be
 # judged before its consumer's pass runs (`split_edge_unjudgeable`), the code
 # and the sentence of each cause (`ConservationStandDown::code`,
-# `ConservationStandDown::detail`) and the block-event note
-# (`block_event_note`). In src/replay_rederive.rs: the step after which a stop
-# released a node's slots (`StopPoint::slots_released_at`,
-# `StopPoint::slots_released_after`, `PassStops::slots_released_at`), the FIFO
-# carry that takes a node held across ranks as deferrable at every step
-# (`FifoCarry::step`) and the pass entry that stands such a node down
-# (`verify`). The change's other lines in the two files thread the
-# classification through a pass, build the wiring, or log and push notes,
-# which the mutation rule does not cover; the replay engine's integration
-# arms pin those.
+# `ConservationStandDown::detail`), the start every no-claim note shares
+# (`no_conservation_claim`) and the block-event note (`block_event_note`). In
+# src/replay_rederive.rs: the step after which a stop released a node's slots
+# (`StopPoint::slots_released_at`, `StopPoint::slots_released_after`,
+# `PassStops::slots_released_at`), the FIFO carry that takes a node held across
+# ranks as deferrable at every step (`FifoCarry::step`) and the pass entry that
+# stands such a node down (`verify`). The change's other lines in the two
+# files thread the classification through a pass, build the wiring, or log
+# and push notes, which the mutation rule does not cover, and the tool makes
+# no mutant of a value read off a map or a list. The replay engine's
+# integration arms pin those lines. Two of them carry the producer's rank and
+# its first step into a consumed edge's start pair in
+# `prepare_pass_verification`; each, replaced by hand with `0`, fails
+# `a_split_block_edge_whose_producer_rank_begins_late_stands_its_conservation_down`
+# (the stand-down it pins is not raised).
 #
 # Run:     cargo mutants -p cerulion_cli_engine --in-place \
 #            --in-diff <the change's diff of the two files> \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
-#            --re 'pass_fed_block_edges|split_edge_unjudgeable|ConservationStandDown::|block_event_note|slots_released_at|slots_released_after|FifoCarry::step|\bverify\b' \
+#            --re 'pass_fed_block_edges|split_edge_unjudgeable|ConservationStandDown::|no_conservation_claim|block_event_note|slots_released_at|slots_released_after|FifoCarry::step|\bverify\b' \
 #            --exclude-re 'tests::' --timeout 600 --cap-lints true \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (the unmutated baseline passed)
-# Result:  28 mutants: 25 caught, 3 unviable, none missed. The unviable ones
+# Result:  30 mutants: 27 caught, 3 unviable, none missed. The unviable ones
 #          replace `block_event_note` and `FifoCarry::step` with
 #          `Default::default()` and `split_edge_unjudgeable` with
 #          `Some(Default::default())`, defaults `RederivationNote`,
