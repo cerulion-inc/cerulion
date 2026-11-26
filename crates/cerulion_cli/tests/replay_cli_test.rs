@@ -401,31 +401,15 @@ fn the_removed_replay_verb_is_an_unrecognized_subcommand() {
     }
 }
 
-/// A malformed resim invocation is answered
-/// BEFORE the login gate.
-///
-/// `bag play` is identity-gated: `command_needs_identity` exempts only `login`,
-/// `completions`, `clean` and the two internal `graph run-worker` /
-/// `run-gateway` subprocess verbs. On a machine that has never signed in the gate answers
-/// first, so this exact argv would exit 7 (auth) rather than 2 (usage), never
-/// reaching the refusal that names `--resim`.
-///
-/// This is one of the few arms whose SUBJECT is the gate, so it removes the
-/// value this repository's own runs carry and meets the gate as a user's
-/// machine does. The isolated `CERULION_HOME` is what makes it real rather than
-/// incidental: the gate reads local auth state, and on a developer desk that IS
-/// signed in it would proceed and mask the ordering entirely. The account
-/// service is a reserved dead port, so the arm reaches no network.
-///
-/// The anti-tautology half is in the same body: a WELL-FORMED resim under the
-/// same gate must STILL authenticate (exit 7). Without it, a fix that simply
-/// exempted `bag play` from the gate would pass, and that is the wrong fix,
-/// since re-execution is a runtime verb.
+/// `bag play` is a local offline verb: both malformed and well-formed
+/// invocations bypass the login gate on a machine that has never signed in.
+/// A malformed invocation still exits 2 (usage), while a well-formed `--resim`
+/// reaches the bag-open error rather than exiting 7 (auth).
 #[test]
 fn a_malformed_resim_is_refused_before_the_login_gate() {
     let home = tempfile::tempdir().expect("tempdir");
 
-    // MALFORMED (`--verify` with no `--resim`): usage, not auth.
+    // MALFORMED (`--verify` with no `--resim`): usage (2), not auth.
     let out = Command::new(env!("CARGO_BIN_EXE_cerulion"))
         .args(["bag", "play", "nonexistent.mcap", "--verify"])
         .env("HOME", home.path())
@@ -446,13 +430,13 @@ fn a_malformed_resim_is_refused_before_the_login_gate() {
         "the refusal must name the actual problem; stderr: {stderr}"
     );
     assert!(
-        !stderr.contains("not signed in"),
+        !stderr.contains("not signed in") && !stderr.contains("never signed in"),
         "a malformed command line must not trigger the login flow; stderr: {stderr}"
     );
 
-    // ANTI-TAUTOLOGY: a WELL-FORMED resim still needs identity. If this ever
-    // returns 2, the usage check has exempted the verb from the gate.
-    let gated = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+    // WELL-FORMED resim is local and offline: it reaches bag-not-found rather
+    // than exiting 7.
+    let local = Command::new(env!("CARGO_BIN_EXE_cerulion"))
         .args(["bag", "play", "nonexistent.mcap", "--resim", "all"])
         .env("HOME", home.path())
         .env("CERULION_HOME", home.path())
@@ -460,12 +444,17 @@ fn a_malformed_resim_is_refused_before_the_login_gate() {
         .env_remove("CERULION_LOGIN_GATE")
         .output()
         .expect("failed to spawn cerulion binary");
-    assert_eq!(
-        gated.status.code(),
+    let local_stderr = stderr_of(&local);
+    assert_ne!(
+        local.status.code(),
         Some(7),
-        "a well-formed resim must still authenticate; stderr: {}",
-        stderr_of(&gated)
+        "local bag play --resim must not require sign-in; stderr: {local_stderr}"
     );
+    assert!(
+        local_stderr.contains("nonexistent.mcap"),
+        "well-formed resim must reach the bag-open check; stderr: {local_stderr}"
+    );
+    assert!(!home.path().join("auth.json").exists());
 }
 
 #[test]

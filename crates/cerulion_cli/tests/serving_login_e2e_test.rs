@@ -44,7 +44,7 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn graph_serving_refuses_without_login_and_preserves_yaml() {
+fn graph_serving_refuses_explicit_egress_and_degrades_permissive_without_login() {
     let root = tempfile::tempdir().unwrap();
     workspace(root.path());
     let home = root.path().join("never-logged-in");
@@ -55,24 +55,44 @@ fn graph_serving_refuses_without_login_and_preserves_yaml() {
         "--single-process",
         "--no-validate",
     ];
-    for network in [
-        "",
-        "network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n  egress: [/serving/absent/out]\n",
-    ] {
-        let yaml = format!("{GRAPH}{network}");
-        std::fs::write(root.path().join("graphs/serving.yaml"), &yaml).unwrap();
-        let out = run(root.path(), &home, &args, false);
-        assert!(stderr(&out).contains(REFUSAL), "{}", stderr(&out));
-        assert!(
-            !home.exists(),
-            "the refusal must not initiate a login transaction"
-        );
-        assert_eq!(
-            std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
-            yaml
-        );
-        assert!(!root.path().join(".cerulion/runs").exists());
-    }
+
+    // Explicit `network: egress:` stays refused before touching the home or run dir.
+    let explicit_yaml = format!(
+        "{GRAPH}network:\n  mode: peer\n  listen: [tcp/127.0.0.1:0]\n  egress: [/serving/absent/out]\n"
+    );
+    std::fs::write(root.path().join("graphs/serving.yaml"), &explicit_yaml).unwrap();
+    let out = run(root.path(), &home, &args, false);
+    assert!(stderr(&out).contains(REFUSAL), "{}", stderr(&out));
+    assert!(
+        !home.exists(),
+        "the refusal must not initiate a login transaction"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
+        explicit_yaml
+    );
+    assert!(!root.path().join(".cerulion/runs").exists());
+
+    // Blockless permissive default degrades to local-only with one loud warning
+    // and reaches the missing-cdylib sentinel without writing auth.json.
+    std::fs::write(root.path().join("graphs/serving.yaml"), GRAPH).unwrap();
+    let degraded = stderr(&run(root.path(), &home, &args, false));
+    assert!(!degraded.contains(REFUSAL), "{degraded}");
+    assert!(
+        degraded.contains("running local-only")
+            && degraded.contains("no prior login or robot pairing")
+            && degraded.contains("cerulion login"),
+        "permissive degradation must log one loud warning; stderr={degraded}"
+    );
+    assert!(
+        degraded.contains("cdylib for node 'absent' not found"),
+        "degraded run must proceed past the serving gate to node loading; stderr={degraded}"
+    );
+    assert!(!home.join("auth.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("graphs/serving.yaml")).unwrap(),
+        GRAPH
+    );
 }
 
 #[test]

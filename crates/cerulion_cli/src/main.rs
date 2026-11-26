@@ -4379,8 +4379,9 @@ mod login_gate_exemption_tests {
             ],
         ];
         for argv in gated {
-            assert!(needs(argv), "{argv:?} must require identity");
-            assert_eq!(needs(argv), true, "{argv:?} must be deterministic");
+            let first = needs(argv);
+            assert!(first, "{argv:?} must require identity");
+            assert_eq!(needs(argv), first, "{argv:?} must be deterministic");
         }
 
         let local: &[&[&str]] = &[
@@ -4432,8 +4433,9 @@ mod login_gate_exemption_tests {
             &["clean", "--report-only"],
         ];
         for argv in local {
-            assert!(!needs(argv), "{argv:?} must not require identity");
-            assert_eq!(needs(argv), false, "{argv:?} must be deterministic");
+            let first = needs(argv);
+            assert!(!first, "{argv:?} must not require identity");
+            assert_eq!(needs(argv), first, "{argv:?} must be deterministic");
         }
     }
 }

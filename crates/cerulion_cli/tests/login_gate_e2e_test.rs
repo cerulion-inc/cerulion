@@ -131,7 +131,11 @@ fn run_binary_at(
 /// the code holds would agree with any wording, including none.
 fn assert_is_the_refusal(stderr: &str) {
     assert!(
-        stderr.contains("never signed in to a Cerulion account"),
+        stderr.contains("Cerulion account service (http://127.0.0.1:1)"),
+        "the refusal must name the resolved account service; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("never signed in"),
         "the refusal must state the condition; stderr={stderr}"
     );
     assert!(
@@ -146,11 +150,8 @@ fn assert_is_the_refusal(stderr: &str) {
 
 /// The refusal a user reads, WHOLE, transcribed by hand from the two lines the
 /// binary prints (the `Error: ` frame `main` puts in front of every `CliError`
-/// included). Written out here rather than composed from the constant the code
-/// holds: a comparison against that constant would agree with any wording,
-/// which is the failure this oracle exists to catch. Whoever rewords the
-/// refusal reworded what a user reads, and retypes it here.
-const REFUSAL_A_USER_READS: &str = "Error: This machine has never signed in to a Cerulion account, and every command needs one.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
+/// included) when `CERULION_ACCOUNT_SERVICE=http://127.0.0.1:1`.
+const REFUSAL_A_USER_READS: &str = "Error: This command requires the Cerulion account service (http://127.0.0.1:1), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
 
 /// Point a spawned `cerulion` at a private iceoryx2 registry under `root`, by
 /// writing the PROJECT-LOCAL config file into `cwd`.
@@ -211,18 +212,16 @@ fn assert_no_identity_was_written(home: &Path) {
 #[test]
 fn a_machine_that_never_signed_in_is_refused_before_the_command_runs() {
     let started = Instant::now();
-    let (code, stderr) = run_cerulion(false, &[], &["node", "list"]);
+    let (code, stderr) = run_cerulion(false, &[], &["account", "devices", "list"]);
     assert_is_the_refusal(&stderr);
+    assert!(
+        stderr.contains(REFUSAL_A_USER_READS),
+        "must print the exact refusal naming the account service; stderr={stderr}"
+    );
     assert_eq!(
         code,
         Some(i32::from(EXIT_AUTH_REQUIRED)),
         "an auth refusal exits 7, distinct from a runtime failure; stderr={stderr}"
-    );
-    // The gate fired before the verb's own logic: outside a workspace `node
-    // list` would have said this, and it never got the chance.
-    assert!(
-        !stderr.contains("Workspace not found"),
-        "the gate must short-circuit before the command runs; stderr={stderr}"
     );
     // Not at a terminal means refuse now, not poll for ten minutes.
     assert!(
@@ -235,14 +234,10 @@ fn a_machine_that_never_signed_in_is_refused_before_the_command_runs() {
 fn a_machine_that_signed_in_runs_the_command() {
     // The anti-tautology control. Without it every assertion above would still
     // hold for a binary that refused unconditionally.
-    let (code, stderr) = run_cerulion(true, &[], &["node", "list"]);
+    let (code, stderr) = run_cerulion(true, &[], &["account", "devices", "list"]);
     assert!(
         !stderr.contains("never signed in"),
         "a signed-in machine must not be refused; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Workspace not found"),
-        "the command ran its normal path; stderr={stderr}"
     );
     assert_ne!(
         code,
@@ -253,9 +248,8 @@ fn a_machine_that_signed_in_runs_the_command() {
 
 #[test]
 fn a_guess_at_a_switch_does_not_switch_the_gate_off() {
-    // The gate is on by default and stays on for every plausible guess. The
-    // one value that works is not documented for users and is not tried here
-    // by name: the property under test is that everything else fails.
+    // The gate is on by default for gated account/remote verbs and stays on for
+    // every plausible guess.
     for (k, v) in [
         ("CERULION_LOGIN_GATE", "0"),
         ("CERULION_LOGIN_GATE", "1"),
@@ -270,7 +264,7 @@ fn a_guess_at_a_switch_does_not_switch_the_gate_off() {
         ("CERULION_LOGIN_REQUIRED", "0"),
         ("CI", "true"),
     ] {
-        let (code, stderr) = run_cerulion(false, &[(k, v)], &["node", "list"]);
+        let (code, stderr) = run_cerulion(false, &[(k, v)], &["account", "devices", "list"]);
         assert_is_the_refusal(&stderr);
         assert_eq!(
             code,
@@ -282,18 +276,16 @@ fn a_guess_at_a_switch_does_not_switch_the_gate_off() {
 
 #[test]
 fn this_repositorys_own_runs_proceed_without_an_account() {
-    // The other half, and the reason the suite can run at all on a machine that
-    // has never signed in: the internal value this repository sets for its own
-    // runs lets an unseeded home through. The home is the same empty one the
-    // refusal arms use, so this can only pass on the switch.
-    let (code, stderr) = run_cerulion(false, &[("CERULION_LOGIN_GATE", "off")], &["node", "list"]);
+    // The internal value this repository sets for its own runs lets an unseeded
+    // home through gated verbs.
+    let (code, stderr) = run_cerulion(
+        false,
+        &[("CERULION_LOGIN_GATE", "off")],
+        &["account", "devices", "list"],
+    );
     assert!(
         !stderr.contains("never signed in"),
         "our own runs are not refused; stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Workspace not found"),
-        "the command ran its normal path; stderr={stderr}"
     );
     assert_ne!(
         code,
@@ -383,18 +375,15 @@ fn clean_runs_on_a_machine_that_has_never_signed_in() {
 
 #[test]
 fn a_gated_verb_under_the_same_never_signed_in_home_still_refuses() {
-    // The anti-tautology control for the arm above: the same empty home, a verb
-    // that is NOT exempt, and the whole message a user reads. Without it the
-    // arm above would pass just as well on a build that had switched the gate
-    // off altogether. `--no-network` bounds the blast radius if it ever does:
-    // a `topic list` that reached its own body would otherwise go scouting.
+    // The anti-tautology control for the arm above: the same empty home, a
+    // gated account verb, and the whole message a user reads.
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
     let (code, stdout, stderr) = run_cerulion_at(
         home.path(),
         cwd.path(),
         &[],
-        &["topic", "list", "--no-network"],
+        &["account", "devices", "list"],
     );
     assert!(
         stderr.contains(REFUSAL_A_USER_READS),
@@ -405,13 +394,167 @@ fn a_gated_verb_under_the_same_never_signed_in_home_still_refuses() {
         Some(i32::from(EXIT_AUTH_REQUIRED)),
         "a gated verb exits 7 on a machine that never signed in; stderr={stderr}"
     );
-    // The command did not run: `topic list` prints a LOCAL section on every
-    // path of its own, and the refusal came instead of all of it.
     assert!(
         stdout.is_empty(),
         "the gate must short-circuit before the verb writes anything; stdout={stdout}"
     );
     assert_no_identity_was_written(home.path());
+}
+
+#[test]
+fn local_topic_and_bag_verbs_run_without_sign_in() {
+    for args in [
+        &["topic", "list", "--local"][..],
+        &["bag", "info", "missing.mcap"],
+        &["schema", "list"],
+        &["node", "list"],
+        &["graph", "list"],
+        &["graph", "validate", "demo"],
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (code, _stdout, stderr) = run_cerulion_at(
+            home.path(),
+            cwd.path(),
+            &[("CERULION_NETWORK", "off")],
+            args,
+        );
+        assert_ne!(
+            code,
+            Some(i32::from(EXIT_AUTH_REQUIRED)),
+            "{args:?} must bypass the login gate; stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("never signed in"),
+            "{args:?} must not print the login refusal; stderr={stderr}"
+        );
+        assert_no_identity_was_written(home.path());
+    }
+}
+
+#[test]
+fn robot_flag_flips_dual_mode_verbs_behind_the_login_gate() {
+    // Without `--robot`, local verbs bypass the login gate.
+    for args in [
+        &["topic", "info", "/no_such_topic"][..],
+        &[
+            "topic",
+            "pub",
+            "/offline_gate_test",
+            "std_msgs/String",
+            "{data: hi}",
+            "--wait-subscribers",
+            "0",
+        ],
+        &["topic", "snapshot", "/no_such_cam", "--timeout", "0"],
+        &[
+            "service",
+            "call",
+            "/no_such_srv",
+            "std_srvs/srv/Trigger",
+            "--timeout",
+            "0",
+        ],
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let root = cwd.path().join("iox2-root");
+        std::fs::create_dir_all(&root).unwrap();
+        write_isolated_iceoryx2_config(cwd.path(), &root);
+        let (code, _stdout, stderr) = run_cerulion_at(
+            home.path(),
+            cwd.path(),
+            &[("CERULION_NETWORK", "off")],
+            args,
+        );
+        assert_ne!(
+            code,
+            Some(i32::from(EXIT_AUTH_REQUIRED)),
+            "{args:?} without --robot must bypass the login gate; stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains("never signed in"),
+            "{args:?} without --robot must not print the login refusal; stderr={stderr}"
+        );
+        assert_no_identity_was_written(home.path());
+    }
+
+    // With `--robot` (and for `graph live` / `graph fires` always), the same
+    // verbs enter the login gate and exit 7 naming the Cerulion account service.
+    for args in [
+        &["viz", "/camera", "--robot", "bench-arm"][..],
+        &["topic", "echo", "/camera", "--robot", "bench-arm"],
+        &["topic", "hz", "/camera", "--robot", "bench-arm"],
+        &["topic", "info", "/camera", "--robot", "bench-arm"],
+        &[
+            "topic",
+            "pub",
+            "/cmd_vel",
+            "std_msgs/String",
+            "{data: hi}",
+            "--robot",
+            "bench-arm",
+        ],
+        &["topic", "snapshot", "/camera", "--robot", "bench-arm"],
+        &[
+            "service",
+            "call",
+            "/reset",
+            "std_srvs/srv/Trigger",
+            "--robot",
+            "bench-arm",
+        ],
+        &["graph", "live"],
+        &["graph", "fires"],
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let (code, stdout, stderr) =
+            run_cerulion_at(home.path(), cwd.path(), &[("CERULION_NETWORK", "")], args);
+        assert_eq!(
+            code,
+            Some(i32::from(EXIT_AUTH_REQUIRED)),
+            "{args:?} must exit 7 without sign-in; stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(REFUSAL_A_USER_READS),
+            "{args:?} must print the exact refusal naming the account service; stderr={stderr}"
+        );
+        assert!(stdout.is_empty(), "{args:?}: stdout={stdout}");
+        assert_no_identity_was_written(home.path());
+    }
+}
+
+#[test]
+fn account_service_refusal_names_override_and_default_url() {
+    let cwd = tempfile::tempdir().unwrap();
+    for (override_url, expected_url) in [
+        (Some("http://127.0.0.1:1"), "http://127.0.0.1:1"),
+        (None, "https://app.cerulion.com"),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+        cmd.args(["account", "devices", "list"])
+            .current_dir(cwd.path())
+            .env_remove("CERULION_LOGIN_GATE")
+            .env_remove("CERULION_ACCOUNT_SERVICE")
+            .env("CERULION_HOME", home.path());
+        if let Some(url) = override_url {
+            cmd.env("CERULION_ACCOUNT_SERVICE", url);
+        }
+        let out = cmd.output().expect("spawn cerulion");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(i32::from(EXIT_AUTH_REQUIRED)),
+            "stderr={stderr}"
+        );
+        let want = format!(
+            "Error: This command requires the Cerulion account service ({expected_url}), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did."
+        );
+        assert!(stderr.contains(&want), "want:\n{want}\ngot:\n{stderr}");
+        assert_no_identity_was_written(home.path());
+    }
 }
 
 #[test]
@@ -463,10 +606,18 @@ fn logout_signs_the_machine_out_and_the_next_command_is_refused() {
         "stderr={stderr}"
     );
 
+    // Local verbs still run on a signed-out machine without entering the gate.
     let (code, _, stderr) = run(&["node", "list"]);
+    assert_ne!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+    assert!(stderr.contains("Workspace not found"), "stderr={stderr}");
+
+    // Account verbs exit 7 with the signed-out refusal naming the account service.
+    let (code, _, stderr) = run(&["account", "devices", "list"]);
     assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
     assert!(
-        stderr.contains("signed out of its Cerulion account") && stderr.contains("cerulion login"),
+        stderr.contains("Cerulion account service (http://127.0.0.1:1)")
+            && stderr.contains("this machine is signed out")
+            && stderr.contains("cerulion login"),
         "stderr={stderr}"
     );
     assert!(!stderr.contains("never signed in"), "stderr={stderr}");
@@ -496,52 +647,52 @@ fn logout_on_a_machine_that_never_signed_in_leaves_no_trace() {
 }
 
 #[test]
-fn a_verb_family_is_gated_like_a_built_in_verb() {
-    // `schema` is a registered verb family, dispatched by the family registry
-    // rather than the `Commands` match. Before the move it exited 7 through the
-    // built-in gate, and a user must not be able to tell the difference: the
-    // whole refusal, exit 7, nothing on stdout, no identity left behind.
+fn a_local_verb_family_runs_without_sign_in_and_a_remote_family_is_gated() {
+    // `schema list` is a local verb family and runs on a never-signed-in machine
+    // without leaving any identity behind.
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
     let (code, stdout, stderr) = run_cerulion_at(home.path(), cwd.path(), &[], &["schema", "list"]);
     assert!(
+        !stderr.contains("never signed in"),
+        "local family verb must not meet the login gate; stderr={stderr}"
+    );
+    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("Built-in ROS 2 messages: "),
+        "the local family ran its normal path; stdout={stdout}"
+    );
+    assert_no_identity_was_written(home.path());
+
+    // A remote-robot verb family (`service call --robot`) stays gated like a
+    // built-in account/remote verb.
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[("CERULION_NETWORK", "")],
+        &[
+            "service",
+            "call",
+            "/reset",
+            "std_srvs/srv/Trigger",
+            "--robot",
+            "bench-arm",
+        ],
+    );
+    assert!(
         stderr.contains(REFUSAL_A_USER_READS),
-        "a family verb must print the whole refusal a user reads; stderr={stderr}"
+        "a remote family verb must print the whole refusal a user reads; stderr={stderr}"
     );
     assert_eq!(
         code,
         Some(i32::from(EXIT_AUTH_REQUIRED)),
-        "a family verb exits 7 on a machine that never signed in; stderr={stderr}"
+        "a remote family verb exits 7 on a machine that never signed in; stderr={stderr}"
     );
-    // `schema list` prints its built-in section on every path of its own, so an
-    // empty stdout is the proof it never ran.
     assert!(
         stdout.is_empty(),
         "the gate must short-circuit before the family runs; stdout={stdout}"
     );
     assert_no_identity_was_written(home.path());
-}
-
-#[test]
-fn a_verb_family_runs_on_a_machine_that_signed_in() {
-    // The anti-tautology control for the arm above: the same verb on a seeded
-    // home runs its own body, so the arm above cannot pass on a family that
-    // refused unconditionally.
-    let home = tempfile::tempdir().unwrap();
-    auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
-    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
-    let (code, stdout, stderr) = run_cerulion_at(home.path(), cwd.path(), &[], &["schema", "list"]);
-    assert!(
-        !stderr.contains("never signed in"),
-        "a signed-in machine must not be refused; stderr={stderr}"
-    );
-    assert_eq!(code, Some(0), "stdout={stdout} stderr={stderr}");
-    // Hand-written from the section header `schema list` prints, not read back
-    // off the code that prints it.
-    assert!(
-        stdout.contains("Built-in ROS 2 messages: "),
-        "the family ran its normal path; stdout={stdout}"
-    );
 }
 
 #[test]
@@ -639,10 +790,17 @@ const HARNESS_FORMS: &[&[&str]] = &[
 ];
 
 #[test]
-fn the_simulated_robot_and_the_bench_stay_behind_the_login_gate() {
-    // A machine that never signed in is refused before the harness runs, with
-    // or without the network switch: the launcher never starts.
-    for args in HARNESS_FORMS {
+fn the_simulated_robot_and_the_bench_run_without_sign_in() {
+    // `--sim` and `bench` reach no robot and no Cerulion service, so a machine
+    // that never signed in runs the harness launcher directly with or without
+    // the network switch and writes no auth.json.
+    let version = env!("CARGO_PKG_VERSION");
+    for (args, words) in [
+        (HARNESS_FORMS[0], &["sim"][..]),
+        (HARNESS_FORMS[1], &["sim", "--http", "127.0.0.1:8765"][..]),
+        (HARNESS_FORMS[2], &["bench", "--model", "m"][..]),
+        (HARNESS_FORMS[3], &["verify"][..]),
+    ] {
         for network in ["", "off"] {
             let home = tempfile::tempdir().unwrap();
             let harness = tempfile::tempdir().unwrap();
@@ -655,16 +813,26 @@ fn the_simulated_robot_and_the_bench_stay_behind_the_login_gate() {
                 &[("CERULION_NETWORK", network), ("CERULION_HARNESS_DIR", dir)],
                 args,
             );
-            assert!(
-                stderr.contains(REFUSAL_A_USER_READS),
-                "{args:?} network={network:?}: the whole refusal; stderr={stderr}"
+            assert_eq!(
+                code,
+                Some(3),
+                "{args:?} network={network:?}: stderr={stderr}"
             );
-            assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
-            assert!(stdout.is_empty(), "stdout={stdout}");
-            assert!(
-                !harness.path().join("ran.txt").exists(),
-                "{args:?} network={network:?}: the launcher ran before the gate"
+            assert_eq!(
+                stdout, "MCP-STREAM\n",
+                "{args:?} network={network:?}: stderr={stderr}"
             );
+            let ran = std::fs::read_to_string(harness.path().join("ran.txt")).unwrap();
+            let mut want = vec![
+                "--home".to_string(),
+                home.path()
+                    .join("harness")
+                    .join(version)
+                    .display()
+                    .to_string(),
+            ];
+            want.extend(words.iter().map(|w| w.to_string()));
+            assert_eq!(ran.lines().collect::<Vec<_>>(), want, "{args:?}");
             assert_no_identity_was_written(home.path());
         }
     }

@@ -475,16 +475,21 @@ pub(crate) static CASES: &[Case] = &[
     local_runs(
         &["graph", "pause"],
         &["graph", "pause", "run-1"],
-        1,
+        4,
         "run-1",
     ),
     local_runs(
         &["graph", "resume"],
         &["graph", "resume", "run-1"],
-        1,
+        4,
         "run-1",
     ),
-    local_runs(&["topic", "list"], &["topic", "list"], 0, "LOCAL"),
+    local_runs(
+        &["topic", "list"],
+        &["topic", "list"],
+        0,
+        "No active local topics.",
+    ),
     local_runs(
         &["topic", "info"],
         &["topic", "info", "/camera"],
@@ -566,7 +571,12 @@ pub(crate) static CASES: &[Case] = &[
         &["bag", "record", "/camera"],
         "records local topics until Ctrl+C",
     ),
-    local_runs(&["flashback"], &["flashback"], 1, "Workspace not found"),
+    local_runs(
+        &["flashback"],
+        &["flashback"],
+        1,
+        "no serving graph on this machine answered",
+    ),
     local_runs(
         &["schema", "create"],
         &["schema", "create", "Demo"],

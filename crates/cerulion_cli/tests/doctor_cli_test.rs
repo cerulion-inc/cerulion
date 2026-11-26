@@ -109,7 +109,7 @@ const CHECK_IDS: [&str; 18] = [
 ];
 
 #[test]
-fn a_full_json_report_lists_every_check_in_order_and_exits_1_on_the_failed_login() {
+fn a_full_json_report_lists_every_check_in_order_and_exits_0_when_unsigned() {
     let sb = Sandbox::new("full");
     // `--local` keeps the run on this machine: the network checks report skip.
     let out = sb.run(&["doctor", "--json", "--local"]);
@@ -143,36 +143,36 @@ fn a_full_json_report_lists_every_check_in_order_and_exits_1_on_the_failed_login
         .map(|v| v.as_u64().unwrap())
         .sum();
     assert_eq!(total, CHECK_IDS.len() as u64);
-    // The empty CERULION_HOME has never signed in: account.login fails, so the
-    // run exits 1, and the login gate did not stop the verb first (exit 7).
-    assert_eq!(out.status.code(), Some(1), "{json}");
-    assert_eq!(json["exit_code"], 1);
+    // The empty CERULION_HOME has never signed in: account.login reports info
+    // so an offline robot exits 0 (and the login gate never ran).
+    assert_eq!(out.status.code(), Some(0), "{json}");
+    assert_eq!(json["exit_code"], 0);
 }
 
 #[test]
-fn an_unsigned_machine_gets_the_login_fix_in_json_and_in_the_table() {
+fn an_unsigned_machine_reports_login_info_in_json_and_in_the_table() {
     let sb = Sandbox::new("login");
     let out = sb.run(&["doctor", "--json", "--check", "account.login"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(0));
     let json = json_of(&out);
     assert_eq!(json["checks"].as_array().unwrap().len(), 1);
-    assert_eq!(json["checks"][0]["status"], "fail");
-    assert_eq!(json["checks"][0]["fix"], "run `cerulion login`");
-    assert_eq!(json["counts"]["fail"], 1);
+    assert_eq!(json["checks"][0]["status"], "info");
+    assert!(json["checks"][0]["fix"].is_null());
+    assert!(json["checks"][0]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("cerulion login"));
+    assert_eq!(json["counts"]["info"], 1);
 
     let table = sb.run(&["doctor", "--check", "account.login"]);
-    assert_eq!(table.status.code(), Some(1));
+    assert_eq!(table.status.code(), Some(0));
     let text = String::from_utf8(table.stdout).unwrap();
     assert!(
-        text.starts_with("FAIL  account.login  this machine has never signed in"),
+        text.starts_with("INFO  account.login  this machine has never signed in"),
         "{text}"
     );
     assert!(
-        text.contains("\n                     fix: run `cerulion login`\n"),
-        "{text}"
-    );
-    assert!(
-        text.ends_with("\n0 pass, 0 info, 0 warn, 1 fail, 0 skip\n"),
+        text.ends_with("\n0 pass, 1 info, 0 warn, 0 fail, 0 skip\n"),
         "{text}"
     );
 }
