@@ -13,8 +13,8 @@
 //!   surface at all; the hosted default does not, and login then takes the
 //!   account id from `/v1/me` (see [`DEFAULT_ACCOUNT_SERVICE`]),
 //! - persists `~/.cerulion/auth.json` (with `logged_in_ever: true`), and
-//! - exposes [`ensure_login_gate`] — the entry every command consults, which
-//!   **auto-triggers** the login flow at first-ever need.
+//! - exposes [`ensure_login_gate`] — the entry every account or remote-robot
+//!   command consults, which **auto-triggers** the login flow at first-ever need.
 //!
 //! ## Endpoint resolution
 //!
@@ -26,10 +26,10 @@
 //!
 //! ## Enforcement
 //!
-//! The gate is on in every build. Every command outside the small exempt set
-//! (`login`, `completions`, and the internal `graph run-worker` / `run-gateway`
-//! subprocess verbs) runs under a logged-in-ever identity, in a released binary
-//! and in one built from source alike.
+//! The gate is on in every build. Every command that calls the account service
+//! or authenticates to a remote robot runs under a logged-in-ever identity, in
+//! a released binary and in one built from source alike. Local and offline
+//! commands do not enter this gate.
 //!
 //! It is asked once per machine, not once per command. The device-code flow
 //! writes a durable `logged_in_ever` marker, and from then on the gate is a
@@ -242,19 +242,38 @@ fn gate_off_breadcrumb() {
 }
 
 /// The two-line refusal a machine that has never signed in receives when the
-/// device-code flow has nobody to talk to. `main` renders it after `Error: `,
-/// then exits [`EXIT_AUTH_REQUIRED`].
+/// device-code flow has nobody to talk to (default account service). `main`
+/// renders the formatted refusal from [`non_interactive_refusal`] after
+/// `Error: `, then exits [`EXIT_AUTH_REQUIRED`].
 ///
-/// It names BOTH fixes, because the two callers who hit it want different ones:
-/// a person who piped the output wants the first, and a CI job or a service
-/// wants the second. `CERULION_HOME` is the whole provisioning story on the
-/// automation side: point it at a directory holding the state of a machine that
-/// signed in, and the gate reads that state instead.
-pub const NON_INTERACTIVE_REFUSAL: &str = "This machine has never signed in to a Cerulion account, and every command needs one.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
+/// It names the account service and BOTH fixes, because the two callers who
+/// hit it want different ones: a person who piped the output wants the first,
+/// and a CI job or a service wants the second. `CERULION_HOME` is the whole
+/// provisioning story on the automation side: point it at a directory holding
+/// the state of a machine that signed in, and the gate reads that state
+/// instead.
+pub const NON_INTERACTIVE_REFUSAL: &str = "This command requires the Cerulion account service (https://app.cerulion.com), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did.";
 
 /// The refusal an identity-needing command gets on a signed-out machine
-/// ([`LocalGate::RefuseSignedOut`]) when no terminal can run the login.
-pub const SIGNED_OUT_REFUSAL: &str = "This machine is signed out of its Cerulion account, and every command needs one.\nRun `cerulion login` in a terminal to sign in again.";
+/// ([`LocalGate::RefuseSignedOut`]) when no terminal can run the login
+/// (default account service).
+pub const SIGNED_OUT_REFUSAL: &str = "This command requires the Cerulion account service (https://app.cerulion.com), and this machine is signed out.\nRun `cerulion login` in a terminal to sign in again.";
+
+/// Format the non-interactive never-signed-in refusal naming `service`.
+#[must_use]
+pub fn non_interactive_refusal(service: &str) -> String {
+    format!(
+        "This command requires the Cerulion account service ({service}), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did."
+    )
+}
+
+/// Format the non-interactive signed-out refusal naming `service`.
+#[must_use]
+pub fn signed_out_refusal(service: &str) -> String {
+    format!(
+        "This command requires the Cerulion account service ({service}), and this machine is signed out.\nRun `cerulion login` in a terminal to sign in again."
+    )
+}
 
 /// Whether the device-code flow can actually reach a person here.
 ///
@@ -329,18 +348,20 @@ fn gate_with(
     match auth::local_gate(&loaded, auth::now_unix_ns()) {
         LocalGate::ProceedValidSession | LocalGate::ProceedExpiredLocalForever => Ok(None),
         gate @ (LocalGate::RefuseNeverLoggedIn | LocalGate::RefuseSignedOut) => {
+            let service = account_service_base();
             if !interactive {
                 let refusal = if gate == LocalGate::RefuseSignedOut {
-                    SIGNED_OUT_REFUSAL
+                    signed_out_refusal(&service)
                 } else {
-                    NON_INTERACTIVE_REFUSAL
+                    non_interactive_refusal(&service)
                 };
-                return Err(CliError::Login(refusal.to_string()));
+                return Err(CliError::Login(refusal));
             }
             writeln!(
                 out,
-                "\nThis machine is not signed in to a Cerulion account, and Cerulion requires \
-                 one. Signing you in now (you can also run `cerulion login` yourself)...\n"
+                "\nThis command requires the Cerulion account service ({service}), and this \
+                 machine is not signed in. Signing you in now (you can also run `cerulion login` \
+                 yourself)...\n"
             )?;
             run_login_carrying(out, telemetry_anon_id).map(Some)
         }
@@ -1929,31 +1950,42 @@ mod tests {
     }
 
     #[test]
-    fn the_non_interactive_refusal_is_two_lines_naming_both_fixes() {
-        // Hand oracle. The first line says what is wrong, the second says what to
-        // do about it on BOTH sides (a person at a terminal, and automation), and
-        // there are exactly two of them so the whole answer is readable in a CI
-        // log that shows one line of stderr.
+    fn the_non_interactive_refusal_is_two_lines_naming_service_and_both_fixes() {
+        // Hand oracle. The first line names the account service and states the
+        // condition; the second says what to do about it on BOTH sides (a
+        // person at a terminal, and automation).
         let lines: Vec<&str> = NON_INTERACTIVE_REFUSAL.lines().collect();
         assert_eq!(lines.len(), 2, "{NON_INTERACTIVE_REFUSAL}");
-        assert!(
-            lines[0].contains("never signed in"),
-            "line 1 must state the condition: {}",
-            lines[0]
+        assert_eq!(
+            lines[0],
+            "This command requires the Cerulion account service (https://app.cerulion.com), and this machine has never signed in."
         );
-        assert!(
-            lines[1].contains("cerulion login"),
-            "line 2 must name the interactive fix: {}",
-            lines[1]
+        assert_eq!(
+            lines[1],
+            "Run `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did."
         );
-        assert!(
-            lines[1].contains("CERULION_HOME"),
-            "line 2 must name the automation fix: {}",
-            lines[1]
+        assert_eq!(
+            NON_INTERACTIVE_REFUSAL,
+            non_interactive_refusal(DEFAULT_ACCOUNT_SERVICE)
         );
         assert!(
             !NON_INTERACTIVE_REFUSAL.contains("CERULION_LOGIN_GATE"),
-            "the refusal must not name a variable that no longer exists"
+            "the refusal must not name the internal test variable"
+        );
+
+        let signed_out_lines: Vec<&str> = SIGNED_OUT_REFUSAL.lines().collect();
+        assert_eq!(signed_out_lines.len(), 2, "{SIGNED_OUT_REFUSAL}");
+        assert_eq!(
+            signed_out_lines[0],
+            "This command requires the Cerulion account service (https://app.cerulion.com), and this machine is signed out."
+        );
+        assert_eq!(
+            signed_out_lines[1],
+            "Run `cerulion login` in a terminal to sign in again."
+        );
+        assert_eq!(
+            SIGNED_OUT_REFUSAL,
+            signed_out_refusal(DEFAULT_ACCOUNT_SERVICE)
         );
     }
 
@@ -2017,7 +2049,34 @@ mod tests {
         let started = std::time::Instant::now();
         let err = ensure_login_gate_with(&mut out, false)
             .expect_err("a never-signed-in machine with no terminal is refused");
-        assert_eq!(err.to_string(), NON_INTERACTIVE_REFUSAL);
+        assert_eq!(
+            err.to_string(),
+            "This command requires the Cerulion account service (http://127.0.0.1:1), and this machine has never signed in.\nRun `cerulion login` once in a terminal, or for automation point CERULION_HOME at a directory holding the state of a machine that did."
+        );
+        // Determinism: a second call returns byte-identical refusal text.
+        let err2 = ensure_login_gate_with(&mut out, false)
+            .expect_err("a never-signed-in machine with no terminal is refused deterministically");
+        assert_eq!(err.to_string(), err2.to_string());
+        // With CERULION_ACCOUNT_SERVICE unset, the refusal names the production default.
+        drop(_svc);
+        let _unset_svc = EnvGuard::unset(ACCOUNT_SERVICE_ENV);
+        let default_err = ensure_login_gate_with(&mut out, false)
+            .expect_err("unset account service still refuses with default URL");
+        assert_eq!(default_err.to_string(), NON_INTERACTIVE_REFUSAL);
+        // Corrupt auth.json refuses with the same never-signed-in message (no dial).
+        std::fs::write(dir.path().join("auth.json"), "{not-json").unwrap();
+        let corrupt_err = ensure_login_gate_with(&mut out, false)
+            .expect_err("corrupt auth.json refuses non-interactively");
+        assert_eq!(corrupt_err.to_string(), NON_INTERACTIVE_REFUSAL);
+        // Signed-out auth.json refuses with the signed-out message naming the account service.
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"account_id":"acct","logged_in_ever":true,"signed_out":true}"#,
+        )
+        .unwrap();
+        let signed_out_err = ensure_login_gate_with(&mut out, false)
+            .expect_err("signed-out machine refuses non-interactively");
+        assert_eq!(signed_out_err.to_string(), SIGNED_OUT_REFUSAL);
         assert!(
             out.is_empty(),
             "the refusal is the returned error, not a prompt: {}",

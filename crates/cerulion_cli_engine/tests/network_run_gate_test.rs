@@ -17,9 +17,10 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use cerulion_cli_engine::graph_cmd::{
-    network_env_kill, remote_network_suppressed, resolve_gateway_base_port, resolve_robot_identity,
-    resolve_run_network, NetworkEnvKill, RunNetwork, TimeSource, GATEWAY_WELL_KNOWN_PORT,
-    KILL_SWITCH_SCOPE, NETWORK_OFF_LOCAL_ONLY_NOTICE, NETWORK_OFF_REDUNDANT_NOTICE,
+    apply_serving_authority_with, network_env_kill, remote_network_suppressed,
+    resolve_gateway_base_port, resolve_robot_identity, resolve_run_network, NetworkEnvKill,
+    RunNetwork, TimeSource, GATEWAY_WELL_KNOWN_PORT, KILL_SWITCH_SCOPE,
+    NETWORK_OFF_LOCAL_ONLY_NOTICE, NETWORK_OFF_REDUNDANT_NOTICE,
 };
 use cerulion_core::graph::config::{GraphConfig, NetworkBlock, NetworkMode, NodeDef};
 use cerulion_core::transport::network::ZenohMode;
@@ -922,5 +923,102 @@ fn netd_network_switch_matches_the_daemon() {
             classify_network_switch(value) == NetworkSwitch::Off,
             "{value:?}"
         );
+    }
+}
+
+// ==========================================================================
+// Serving authority degradation for permissive-default vs strict egress.
+// ==========================================================================
+
+#[test]
+#[traced_test]
+fn permissive_without_authority_degrades_to_off_with_loud_warn() {
+    let _lock = env_lock();
+    let config = graph_with(None);
+    let initial = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    assert!(matches!(initial, RunNetwork::Permissive(_)));
+
+    let mut checked = 0;
+    let degraded = apply_serving_authority_with("demo_graph", &config, initial, || {
+        checked += 1;
+        Err("serving the network requires a prior login; run `cerulion login`")
+    })
+    .expect("permissive without authority degrades instead of refusing");
+    assert_eq!(checked, 1);
+    assert!(matches!(degraded, RunNetwork::Off));
+    assert!(
+        logs_contain("demo_graph")
+            && logs_contain("running local-only")
+            && logs_contain("no prior login or robot pairing")
+            && logs_contain("cerulion login"),
+        "degradation must log one loud warning naming the graph and cerulion login"
+    );
+}
+
+#[test]
+#[traced_test]
+fn permissive_with_authority_stays_permissive_without_local_only_warn() {
+    let _lock = env_lock();
+    let config = graph_with(None);
+    let initial = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let mut checked = 0;
+    let kept = apply_serving_authority_with("demo_graph", &config, initial, || {
+        checked += 1;
+        Ok(())
+    })
+    .expect("permissive with authority stays permissive");
+    assert_eq!(checked, 1);
+    assert!(matches!(kept, RunNetwork::Permissive(_)));
+    assert!(!logs_contain("network serving was skipped"));
+}
+
+#[test]
+fn strict_with_egress_refuses_without_authority_and_allows_with_it() {
+    let _lock = env_lock();
+    let config = graph_with(Some(egress_only_block()));
+    let strict_err = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let refusal = "serving the network requires a prior login; run `cerulion login`";
+    let err = apply_serving_authority_with("demo_graph", &config, strict_err, || Err(refusal))
+        .expect_err("explicit egress must refuse without authority");
+    assert_eq!(err.to_string(), refusal);
+
+    let strict_ok = resolve_run_network(&config, false, TimeSource::Real, false).unwrap();
+    let kept = apply_serving_authority_with("demo_graph", &config, strict_ok, || Ok(()))
+        .expect("explicit egress with authority proceeds");
+    assert!(matches!(kept, RunNetwork::Strict(_)));
+}
+
+#[test]
+fn strict_without_egress_and_off_and_inert_skip_authority_check() {
+    let _lock = env_lock();
+    let no_egress = NetworkBlock {
+        mode: NetworkMode::Peer,
+        connect: vec![],
+        listen: vec!["tcp/127.0.0.1:7447".to_string()],
+        egress: vec![],
+        ingress: vec![],
+        tls: None,
+        default_reliability: cerulion_core::EgressReliability::Reliable,
+    };
+    let strict_cfg = graph_with(Some(no_egress));
+    let strict = resolve_run_network(&strict_cfg, false, TimeSource::Real, false).unwrap();
+    let mut calls = 0;
+    let strict_out = apply_serving_authority_with("demo_graph", &strict_cfg, strict, || {
+        calls += 1;
+        Err("must not be called")
+    })
+    .unwrap();
+    assert!(matches!(strict_out, RunNetwork::Strict(_)));
+    assert_eq!(calls, 0);
+
+    let plain = graph_with(None);
+    for mode in [RunNetwork::Off, RunNetwork::Inert] {
+        let out = apply_serving_authority_with("demo_graph", &plain, mode, || {
+            calls += 1;
+            Err("must not be called")
+        })
+        .unwrap();
+        assert!(matches!(out, RunNetwork::Off | RunNetwork::Inert));
+        assert_eq!(calls, 0);
     }
 }

@@ -4222,6 +4222,51 @@ pub fn resolve_run_network(
     Ok(RunNetwork::Permissive(permissive_network_config()?))
 }
 
+/// Apply the local serving-authority rule to a resolved [`RunNetwork`].
+///
+/// - [`RunNetwork::Strict`] with declared `egress:` requires a prior login or
+///   robot pairing and returns `Err(CliError::Validation)` when absent.
+/// - [`RunNetwork::Strict`] with no declared `egress:` does not check serving
+///   authority and stays `Strict`.
+/// - [`RunNetwork::Permissive`] keeps serving when authority is present, and
+///   degrades to [`RunNetwork::Off`] with one loud warning when absent so an
+///   offline or never-signed-in machine runs local-only and never opens a
+///   network listener without a sign-in.
+/// - [`RunNetwork::Off`] and [`RunNetwork::Inert`] skip the authority check
+///   and return unchanged.
+pub fn apply_serving_authority_with(
+    graph_identity: &str,
+    config: &GraphConfig,
+    run_network: RunNetwork,
+    check_authority: impl FnOnce() -> Result<(), &'static str>,
+) -> CliResult<RunNetwork> {
+    match run_network {
+        RunNetwork::Strict(net) => {
+            let has_egress = config
+                .network
+                .as_ref()
+                .is_some_and(|network| !network.egress.is_empty());
+            if has_egress {
+                check_authority().map_err(|error| CliError::Validation(error.into()))?;
+            }
+            Ok(RunNetwork::Strict(net))
+        }
+        RunNetwork::Permissive(net) => match check_authority() {
+            Ok(()) => Ok(RunNetwork::Permissive(net)),
+            Err(_) => {
+                tracing::warn!(
+                    graph = %graph_identity,
+                    "running local-only: network serving was skipped because this machine has no \
+                     prior login or robot pairing; run `cerulion login` to serve topics over the \
+                     network"
+                );
+                Ok(RunNetwork::Off)
+            }
+        },
+        off @ (RunNetwork::Off | RunNetwork::Inert) => Ok(off),
+    }
+}
+
 /// The SYNTHESIZED permissive-default `NetworkConfig`, peer mode, gossip
 /// scouting on, multicast scouting from
 /// [`cerulion_core::transport::network::MULTICAST_SCOUTING_ENV`] (default off:
@@ -6350,30 +6395,24 @@ pub fn graph_run(
     // Local workers share SHM; paired networking is held on netd, and explicit
     // open compatibility uses its locator-based gateway.
     let run_network = resolve_run_network(&config, network_off, time_source, record.is_some())?;
-    let will_serve = match &run_network {
-        RunNetwork::Strict(_) => config
-            .network
-            .as_ref()
-            .is_some_and(|network| !network.egress.is_empty()),
-        RunNetwork::Permissive(_) => {
-            config.nodes.iter().any(|node| !node.outputs.is_empty()) || config.has_ros2_nodes()
-        }
-        RunNetwork::Off | RunNetwork::Inert => false,
-    };
-    if will_serve {
-        cerulion_netd::serving_login::require_serving_authority()
-            .map_err(|error| CliError::Validation(error.into()))?;
-    }
-    // The permissive default applies to every normal
-    // real-clock live run reaching this function — `graph run`, `node run`'s
-    // temp single-node graph, AND `ros2 attach` (the flagship automagic surface:
-    // attach a robot and it is network-viewable with zero config). Serving
-    // requires saved local authority for producers; producer-free runs skip
-    // that gate. Network suppressors are `--network off` /
-    // `CERULION_NETWORK=off`, the virtual/external clocks, and the
-    // record+declared-ingress refusal — all already folded into `run_network`
-    // above. (`graph profile` never routes through this function — see the
-    // explicit local-only profile arm in `resolve_run_network`'s docs.)
+    let run_network = apply_serving_authority_with(
+        config.identity(),
+        &config,
+        run_network,
+        cerulion_netd::serving_login::require_serving_authority,
+    )?;
+    // The permissive default applies to every normal real-clock live run
+    // reaching this function — `graph run`, `node run`'s temp single-node
+    // graph, AND `ros2 attach` (which checks `require_serving_authority` before
+    // entering `graph_run`). Under `RunNetwork::Permissive`, a machine with no
+    // prior login or robot pairing degrades to `RunNetwork::Off` with one loud
+    // warning so offline runs work without ever opening a network listener;
+    // explicit `network: egress:` stays refused. Network suppressors are
+    // `--network off` / `CERULION_NETWORK=off`, the virtual/external clocks,
+    // and the record+declared-ingress refusal — all already folded into
+    // `run_network` above. (`graph profile` never routes through this function
+    // — see the explicit local-only profile arm in `resolve_run_network`'s
+    // docs.)
 
     // The execution mode is read from the environment exactly once per run,
     // HERE, and the result threaded to every reader below.
