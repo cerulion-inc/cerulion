@@ -7257,9 +7257,12 @@ impl Scheduler {
                 set_max_ns = hi,
                 window_ns,
                 "sync discarded an UNMATCHABLE frame: a partner ran past it by more than \
-                 the window. Widen `sync_window_ms`, fix a stalled or skewed producer, or \
-                 raise the fast input's `depth` above the fast:slow rate ratio (below it, \
-                 `drop_oldest` evicts the frames the matcher needed before it sees them)"
+                 the window. Fix a stalled or skewed producer, or raise the fast input's \
+                 `depth` above the fast:slow rate ratio (below it, `drop_oldest` evicts \
+                 the frames the matcher needed before it sees them). If you raise \
+                 `sync_window_ms`, keep it strictly below `input_period - skew`: a window \
+                 at or above that bound can silently pair every subsequent sample with \
+                 the previous period after one drop"
             ),
             RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
                 node_id = %id,

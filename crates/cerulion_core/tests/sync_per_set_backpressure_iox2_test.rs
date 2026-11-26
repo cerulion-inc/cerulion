@@ -1704,11 +1704,13 @@ fn a_sample_gate_wider_than_the_sync_window_warns_once_and_still_builds() {
                 && l.contains("sample_interval_ms=80")
                 && l.contains("sync_window_ms=50")
                 && l.contains("input=a")
+                && l.contains("strictly below the input period minus skew")
+                && !l.contains("or widen `sync_window_ms`")
         });
         if !named {
             return Err(
-                "the warn must name BOTH windows and the input, or an operator \
-                 cannot tell which declaration to change"
+                "the warn must name BOTH windows, the input, and the period-minus-skew \
+                 ceiling instead of advising an unconditional widen"
                     .to_string(),
             );
         }

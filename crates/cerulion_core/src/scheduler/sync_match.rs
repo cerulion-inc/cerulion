@@ -718,4 +718,291 @@ mod tests {
             "lidar is never probed — the gate short-circuits at cam"
         );
     }
+
+    // ---- issue #993: 30 Hz loss, period-minus-skew bound, and recovery ----
+
+    /// Minimal hand-driven two-input driver over an arrival schedule: each
+    /// arrival pushes a frame to input 0 or 1, fills empty/emitted heads, and
+    /// runs `next_sync_step` to quiescence (`Wait`). Records every non-Wait
+    /// step, emitted `(a_ts, b_ts)` pair, discard count, and skip count.
+    struct TwoInputTrace {
+        steps: Vec<SyncStep>,
+        emitted: Vec<(u64, u64)>,
+        unmatched_discards: usize,
+        closer_skips: usize,
+    }
+
+    fn drive_two_input_arrivals(
+        arrivals: &[(usize, u64)],
+        window: Option<Duration>,
+    ) -> TwoInputTrace {
+        let mut queues: [Vec<u64>; 2] = [Vec::new(), Vec::new()];
+        let mut heads: [Option<SyncHead>; 2] = [None, None];
+        let mut steps = Vec::new();
+        let mut emitted = Vec::new();
+        let mut unmatched_discards = 0usize;
+        let mut closer_skips = 0usize;
+
+        for &(idx, ts) in arrivals {
+            queues[idx].push(ts);
+            loop {
+                for i in 0..2 {
+                    let needs_refill = matches!(
+                        heads[i],
+                        None | Some(SyncHead {
+                            state: HeadState::Emitted,
+                            ..
+                        })
+                    );
+                    if needs_refill && !queues[i].is_empty() {
+                        heads[i] = Some(SyncHead::filled(queues[i].remove(0)));
+                    }
+                }
+                let mut next = [NextInfo::Unknown; 2];
+                let terminal = loop {
+                    let step = next_sync_step(&heads, &next, window);
+                    if step != SyncStep::Wait {
+                        steps.push(step.clone());
+                    }
+                    match step {
+                        SyncStep::NeedNext(i, _) => {
+                            next[i] = if queues[i].is_empty() {
+                                NextInfo::None
+                            } else {
+                                NextInfo::Present
+                            };
+                        }
+                        SyncStep::NeedStamp(i) => {
+                            next[i] = match queues[i].first() {
+                                Some(&p) => NextInfo::Stamp(p),
+                                None => NextInfo::None,
+                            };
+                        }
+                        SyncStep::Advance(i) => {
+                            closer_skips += 1;
+                            let promoted = queues[i].remove(0);
+                            heads[i] = Some(SyncHead::filled(promoted));
+                            next[i] = NextInfo::Unknown;
+                        }
+                        other => break other,
+                    }
+                };
+                match terminal {
+                    SyncStep::Wait => break,
+                    SyncStep::Fire => {
+                        let a_ts = heads[0].expect("fire requires filled head 0").ts;
+                        let b_ts = heads[1].expect("fire requires filled head 1").ts;
+                        emitted.push((a_ts, b_ts));
+                        heads[0] = Some(SyncHead::emitted(a_ts));
+                        heads[1] = Some(SyncHead::emitted(b_ts));
+                    }
+                    SyncStep::DiscardTie(indices) => {
+                        for i in indices {
+                            unmatched_discards += 1;
+                            heads[i] = None;
+                        }
+                    }
+                    SyncStep::NeedNext(..) | SyncStep::NeedStamp(_) | SyncStep::Advance(_) => {
+                        unreachable!("handled in inner loop");
+                    }
+                }
+            }
+        }
+
+        TwoInputTrace {
+            steps,
+            emitted,
+            unmatched_discards,
+            closer_skips,
+        }
+    }
+
+    const PERIOD_30HZ_NS: u64 = 33_333_333;
+    const SKEW_5MS_NS: u64 = 5_000_000;
+
+    #[test]
+    fn thirty_hz_loss_with_window_below_period_minus_skew_discards_orphan_and_recovers() {
+        // Two 30 Hz streams where A (image) arrives 5 ms before B (capture time).
+        // A_1 is dropped. With window = 20 ms < 33.333 ms - 5 ms = 28.333 ms,
+        // (A_2, B_1) exceeds the window, discards orphan B_1 once, and recovers.
+        let t = PERIOD_30HZ_NS;
+        let s = SKEW_5MS_NS;
+        let arrivals = [
+            (0, 0),
+            (1, s),
+            // A_1 dropped; only B_1 arrives.
+            (1, t + s),
+            (0, 2 * t),
+            (1, 2 * t + s),
+            (0, 3 * t),
+            (1, 3 * t + s),
+        ];
+
+        let trace = drive_two_input_arrivals(&arrivals, w(20));
+
+        assert_eq!(
+            trace.emitted,
+            vec![(0, s), (2 * t, 2 * t + s), (3 * t, 3 * t + s)],
+            "after discarding orphan B_1, frames 2 and 3 must pair cleanly"
+        );
+        assert_eq!(
+            trace.unmatched_discards, 1,
+            "only the orphaned B_1 must be discarded as UNMATCHABLE"
+        );
+        assert_eq!(trace.closer_skips, 0);
+        assert!(
+            trace.steps.contains(&SyncStep::DiscardTie(vec![1])),
+            "orphan B_1 at index 1 must die via DiscardTie([1]): {:?}",
+            trace.steps
+        );
+    }
+
+    #[test]
+    fn thirty_hz_loss_at_exact_period_minus_skew_boundary_pairs_wrong_sample() {
+        // Span of (A_2, B_1) is exactly period - skew = 28_333_333 ns.
+        let t = PERIOD_30HZ_NS;
+        let s = SKEW_5MS_NS;
+        let boundary_ns = t - s;
+
+        let arrivals = [
+            (0, 0),
+            (1, s),
+            (1, t + s),
+            (0, 2 * t),
+            (1, 2 * t + s),
+            (0, 3 * t),
+            (1, 3 * t + s),
+        ];
+
+        // Inclusive window == period - skew fires (A_2, B_1) and locks (A_3, B_2)
+        // with zero discards and zero skips.
+        let locked = drive_two_input_arrivals(&arrivals, Some(Duration::from_nanos(boundary_ns)));
+        assert_eq!(
+            locked.emitted,
+            vec![(0, s), (2 * t, t + s), (3 * t, 2 * t + s)],
+            "at exact window == period - skew, every pair after the loss shifts by one period"
+        );
+        assert_eq!(locked.unmatched_discards, 0);
+        assert_eq!(locked.closer_skips, 0);
+
+        // One nanosecond below the boundary discards orphan B_1 and recovers.
+        let recovered =
+            drive_two_input_arrivals(&arrivals, Some(Duration::from_nanos(boundary_ns - 1)));
+        assert_eq!(
+            recovered.emitted,
+            vec![(0, s), (2 * t, 2 * t + s), (3 * t, 3 * t + s)],
+            "one nanosecond below period - skew must discard B_1 and recover"
+        );
+        assert_eq!(recovered.unmatched_discards, 1);
+        assert_eq!(recovered.closer_skips, 0);
+    }
+
+    #[test]
+    fn thirty_hz_loss_under_unbounded_sync_phase_locks_every_subsequent_pair() {
+        // Under unbounded_sync (window = None), one lost A_1 causes every
+        // subsequent pair to lock onto (A_{k+1}, B_k) with zero discards/skips.
+        let t = PERIOD_30HZ_NS;
+        let s = SKEW_5MS_NS;
+        let arrivals = [
+            (0, 0),
+            (1, s),
+            (1, t + s),
+            (0, 2 * t),
+            (1, 2 * t + s),
+            (0, 3 * t),
+            (1, 3 * t + s),
+            (0, 4 * t),
+            (1, 4 * t + s),
+        ];
+
+        let trace = drive_two_input_arrivals(&arrivals, None);
+
+        assert_eq!(
+            trace.emitted,
+            vec![
+                (0, s),
+                (2 * t, t + s),
+                (3 * t, 2 * t + s),
+                (4 * t, 3 * t + s),
+            ],
+            "unbounded_sync must phase-lock all three post-loss pairs onto (A_{{k+1}}, B_k)"
+        );
+        assert_eq!(trace.unmatched_discards, 0);
+        assert_eq!(trace.closer_skips, 0);
+    }
+
+    #[test]
+    fn thirty_hz_loss_with_reversed_skew_recovers_via_single_advance() {
+        // B arrives 5 ms BEFORE A: B_k = k * T, A_k = k * T + skew.
+        // When A_1 is dropped, B_2 arrives while A is still waiting, so when
+        // A_2 lands B holds [B_1, B_2] and A has no next: the matcher advances
+        // past B_1 once and fires the aligned (A_2, B_2) pair.
+        let t = PERIOD_30HZ_NS;
+        let s = SKEW_5MS_NS;
+        let arrivals = [
+            (1, 0),
+            (0, s),
+            (1, t),
+            // A_1 dropped; B_2 lands before A_2.
+            (1, 2 * t),
+            (0, 2 * t + s),
+            (1, 3 * t),
+            (0, 3 * t + s),
+        ];
+
+        let trace = drive_two_input_arrivals(&arrivals, None);
+
+        assert_eq!(
+            trace.emitted,
+            vec![(s, 0), (2 * t + s, 2 * t), (3 * t + s, 3 * t)],
+            "reversed skew must recover via one Advance on B and pair (A_2, B_2)"
+        );
+        assert_eq!(trace.unmatched_discards, 0);
+        assert_eq!(trace.closer_skips, 1);
+        assert!(
+            trace.steps.contains(&SyncStep::Advance(1)),
+            "recovery must advance index 1 (B): {:?}",
+            trace.steps
+        );
+    }
+
+    #[test]
+    fn thirty_hz_recovery_sequence_is_bit_identical_across_two_runs() {
+        let t = PERIOD_30HZ_NS;
+        let s = SKEW_5MS_NS;
+        let arrivals = [
+            (0, 0),
+            (1, s),
+            (1, t + s),
+            (0, 2 * t),
+            (1, 2 * t + s),
+            (0, 3 * t),
+            (1, 3 * t + s),
+        ];
+
+        let run1 = drive_two_input_arrivals(&arrivals, w(20));
+        let run2 = drive_two_input_arrivals(&arrivals, w(20));
+
+        let expected_emitted = vec![(0, s), (2 * t, 2 * t + s), (3 * t, 3 * t + s)];
+        let expected_steps = vec![
+            // (A_0, B_0)
+            SyncStep::NeedNext(0, ProbeSite::Argmin),
+            SyncStep::Fire,
+            // (A_2, B_1): span 28.333 ms > 20 ms -> discard B_1
+            SyncStep::DiscardTie(vec![1]),
+            // (A_2, B_2)
+            SyncStep::NeedNext(0, ProbeSite::Argmin),
+            SyncStep::Fire,
+            // (A_3, B_3)
+            SyncStep::NeedNext(0, ProbeSite::Argmin),
+            SyncStep::Fire,
+        ];
+
+        assert_eq!(run1.emitted, expected_emitted);
+        assert_eq!(run1.steps, expected_steps);
+        assert_eq!(run1.emitted, run2.emitted);
+        assert_eq!(run1.steps, run2.steps);
+        assert_eq!(run1.unmatched_discards, run2.unmatched_discards);
+        assert_eq!(run1.closer_skips, run2.closer_skips);
+    }
 }

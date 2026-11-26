@@ -9308,7 +9308,9 @@ impl GraphRuntime {
                                      (`sync_unmatched_discard_count`), on a graph whose producers \
                                      are perfectly healthy. Not refused: an in-phase pair aligns \
                                      at any N. Fix if unintended: lower N below the window, or \
-                                     widen `sync_window_ms`"
+                                     raise `sync_window_ms` while keeping it strictly below the \
+                                     input period minus skew (at or above that bound, one drop \
+                                     can silently pair every later sample with the previous period)"
                                 );
                             }
                         }
