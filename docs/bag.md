@@ -1357,7 +1357,7 @@ node, the input, the writer and the sequence:
 
 | Cause (`--report` code) | Meaning |
 |---|---|
-| `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
+| `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: either the bag's frames of that writer begin at a later sequence (the recorder's taps attached after it, or the window dropped earlier frames), or the recorder lost a frame between held sequences |
 | `read_identity_absent` | A read popped frames and no annotation named their writer, or a read or a `batch_frame` record on a multi-writer edge carries no annotation of its own. On a bag recorded below format 11 that begins mid-run, the message says the read continues a writer run the bag does not hold and to record the run again |
 | `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
 | `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9, or a batch deeper than its read stage's window, names only the newest |
@@ -1395,7 +1395,11 @@ fed:
   record the run again. From format 11 a bag that begins at a checkpoint names
   the writer of every read in it and is fed. A free-run bag with several worker
   ranks is refused by every replay, `--resim all` included, since per-rank
-  resume anchors are not supported.
+  resume anchors are not supported. On any mid-run replay (lockstep or free-run,
+  with or without `--verify`), a re-executed single-writer topic whose recorded
+  frames begin after its first resumed commit is refused by name before step 1
+  (exit 2), naming the topic, the resumed step, the first commit step and the
+  first recorded sequence, instead of seeding the publisher from a later frame.
 
  Replay such a bag with `--resim all` and no
 `--verify`, which re-creates each consumer's queue and labels its reads best
