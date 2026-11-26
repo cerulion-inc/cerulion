@@ -2911,6 +2911,64 @@ impl ReadPlanStage {
         Ok(false)
     }
 
+    /// Pure read of whether the entry immediately at the current cursor in this
+    /// step's plan is a recorded `HandOff` ([`DueShape::ServedWithoutPop`])
+    /// naming `expected_seq`.
+    ///
+    /// Used by `CerulionSubscriber::sync_next_arrived` when a per-set `Sync`
+    /// trigger input already holds a parked `next_head` (for example after a
+    /// partial tick stopped at an empty context input): live advances that
+    /// parked frame in the current alignment pass only if `sync_discard_head`
+    /// recorded a `HandOff` for its exact sequence before any subsequent pop on
+    /// this stage. Pure read: does not advance `cursor`, call the feed, or
+    /// allocate. Returns `Err(GatePoisoned)` if the gate mutex was poisoned so
+    /// the caller fails closed.
+    #[inline(never)]
+    pub(crate) fn next_is_handoff(&self, expected_seq: Option<u32>) -> Result<bool, GatePoisoned> {
+        if !self.is_armed() {
+            return Ok(false);
+        }
+        let now = self.now_step.load(Ordering::Acquire);
+        let inner = self.lock_plan()?;
+        if inner.unusable {
+            return Err(GatePoisoned);
+        }
+        if !inner.installed || inner.step != now {
+            return Ok(false);
+        }
+        let Some(due) = inner.due.get(inner.cursor) else {
+            return Ok(false);
+        };
+        Ok(matches!(due.shape(), DueShape::ServedWithoutPop) && due.served_seq() == expected_seq)
+    }
+
+    /// Advance the cursor past one recorded `HandOff`
+    /// ([`DueShape::ServedWithoutPop`]) matching `expected_seq` when
+    /// `sync_discard_head` promotes `next_head` during replay.
+    ///
+    /// Keeping the cursor in lockstep with promoted handoffs prevents a stale
+    /// `HandOff` from remaining at `cursor` across subsequent matcher steps in
+    /// the same alignment pass. Does not call the feed or allocate.
+    #[inline(never)]
+    pub(crate) fn consume_handoff(&self, expected_seq: Option<u32>) {
+        if !self.is_armed() {
+            return;
+        }
+        let now = self.now_step.load(Ordering::Acquire);
+        let Ok(mut inner) = self.lock_plan() else {
+            return;
+        };
+        if !inner.installed || inner.step != now {
+            return;
+        }
+        if let Some(due) = inner.due.get(inner.cursor) {
+            if matches!(due.shape(), DueShape::ServedWithoutPop) && due.served_seq() == expected_seq
+            {
+                inner.cursor += 1;
+            }
+        }
+    }
+
     /// Site-aware twin of [`Self::admit_at`].
     ///
     /// `empty_recorded` states whether the recording stages a `NoFrame` record
@@ -7116,6 +7174,70 @@ mod tests {
         std::panic::set_hook(hook);
         assert!(caught.is_err());
         assert_eq!(plan.next_is_peek(), Err(GatePoisoned));
+    }
+
+    #[test]
+    fn next_is_handoff_and_consume_handoff_respect_cursor_seq_step_and_poison() {
+        let now = Arc::new(AtomicU64::new(5));
+        let plan = ReadPlanStage::new(
+            plan_key("sync_node", 0, ReadStageRole::Body),
+            ORDINARY_RIM,
+            None,
+            Arc::clone(&now),
+        );
+        // Unarmed returns Ok(false) and consume_handoff is a no-op.
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(false));
+        plan.consume_handoff(Some(10));
+
+        plan.arm(ConsultRule::Recorded).unwrap();
+        // Uninstalled returns Ok(false).
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(false));
+
+        // Installed for step 5: HandOff(10) -> Peek(11) -> HandOff(11).
+        plan.install_step(5, &[hand_off(10), DueRead::peek(1, Some(11)), hand_off(11)])
+            .unwrap();
+
+        // Wrong step returns Ok(false) without mutating cursor or mismatches.
+        at_step(&now, 6);
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(false));
+        plan.consume_handoff(Some(10));
+        assert_eq!(plan.mismatches(), 0);
+
+        // Back to step 5: matching HandOff at cursor returns Ok(true); wrong
+        // sequence returns Ok(false); neither moves cursor.
+        at_step(&now, 5);
+        assert_eq!(plan.next_is_handoff(Some(99)), Ok(false));
+        assert_eq!(plan.next_is_handoff(None), Ok(false));
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(true));
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(true));
+
+        // Non-matching consume_handoff does not advance cursor.
+        plan.consume_handoff(Some(99));
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(true));
+
+        // Matching consume_handoff advances cursor onto Peek(11).
+        plan.consume_handoff(Some(10));
+        // Peek(11) is not a HandOff, and next_is_handoff does NOT scan past
+        // Peek(11) to HandOff(11).
+        assert_eq!(plan.next_is_handoff(Some(11)), Ok(false));
+        assert_eq!(plan.next_is_peek(), Ok(true));
+
+        // Consuming Peek(11) exposes HandOff(11).
+        assert_eq!(plan.admit(), GateAnswer::Exact(DueRead::peek(1, Some(11))));
+        assert_eq!(plan.next_is_handoff(Some(11)), Ok(true));
+        plan.consume_handoff(Some(11));
+        assert_eq!(plan.next_is_handoff(Some(11)), Ok(false));
+
+        // Poisoned mutex returns Err(GatePoisoned) so R-Fail fails closed.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = plan.inner.lock().expect("not poisoned yet");
+            panic!("poison next_is_handoff");
+        }));
+        std::panic::set_hook(hook);
+        assert!(caught.is_err());
+        assert_eq!(plan.next_is_handoff(Some(11)), Err(GatePoisoned));
     }
 
     #[test]

@@ -5213,18 +5213,28 @@ impl CerulionSubscriber {
     /// why `false` is the gate's PASS witness and therefore the one answer a
     /// lost error must never be able to fabricate.
     pub(crate) fn sync_next_arrived(&mut self) -> TransportResult<bool> {
-        if self.next_head.is_some() {
-            return Ok(true);
-        }
         // Under an armed replay read gate, the private feed queue stays empty
         // until an admission fills it, so probing `has_samples()` would always
-        // answer `false`. Ask the step's plan whether the next spendable entry
-        // is a recorded matcher peek instead.
+        // answer `false`, while an already-parked `next_head` from an earlier
+        // partial tick would unconditionally answer `true` and let the matcher
+        // advance it when a partner's successor was recorded as a post-fire
+        // refill instead of a `Peek`. Decide from this stage's own recorded
+        // plan: a parked `next_head` is eligible to advance only when the entry
+        // at the cursor is its recorded `HandOff` (`ServedWithoutPop` with the
+        // staged frame's sequence), and an empty `next_head` asks whether the
+        // next spendable entry is a recorded `Peek`.
         if let Some(gate) = self.replay_gate() {
-            return gate.next_is_peek().map_err(|_| TransportError::Receive {
+            let answer = match &self.next_head {
+                Some(staged) => gate.next_is_handoff(wire_sequence(staged.payload())),
+                None => gate.next_is_peek(),
+            };
+            return answer.map_err(|_| TransportError::Receive {
                 topic: self.topic.clone(),
                 reason: "replay read gate poisoned during sync_next_arrived".to_string(),
             });
+        }
+        if self.next_head.is_some() {
+            return Ok(true);
         }
         // The CHECKED twin, never `has_pending_sample`: that one is
         // `has_samples().unwrap_or(false)`, and `false` is this call site's
@@ -5502,6 +5512,9 @@ impl CerulionSubscriber {
                         ReadSiteRole::Drain,
                     );
                 }
+            }
+            if let Some(gate) = self.replay_gate() {
+                gate.consume_handoff(wire_sequence(promoted.payload()));
             }
             self.frozen = Some(FrozenSlot::Sample(promoted));
             // SLOT EXIT (the skipped head only): the promotion itself
@@ -8878,6 +8891,133 @@ mod tests {
         let err = sub_bad
             .sync_next_arrived()
             .expect_err("poisoned gate fails closed");
+        assert!(
+            matches!(err, TransportError::Receive { .. }),
+            "expected TransportError::Receive, got {err:?}"
+        );
+
+        // Parked-peek regression: when a partial Sync tick leaves a frame
+        // parked in `next_head` across a step boundary, `sync_next_arrived`
+        // answers `false` when the new step has no matching `HandOff` at cursor
+        // (empty plan, a later `Peek`, or a `HandOff` for another sequence),
+        // answers `true` when the cursor holds a matching `HandOff`, consumes
+        // that `HandOff` on `sync_discard_head`, and fails closed when the gate
+        // is poisoned while `next_head` is populated.
+        let topic_parked = "gated_sync_parked_peek";
+        let port_parked = mgr
+            .create_publisher(topic_parked, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub_p = mgr.create_subscriber(topic_parked).expect("subscriber");
+        sub_p.mark_fifo_consume();
+        sub_p.mark_per_set_sync_trigger();
+        let mut parked_entries = std::collections::HashMap::new();
+        parked_entries.insert(
+            0,
+            SyncFeedEntry {
+                seq: 30,
+                ts: 10_000,
+                ids: vec![(FED_WRITER_A, 30)],
+            },
+        );
+        parked_entries.insert(
+            1,
+            SyncFeedEntry {
+                seq: 31,
+                ts: 35_000,
+                ids: vec![(FED_WRITER_A, 31)],
+            },
+        );
+        let feed_parked = Arc::new(CountingSyncFeed {
+            port: std::sync::Mutex::new(port_parked),
+            entries: parked_entries,
+            fills: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let now_p = Arc::new(AtomicU64::new(0));
+        let plan_p = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sync".to_string(),
+                input_idx: 1,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::clone(&now_p),
+        ));
+        assert!(
+            plan_p.install_feed(Arc::clone(&feed_parked) as Arc<dyn crate::replay_feed::ReadFeed>)
+        );
+        plan_p.arm(ConsultRule::Recorded).expect("arm");
+        plan_p
+            .install_step(0, &[DueRead::pops(1, Some(30)), DueRead::peek(1, Some(31))])
+            .expect("install step 0");
+        sub_p.set_replay_read_plan(Arc::clone(&plan_p));
+
+        // Step 0: fill head (seq 30) and park peek (seq 31) without advancing.
+        assert_eq!(sub_p.snapshot_latest_for_trigger(), (1, Some(10_000)));
+        assert!(sub_p.sync_next_arrived().expect("probe step 0"));
+        assert_eq!(
+            sub_p
+                .sync_peek_next_stamp(SyncAlignSite::Boundary)
+                .expect("peek step 0"),
+            Some(35_000)
+        );
+        plan_p.sweep(0);
+
+        // Step 1 (empty plan, partner had a refill so live did not advance):
+        // parked next_head answers false so matcher keeps the current pair.
+        now_p.store(1, Ordering::Release);
+        plan_p.install_step(1, &[]).expect("install step 1");
+        assert!(!sub_p.sync_next_arrived().expect("probe empty step 1"));
+
+        // Step 2 (a later Peek at cursor, no HandOff for seq 31): still false
+        // while seq 31 is parked; does not skip ahead to the later Peek.
+        now_p.store(2, Ordering::Release);
+        plan_p
+            .install_step(2, &[DueRead::peek(1, Some(32))])
+            .expect("install step 2");
+        assert!(!sub_p.sync_next_arrived().expect("probe peek step 2"));
+
+        // Step 3 (HandOff for a different seq 99): still false.
+        now_p.store(3, Ordering::Release);
+        plan_p
+            .install_step(3, &[DueRead::served_without_pop(Some(99))])
+            .expect("install step 3");
+        assert!(!sub_p.sync_next_arrived().expect("probe wrong handoff"));
+
+        // Step 4 (matching HandOff(31) at cursor): answers true, and
+        // sync_discard_head promotes seq 31 while consuming HandOff(31).
+        now_p.store(4, Ordering::Release);
+        plan_p
+            .install_step(
+                4,
+                &[
+                    DueRead::served_without_pop(Some(31)),
+                    DueRead::pops(1, Some(32)),
+                ],
+            )
+            .expect("install step 4");
+        assert!(sub_p.sync_next_arrived().expect("probe matching handoff"));
+        assert_eq!(
+            sub_p
+                .sync_discard_head(SyncAlignSite::Boundary)
+                .expect("advance parked"),
+            Some(35_000)
+        );
+        assert!(
+            !sub_p.sync_next_arrived().expect("probe after advance"),
+            "after promoting seq 31 and consuming HandOff(31), Drain(32) answers false"
+        );
+
+        // Step 5 (poisoned gate while next_head is Some): fails closed.
+        sub_p.next_head = sub_p.frozen.take().and_then(|slot| match slot {
+            FrozenSlot::Sample(s) => Some(s),
+            _ => None,
+        });
+        assert!(sub_p.next_head.is_some());
+        plan_p.poison_for_test();
+        let err = sub_p
+            .sync_next_arrived()
+            .expect_err("poisoned gate with parked next_head fails closed");
         assert!(
             matches!(err, TransportError::Receive { .. }),
             "expected TransportError::Receive, got {err:?}"
