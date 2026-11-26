@@ -1005,4 +1005,127 @@ mod tests {
         assert_eq!(run1.unmatched_discards, run2.unmatched_discards);
         assert_eq!(run1.closer_skips, run2.closer_skips);
     }
+
+    // ---- sample(N) gates: admitted frames from different producer ticks ----
+    //
+    // A `sample(N)` gate admits a frame iff its wire stamp is at least N after
+    // the gate's last admitted frame, and each input's gate keeps its own last
+    // admitted stamp. The arrivals below are the frames the gates ADMIT from two
+    // 30 ms producers (A on ticks 0, 30, 60, ..., B 5 ms later), walked by hand.
+
+    /// Admitted frames after A's 60 ms frame is lost, `sample(31)` on both
+    /// inputs. Gate A admits 0, refuses 30, admits 90 (90 - 0 >= 31), refuses
+    /// 120, admits 150, refuses 180, admits 210. Gate B admits 5, 65, 125, 185.
+    /// The gates now sit on different producer ticks, so no same-tick pair is
+    /// ever admitted again.
+    const SAMPLED_AFTER_DROP: [(usize, u64); 8] = [
+        (0, 0),
+        (1, 5 * MS),
+        (1, 65 * MS),
+        (0, 90 * MS),
+        (1, 125 * MS),
+        (0, 150 * MS),
+        (1, 185 * MS),
+        (0, 210 * MS),
+    ];
+
+    #[test]
+    fn sampled_inputs_after_a_drop_pair_the_previous_tick_with_no_count() {
+        // Window 32 ms, above the 30 ms producer period but below the 60 ms
+        // admitted spacing: every pair after the drop is one producer tick
+        // apart (25 ms span), and neither counter moves.
+        let trace = drive_two_input_arrivals(&SAMPLED_AFTER_DROP, w(32));
+        assert_eq!(
+            trace.emitted,
+            vec![
+                (0, 5 * MS),
+                (90 * MS, 65 * MS),
+                (150 * MS, 125 * MS),
+                (210 * MS, 185 * MS),
+            ],
+            "after the drop every fire pairs A with B from the previous tick"
+        );
+        assert_eq!(trace.unmatched_discards, 0);
+        assert_eq!(trace.closer_skips, 0);
+    }
+
+    #[test]
+    fn sampled_inputs_in_phase_pair_the_same_tick() {
+        // Discriminator: the same gates with no drop admit A on 0, 60, 120,
+        // 180 and B on 5, 65, 125, 185, so every pair is from one tick.
+        let arrivals = [
+            (0, 0),
+            (1, 5 * MS),
+            (0, 60 * MS),
+            (1, 65 * MS),
+            (0, 120 * MS),
+            (1, 125 * MS),
+            (0, 180 * MS),
+            (1, 185 * MS),
+        ];
+        let trace = drive_two_input_arrivals(&arrivals, w(32));
+        assert_eq!(
+            trace.emitted,
+            vec![
+                (0, 5 * MS),
+                (60 * MS, 65 * MS),
+                (120 * MS, 125 * MS),
+                (180 * MS, 185 * MS),
+            ]
+        );
+        assert_eq!(trace.unmatched_discards, 0);
+        assert_eq!(trace.closer_skips, 0);
+    }
+
+    #[test]
+    fn sampled_inputs_after_a_drop_below_period_minus_skew_discard_loudly() {
+        // Window 20 ms, below 30 ms - 5 ms: the out-of-phase frames are 25 or
+        // 35 ms apart, so each one is discarded as UNMATCHABLE and counted.
+        let trace = drive_two_input_arrivals(&SAMPLED_AFTER_DROP, w(20));
+        assert_eq!(trace.emitted, vec![(0, 5 * MS)]);
+        assert_eq!(
+            trace.unmatched_discards, 5,
+            "B65, A90, B125, A150 and B185 are each discarded once"
+        );
+        assert_eq!(trace.closer_skips, 0);
+    }
+
+    /// `sample(31)` on A only, no drop. Gate A admits 0, 60, 120; B delivers
+    /// every 30 ms frame 5, 35, 65, 95, 125.
+    const SAMPLED_A_PLAIN_B: [(usize, u64); 8] = [
+        (0, 0),
+        (1, 5 * MS),
+        (1, 35 * MS),
+        (0, 60 * MS),
+        (1, 65 * MS),
+        (1, 95 * MS),
+        (0, 120 * MS),
+        (1, 125 * MS),
+    ];
+
+    #[test]
+    fn one_sampled_input_pairs_the_previous_tick_with_no_drop() {
+        // Window 32 ms: A60 meets the leftover B35 (25 ms span) before B65
+        // arrives, and A120 meets B95 after B65 is discarded.
+        let trace = drive_two_input_arrivals(&SAMPLED_A_PLAIN_B, w(32));
+        assert_eq!(
+            trace.emitted,
+            vec![(0, 5 * MS), (60 * MS, 35 * MS), (120 * MS, 95 * MS)]
+        );
+        assert_eq!(trace.unmatched_discards, 1, "only B65 is discarded");
+        assert_eq!(trace.closer_skips, 0);
+    }
+
+    #[test]
+    fn one_sampled_input_below_period_minus_skew_pairs_the_same_tick() {
+        // Window 20 ms: the leftover B frame is discarded and A pairs with B
+        // from its own tick.
+        let trace = drive_two_input_arrivals(&SAMPLED_A_PLAIN_B, w(20));
+        assert_eq!(
+            trace.emitted,
+            vec![(0, 5 * MS), (60 * MS, 65 * MS), (120 * MS, 125 * MS)]
+        );
+        assert_eq!(trace.unmatched_discards, 2, "B35 and B95 are discarded");
+        assert_eq!(trace.closer_skips, 0);
+    }
 }
