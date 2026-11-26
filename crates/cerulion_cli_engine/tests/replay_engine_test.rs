@@ -43131,6 +43131,27 @@ fn sp_no_claim(topic: &str) -> String {
     )
 }
 
+/// Assert that `outcome` compared every frame and read it reproduced: the read
+/// log verified clean on `edges` edges with nothing quarantined, and `topics`
+/// topics checked and passed. A clean verdict alone also passes a read log
+/// that compared nothing or quarantined a node.
+fn sp_assert_compared(outcome: &ReplayOutcome, label: &str, edges: usize, topics: usize) {
+    assert_eq!(
+        outcome.read_log,
+        replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: edges,
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+        },
+        "{label}: the read log"
+    );
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (topics, topics),
+        "{label}: the topics checked and passed"
+    );
+}
+
 /// THE ARM: the split fixture's `block` edge, its producer on rank 0 and its
 /// consumer alone on rank 1, as a free-run bag of two ranks. A fed `--verify`
 /// replay under a clean record-health stamp reproduces every frame of both
@@ -43152,7 +43173,8 @@ fn a_crafted_cross_rank_block_edge_verifies() {
     ri_assert_fed(&outcome);
     assert_clean_verdict(&outcome, "a split block edge");
     assert_eq!(resim_exit(&outcome, true), 0);
-    assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 2));
+    // One edge, `src` to `sink.inp`, the graph's only input; two topics.
+    sp_assert_compared(&outcome, "a split block edge", 1, 2);
     assert_eq!(
         sp_notes(&outcome),
         vec![
@@ -43387,6 +43409,9 @@ fn a_split_block_edge_whose_consumer_stops_stands_its_conservation_down() {
     ri_two_rank_bag_labelled(&rec, &bag, |id| id == "sink", false);
     let outcome = bh_replay_stamped(&bag, || bh_factories(Some(3.0)), bh_clean_stamp(&rec));
     assert_clean_verdict(&outcome, "the consumer stops");
+    // Two edges, `src` to `relay.inp` on rank 0 and `relay` to `sink.inp` on
+    // rank 1; three topics, each with frames.
+    sp_assert_compared(&outcome, "the consumer stops", 2, 3);
     assert_eq!(
         sp_notes(&outcome),
         vec![
@@ -43794,9 +43819,14 @@ fn a_split_block_consumer_that_reads_its_block_events_differs_with_the_note() {
 
 /// The split fixture with the edge reversed across ranks: `src` alone on rank
 /// 1 and `sink` on rank 0, so the consumer's pass runs first. The verdict is
-/// the forward split's: every frame and read reproduced, `src` stood down on
-/// its rank, the edge judged on the sink's drains with no note, and the
-/// block-event note naming rank 1 as the producer's.
+/// the forward split's: every frame and read reproduced (the read log clean
+/// on the one edge, both topics passed), `src` stood down on its rank, no
+/// conservation note, and the block-event note naming rank 1 as the
+/// producer's. The twin shows the edge is judged on rank 0, not skipped: the
+/// same split with the consumer's rank ending after step 4, as in
+/// [`a_split_block_edge_whose_consumer_rank_ends_early_reports_one_over_run`],
+/// reports that arm's over-run (seven frames published, three drained, four
+/// outstanding against a depth of 3).
 #[test]
 #[serial]
 fn a_split_block_edge_with_its_consumer_on_rank_0_verifies() {
@@ -43808,6 +43838,7 @@ fn a_split_block_edge_with_its_consumer_on_rank_0_verifies() {
     ri_assert_fed(&outcome);
     assert_clean_verdict(&outcome, "the reversed split");
     assert_eq!(resim_exit(&outcome, true), 0);
+    sp_assert_compared(&outcome, "the reversed split", 1, 2);
     assert_eq!(
         sp_notes(&outcome),
         vec![
@@ -43831,6 +43862,53 @@ fn a_split_block_edge_with_its_consumer_on_rank_0_verifies() {
             .starts_with("block input 'sink.inp' reads '/sp/src/out' from rank 1; "),
         "{}",
         outcome.rederivation_notes[0].detail
+    );
+
+    let mut rec = rec;
+    rec.messages
+        .get_mut(SP_SINK_TOPIC)
+        .expect("the sink's topic")
+        .truncate(3);
+    let short = dir.path().join("sp_split_reversed_short_consumer.mcap");
+    ri_ranked_bag_cut(
+        &rec,
+        &short,
+        |id: &str| u32::from(id == "src"),
+        2,
+        &[],
+        ri_free_run_recorder_json(),
+        |per_rank| per_rank[0].retain(|r| r.step <= 4),
+        None,
+    );
+    let twin = bh_replay_stamped(&short, sp_factories, bh_clean_stamp(&rec));
+    assert_eq!(resim_exit(&twin, true), 0, "{:?}", twin.violations);
+    assert_eq!(
+        sp_notes(&twin),
+        vec![
+            (
+                0,
+                replay_engine::RederivationNoteKind::BlockEventNotReproduced,
+                "sink",
+                None
+            ),
+            (
+                0,
+                replay_engine::RederivationNoteKind::Conservation,
+                SP_SRC_TOPIC,
+                None
+            ),
+            (
+                1,
+                replay_engine::RederivationNoteKind::StandDown,
+                "src",
+                Some("block_gated")
+            ),
+        ]
+    );
+    assert_eq!(
+        twin.rederivation_notes[1].detail,
+        "block credit conservation broken on '/sp/src/out' -> sink.inp: outstanding 4 exceeds \
+         depth 3 (published 7, drained 3) (report-only \u{2014} never a replay verdict)"
     );
 }
 
@@ -43878,10 +43956,13 @@ fn paced_split_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 /// 3, 5 and 7 (`x` 1 to 4) and nothing at step 0; the sink, its throttle open
 /// at each of those steps, drains each frame the step it arrives (`x` 1 to 4).
 /// So rank 1's step 0 holds only its boundary, and cutting it is a rank that
-/// joined at step 1 with nothing lost. Whole, the edge is judged on the
-/// sink's four drains with no note. Cut, every frame and read still
-/// reproduces, and the edge stands down because the producer's rank begins
-/// past step 0.
+/// joined at step 1 with nothing lost. Whole, every frame and read
+/// reproduces (the read log clean on the one edge, both topics passed) with
+/// no conservation note. Cut, the same holds, and the edge stands down
+/// because the producer's rank begins past step 0. The twin shows the whole
+/// edge is judged, not skipped: with the consumer's rank ending after step 0,
+/// before the sink's first drain, all four frames are outstanding against a
+/// depth of 3, an over-run of one.
 #[test]
 #[serial]
 fn a_split_block_edge_whose_producer_rank_begins_late_stands_its_conservation_down() {
@@ -43913,6 +43994,7 @@ fn a_split_block_edge_whose_producer_rank_begins_late_stands_its_conservation_do
     ri_two_rank_bag_labelled(&rec, &whole, |id| id == "src", false);
     let judged = bh_replay_stamped(&whole, paced_split_factories, bh_clean_stamp(&rec));
     assert_clean_verdict(&judged, "the producer's rank whole");
+    sp_assert_compared(&judged, "the producer's rank whole", 1, 2);
     assert_eq!(sp_notes(&judged), vec![block_event, src_gated]);
 
     let late = dir.path().join("pk_split_producer_late.mcap");
@@ -43928,6 +44010,7 @@ fn a_split_block_edge_whose_producer_rank_begins_late_stands_its_conservation_do
     );
     let outcome = bh_replay_stamped(&late, paced_split_factories, bh_clean_stamp(&rec));
     assert_clean_verdict(&outcome, "the producer's rank begins at step 1");
+    sp_assert_compared(&outcome, "the producer's rank begins at step 1", 1, 2);
     assert_eq!(
         sp_notes(&outcome),
         vec![
@@ -43947,16 +44030,56 @@ fn a_split_block_edge_whose_producer_rank_begins_late_stands_its_conservation_do
          '/pk/src/out' -> sink.inp: rank 1, which produces '/pk/src/out', begins at step 1, \
          past step 0, and the bag records no edge's outstanding count there"
     );
+
+    let mut rec = rec;
+    rec.messages
+        .get_mut("/pk/sink/out")
+        .expect("the sink's topic")
+        .clear();
+    let short = dir.path().join("pk_split_reversed_short_consumer.mcap");
+    ri_ranked_bag_cut(
+        &rec,
+        &short,
+        |id: &str| u32::from(id == "src"),
+        2,
+        &[],
+        ri_free_run_recorder_json(),
+        |per_rank| per_rank[0].retain(|r| r.step == 0),
+        None,
+    );
+    let twin = bh_replay_stamped(&short, paced_split_factories, bh_clean_stamp(&rec));
+    assert_eq!(resim_exit(&twin, true), 0, "{:?}", twin.violations);
+    assert_eq!(
+        sp_notes(&twin),
+        vec![
+            block_event,
+            (
+                0,
+                replay_engine::RederivationNoteKind::Conservation,
+                "/pk/src/out",
+                None
+            ),
+            src_gated,
+        ]
+    );
+    assert_eq!(
+        twin.rederivation_notes[1].detail,
+        "block credit conservation broken on '/pk/src/out' -> sink.inp: outstanding 4 exceeds \
+         depth 3 (published 4, drained 0) (report-only \u{2014} never a replay verdict)"
+    );
 }
 
 /// The split fixture recorded with a checkpoint due at step 4: the recorder
 /// reopens every read stage's writer runs after step 4 and flags the step 5
-/// boundary, so the sink's next read (step 6) names its writer again. The
-/// window head changes no fire and no frame (the premise is the split
-/// fixture's). Split as in [`a_crafted_cross_rank_block_edge_verifies`], a fed
-/// `--verify` replay reopens the consumer's read stages before step 5 as the
-/// recorder did, and reproduces every frame and every recorded read: exit 0,
-/// the read log clean.
+/// boundary, so the sink, which names its writer at its first read (step 0),
+/// names it again at its first read after the head, its fire at step 6 (its
+/// throttle shut at step 5). The recording and the consumer's rank of the
+/// split bag carry the flag, and the window head changes no fire and no frame
+/// (the premise is the split fixture's). Split as in
+/// [`a_crafted_cross_rank_block_edge_verifies`], a fed `--verify` replay
+/// reproduces every frame of both topics and every recorded read across the
+/// head: exit 0, and the read log clean on the one edge with nothing
+/// quarantined.
 #[test]
 #[serial]
 fn a_split_block_edge_fed_across_a_reopened_window_head_verifies() {
@@ -43968,13 +44091,41 @@ fn a_split_block_edge_fed_across_a_reopened_window_head_verifies() {
     );
     assert_eq!(bh_fire_steps(&rec, "sink"), vec![0, 2, 4, 6, 8]);
     assert_eq!(bh_xs(&rec, SP_SINK_TOPIC), vec![1.0, 2.0, 4.0, 5.0, 7.0]);
+    let flagged = |records: &[TraceRingRecord]| -> Vec<u64> {
+        records
+            .iter()
+            .filter(|r| {
+                r.record_type == RECORD_TYPE_STEP_BOUNDARY
+                    && r.global_level == STEP_BOUNDARY_FLAG_RUNS_REOPENED
+            })
+            .map(|r| r.step)
+            .collect()
+    };
+    assert_eq!(flagged(&rec.trace), vec![5], "the recording's flag");
+    let mut named: Vec<u64> = ri_node_reads(&rec, "sink")
+        .into_iter()
+        .filter(|r| r.1 == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER)
+        .map(|r| r.0)
+        .collect();
+    named.dedup();
+    assert_eq!(named, vec![0, 6], "the steps the sink names its writer at");
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("sp_split_window_head.mcap");
-    ri_two_rank_bag_labelled(&rec, &bag, sp_sink_alone, false);
+    ri_ranked_bag_cut(
+        &rec,
+        &bag,
+        |id: &str| u32::from(sp_sink_alone(id)),
+        2,
+        &[],
+        ri_free_run_recorder_json(),
+        |per_rank| assert_eq!(flagged(&per_rank[1]), vec![5], "the consumer's rank's flag"),
+        None,
+    );
     let outcome = bh_replay_stamped(&bag, sp_factories, bh_clean_stamp(&rec));
     ri_assert_fed(&outcome);
     assert_clean_verdict(&outcome, "a split edge across a reopened window head");
     assert_eq!(resim_exit(&outcome, true), 0);
+    sp_assert_compared(&outcome, "a split edge across a reopened window head", 1, 2);
     assert_eq!(
         sp_notes(&outcome),
         vec![
@@ -44027,8 +44178,13 @@ impl HalfRateRelayNode {
 ///
 /// In one rank the plain relay is judged, and the step 1 pop it left unfired
 /// with nothing to defer it is the finding (exit 6). Split from its consumer
-/// it stands down (`block_gated`), so the same changed build replays clean
-/// (exit 0): a held producer's rule is not judged at all.
+/// the same changed build replays clean (exit 0), for two causes: the relay
+/// stands down (`block_gated`), and the FIFO carry walk takes a node held
+/// across ranks as deferrable at every step, so even a judged relay would
+/// carry the step 1 pop with no finding. The note list below catches a change
+/// that starts judging a held producer on its own rule (its `block_gated`
+/// note goes), and the exit catches one that also judges the step 1 pop
+/// strictly (exit 6).
 #[test]
 #[serial]
 fn a_held_producer_split_from_its_consumer_is_not_judged_on_its_own_rule() {
