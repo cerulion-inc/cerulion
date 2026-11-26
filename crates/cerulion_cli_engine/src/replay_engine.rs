@@ -281,7 +281,9 @@ impl Drop for SlotLock {
 /// Why a claim passed over a slot whose lock a running resim does not hold.
 #[derive(Debug)]
 enum SlotPassedOver {
-    /// Its lock file could not be opened or locked: the path and the error.
+    /// Its lock file could not be opened, verified (for example a symlink, a
+    /// non-regular file, or a file owned by another user), or locked: the path
+    /// and the error.
     Lock(String),
     /// The slot's private iceoryx2 config could not be built.
     Config(String),
@@ -361,15 +363,28 @@ fn log_passed_over_slot(
     }
 }
 
+/// Refuse a slot lock file whose `fstat` owner uid does not match
+/// `expected_euid`.
+fn check_slot_lock_owner(path: &Path, file_uid: u32, expected_euid: u32) -> Result<(), String> {
+    if file_uid == expected_euid {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: lock file is owned by uid {file_uid}, not current uid {expected_euid}",
+            path.display()
+        ))
+    }
+}
+
 /// Claim the lowest slot below `slots` whose lock file in `lock_dir`
 /// (`cer_resim_{slot:08x}.lock`, created with mode `0600`) this process can
 /// lock with an exclusive non-blocking `flock`, and that `ready` accepts once
 /// the lock is held.
 ///
 /// A slot whose lock another process holds is skipped. A slot whose lock file
-/// cannot be opened or locked (another user's, say) or that `ready` refuses
-/// is passed over, its lock released (unlocked, then closed, see
-/// [`SlotLock`]), and logged through one
+/// cannot be opened, is a symlink or non-regular file, is owned by another
+/// user, cannot be locked, or that `ready` refuses is passed over, its lock
+/// released (unlocked, then closed, see [`SlotLock`]), and logged through one
 /// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
 /// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
 /// suppressed repeats logs how many. With no slot left the claim is
@@ -380,7 +395,8 @@ fn claim_resim_slot(
     slots: u32,
     mut ready: impl FnMut(u32) -> Result<(), SlotPassedOver>,
 ) -> Result<ResimSlot, ReplayError> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let expected_euid = cerulion_hygiene::euid();
     let mut latch = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
     let mut first_failure: Option<String> = None;
     let mut last_refusal: Option<(u32, SlotPassedOver)> = None;
@@ -392,9 +408,20 @@ fn claim_resim_slot(
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| format!("{}: {e}", path.display()))
             .and_then(|lock| {
+                let meta = lock
+                    .metadata()
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if !meta.file_type().is_file() {
+                    return Err(format!(
+                        "{}: lock file is not a regular file",
+                        path.display()
+                    ));
+                }
+                check_slot_lock_owner(&path, meta.uid(), expected_euid)?;
                 match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
                 {
                     Ok(()) => Ok(Some(SlotLock(lock))),
@@ -460,6 +487,8 @@ struct SlotReclaim {
     segments_removed: u64,
     /// Leftover segments that could not be removed.
     segments_failed: u64,
+    /// Error text from the first leftover segment that could not be removed.
+    first_segment_error: Option<String>,
 }
 
 impl SlotReclaim {
@@ -474,10 +503,17 @@ impl SlotReclaim {
                  ({error})"
             )),
             Ok(0) if self.segments_failed == 0 => None,
-            Ok(0) => Some(format!(
-                "leftover segments of its namespace that could not be removed: {}",
-                self.segments_failed
-            )),
+            Ok(0) => Some(match &self.first_segment_error {
+                Some(first) => format!(
+                    "leftover segments of its namespace that could not be removed: {} (first \
+                     error: {first})",
+                    self.segments_failed
+                ),
+                None => format!(
+                    "leftover segments of its namespace that could not be removed: {}",
+                    self.segments_failed
+                ),
+            }),
             Ok(left) => Some(format!(
                 "nodes still registered in its namespace after the dead-node sweep: {left} (the \
                  sweep removed {}, failed on {} and deferred {}; it removes only the nodes of \
@@ -523,6 +559,7 @@ fn reclaim_resim_slot(
         nodes_left: listed.map(|()| nodes).map_err(|e| e.to_string()),
         segments_removed: 0,
         segments_failed: 0,
+        first_segment_error: None,
     };
     if reclaim.nodes_left != Ok(0) {
         return reclaim;
@@ -553,20 +590,24 @@ fn reclaim_resim_slot(
         match remove_leftover_segment(&entry.path()) {
             SegmentRemoval::Removed => reclaim.segments_removed += 1,
             SegmentRemoval::NotASegment => {}
-            SegmentRemoval::Failed => reclaim.segments_failed += 1,
+            SegmentRemoval::Failed(error) => {
+                reclaim.segments_failed += 1;
+                reclaim.first_segment_error.get_or_insert(error);
+            }
         }
     }
     reclaim
 }
 
 /// What [`remove_leftover_segment`] did with one file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SegmentRemoval {
     Removed,
     /// Not a segment (a directory or a link, or on macOS anything but a state
     /// file), so it was left alone.
     NotASegment,
-    Failed,
+    /// Removal failed, with the underlying error message.
+    Failed(String),
 }
 
 /// Remove one leftover segment of a reclaimed namespace: a regular file, which
@@ -585,14 +626,12 @@ fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
         return SegmentRemoval::NotASegment;
     }
     #[cfg(target_os = "macos")]
-    let removed =
-        crate::shm_state::remove_unused_state_file(path, &crate::shm_state::LibcProbe).is_ok();
+    let result = crate::shm_state::remove_unused_state_file(path, &crate::shm_state::LibcProbe);
     #[cfg(not(target_os = "macos"))]
-    let removed = std::fs::remove_file(path).is_ok();
-    if removed {
-        SegmentRemoval::Removed
-    } else {
-        SegmentRemoval::Failed
+    let result = std::fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()));
+    match result {
+        Ok(()) => SegmentRemoval::Removed,
+        Err(error) => SegmentRemoval::Failed(error),
     }
 }
 
@@ -607,32 +646,33 @@ fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
 /// closes, at process exit, or at the exec of a child forked just before it.
 static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
 
-/// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
-/// claims the lowest free slot whose namespace reclaims clean, within the
-/// startup sweep budget for all the slots it tries.
-fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayError> {
-    let mut held = RESIM_SLOT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(running) = held.as_ref() {
-        return Ok(running.slot);
-    }
-    let budget = cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET;
+/// Claim and reclaim a resim namespace slot against explicit `lock_dir` and
+/// `segment_dir` paths, bounded by `budget`.
+///
+/// Factored out of [`process_resim_slot`] so the full claim-plus-reclaim
+/// composition can be unit-tested over temporary directories on every Unix
+/// platform without touching `/tmp` or `/dev/shm`.
+fn claim_and_reclaim_resim_slot(
+    base: &iceoryx2::config::Config,
+    lock_dir: &Path,
+    segment_dir: Option<&Path>,
+    slots: u32,
+    budget: Duration,
+) -> Result<ResimSlot, ReplayError> {
     // Startup hygiene only, as in `reclaim_resim_slot`.
     let started = std::time::Instant::now();
-    let lock_dir = resim_slot_lock_dir(base);
     // The iceoryx2 root a fallback names may not exist before the first node;
     // a directory that cannot be made fails the claim's first open, by name.
-    let _ = std::fs::create_dir_all(&lock_dir);
+    let _ = std::fs::create_dir_all(lock_dir);
     // Summed over every slot whose namespace the claim reclaimed.
     let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
-    let claimed = claim_resim_slot(&lock_dir, RESIM_NAMESPACE_SLOTS, |slot| {
+    let claimed = claim_resim_slot(lock_dir, slots, |slot| {
         let ix_config =
             resim_ix_config(base, slot).map_err(|e| SlotPassedOver::Config(e.to_string()))?;
         let reclaim = reclaim_resim_slot(
             &ix_config,
             slot,
-            SEGMENT_NAME_DIR.map(Path::new),
+            segment_dir,
             budget.saturating_sub(started.elapsed()),
         );
         cleanups += reclaim.cleaned.cleanups;
@@ -652,6 +692,28 @@ fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayErro
         total_failures,
         "replay: claimed and reclaimed a resim namespace slot"
     );
+    Ok(claimed)
+}
+
+/// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
+/// claims the lowest free slot whose namespace reclaims clean, within the
+/// startup sweep budget for all the slots it tries.
+fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayError> {
+    let mut held = RESIM_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(running) = held.as_ref() {
+        return Ok(running.slot);
+    }
+    let budget = cerulion_core::transport::dead_node_sweep::STARTUP_DEAD_NODE_SWEEP_BUDGET;
+    let lock_dir = resim_slot_lock_dir(base);
+    let claimed = claim_and_reclaim_resim_slot(
+        base,
+        &lock_dir,
+        SEGMENT_NAME_DIR.map(Path::new),
+        RESIM_NAMESPACE_SLOTS,
+        budget,
+    )?;
     let slot = claimed.slot;
     *held = Some(claimed);
     Ok(slot)
@@ -43258,9 +43320,10 @@ mod unlisted_macro_output_tests {
 #[cfg(test)]
 mod resim_namespace_tests {
     use super::{
-        claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
-        resim_namespace_slot, ResimSlot, SlotLock, SlotPassedOver, SlotReclaim,
-        RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+        check_slot_lock_owner, claim_and_reclaim_resim_slot, claim_resim_slot, reclaim_resim_slot,
+        resim_ix_config, resim_namespace_prefix, resim_namespace_slot, ResimSlot, SlotLock,
+        SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS,
+        SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
@@ -43520,6 +43583,7 @@ mod resim_namespace_tests {
             nodes_left: Ok(left),
             segments_removed: 0,
             segments_failed: 0,
+            first_segment_error: None,
         }
     }
 
@@ -43562,11 +43626,25 @@ mod resim_namespace_tests {
         let stuck = SlotReclaim {
             segments_removed: 1,
             segments_failed: 2,
-            ..clean
+            ..clean.clone()
         };
         assert_eq!(
             stuck.refusal().as_deref(),
             Some("leftover segments of its namespace that could not be removed: 2")
+        );
+
+        let stuck_with_cause = SlotReclaim {
+            segments_removed: 1,
+            segments_failed: 2,
+            first_segment_error: Some("/tmp/seg.shm_state: EACCES".to_string()),
+            ..clean
+        };
+        assert_eq!(
+            stuck_with_cause.refusal().as_deref(),
+            Some(
+                "leftover segments of its namespace that could not be removed: 2 (first error: \
+                 /tmp/seg.shm_state: EACCES)"
+            )
         );
     }
 
@@ -43994,6 +44072,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(0),
                 segments_removed: 0,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert_eq!(untouched.refusal(), None);
@@ -44016,6 +44095,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(0),
                 segments_removed: 2,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert_eq!(reclaimed.refusal(), None);
@@ -44042,6 +44122,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(0),
                 segments_removed: 0,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert_eq!(reclaimed.refusal(), None);
@@ -44099,6 +44180,7 @@ mod resim_namespace_tests {
                 nodes_left: Ok(1),
                 segments_removed: 0,
                 segments_failed: 0,
+                first_segment_error: None,
             }
         );
         assert!(held.refusal().is_some());
@@ -44188,6 +44270,146 @@ mod resim_namespace_tests {
         assert_eq!(reclaimed.nodes_left, Ok(0));
         assert_eq!(reclaimed.refusal(), None);
         assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+
+    #[test]
+    fn claim_refuses_symlink_lock_file_and_moves_to_next_slot() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let target = dir.path().join("victim.txt");
+        std::fs::write(&target, b"untouched").expect("write victim");
+        let link = dir.path().join("cer_resim_00000000.lock");
+        std::os::unix::fs::symlink(&target, &link).expect("plant symlink at slot 0");
+
+        // With 1 slot, the refusal names the symlink path.
+        let err = claim_resim_slot(dir.path(), 1, |_| Ok(())).expect_err("symlink refuses slot 0");
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string().contains(&link.display().to_string()),
+            "error must name the symlink lock path: {err}"
+        );
+
+        // With >1 slot, slot 0 is passed over and slot 1 is claimed.
+        let claimed = claim_resim_slot(dir.path(), 4, |_| Ok(())).expect("slot 1 is claimed");
+        assert_eq!(claimed.slot, 1, "symlink at slot 0 must be passed over");
+        assert_eq!(
+            std::fs::read(&target).expect("read victim"),
+            b"untouched",
+            "victim file must not be touched"
+        );
+    }
+
+    #[test]
+    fn claim_refuses_foreign_owned_lock_file() {
+        let path = Path::new("/tmp/cer_resim_00000000.lock");
+        assert_eq!(check_slot_lock_owner(path, 1000, 1000), Ok(()));
+        let err = check_slot_lock_owner(path, 0, 1000).expect_err("foreign uid refused");
+        assert!(err.contains("/tmp/cer_resim_00000000.lock"), "{err}");
+        assert!(err.contains("uid 0"), "{err}");
+        assert!(err.contains("uid 1000"), "{err}");
+        // Determinism: repeated calls produce identical error text.
+        assert_eq!(
+            check_slot_lock_owner(path, 0, 1000),
+            Err(err),
+            "owner predicate must be deterministic"
+        );
+    }
+
+    #[test]
+    fn reclaim_preserves_first_segment_removal_error_text() {
+        let root = IsolatedRoot::mint("rslotsegerr");
+        let slot = unclaimable_slot(4);
+        let ix_config = resim_ix_config(&root.config(), slot).expect("the private config");
+        let segments = tempfile::tempdir().expect("a segment directory");
+        let bad = segments
+            .path()
+            .join(format!("{}bad.shm_state", resim_namespace_prefix(slot)));
+        std::fs::write(&bad, b"../not-four-segments").expect("write unparsable state file");
+
+        #[cfg(not(target_os = "macos"))]
+        let _restore_perms = {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_path = segments.path().to_path_buf();
+            std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(0o555))
+                .expect("make segment dir read-only");
+            struct Restore(PathBuf);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                }
+            }
+            Restore(dir_path)
+        };
+
+        let reclaimed = reclaim_resim_slot(
+            &ix_config,
+            slot,
+            Some(segments.path()),
+            Duration::from_secs(10),
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(reclaimed.segments_failed, 1);
+            let refusal = reclaimed.refusal().expect("failed segment refuses slot");
+            assert!(
+                refusal.contains("NotFourSegments"),
+                "refusal must quote the first segment removal error: {refusal}"
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        if cerulion_hygiene::euid() != 0 {
+            assert_eq!(reclaimed.segments_failed, 1);
+            let refusal = reclaimed.refusal().expect("failed segment refuses slot");
+            assert!(
+                refusal.contains("first error:") && refusal.contains(&bad.display().to_string()),
+                "refusal must quote the first segment removal error: {refusal}"
+            );
+        }
+        let _ = reclaimed;
+    }
+
+    #[test]
+    fn claim_and_reclaim_composition_works_with_injected_dirs() {
+        let root = IsolatedRoot::mint("rslotcomp");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let prefix0 = resim_namespace_prefix(0);
+        let leftover = segments.path().join(format!("{prefix0}leftover.shm_state"));
+        std::fs::write(&leftover, b"").expect("plant leftover slot 0 segment");
+
+        let first = claim_and_reclaim_resim_slot(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            4,
+            Duration::from_secs(10),
+        )
+        .expect("first claim succeeds");
+        assert_eq!(first.slot, 0);
+        assert!(
+            !leftover.exists(),
+            "first claim must reclaim slot 0's leftover segment"
+        );
+        drop(first);
+
+        // Second claim deterministically reuses slot 0 and reclaims a new leftover.
+        let leftover2 = segments
+            .path()
+            .join(format!("{prefix0}leftover2.shm_state"));
+        std::fs::write(&leftover2, b"").expect("plant second leftover slot 0 segment");
+        let second = claim_and_reclaim_resim_slot(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            4,
+            Duration::from_secs(10),
+        )
+        .expect("second claim succeeds");
+        assert_eq!(second.slot, 0);
+        assert!(
+            !leftover2.exists(),
+            "second claim must reclaim slot 0's leftover segment"
+        );
     }
 }
 
