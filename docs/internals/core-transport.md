@@ -568,6 +568,17 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   refuses as before. Oracle tests: the `marker_teardown`, `egress_scope` and
   `mirror_origin` unit tests, which inject the teardown through the open seam
   and pin one open for `Never`.
+- Rmw graph registry (`transport/rmw_graph_registry.rs`, `/__cerulion/rmw_graph` and the
+  doorbell `/__cerulion/rmw_graph/event`): each `rmw_cerulion` process holds one
+  `RmwGraphWriter` (`TransportManager::open_rmw_graph_writer`), a handle that keeps the
+  manager alive and is not a manager field. `add`/`remove` count endpoints per
+  `(topic, type_name)`; the publisher opens on the first call, and a failed open keeps the
+  counts and runs again on the next call. The writer id is the publisher id. A change sends
+  the snapshot (one generation, one or more parts); the pump sends it again on a doorbell
+  ring or every 500 ms. `gather_rmw_graph(own_writer, window)` waits only for the listed
+  publishers whose owner node is not `Dead`, minus `own_writer` (`required_writers`); it
+  reads the node list and never reaps. No required writer: `Settled` at once, no ring.
+  Static config and frame v1 are fixed for the service name; a change takes a new name.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
