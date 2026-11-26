@@ -5,7 +5,7 @@
 
 use serde_json::json;
 
-use super::{call, entry, frame, reply, Effect, Event, Outcome, Stage, Vector};
+use super::{call, entry, frame, reply, Effect, Event, Given, Latch, Outcome, Stage, Vector};
 
 /// `tools/list` is the manifest's tools in the order it declares them, then
 /// `estop`, then `estop_clear`.
@@ -15,6 +15,7 @@ use super::{call, entry, frame, reply, Effect, Event, Outcome, Stage, Vector};
 /// `limits.estop_clear: agent`, the built-in `estop_clear`."
 pub fn the_tool_list_is_the_manifest_then_estop_then_estop_clear() -> Vector {
     Vector {
+        given: Given::fresh(),
         events: vec![Event::List],
         expect: vec![Effect::Listed(vec![
             "arm.step",
@@ -44,6 +45,7 @@ pub fn the_tool_list_is_the_manifest_then_estop_then_estop_clear() -> Vector {
 pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Vector {
     let q = || json!({ "q": [0.1, -0.2] });
     Vector {
+        given: Given::fresh(),
         events: vec![
             call(1, "arm.step", q()),
             call(2, "arm.step", q()),
@@ -86,6 +88,7 @@ pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Ve
 /// never reaches the graph".
 pub fn an_undeclared_tool_and_bad_arguments_never_reach_the_graph() -> Vector {
     Vector {
+        given: Given::fresh(),
         events: vec![
             call(1, "arm.fly", json!({})),
             call(2, "arm.step", json!({ "q": [1.0] })),
@@ -114,6 +117,7 @@ pub fn an_undeclared_tool_and_bad_arguments_never_reach_the_graph() -> Vector {
 /// (`not_in_manifest`, receipted `denied`).
 pub fn a_name_no_tool_can_have_is_receipted_under_a_fixed_verb() -> Vector {
     Vector {
+        given: Given::fresh(),
         events: vec![
             call(1, "x".repeat(300), json!({})),
             call(2, "arm/step", json!({})),
@@ -139,12 +143,117 @@ pub fn a_name_no_tool_can_have_is_receipted_under_a_fixed_verb() -> Vector {
 pub fn a_silent_graph_times_out_and_the_call_may_have_run() -> Vector {
     let q = || json!({ "q": [0.0, 0.0] });
     Vector {
+        given: Given::fresh(),
         events: vec![call(1, "arm.mute", q())],
         expect: vec![
             entry("arm.mute", Stage::Intent),
             frame("arm.mute", q()),
             entry("arm.mute", Stage::Error("timeout")),
             reply(1, Outcome::TimedOut).carrying("/safety_class", json!("reversible")),
+        ],
+    }
+}
+
+/// `estop` closes the latch and writes its file; a motion call is then
+/// refused and never published, while a read tool still runs.
+///
+/// docs/rcp.md, E-stop: `estop` "takes an optional `reason` (cut to 200
+/// characters)", "publishes its own frame, `{"call_id": N, "tool": "estop",
+/// "args": {"reason": ...}}`", "returns `estopped: true` with
+/// `graph_acknowledged` saying whether the graph answered", and "Its `intent`
+/// receipt is closed by `ok` when the graph answered"; "The latch is also
+/// written to `<receipts>.estop`". Tools, step 4: "While the e-stop is engaged
+/// a `reversible` or `irreversible` tool is refused (`estopped`) and receipted
+/// `denied`. `read` tools skip this step." Safety classes: `read` writes no
+/// intent receipt and "runs" while e-stopped.
+pub fn estop_refuses_motion_and_lets_reads_run() -> Vector {
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            call(1, "estop", json!({ "reason": "x".repeat(500) })),
+            call(2, "arm.step", json!({ "q": [0.0, 0.0] })),
+            call(3, "arm.peek", json!({})),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "x".repeat(200) })),
+            entry("estop", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("arm.step", Stage::Denied),
+            reply(2, Outcome::Refused("estopped")).carrying("/safety_class", json!("reversible")),
+            frame("arm.peek", json!({})),
+            entry("arm.peek", Stage::Ok),
+            reply(3, Outcome::Ran)
+                .answering(1)
+                .carrying("/safety_class", json!("read")),
+            Effect::LatchFile(true),
+        ],
+    }
+}
+
+/// A daemon that starts and finds the latch file an earlier one left starts
+/// with the e-stop engaged.
+///
+/// docs/rcp.md, E-stop: "a daemon that starts and finds that file starts with
+/// the latch closed"; Tools, step 4: refused "(`estopped`) and receipted
+/// `denied`". AGENTS.md: "a daemon that finds the file starts latched".
+pub fn a_latch_left_by_an_earlier_daemon_refuses_motion() -> Vector {
+    Vector {
+        given: Given {
+            latch: Latch::LeftClosed,
+        },
+        events: vec![
+            call(1, "arm.step", json!({ "q": [0.0, 0.0] })),
+            Event::ProbeLatchFile,
+        ],
+        expect: vec![
+            entry("arm.step", Stage::Denied),
+            reply(1, Outcome::Refused("estopped")).carrying("/safety_class", json!("reversible")),
+            Effect::LatchFile(true),
+        ],
+    }
+}
+
+/// An `irreversible` tool runs with an intent receipt, is labelled in every
+/// result, and is refused while e-stopped like any motion call.
+///
+/// docs/rcp.md, Safety classes: `irreversible` has an intent receipt and is
+/// "refused" while e-stopped; "Every result of a manifest tool call after the
+/// name lookup, success or refusal, carries `"safety_class"`"; "Receipt lines
+/// record the tool name as `verb`". E-stop and Tools, step 4, as in
+/// [`estop_refuses_motion_and_lets_reads_run`].
+pub fn an_irreversible_tool_is_receipted_labelled_and_latch_gated() -> Vector {
+    Vector {
+        given: Given::fresh(),
+        events: vec![
+            call(1, "arm.cut", json!({})),
+            call(2, "estop", json!({ "reason": "stop" })),
+            call(3, "arm.cut", json!({})),
+            call(4, "arm.peek", json!({})),
+        ],
+        expect: vec![
+            entry("arm.cut", Stage::Intent),
+            frame("arm.cut", json!({})),
+            entry("arm.cut", Stage::Ok),
+            reply(1, Outcome::Ran)
+                .answering(0)
+                .carrying("/safety_class", json!("irreversible")),
+            entry("estop", Stage::Intent),
+            frame("estop", json!({ "reason": "stop" })),
+            entry("estop", Stage::Ok),
+            reply(2, Outcome::Ran)
+                .carrying("/estopped", json!(true))
+                .carrying("/graph_acknowledged", json!(true)),
+            entry("arm.cut", Stage::Denied),
+            reply(3, Outcome::Refused("estopped")).carrying("/safety_class", json!("irreversible")),
+            frame("arm.peek", json!({})),
+            entry("arm.peek", Stage::Ok),
+            reply(4, Outcome::Ran)
+                .answering(2)
+                .carrying("/safety_class", json!("read")),
         ],
     }
 }

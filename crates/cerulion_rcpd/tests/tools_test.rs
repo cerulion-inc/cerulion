@@ -104,6 +104,9 @@ vectors!(
     an_undeclared_tool_and_bad_arguments_never_reach_the_graph,
     a_name_no_tool_can_have_is_receipted_under_a_fixed_verb,
     a_silent_graph_times_out_and_the_call_may_have_run,
+    estop_refuses_motion_and_lets_reads_run,
+    a_latch_left_by_an_earlier_daemon_refuses_motion,
+    an_irreversible_tool_is_receipted_labelled_and_latch_gated,
 );
 
 /// Answers every call frame, oldest first, with `{call_id, tool, ok, n}` on
@@ -289,47 +292,6 @@ fn open_host_as_configured(
         .map(|host| Arc::new(host.with_estop_clear(loaded.limits.estop_clear)))
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn estop_latches_and_refuses_later_motion_but_not_reads() {
-    let mut f = Fixture::new("estop", true).await;
-    let (is_error, body) = f
-        .call(ESTOP_TOOL, json!({ "reason": "x".repeat(500) }))
-        .await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["estopped"], json!(true));
-    assert_eq!(body["graph_acknowledged"], json!(true));
-    assert_eq!(
-        body["result"]["tool"],
-        json!(ESTOP_TOOL),
-        "the graph was told"
-    );
-
-    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    let (is_error, _) = f.call("arm.peek", json!({})).await;
-    assert!(!is_error, "a read tool still runs while e-stopped");
-
-    let seen = f.stop_graph();
-    let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
-    assert_eq!(
-        tools,
-        [ESTOP_TOOL, "arm.peek"],
-        "the refused step was never journaled"
-    );
-    let reason = seen[0]["args"]["reason"].as_str().expect("reason");
-    assert_eq!(reason.chars().count(), 200, "the reason is truncated");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.step", "denied"),
-            ("arm.peek", "ok"),
-        ])
-    );
-}
-
 /// Records when each call frame is published, on a subscriber of its own.
 fn spawn_tap(
     mgr: Arc<TransportManager>,
@@ -400,18 +362,6 @@ async fn estop_does_not_wait_behind_a_call_in_flight() {
     let seen = f.stop_graph();
     let tools: Vec<&str> = seen.iter().filter_map(|c| c["tool"].as_str()).collect();
     assert_eq!(tools, ["arm.slow", ESTOP_TOOL]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_latch_survives_a_restart() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let receipts = dir.path().join("receipts/log.jsonl");
-    std::fs::create_dir_all(receipts.parent().expect("parent")).expect("mkdir");
-    std::fs::write(latch_path(&receipts), "earlier stop\n").expect("write latch");
-    let f = Fixture::in_dir("latch", true, dir, "").await;
-    let (is_error, body) = f.call("arm.step", json!({ "q": [0.0, 0.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("estopped"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -661,43 +611,6 @@ async fn tools_list_labels_every_safety_class() {
     }
     let estop = tools[ESTOP_TOOL]["description"].as_str().expect("text");
     assert!(estop.contains("estop_clear"), "{estop}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_irreversible_tool_runs_receipted_labelled_and_latch_gated() {
-    let mut f = Fixture::new("irreversible", true).await;
-    let (is_error, body) = f.call("arm.cut", json!({})).await;
-    assert!(!is_error, "{body}");
-    assert_eq!(body["safety_class"], json!("irreversible"));
-    assert_eq!(body["result"]["tool"], json!("arm.cut"));
-    let (is_error, _) = f.call(ESTOP_TOOL, json!({})).await;
-    assert!(!is_error);
-    let (is_error, body) = f.call("arm.cut", json!({})).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("estopped"));
-    assert_eq!(body["safety_class"], json!("irreversible"));
-    let (_, body) = f.call("arm.peek", json!({})).await;
-    assert_eq!(body["safety_class"], json!("read"));
-    let tools: Vec<Value> = f
-        .stop_graph()
-        .into_iter()
-        .map(|c| c["tool"].clone())
-        .collect();
-    assert_eq!(
-        tools,
-        [json!("arm.cut"), json!(ESTOP_TOOL), json!("arm.peek")]
-    );
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.cut", "intent"),
-            ("arm.cut", "ok"),
-            (ESTOP_TOOL, "intent"),
-            (ESTOP_TOOL, "ok"),
-            ("arm.cut", "denied"),
-            ("arm.peek", "ok"),
-        ])
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

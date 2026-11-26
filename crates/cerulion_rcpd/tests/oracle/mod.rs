@@ -6,12 +6,13 @@
 //! the doc line its vector names; none is copied from a run.
 //!
 //! The effects are what is visible from outside the daemon: the reply the
-//! client reads, the frames the graph receives on the calls topic, and the
-//! receipt log's lines. The daemon sits behind [`Daemon`], so any host that
-//! serves the tools over MCP runs the same vectors.
+//! client reads, the frames the graph receives on the calls topic, the
+//! receipt log's lines, the `tools/list` answers and whether the latch file
+//! `<receipts>.estop` exists. The daemon sits behind [`Daemon`], so any host
+//! that serves the tools over MCP runs the same vectors.
 //!
-//! Effects are checked per channel: replies by request, frames and receipt
-//! lines in order. No vector writes a `call_id` as a number: a reply names the
+//! Effects are checked per channel: replies by request; frames, receipt
+//! lines, `tools/list` answers and latch file probes in order. No vector writes a `call_id` as a number: a reply names the
 //! frame whose `call_id` it carries.
 
 pub mod graph;
@@ -135,6 +136,8 @@ pub enum Event {
     Call { req: Req, tool: String, args: Value },
     /// `tools/list`.
     List,
+    /// Check whether the latch file `<receipts>.estop` exists.
+    ProbeLatchFile,
 }
 
 /// `tools/call` of `tool` with `args` as request `req`.
@@ -197,6 +200,8 @@ pub enum Effect {
     Entry { verb: &'static str, stage: Stage },
     /// The next `tools/list` answer: the tool names, in order.
     Listed(Vec<&'static str>),
+    /// The next latch file probe: whether `<receipts>.estop` exists.
+    LatchFile(bool),
 }
 
 /// The reply to `req` ends with `outcome`.
@@ -239,11 +244,41 @@ impl Effect {
     }
 }
 
+/// What is on disk before the daemon starts.
+pub enum Latch {
+    /// No latch file.
+    Absent,
+    /// A latch file an earlier daemon left.
+    LeftClosed,
+}
+
+/// The state a vector starts from.
+pub struct Given {
+    pub latch: Latch,
+}
+
+impl Given {
+    /// A first start: no latch file.
+    pub fn fresh() -> Self {
+        Self {
+            latch: Latch::Absent,
+        }
+    }
+}
+
 /// One scenario. `expect` lists the effects in the order `docs/rcp.md`
 /// gives them; only the order within each channel is checked.
 pub struct Vector {
+    pub given: Given,
     pub events: Vec<Event>,
     pub expect: Vec<Effect>,
+}
+
+/// The latch file for the receipt log at `receipts`, by its documented name.
+fn latch_file(receipts: &Path) -> PathBuf {
+    let mut name = receipts.as_os_str().to_owned();
+    name.push(".estop");
+    PathBuf::from(name)
 }
 
 /// What one vector's events produced, per channel.
@@ -256,6 +291,8 @@ pub struct Trace {
     pub entries: Vec<(String, String)>,
     /// The tool names of each `tools/list`, in order.
     pub listed: Vec<Vec<String>>,
+    /// Each latch file probe, in order.
+    pub latch: Vec<bool>,
 }
 
 /// A daemon serving the vector manifest, the stand-in graph, and one MCP
@@ -264,24 +301,35 @@ pub struct Session<D> {
     client: RunningService<RoleClient, ()>,
     daemon: D,
     graph: graph::Graph,
+    latch_file: PathBuf,
     _dir: tempfile::TempDir,
 }
 
 impl<D: Daemon> Session<D> {
-    /// Boot `D` on the vector manifest with the stand-in graph answering.
-    pub async fn open() -> Self {
+    /// Boot `D` from `given` on the vector manifest, with the stand-in
+    /// graph answering.
+    pub async fn open(given: &Given) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let prefix = unique("vector");
         let loaded = manifest(dir.path(), &prefix);
         let mgr = manager("vector");
         let graph = graph::Graph::spawn(mgr.clone(), &prefix);
         let receipts: PathBuf = dir.path().join("receipts/log.jsonl");
+        let latch_file = latch_file(&receipts);
+        match given.latch {
+            Latch::Absent => {}
+            Latch::LeftClosed => {
+                std::fs::create_dir_all(dir.path().join("receipts")).expect("mkdir");
+                std::fs::write(&latch_file, "earlier stop\n").expect("write latch file");
+            }
+        }
         let (daemon, stream) = D::boot(&mgr, &loaded, &receipts);
         let client = ().serve(stream).await.expect("client session");
         Self {
             client,
             daemon,
             graph,
+            latch_file,
             _dir: dir,
         }
     }
@@ -315,11 +363,13 @@ impl<D: Daemon> Session<D> {
     }
 }
 
-/// Run `events` against a fresh `D` and record what each channel saw.
-pub async fn play<D: Daemon>(events: &[Event]) -> Trace {
-    let session = Session::<D>::open().await;
+/// Run `events` against a `D` started from `given` and record what each
+/// channel saw.
+pub async fn play<D: Daemon>(given: &Given, events: &[Event]) -> Trace {
+    let session = Session::<D>::open(given).await;
     let mut replies = BTreeMap::new();
     let mut listed = Vec::new();
+    let mut latch = Vec::new();
     for event in events {
         match event {
             Event::Call { req, tool, args } => {
@@ -330,6 +380,7 @@ pub async fn play<D: Daemon>(events: &[Event]) -> Trace {
                 );
             }
             Event::List => listed.push(session.list().await),
+            Event::ProbeLatchFile => latch.push(session.latch_file.exists()),
         }
     }
     let frames = session.graph.stop();
@@ -339,12 +390,13 @@ pub async fn play<D: Daemon>(events: &[Event]) -> Trace {
         frames,
         entries,
         listed,
+        latch,
     }
 }
 
 /// Run `vector` against a fresh `D` and check every channel.
 pub async fn run<D: Daemon>(vector: Vector) {
-    let trace = play::<D>(&vector.events).await;
+    let trace = play::<D>(&vector.given, &vector.events).await;
     check(&vector.expect, &trace);
 }
 
@@ -354,6 +406,7 @@ fn check(expect: &[Effect], trace: &Trace) {
     let mut frames: Vec<(String, Value)> = Vec::new();
     let mut entries: Vec<(String, String)> = Vec::new();
     let mut listed: Vec<Vec<String>> = Vec::new();
+    let mut latch = Vec::new();
     for effect in expect {
         match effect {
             Effect::Reply {
@@ -370,6 +423,7 @@ fn check(expect: &[Effect], trace: &Trace) {
             Effect::Frame { tool, args } => frames.push((tool.to_string(), args.clone())),
             Effect::Entry { verb, stage } => entries.push((verb.to_string(), stage.word())),
             Effect::Listed(names) => listed.push(names.iter().map(|n| n.to_string()).collect()),
+            Effect::LatchFile(exists) => latch.push(*exists),
         }
     }
 
@@ -389,6 +443,7 @@ fn check(expect: &[Effect], trace: &Trace) {
     }
     assert_eq!(trace.entries, entries, "the receipt log");
     assert_eq!(trace.listed, listed, "the tools/list answers");
+    assert_eq!(trace.latch, latch, "the latch file probes");
 
     assert_eq!(
         trace.replies.keys().collect::<Vec<_>>(),
