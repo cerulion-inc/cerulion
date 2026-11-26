@@ -220,6 +220,47 @@ fn process_resim_slot(base: &iceoryx2::config::Config) -> Result<u32, ReplayErro
     Ok(slot)
 }
 
+/// Verify that the active replay transport is running on `expected` rather
+/// than another namespace (such as the shared `iox2_` namespace or a different
+/// resim slot).
+fn verify_resim_transport_prefix(running: &str, expected: &str) -> Result<(), ReplayError> {
+    if running != expected {
+        return Err(ReplayError::Internal {
+            reason: format!(
+                "the replay transport was already running on the iceoryx2 namespace '{running}' \
+                 instead of the resim's private '{expected}'; refusing to re-execute onto a \
+                 namespace other processes attach to"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn init_resim_transport_with_slot(
+    config: cerulion_core::TransportConfig,
+    base: &iceoryx2::config::Config,
+    slot: u32,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    let ix_config = resim_ix_config(base, slot)?;
+    let transport = TransportManager::init_with_config(config, ix_config)
+        .map_err(replay_transport_init_error)?;
+    let expected = resim_namespace_prefix(slot);
+    let running = transport.iox_config().global.prefix.to_string();
+    verify_resim_transport_prefix(&running, &expected)?;
+    Ok(transport)
+}
+
+/// Test seam for exercising the real `TransportManager` singleton prefix
+/// guard on an isolated iceoryx2 config without touching host slot locks.
+#[cfg(any(test, feature = "test-seams"))]
+pub fn init_resim_transport_with_slot_for_test(
+    config: cerulion_core::TransportConfig,
+    base: &iceoryx2::config::Config,
+    slot: u32,
+) -> Result<Arc<TransportManager>, ReplayError> {
+    init_resim_transport_with_slot(config, base, slot)
+}
+
 /// Start the process transport of a resim on the resim's private namespace.
 ///
 /// The cross-process transport is built with [`resim_ix_config`] for the slot
@@ -242,21 +283,7 @@ fn init_resim_transport(
         cerulion_core::transport::TransportKind::CrossProcess => {
             let base = iceoryx2::config::Config::global_config();
             let slot = process_resim_slot(base)?;
-            let ix_config = resim_ix_config(base, slot)?;
-            let transport = TransportManager::init_with_config(config, ix_config)
-                .map_err(replay_transport_init_error)?;
-            let expected = resim_namespace_prefix(slot);
-            let running = transport.iox_config().global.prefix.to_string();
-            if running != expected {
-                return Err(ReplayError::Internal {
-                    reason: format!(
-                        "the replay transport was already running on the iceoryx2 namespace \
-                         '{running}' instead of the resim's private '{expected}'; refusing to \
-                         re-execute onto a namespace other processes attach to"
-                    ),
-                });
-            }
-            Ok(transport)
+            init_resim_transport_with_slot(config, base, slot)
         }
     }
 }
@@ -42822,9 +42849,9 @@ mod unlisted_macro_output_tests {
 mod resim_namespace_tests {
     use super::{
         check_slot_lock_owner, claim_and_reclaim_resim_slot, claim_resim_slot, reclaim_resim_slot,
-        resim_ix_config, resim_namespace_prefix, resim_namespace_slot, ResimSlot, SlotLock,
-        SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS,
-        SEGMENT_NAME_DIR,
+        resim_ix_config, resim_namespace_prefix, resim_namespace_slot,
+        verify_resim_transport_prefix, ResimSlot, SlotLock, SlotPassedOver, SlotReclaim,
+        RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
@@ -43911,6 +43938,30 @@ mod resim_namespace_tests {
             !leftover2.exists(),
             "second claim must reclaim slot 0's leftover segment"
         );
+    }
+
+    #[test]
+    fn init_resim_transport_refuses_wrong_running_prefix() {
+        let expected = resim_namespace_prefix(0);
+        assert!(verify_resim_transport_prefix(&expected, &expected).is_ok());
+
+        for wrong in ["iox2_", &resim_namespace_prefix(1)] {
+            let err = verify_resim_transport_prefix(wrong, &expected)
+                .expect_err("wrong running prefix must be refused");
+            assert_eq!(err.exit_code(), 5);
+            let text = err.to_string();
+            assert!(
+                text.contains(wrong) && text.contains(&expected),
+                "refusal must name both prefixes; got: {text}"
+            );
+            assert_eq!(
+                verify_resim_transport_prefix(wrong, &expected)
+                    .unwrap_err()
+                    .to_string(),
+                text,
+                "prefix refusal must be deterministic"
+            );
+        }
     }
 }
 
