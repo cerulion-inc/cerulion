@@ -595,6 +595,8 @@ async fn estop_is_served_under_600_stalled_bootstrap_sessions_within_bound() {
 
     const STALLED_CONNECTIONS: usize = 600;
     const UNPAIRED_CAP: usize = 64;
+    const EXCESS_CONNECTIONS: usize = STALLED_CONNECTIONS - UNPAIRED_CAP;
+    const MIN_ACTIVE_STALLERS: usize = UNPAIRED_CAP;
     const CLIENT_ENDPOINTS: usize = 6;
     const MAX_CONCURRENT_DIALS: usize = 12;
 
@@ -614,62 +616,91 @@ async fn estop_is_served_under_600_stalled_bootstrap_sessions_within_bound() {
         endpoints.push(Arc::new(disabled_endpoint([100 + i as u8; 32]).await));
     }
 
-    let (cap_refused, deadline_closed, still_open, elapsed, estop_res) =
+    let (cap_refused, held_open_before, held_open_after, elapsed, estop_res) =
         with_serving(&r, &robot, async {
             let dial_gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS));
-            let mut dial_tasks = tokio::task::JoinSet::new();
 
-            for idx in 0..STALLED_CONNECTIONS {
+            // 1. Fill all 64 unpaired permits with stalled bootstrap sessions
+            //    that complete the cerud Hello handshake and then park inside
+            //    `serve_connection` on the blocking pool (120 s session
+            //    deadline). Reading Ack proves synchronously that every permit
+            //    is held and guarantees these 64 stalled peers stay alive
+            //    through the excess flood and the `engage-estop` measurement.
+            let hello = serde_json::to_vec(&cerud::protocol::Hello::current()).unwrap();
+            let hello_len = (hello.len() as u32).to_be_bytes();
+            let mut active_tasks = tokio::task::JoinSet::new();
+            for idx in 0..UNPAIRED_CAP {
                 let ep = Arc::clone(&endpoints[idx % CLIENT_ENDPOINTS]);
                 let addr = robot_addr.clone();
                 let gate = Arc::clone(&dial_gate);
-                dial_tasks.spawn(async move {
+                let hello = hello.clone();
+                active_tasks.spawn(async move {
                     let _permit = gate.acquire_owned().await.unwrap();
                     let conn = cerulion_link::dial(&ep, addr, cerulion_link::alpn::OPS)
                         .await
-                        .expect("unpaired bootstrap dial completes TLS");
-                    let stream = match cerulion_link::open_frame_stream(&conn).await {
-                        Ok((mut send, recv)) => {
-                            if send.write_all(&[0x00]).await.is_ok() {
-                                Some((send, recv))
-                            } else {
-                                None
-                            }
-                        }
-                        Err(_) => None,
-                    };
-                    (conn, stream)
+                        .expect("active bootstrap staller dial completes TLS");
+                    let (mut send, mut recv) = cerulion_link::open_frame_stream(&conn)
+                        .await
+                        .expect("active bootstrap staller open_bi");
+                    send.write_all(&hello_len)
+                        .await
+                        .expect("write bootstrap hello len");
+                    send.write_all(&hello).await.expect("write bootstrap hello");
+                    let mut ack_len_buf = [0u8; 4];
+                    recv.read_exact(&mut ack_len_buf)
+                        .await
+                        .expect("read bootstrap ack len");
+                    let ack_len = u32::from_be_bytes(ack_len_buf) as usize;
+                    let mut ack_buf = vec![0u8; ack_len];
+                    recv.read_exact(&mut ack_buf)
+                        .await
+                        .expect("read bootstrap ack");
+                    let reply: cerud::protocol::HandshakeReply =
+                        serde_json::from_slice(&ack_buf).expect("decode bootstrap ack");
+                    assert!(
+                        matches!(reply, cerud::protocol::HandshakeReply::Ack { .. }),
+                        "expected Ack for stalled bootstrap peer, got {reply:?}"
+                    );
+                    (conn, send, recv)
                 });
             }
-
-            let mut conns = Vec::with_capacity(STALLED_CONNECTIONS);
-            while let Some(res) = dial_tasks.join_next().await {
-                conns.push(res.expect("dial task did not panic"));
+            let mut held = Vec::with_capacity(UNPAIRED_CAP);
+            while let Some(res) = active_tasks.join_next().await {
+                held.push(res.expect("active staller task did not panic"));
             }
 
-            // Give server-side cap closes a beat to arrive on connections that
-            // wrote their 1 byte before the close frame reached the client.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-
+            // 2. Flood the remaining 536 unpaired bootstrap connections (600
+            //    total) with 1-byte stallers and confirm each hits the
+            //    64-permit cap.
+            let mut excess_tasks = tokio::task::JoinSet::new();
+            for idx in UNPAIRED_CAP..STALLED_CONNECTIONS {
+                let ep = Arc::clone(&endpoints[idx % CLIENT_ENDPOINTS]);
+                let addr = robot_addr.clone();
+                let gate = Arc::clone(&dial_gate);
+                excess_tasks.spawn(async move {
+                    let _permit = gate.acquire_owned().await.unwrap();
+                    let conn = cerulion_link::dial(&ep, addr, cerulion_link::alpn::OPS)
+                        .await
+                        .expect("excess unpaired dial completes TLS");
+                    if let Ok((mut send, _recv)) = cerulion_link::open_frame_stream(&conn).await {
+                        let _ = send.write_all(&[0x00]).await;
+                    }
+                    wait_app_close_reason(&conn, Duration::from_secs(5)).await
+                });
+            }
             let mut cap_refused = 0usize;
-            let mut deadline_closed = 0usize;
-            let mut still_open = 0usize;
-            for (conn, _) in &conns {
-                match conn.close_reason() {
-                    Some(cerulion_link::ConnectionError::ApplicationClosed(ref close))
-                        if close.reason.as_ref() == b"unpaired session cap" =>
-                    {
-                        cap_refused += 1;
-                    }
-                    Some(cerulion_link::ConnectionError::ApplicationClosed(ref close))
-                        if close.reason.as_ref() == b"ops bootstrap first-frame deadline" =>
-                    {
-                        deadline_closed += 1;
-                    }
-                    None => still_open += 1,
-                    Some(_) => {}
+            while let Some(res) = excess_tasks.join_next().await {
+                if res.expect("excess dial task did not panic").as_deref()
+                    == Some(b"unpaired session cap".as_slice())
+                {
+                    cap_refused += 1;
                 }
             }
+
+            let held_open_before = held
+                .iter()
+                .filter(|(conn, _, _)| conn.close_reason().is_none())
+                .count();
 
             let start = Instant::now();
             let res = tokio::time::timeout(
@@ -681,8 +712,13 @@ async fn estop_is_served_under_600_stalled_bootstrap_sessions_within_bound() {
             .await;
             let elapsed = start.elapsed();
 
-            drop(conns);
-            (cap_refused, deadline_closed, still_open, elapsed, res)
+            let held_open_after = held
+                .iter()
+                .filter(|(conn, _, _)| conn.close_reason().is_none())
+                .count();
+
+            drop(held);
+            (cap_refused, held_open_before, held_open_after, elapsed, res)
         })
         .await;
 
@@ -695,18 +731,19 @@ async fn estop_is_served_under_600_stalled_bootstrap_sessions_within_bound() {
         elapsed < ESTOP_CEILING,
         "engage-estop took {elapsed:?}, exceeding {ESTOP_CEILING:?} under 600 stalled bootstrap sessions"
     );
-    assert!(
-        still_open <= UNPAIRED_CAP,
-        "at most {UNPAIRED_CAP} unpaired bootstrap sessions may stay open, got {still_open}"
+    assert_eq!(
+        held_open_before, UNPAIRED_CAP,
+        "all {UNPAIRED_CAP} stalled bootstrap peers must be open before engage-estop, got {held_open_before}"
     );
     assert!(
-        cap_refused > 0,
-        "excess unpaired connections must hit the unpaired session cap (cap_refused={cap_refused}, deadline_closed={deadline_closed}, still_open={still_open})"
+        (MIN_ACTIVE_STALLERS..=UNPAIRED_CAP).contains(&held_open_after),
+        "at least {MIN_ACTIVE_STALLERS} (and at most {UNPAIRED_CAP}) stalled bootstrap peers must \
+         still hold their connections after engage-estop completes, got {held_open_after}"
     );
-    assert!(
-        cap_refused + deadline_closed >= STALLED_CONNECTIONS - UNPAIRED_CAP,
-        "expected at least {} excess connections closed by cap or first-frame deadline, got cap={cap_refused} deadline={deadline_closed} open={still_open}",
-        STALLED_CONNECTIONS - UNPAIRED_CAP
+    assert_eq!(
+        cap_refused, EXCESS_CONNECTIONS,
+        "all {EXCESS_CONNECTIONS} excess unpaired connections must hit the unpaired session cap, \
+         got {cap_refused}"
     );
 
     {
@@ -758,7 +795,7 @@ async fn stalled_refused_and_skeleton_connections_share_the_unpaired_cap() {
     }
     let extra_unpaired = disabled_endpoint([119; 32]).await;
 
-    let (refused_65th_wire, refused_65th_ops, elapsed, estop_res) =
+    let (refused_65th_wire, refused_65th_ops, held_open_after, elapsed, estop_res) =
         with_serving(&r, &robot, async {
             // Saturate all 64 permits with stalled refused wire connections
             // (unpaired peer on cerulion/wire/2 -> Refuse -> skeleton report
@@ -824,10 +861,26 @@ async fn stalled_refused_and_skeleton_connections_share_the_unpaired_cap() {
             .await;
             let elapsed = start.elapsed();
 
+            let held_open_after = held
+                .iter()
+                .filter(|(conn, _, _)| conn.close_reason().is_none())
+                .count();
+
             drop(held);
-            (refused_65th_wire, refused_65th_ops, elapsed, res)
+            (
+                refused_65th_wire,
+                refused_65th_ops,
+                held_open_after,
+                elapsed,
+                res,
+            )
         })
         .await;
+
+    assert_eq!(
+        held_open_after, UNPAIRED_CAP,
+        "all {UNPAIRED_CAP} stalled refused wire connections must remain open through engage-estop, got {held_open_after}"
+    );
 
     assert_eq!(
         refused_65th_wire.as_deref(),
