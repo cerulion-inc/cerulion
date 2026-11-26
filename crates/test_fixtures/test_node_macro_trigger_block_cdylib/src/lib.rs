@@ -17,8 +17,9 @@
 //! the supervisor mints when a hand-written `process_groups:` puts the
 //! producer in another worker, which it does only for an edge with one
 //! in-graph producer and no `block_timeout_ms`. The derived partition
-//! co-locates the flow instead. Staged as the `sink` of the D5 chain, this
-//! node makes that co-location observable over the real binary.
+//! co-locates the flow instead. Staged as the `sink` of the `block` chain of
+//! `cerulion_cli`'s `mp_auto_partition_e2e_test` (its `BLOCK_SINK_FIXTURE`),
+//! this node makes that co-location observable over the real binary.
 //!
 //! `depth = 4` is deliberately shallow: it keeps the defer reachable at the
 //! e2e's tick rate rather than needing a long run to fill a default queue.
