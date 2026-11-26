@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The cross-process rmw topic graph registry codec and gather fold.
 //!
-//! This module defines the host-wide wire format v1, fixed shared-memory
-//! service sizing constants, snapshot frame encoder/decoder, per-writer
-//! generation fold, and required-writer filter for `/__cerulion/rmw_graph`.
+//! Defines the host-wide wire format v1, fixed shared-memory service sizing
+//! constants, snapshot frame encoder and decoder, per-writer generation fold,
+//! and required-writer filter for `/__cerulion/rmw_graph`.
 //!
 //! # Wire contract (frame v1)
 //!
-//! There is one frame kind: a snapshot part carrying `(topic, type_name)` pairs
-//! for one generation of a writer process. All multi-byte integers are
-//! little-endian:
+//! One frame kind: a snapshot part carrying `(topic, type_name)` pairs for one
+//! generation of a writer process. All multi-byte integers are little-endian:
 //!
 //! ```text
 //! offset  size  field
@@ -35,16 +34,16 @@
 //! service with these constants, so an incompatible change requires a new
 //! service name.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub use super::mirror_registry::GatherCompleteness;
 
 /// Fixed iceoryx2 pub/sub service name for the rmw topic graph registry.
-///
 /// Carries no `/data` suffix so `TransportManager::list_topics` and
 /// `cerulion_bagd` never surface it as a user topic.
 pub const RMW_GRAPH_REGISTRY_SERVICE_NAME: &str = "/__cerulion/rmw_graph";
 
 /// Fixed iceoryx2 event service name for the rmw topic graph doorbell.
-///
 /// Carries no `/data` suffix and uses a distinct service name from
 /// [`RMW_GRAPH_REGISTRY_SERVICE_NAME`].
 pub const RMW_GRAPH_DOORBELL_SERVICE_NAME: &str = "/__cerulion/rmw_graph/event";
@@ -95,13 +94,9 @@ const OFF_GENERATION: usize = 20;
 const OFF_PART_INDEX: usize = 24;
 const OFF_PART_COUNT: usize = 26;
 const OFF_ENTRY_COUNT: usize = 28;
-
-const _: () = assert!(OFF_ENTRY_COUNT + 2 == RMW_GRAPH_HEADER_LEN);
-
-/// Upper bound on per-writer shared-memory pool bytes (8 MiB).
 const MAX_PER_WRITER_POOL_BYTES: usize = 8 * 1024 * 1024;
 
-// Compile-time pins on the host-wide static configuration.
+const _: () = assert!(OFF_ENTRY_COUNT + 2 == RMW_GRAPH_HEADER_LEN);
 const _: () = assert!(
     RMW_GRAPH_HEADER_LEN
         + RMW_GRAPH_ENTRY_HEADER_LEN
@@ -127,24 +122,17 @@ const _: () = assert!(
 /// One `(topic, type_name)` entry carried in a snapshot part frame.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RmwGraphEntry {
-    /// ROS topic name (for example, `"/joint_states"`).
     pub topic: String,
-    /// ROS message type name (for example, `"sensor_msgs/msg/JointState"`).
     pub type_name: String,
 }
 
 /// One decoded snapshot part frame from the rmw graph registry wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RmwGraphFrame {
-    /// Iceoryx2 `UniquePublisherId::value()` of the control publisher.
     pub writer_id: u128,
-    /// Monotonic per-writer snapshot generation counter.
     pub generation: u32,
-    /// Zero-based index of this part within the generation (`0..part_count`).
     pub part_index: u16,
-    /// Total number of parts in this generation (`>= 1`).
     pub part_count: u16,
-    /// Entries carried in this part (empty when a writer has zero endpoints).
     pub entries: Vec<RmwGraphEntry>,
 }
 
@@ -159,69 +147,37 @@ pub enum RmwGraphFrameError {
     EmptyType,
     /// A topic name exceeds [`MAX_RMW_GRAPH_TOPIC_LEN`] bytes.
     #[error("topic length {len} exceeds the {MAX_RMW_GRAPH_TOPIC_LEN}-byte limit")]
-    TopicTooLong {
-        /// Byte length of the rejected topic name.
-        len: usize,
-    },
+    TopicTooLong { len: usize },
     /// A ROS type name exceeds [`MAX_RMW_GRAPH_TYPE_LEN`] bytes.
     #[error("type length {len} exceeds the {MAX_RMW_GRAPH_TYPE_LEN}-byte limit")]
-    TypeTooLong {
-        /// Byte length of the rejected type name.
-        len: usize,
-    },
+    TypeTooLong { len: usize },
     /// A snapshot would require more than `u16::MAX` parts.
     #[error("snapshot requires {count} parts, exceeding the u16 limit")]
-    TooManyParts {
-        /// Computed number of parts.
-        count: usize,
-    },
+    TooManyParts { count: usize },
     /// The raw frame is shorter than [`RMW_GRAPH_HEADER_LEN`].
     #[error("frame is {len} bytes, shorter than the {RMW_GRAPH_HEADER_LEN}-byte header")]
-    TruncatedHeader {
-        /// Observed frame length in bytes.
-        len: usize,
-    },
+    TruncatedHeader { len: usize },
     /// The raw frame exceeds [`RMW_GRAPH_FRAME_LEN`].
     #[error("frame is {len} bytes, exceeding the {RMW_GRAPH_FRAME_LEN}-byte limit")]
-    FrameTooLarge {
-        /// Observed frame length in bytes.
-        len: usize,
-    },
+    FrameTooLarge { len: usize },
     /// The leading magic bytes are not [`RMW_GRAPH_MAGIC`].
     #[error("bad frame magic (not an rmw graph frame)")]
     BadMagic,
     /// The version byte is not [`RMW_GRAPH_VERSION`].
     #[error("unsupported frame version {found} (expected {RMW_GRAPH_VERSION})")]
-    BadVersion {
-        /// Observed version byte.
-        found: u8,
-    },
+    BadVersion { found: u8 },
     /// The reserved header byte is non-zero.
     #[error("non-zero reserved header byte {found} (expected 0)")]
-    BadReserved {
-        /// Observed reserved byte.
-        found: u8,
-    },
+    BadReserved { found: u8 },
     /// `part_count` is zero or `part_index >= part_count`.
     #[error("invalid part bounds: part_index={part_index}, part_count={part_count}")]
-    InvalidPartBounds {
-        /// Observed part index.
-        part_index: u16,
-        /// Observed total part count.
-        part_count: u16,
-    },
+    InvalidPartBounds { part_index: u16, part_count: u16 },
     /// The frame ended before entry `entry_index` completed.
     #[error("frame truncated while reading entry {entry_index}")]
-    TruncatedEntry {
-        /// Zero-based index of the truncated entry.
-        entry_index: usize,
-    },
+    TruncatedEntry { entry_index: usize },
     /// Unconsumed bytes remain after the declared `entry_count` entries.
     #[error("frame carries {trailing} trailing bytes after the declared entries")]
-    TrailingBytes {
-        /// Number of unconsumed trailing bytes.
-        trailing: usize,
-    },
+    TrailingBytes { trailing: usize },
     /// Topic or type bytes are not valid UTF-8.
     #[error("topic or type bytes are not valid UTF-8")]
     InvalidUtf8,
@@ -258,7 +214,7 @@ fn write_part(
     let mut buf = Vec::with_capacity(RMW_GRAPH_HEADER_LEN + payload_len);
     buf.extend_from_slice(&RMW_GRAPH_MAGIC);
     buf.push(RMW_GRAPH_VERSION);
-    buf.push(0); // reserved
+    buf.push(0);
     buf.extend_from_slice(&writer_id.to_le_bytes());
     buf.extend_from_slice(&generation.to_le_bytes());
     buf.extend_from_slice(&part_index.to_le_bytes());
@@ -281,12 +237,6 @@ fn write_part(
 /// sorted so output frames are canonical regardless of input order. An empty
 /// entry set produces a single 30-byte frame with `part_index = 0`,
 /// `part_count = 1`, and `entry_count = 0`.
-///
-/// # Errors
-///
-/// Returns [`RmwGraphFrameError::EmptyTopic`], [`RmwGraphFrameError::EmptyType`],
-/// [`RmwGraphFrameError::TopicTooLong`], [`RmwGraphFrameError::TypeTooLong`],
-/// or [`RmwGraphFrameError::TooManyParts`].
 pub fn encode_snapshot<'a, I>(
     writer_id: u128,
     generation: u32,
@@ -346,14 +296,46 @@ where
     Ok(frames)
 }
 
+fn parse_entry_slice(
+    bytes: &[u8],
+    cursor: usize,
+    entry_index: usize,
+) -> Result<(&str, &str, usize), RmwGraphFrameError> {
+    let topic_len = usize::from(
+        read_u16_le(bytes, cursor).ok_or(RmwGraphFrameError::TruncatedEntry { entry_index })?,
+    );
+    let type_len = usize::from(
+        read_u16_le(bytes, cursor + 2).ok_or(RmwGraphFrameError::TruncatedEntry { entry_index })?,
+    );
+    if topic_len == 0 {
+        return Err(RmwGraphFrameError::EmptyTopic);
+    }
+    if topic_len > MAX_RMW_GRAPH_TOPIC_LEN {
+        return Err(RmwGraphFrameError::TopicTooLong { len: topic_len });
+    }
+    if type_len == 0 {
+        return Err(RmwGraphFrameError::EmptyType);
+    }
+    if type_len > MAX_RMW_GRAPH_TYPE_LEN {
+        return Err(RmwGraphFrameError::TypeTooLong { len: type_len });
+    }
+    let topic_start = cursor + RMW_GRAPH_ENTRY_HEADER_LEN;
+    let topic_end = topic_start.saturating_add(topic_len);
+    let type_end = topic_end.saturating_add(type_len);
+    if type_end > bytes.len() {
+        return Err(RmwGraphFrameError::TruncatedEntry { entry_index });
+    }
+    let topic = std::str::from_utf8(&bytes[topic_start..topic_end])
+        .map_err(|_| RmwGraphFrameError::InvalidUtf8)?;
+    let type_name = std::str::from_utf8(&bytes[topic_end..type_end])
+        .map_err(|_| RmwGraphFrameError::InvalidUtf8)?;
+    Ok((topic, type_name, type_end))
+}
+
 /// Decode one snapshot part frame from raw wire bytes.
 ///
 /// Every header field, length prefix, byte bound, and UTF-8 check runs before
 /// any heap allocation so hostile or truncated frames never over-allocate.
-///
-/// # Errors
-///
-/// Returns a specific [`RmwGraphFrameError`] variant for any malformed frame.
 pub fn decode_frame(bytes: &[u8]) -> Result<RmwGraphFrame, RmwGraphFrameError> {
     if bytes.len() < RMW_GRAPH_HEADER_LEN {
         return Err(RmwGraphFrameError::TruncatedHeader { len: bytes.len() });
@@ -389,43 +371,13 @@ pub fn decode_frame(bytes: &[u8]) -> Result<RmwGraphFrame, RmwGraphFrameError> {
         });
     }
 
-    // Pass 1: validate every entry length, frame boundary, and UTF-8 slice
-    // before allocating the result vector or any strings.
+    // Pass 1 validates every entry length, boundary, and UTF-8 slice before
+    // allocating the output vector or any owned strings.
     let count = usize::from(entry_count);
     let mut cursor = RMW_GRAPH_HEADER_LEN;
     for entry_index in 0..count {
-        let Some(topic_len_u16) = read_u16_le(bytes, cursor) else {
-            return Err(RmwGraphFrameError::TruncatedEntry { entry_index });
-        };
-        let Some(type_len_u16) = read_u16_le(bytes, cursor + 2) else {
-            return Err(RmwGraphFrameError::TruncatedEntry { entry_index });
-        };
-        let topic_len = usize::from(topic_len_u16);
-        let type_len = usize::from(type_len_u16);
-        if topic_len == 0 {
-            return Err(RmwGraphFrameError::EmptyTopic);
-        }
-        if topic_len > MAX_RMW_GRAPH_TOPIC_LEN {
-            return Err(RmwGraphFrameError::TopicTooLong { len: topic_len });
-        }
-        if type_len == 0 {
-            return Err(RmwGraphFrameError::EmptyType);
-        }
-        if type_len > MAX_RMW_GRAPH_TYPE_LEN {
-            return Err(RmwGraphFrameError::TypeTooLong { len: type_len });
-        }
-        let topic_start = cursor + RMW_GRAPH_ENTRY_HEADER_LEN;
-        let topic_end = topic_start.saturating_add(topic_len);
-        let type_end = topic_end.saturating_add(type_len);
-        if type_end > bytes.len() {
-            return Err(RmwGraphFrameError::TruncatedEntry { entry_index });
-        }
-        if std::str::from_utf8(&bytes[topic_start..topic_end]).is_err()
-            || std::str::from_utf8(&bytes[topic_end..type_end]).is_err()
-        {
-            return Err(RmwGraphFrameError::InvalidUtf8);
-        }
-        cursor = type_end;
+        let (_, _, next) = parse_entry_slice(bytes, cursor, entry_index)?;
+        cursor = next;
     }
     if cursor != bytes.len() {
         return Err(RmwGraphFrameError::TrailingBytes {
@@ -433,28 +385,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<RmwGraphFrame, RmwGraphFrameError> {
         });
     }
 
-    // Pass 2: every bound and UTF-8 invariant passed; materialize owned strings.
     let mut entries = Vec::with_capacity(count);
     let mut cursor = RMW_GRAPH_HEADER_LEN;
     for entry_index in 0..count {
-        let topic_len = usize::from(
-            read_u16_le(bytes, cursor).ok_or(RmwGraphFrameError::TruncatedEntry { entry_index })?,
-        );
-        let type_len = usize::from(
-            read_u16_le(bytes, cursor + 2)
-                .ok_or(RmwGraphFrameError::TruncatedEntry { entry_index })?,
-        );
-        let topic_start = cursor + RMW_GRAPH_ENTRY_HEADER_LEN;
-        let topic_end = topic_start + topic_len;
-        let type_end = topic_end + type_len;
-        let topic = std::str::from_utf8(&bytes[topic_start..topic_end])
-            .map_err(|_| RmwGraphFrameError::InvalidUtf8)?
-            .to_string();
-        let type_name = std::str::from_utf8(&bytes[topic_end..type_end])
-            .map_err(|_| RmwGraphFrameError::InvalidUtf8)?
-            .to_string();
-        entries.push(RmwGraphEntry { topic, type_name });
-        cursor = type_end;
+        let (topic, type_name, next) = parse_entry_slice(bytes, cursor, entry_index)?;
+        entries.push(RmwGraphEntry {
+            topic: topic.to_string(),
+            type_name: type_name.to_string(),
+        });
+        cursor = next;
     }
 
     Ok(RmwGraphFrame {
@@ -466,54 +405,220 @@ pub fn decode_frame(bytes: &[u8]) -> Result<RmwGraphFrame, RmwGraphFrameError> {
     })
 }
 
+/// Result of folding snapshot frames for a gather pass: sorted deduplicated
+/// `topic -> sorted unique type names`, paired with [`GatherCompleteness`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RmwGraphGather {
+    pub topics: BTreeMap<String, BTreeSet<String>>,
+    pub completeness: GatherCompleteness,
+}
+
+#[derive(Debug, Clone)]
+struct GenerationBuffer {
+    part_count: u16,
+    inconsistent: bool,
+    parts: BTreeMap<u16, Vec<RmwGraphEntry>>,
+}
+
+impl GenerationBuffer {
+    fn is_complete(&self) -> bool {
+        !self.inconsistent && self.parts.len() == usize::from(self.part_count)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct WriterFoldState {
+    newest_complete: Option<(u32, Vec<RmwGraphEntry>)>,
+    pending: BTreeMap<u32, GenerationBuffer>,
+}
+
+/// Pure per-writer generation fold for an rmw graph gather.
+///
+/// A writer counts as heard only once every part (`0..part_count`) of a single
+/// generation has arrived with consistent `part_count`. Across generations from
+/// one writer, the newest complete generation wins. When finalized against a
+/// `required` writer set, any required writer with no complete generation
+/// produces [`GatherCompleteness::Incomplete`] while still contributing entries
+/// heard in its newest partial generation.
+#[derive(Debug, Clone, Default)]
+pub struct RmwGraphGatherFold {
+    writers: BTreeMap<u128, WriterFoldState>,
+}
+
+impl RmwGraphGatherFold {
+    /// Create an empty gather fold.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one decoded snapshot part frame.
+    pub fn ingest(&mut self, frame: RmwGraphFrame) {
+        if frame.part_count == 0 || frame.part_index >= frame.part_count {
+            return;
+        }
+        let writer = self.writers.entry(frame.writer_id).or_default();
+        if let Some((complete_gen, _)) = &writer.newest_complete {
+            if frame.generation <= *complete_gen {
+                return;
+            }
+        }
+        let buf = writer
+            .pending
+            .entry(frame.generation)
+            .or_insert_with(|| GenerationBuffer {
+                part_count: frame.part_count,
+                inconsistent: false,
+                parts: BTreeMap::new(),
+            });
+        if buf.part_count != frame.part_count {
+            buf.inconsistent = true;
+            return;
+        }
+        if buf.inconsistent {
+            return;
+        }
+        buf.parts.entry(frame.part_index).or_insert(frame.entries);
+        if buf.is_complete() {
+            if let Some(done) = writer.pending.remove(&frame.generation) {
+                let entries = done.parts.into_values().flatten().collect();
+                writer.newest_complete = Some((frame.generation, entries));
+                writer.pending.retain(|&g, _| g > frame.generation);
+            }
+        }
+    }
+
+    /// Whether `writer_id` has delivered at least one complete generation.
+    #[must_use]
+    pub fn is_writer_complete(&self, writer_id: u128) -> bool {
+        self.writers
+            .get(&writer_id)
+            .is_some_and(|w| w.newest_complete.is_some())
+    }
+
+    /// Whether every writer in `required` has delivered a complete generation.
+    #[must_use]
+    pub fn is_settled(&self, required: &BTreeSet<u128>) -> bool {
+        required.iter().all(|id| self.is_writer_complete(*id))
+    }
+
+    /// Produce the union of entries and [`GatherCompleteness`] for `required`.
+    #[must_use]
+    pub fn finish(&self, required: &BTreeSet<u128>) -> RmwGraphGather {
+        let mut topics: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut writers_heard = 0usize;
+        for &writer_id in required {
+            let Some(writer) = self.writers.get(&writer_id) else {
+                continue;
+            };
+            if let Some((_, entries)) = &writer.newest_complete {
+                writers_heard += 1;
+                insert_entries(&mut topics, entries);
+            } else if let Some((_, partial)) = writer.pending.iter().next_back() {
+                for entries in partial.parts.values() {
+                    insert_entries(&mut topics, entries);
+                }
+            }
+        }
+        let completeness = if writers_heard == required.len() {
+            GatherCompleteness::Settled
+        } else {
+            GatherCompleteness::Incomplete {
+                live_writers: required.len(),
+                writers_heard,
+            }
+        };
+        RmwGraphGather {
+            topics,
+            completeness,
+        }
+    }
+}
+
+fn insert_entries(topics: &mut BTreeMap<String, BTreeSet<String>>, entries: &[RmwGraphEntry]) {
+    for entry in entries {
+        topics
+            .entry(entry.topic.clone())
+            .or_default()
+            .insert(entry.type_name.clone());
+    }
+}
+
+/// Compute the exact set of remote writer publisher IDs a gather must hear
+/// from before returning [`GatherCompleteness::Settled`].
+///
+/// Each element of `listed` is `(publisher_id, owner_node_id)` from iceoryx2's
+/// `dynamic_config().list_publishers(...)`. Publishers whose `owner_node_id` is
+/// in `dead_nodes` (observed in `NodeState::Dead`) or whose `publisher_id`
+/// equals `own_writer` are excluded. Publishers whose owner node is alive,
+/// absent from the node listing, or `Inaccessible` remain required.
+#[must_use]
+pub fn required_writers<N: Ord>(
+    listed: &[(u128, N)],
+    dead_nodes: &BTreeSet<N>,
+    own_writer: Option<u128>,
+) -> BTreeSet<u128> {
+    listed
+        .iter()
+        .filter(|(publisher_id, node_id)| {
+            own_writer != Some(*publisher_id) && !dead_nodes.contains(node_id)
+        })
+        .map(|(publisher_id, _)| *publisher_id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct TestHeader {
-        magic: [u8; 2],
-        version: u8,
-        reserved: u8,
-        writer_id: u128,
-        generation: u32,
-        part_index: u16,
-        part_count: u16,
-        entry_count: u16,
+    fn valid_header_with(patch: impl FnOnce(&mut [u8])) -> Vec<u8> {
+        let mut bytes = vec![0u8; RMW_GRAPH_HEADER_LEN];
+        bytes[0..2].copy_from_slice(&RMW_GRAPH_MAGIC);
+        bytes[OFF_VERSION] = RMW_GRAPH_VERSION;
+        bytes[OFF_WRITER_ID..OFF_WRITER_ID + 16].copy_from_slice(&1u128.to_le_bytes());
+        bytes[OFF_GENERATION..OFF_GENERATION + 4].copy_from_slice(&1u32.to_le_bytes());
+        bytes[OFF_PART_COUNT..OFF_PART_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        patch(&mut bytes);
+        bytes
     }
 
-    impl TestHeader {
-        fn valid() -> Self {
-            Self {
-                magic: RMW_GRAPH_MAGIC,
-                version: RMW_GRAPH_VERSION,
-                reserved: 0,
-                writer_id: 1,
-                generation: 1,
-                part_index: 0,
-                part_count: 1,
-                entry_count: 0,
-            }
-        }
-
-        fn to_bytes(&self) -> Vec<u8> {
-            let mut bytes = Vec::with_capacity(RMW_GRAPH_HEADER_LEN);
-            bytes.extend_from_slice(&self.magic);
-            bytes.push(self.version);
-            bytes.push(self.reserved);
-            bytes.extend_from_slice(&self.writer_id.to_le_bytes());
-            bytes.extend_from_slice(&self.generation.to_le_bytes());
-            bytes.extend_from_slice(&self.part_index.to_le_bytes());
-            bytes.extend_from_slice(&self.part_count.to_le_bytes());
-            bytes.extend_from_slice(&self.entry_count.to_le_bytes());
-            bytes
-        }
-    }
-
-    fn append_entry(buf: &mut Vec<u8>, topic: &[u8], type_name: &[u8]) {
+    fn one_entry_wire(topic: &[u8], type_name: &[u8]) -> Vec<u8> {
+        let mut buf = valid_header_with(|b| {
+            b[OFF_ENTRY_COUNT..OFF_ENTRY_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        });
         buf.extend_from_slice(&(topic.len() as u16).to_le_bytes());
         buf.extend_from_slice(&(type_name.len() as u16).to_le_bytes());
         buf.extend_from_slice(topic);
         buf.extend_from_slice(type_name);
+        buf
+    }
+
+    fn make_frame(
+        writer_id: u128,
+        generation: u32,
+        part_index: u16,
+        part_count: u16,
+        entries: &[(&str, &str)],
+    ) -> RmwGraphFrame {
+        RmwGraphFrame {
+            writer_id,
+            generation,
+            part_index,
+            part_count,
+            entries: entries
+                .iter()
+                .map(|&(topic, type_name)| RmwGraphEntry {
+                    topic: topic.to_string(),
+                    type_name: type_name.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn topic_map(rows: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
+        rows.iter()
+            .map(|&(t, tys)| (t.to_string(), tys.iter().map(|&s| s.to_string()).collect()))
+            .collect()
     }
 
     #[test]
@@ -529,10 +634,9 @@ mod tests {
     #[test]
     fn encode_matches_hand_written_wire_oracle_for_two_entries() {
         let writer_id: u128 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10;
-        let generation: u32 = 0x1122_3344;
         let frames = encode_snapshot(
             writer_id,
-            generation,
+            0x1122_3344,
             [
                 ("/joint_states", "sensor_msgs/msg/JointState"),
                 ("/clock", "rosgraph_msgs/msg/Clock"),
@@ -541,29 +645,19 @@ mod tests {
         .expect("valid snapshot encodes");
 
         // Sorted order places /clock before /joint_states.
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&[0xCE, 0x52]); // magic
-        expected.push(0x01); // version
-        expected.push(0x00); // reserved
-        expected.extend_from_slice(&[
+        let mut expected = vec![
+            0xCE, 0x52, 0x01, 0x00, // magic, version=1, reserved=0
             0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A, 0x09, // writer_id LE low
             0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // writer_id LE high
-        ]);
-        expected.extend_from_slice(&[0x44, 0x33, 0x22, 0x11]); // generation LE
-        expected.extend_from_slice(&[0x00, 0x00]); // part_index = 0
-        expected.extend_from_slice(&[0x01, 0x00]); // part_count = 1
-        expected.extend_from_slice(&[0x02, 0x00]); // entry_count = 2
-                                                   // Entry 0: "/clock" (6 bytes), "rosgraph_msgs/msg/Clock" (23 bytes)
-        expected.extend_from_slice(&[0x06, 0x00, 0x17, 0x00]);
-        expected.extend_from_slice(b"/clock");
-        expected.extend_from_slice(b"rosgraph_msgs/msg/Clock");
-        // Entry 1: "/joint_states" (13 bytes), "sensor_msgs/msg/JointState" (26 bytes)
-        expected.extend_from_slice(&[0x0D, 0x00, 0x1A, 0x00]);
-        expected.extend_from_slice(b"/joint_states");
-        expected.extend_from_slice(b"sensor_msgs/msg/JointState");
+            0x44, 0x33, 0x22, 0x11, // generation LE
+            0x00, 0x00, 0x01, 0x00, 0x02, 0x00, // part 0/1, 2 entries
+            0x06, 0x00, 0x17, 0x00, // "/clock" (6), "rosgraph_msgs/msg/Clock" (23)
+        ];
+        expected.extend_from_slice(b"/clockrosgraph_msgs/msg/Clock");
+        expected.extend_from_slice(&[0x0D, 0x00, 0x1A, 0x00]); // 13, 26
+        expected.extend_from_slice(b"/joint_statessensor_msgs/msg/JointState");
 
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], expected);
+        assert_eq!(frames, vec![expected]);
     }
 
     #[test]
@@ -572,78 +666,49 @@ mod tests {
         let frames =
             encode_snapshot(writer_id, 7, std::iter::empty()).expect("empty snapshot encodes");
 
-        let expected: Vec<u8> = vec![
-            0xCE, 0x52, // magic
-            0x01, // version
-            0x00, // reserved
+        let expected = vec![
+            0xCE, 0x52, 0x01, 0x00, // magic, version, reserved
             0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // writer_id LE low
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xAA, // writer_id LE high
             0x07, 0x00, 0x00, 0x00, // generation = 7
-            0x00, 0x00, // part_index = 0
-            0x01, 0x00, // part_count = 1
-            0x00, 0x00, // entry_count = 0
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // part 0/1, 0 entries
         ];
-
         assert_eq!(frames, vec![expected]);
     }
 
     #[test]
-    fn decode_hand_written_wire_oracle_returns_exact_frame() {
+    fn decode_hand_written_wire_oracle_and_zero_entry_part() {
         let mut raw = vec![
-            0xCE, 0x52, // magic
-            0x01, // version
-            0x00, // reserved
+            0xCE, 0x52, 0x01, 0x00, // magic, version, reserved
             0x2A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // writer_id = 42
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // writer_id high
             0x03, 0x00, 0x00, 0x00, // generation = 3
-            0x01, 0x00, // part_index = 1
-            0x02, 0x00, // part_count = 2
-            0x01, 0x00, // entry_count = 1
+            0x01, 0x00, 0x02, 0x00, 0x01, 0x00, // part 1/2, 1 entry
             0x07, 0x00, 0x16, 0x00, // topic_len = 7, type_len = 22
         ];
-        raw.extend_from_slice(b"/rosout");
-        raw.extend_from_slice(b"rcl_interfaces/msg/Log");
+        raw.extend_from_slice(b"/rosoutrcl_interfaces/msg/Log");
 
-        let frame = decode_frame(&raw).expect("valid hand-written wire decodes");
         assert_eq!(
-            frame,
-            RmwGraphFrame {
-                writer_id: 42,
-                generation: 3,
-                part_index: 1,
-                part_count: 2,
-                entries: vec![RmwGraphEntry {
-                    topic: "/rosout".to_string(),
-                    type_name: "rcl_interfaces/msg/Log".to_string(),
-                }],
-            }
+            decode_frame(&raw),
+            Ok(make_frame(
+                42,
+                3,
+                1,
+                2,
+                &[("/rosout", "rcl_interfaces/msg/Log")]
+            ))
         );
-    }
 
-    #[test]
-    fn decode_zero_entry_part_succeeds() {
-        let raw = TestHeader {
-            writer_id: 99,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        let frame = decode_frame(&raw).expect("zero-entry part decodes");
-        assert_eq!(
-            frame,
-            RmwGraphFrame {
-                writer_id: 99,
-                generation: 1,
-                part_index: 0,
-                part_count: 1,
-                entries: Vec::new(),
-            }
-        );
+        let empty = valid_header_with(|b| {
+            b[OFF_WRITER_ID..OFF_WRITER_ID + 16].copy_from_slice(&99u128.to_le_bytes());
+        });
+        assert_eq!(decode_frame(&empty), Ok(make_frame(99, 1, 0, 1, &[])));
     }
 
     #[test]
     fn encode_splits_large_snapshot_across_bounded_parts() {
-        // Each entry is 4 + 20 + 26 = 50 bytes. 50 * 50 = 2500 > 2048 - 30 = 2018,
-        // so 50 entries must split into 2 parts (40 in part 0, 10 in part 1).
+        // Each entry is 4 + 20 + 26 = 50 bytes. 50 entries = 2500 > 2048 - 30 = 2018,
+        // so encoding splits into 40 entries in part 0 and 10 entries in part 1.
         let pairs: Vec<(String, String)> = (0..50)
             .map(|i| {
                 (
@@ -663,12 +728,14 @@ mod tests {
 
         let part0 = decode_frame(&frames[0]).expect("part 0 decodes");
         let part1 = decode_frame(&frames[1]).expect("part 1 decodes");
-        assert_eq!(part0.part_index, 0);
-        assert_eq!(part0.part_count, 2);
-        assert_eq!(part0.entries.len(), 40);
-        assert_eq!(part1.part_index, 1);
-        assert_eq!(part1.part_count, 2);
-        assert_eq!(part1.entries.len(), 10);
+        assert_eq!(
+            (part0.part_index, part0.part_count, part0.entries.len()),
+            (0, 2, 40)
+        );
+        assert_eq!(
+            (part1.part_index, part1.part_count, part1.entries.len()),
+            (1, 2, 10)
+        );
         assert_eq!(part0.entries[0].topic, "/robot/topic_num_000");
         assert_eq!(part1.entries[9].topic, "/robot/topic_num_049");
     }
@@ -701,22 +768,23 @@ mod tests {
 
     #[test]
     fn encode_refuses_empty_and_oversized_names() {
+        let long_topic = format!("/{}", "a".repeat(MAX_RMW_GRAPH_TOPIC_LEN));
+        let long_type = "t".repeat(MAX_RMW_GRAPH_TYPE_LEN + 1);
+
         assert_eq!(
-            encode_snapshot(1, 1, [("", "std_msgs/msg/String")]),
+            encode_snapshot(1, 1, [("/ok", "pkg/msg/Ok"), ("", "std_msgs/msg/String")]),
             Err(RmwGraphFrameError::EmptyTopic)
         );
         assert_eq!(
             encode_snapshot(1, 1, [("/a", "")]),
             Err(RmwGraphFrameError::EmptyType)
         );
-        let long_topic = format!("/{}", "a".repeat(MAX_RMW_GRAPH_TOPIC_LEN));
         assert_eq!(
             encode_snapshot(1, 1, [(long_topic.as_str(), "std_msgs/msg/String")]),
             Err(RmwGraphFrameError::TopicTooLong {
                 len: MAX_RMW_GRAPH_TOPIC_LEN + 1
             })
         );
-        let long_type = "t".repeat(MAX_RMW_GRAPH_TYPE_LEN + 1);
         assert_eq!(
             encode_snapshot(1, 1, [("/a", long_type.as_str())]),
             Err(RmwGraphFrameError::TypeTooLong {
@@ -727,223 +795,383 @@ mod tests {
 
     #[test]
     fn decode_refuses_every_malformed_wire_shape() {
-        // Truncated header
-        assert_eq!(
-            decode_frame(&[0xCE, 0x52, 0x01]),
-            Err(RmwGraphFrameError::TruncatedHeader { len: 3 })
-        );
+        let mut trunc_body = valid_header_with(|b| {
+            b[OFF_ENTRY_COUNT..OFF_ENTRY_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        });
+        trunc_body.extend_from_slice(&[4, 0, 4, 0, b'/', b'a', b'b', b'c']);
 
-        // Oversized frame
-        let oversized = vec![0u8; RMW_GRAPH_FRAME_LEN + 1];
-        assert_eq!(
-            decode_frame(&oversized),
-            Err(RmwGraphFrameError::FrameTooLarge {
-                len: RMW_GRAPH_FRAME_LEN + 1
-            })
-        );
-
-        // Bad magic (mirror_registry's 0xCE37 and run_registry's 0xCE81)
-        let mirror_magic = TestHeader {
-            magic: [0xCE, 0x37],
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(
-            decode_frame(&mirror_magic),
-            Err(RmwGraphFrameError::BadMagic)
-        );
-        let run_magic = TestHeader {
-            magic: [0xCE, 0x81],
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(decode_frame(&run_magic), Err(RmwGraphFrameError::BadMagic));
-
-        // Bad version
-        let bad_ver = TestHeader {
-            version: 2,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(
-            decode_frame(&bad_ver),
-            Err(RmwGraphFrameError::BadVersion { found: 2 })
-        );
-
-        // Non-zero reserved byte
-        let bad_res = TestHeader {
-            reserved: 0xFF,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(
-            decode_frame(&bad_res),
-            Err(RmwGraphFrameError::BadReserved { found: 0xFF })
-        );
-
-        // Invalid part bounds: part_count == 0 and part_index >= part_count
-        let zero_parts = TestHeader {
-            part_count: 0,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(
-            decode_frame(&zero_parts),
-            Err(RmwGraphFrameError::InvalidPartBounds {
-                part_index: 0,
-                part_count: 0
-            })
-        );
-        let oob_part = TestHeader {
-            part_index: 2,
-            part_count: 2,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(
-            decode_frame(&oob_part),
-            Err(RmwGraphFrameError::InvalidPartBounds {
-                part_index: 2,
-                part_count: 2
-            })
-        );
-
-        // Hostile entry_count = u16::MAX with no entry bytes (must fail without allocating)
-        let huge_count = TestHeader {
-            entry_count: u16::MAX,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        assert_eq!(
-            decode_frame(&huge_count),
-            Err(RmwGraphFrameError::TruncatedEntry { entry_index: 0 })
-        );
-
-        // Entry length prefix present, but payload truncated
-        let mut trunc_body = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        trunc_body.extend_from_slice(&4u16.to_le_bytes());
-        trunc_body.extend_from_slice(&4u16.to_le_bytes());
-        trunc_body.extend_from_slice(b"/abc"); // missing 4 type bytes
-        assert_eq!(
-            decode_frame(&trunc_body),
-            Err(RmwGraphFrameError::TruncatedEntry { entry_index: 0 })
-        );
-
-        // Empty topic in wire entry
-        let mut empty_topic = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        append_entry(&mut empty_topic, b"", b"std_msgs/msg/String");
-        assert_eq!(
-            decode_frame(&empty_topic),
-            Err(RmwGraphFrameError::EmptyTopic)
-        );
-
-        // Empty type in wire entry
-        let mut empty_type = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        append_entry(&mut empty_type, b"/a", b"");
-        assert_eq!(
-            decode_frame(&empty_type),
-            Err(RmwGraphFrameError::EmptyType)
-        );
-
-        // Topic length over bound (even before payload bytes exist)
-        let mut over_topic = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
+        let mut over_topic = valid_header_with(|b| {
+            b[OFF_ENTRY_COUNT..OFF_ENTRY_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        });
         over_topic.extend_from_slice(&((MAX_RMW_GRAPH_TOPIC_LEN + 1) as u16).to_le_bytes());
         over_topic.extend_from_slice(&1u16.to_le_bytes());
-        assert_eq!(
-            decode_frame(&over_topic),
-            Err(RmwGraphFrameError::TopicTooLong {
-                len: MAX_RMW_GRAPH_TOPIC_LEN + 1
-            })
-        );
 
-        // Type length over bound
-        let mut over_type = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
+        let mut over_type = valid_header_with(|b| {
+            b[OFF_ENTRY_COUNT..OFF_ENTRY_COUNT + 2].copy_from_slice(&1u16.to_le_bytes());
+        });
         over_type.extend_from_slice(&2u16.to_le_bytes());
         over_type.extend_from_slice(&((MAX_RMW_GRAPH_TYPE_LEN + 1) as u16).to_le_bytes());
-        assert_eq!(
-            decode_frame(&over_type),
-            Err(RmwGraphFrameError::TypeTooLong {
-                len: MAX_RMW_GRAPH_TYPE_LEN + 1
-            })
-        );
 
-        // Non-UTF-8 topic bytes
-        let mut bad_utf8_topic = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        append_entry(&mut bad_utf8_topic, &[0xFF, 0xFE], b"pkg/msg/T");
-        assert_eq!(
-            decode_frame(&bad_utf8_topic),
-            Err(RmwGraphFrameError::InvalidUtf8)
-        );
-
-        // Non-UTF-8 type bytes
-        let mut bad_utf8_type = TestHeader {
-            entry_count: 1,
-            ..TestHeader::valid()
-        }
-        .to_bytes();
-        append_entry(&mut bad_utf8_type, b"/ok", &[0x80, 0x81]);
-        assert_eq!(
-            decode_frame(&bad_utf8_type),
-            Err(RmwGraphFrameError::InvalidUtf8)
-        );
-
-        // Trailing bytes after declared entries
-        let mut trailing = TestHeader::valid().to_bytes();
+        let mut trailing = valid_header_with(|_| {});
         trailing.extend_from_slice(&[0xDE, 0xAD]);
-        assert_eq!(
-            decode_frame(&trailing),
-            Err(RmwGraphFrameError::TrailingBytes { trailing: 2 })
-        );
+
+        let cases: Vec<(Vec<u8>, RmwGraphFrameError)> = vec![
+            (
+                vec![0xCE, 0x52, 0x01],
+                RmwGraphFrameError::TruncatedHeader { len: 3 },
+            ),
+            (
+                vec![0u8; RMW_GRAPH_FRAME_LEN + 1],
+                RmwGraphFrameError::FrameTooLarge {
+                    len: RMW_GRAPH_FRAME_LEN + 1,
+                },
+            ),
+            (
+                valid_header_with(|b| b[0..2].copy_from_slice(&[0xCE, 0x37])),
+                RmwGraphFrameError::BadMagic,
+            ),
+            (
+                valid_header_with(|b| b[0..2].copy_from_slice(&[0xCE, 0x81])),
+                RmwGraphFrameError::BadMagic,
+            ),
+            (
+                valid_header_with(|b| b[OFF_VERSION] = 2),
+                RmwGraphFrameError::BadVersion { found: 2 },
+            ),
+            (
+                valid_header_with(|b| b[OFF_RESERVED] = 0xFF),
+                RmwGraphFrameError::BadReserved { found: 0xFF },
+            ),
+            (
+                valid_header_with(|b| {
+                    b[OFF_PART_COUNT..OFF_PART_COUNT + 2].copy_from_slice(&0u16.to_le_bytes());
+                }),
+                RmwGraphFrameError::InvalidPartBounds {
+                    part_index: 0,
+                    part_count: 0,
+                },
+            ),
+            (
+                valid_header_with(|b| {
+                    b[OFF_PART_INDEX..OFF_PART_INDEX + 2].copy_from_slice(&2u16.to_le_bytes());
+                    b[OFF_PART_COUNT..OFF_PART_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
+                }),
+                RmwGraphFrameError::InvalidPartBounds {
+                    part_index: 2,
+                    part_count: 2,
+                },
+            ),
+            // Hostile entry_count = u16::MAX with no entry bytes must fail before allocating.
+            (
+                valid_header_with(|b| {
+                    b[OFF_ENTRY_COUNT..OFF_ENTRY_COUNT + 2]
+                        .copy_from_slice(&u16::MAX.to_le_bytes());
+                }),
+                RmwGraphFrameError::TruncatedEntry { entry_index: 0 },
+            ),
+            (
+                trunc_body,
+                RmwGraphFrameError::TruncatedEntry { entry_index: 0 },
+            ),
+            (
+                one_entry_wire(b"", b"std_msgs/msg/String"),
+                RmwGraphFrameError::EmptyTopic,
+            ),
+            (one_entry_wire(b"/a", b""), RmwGraphFrameError::EmptyType),
+            (
+                over_topic,
+                RmwGraphFrameError::TopicTooLong {
+                    len: MAX_RMW_GRAPH_TOPIC_LEN + 1,
+                },
+            ),
+            (
+                over_type,
+                RmwGraphFrameError::TypeTooLong {
+                    len: MAX_RMW_GRAPH_TYPE_LEN + 1,
+                },
+            ),
+            (
+                one_entry_wire(&[0xFF, 0xFE], b"pkg/msg/T"),
+                RmwGraphFrameError::InvalidUtf8,
+            ),
+            (
+                one_entry_wire(b"/ok", &[0x80, 0x81]),
+                RmwGraphFrameError::InvalidUtf8,
+            ),
+            (trailing, RmwGraphFrameError::TrailingBytes { trailing: 2 }),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(decode_frame(&raw), Err(expected));
+        }
     }
 
     #[test]
-    fn encode_and_decode_accept_exact_length_boundaries() {
+    fn encode_and_decode_accept_exact_field_and_frame_boundaries() {
         let max_topic = format!("/{}", "a".repeat(MAX_RMW_GRAPH_TOPIC_LEN - 1));
         let max_type = "b".repeat(MAX_RMW_GRAPH_TYPE_LEN);
-        assert_eq!(max_topic.len(), MAX_RMW_GRAPH_TOPIC_LEN);
-        assert_eq!(max_type.len(), MAX_RMW_GRAPH_TYPE_LEN);
-
         let frames = encode_snapshot(77, 1, [(max_topic.as_str(), max_type.as_str())])
-            .expect("exact max lengths encode");
+            .expect("exact max field lengths encode");
         assert_eq!(frames.len(), 1);
         assert_eq!(
-            frames[0].len(),
-            RMW_GRAPH_HEADER_LEN
-                + RMW_GRAPH_ENTRY_HEADER_LEN
-                + MAX_RMW_GRAPH_TOPIC_LEN
-                + MAX_RMW_GRAPH_TYPE_LEN
-        );
-        let decoded = decode_frame(&frames[0]).expect("exact max lengths decode");
-        assert_eq!(
-            decoded.entries,
+            decode_frame(&frames[0])
+                .expect("exact max lengths decode")
+                .entries,
             vec![RmwGraphEntry {
                 topic: max_topic,
                 type_name: max_type,
             }]
         );
+
+        // Exact RMW_GRAPH_FRAME_LEN (2048): 30 + 3*(4+250+250) + (4+251+251) = 2048.
+        let t0 = format!("/0{}", "x".repeat(248));
+        let t1 = format!("/1{}", "x".repeat(248));
+        let t2 = format!("/2{}", "x".repeat(248));
+        let t3 = format!("/3{}", "x".repeat(249));
+        let ty250 = "y".repeat(250);
+        let ty251 = "y".repeat(251);
+        let exact_frames = encode_snapshot(
+            88,
+            2,
+            [
+                (t0.as_str(), ty250.as_str()),
+                (t1.as_str(), ty250.as_str()),
+                (t2.as_str(), ty250.as_str()),
+                (t3.as_str(), ty251.as_str()),
+            ],
+        )
+        .expect("exact 2048-byte frame encodes");
+        assert_eq!(exact_frames.len(), 1);
+        assert_eq!(exact_frames[0].len(), RMW_GRAPH_FRAME_LEN);
+        assert_eq!(
+            decode_frame(&exact_frames[0])
+                .expect("2048B decodes")
+                .entries
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn required_writers_filters_dead_and_own_and_keeps_absent_owners() {
+        let listed = [
+            (10u128, 100u64), // alive owner
+            (20, 200),        // dead owner
+            (30, 300),        // absent or inaccessible owner: stays required
+            (40, 400),        // own writer
+            (50, 200),        // second publisher on dead owner
+        ];
+        let dead = BTreeSet::from([200u64, 999]);
+
+        assert_eq!(
+            required_writers(&listed, &dead, Some(40)),
+            BTreeSet::from([10, 30])
+        );
+        assert_eq!(
+            required_writers(&listed, &dead, None),
+            BTreeSet::from([10, 30, 40])
+        );
+        assert_eq!(
+            required_writers(&[(40u128, 400u64)], &BTreeSet::new(), Some(40)),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn fold_two_part_generation_settles_only_when_both_parts_arrive() {
+        let required = BTreeSet::from([10u128]);
+        let mut fold = RmwGraphGatherFold::new();
+
+        fold.ingest(make_frame(
+            10,
+            1,
+            1,
+            2,
+            &[("/joint_states", "sensor_msgs/msg/JointState")],
+        ));
+        assert!(!fold.is_writer_complete(10));
+        assert!(!fold.is_settled(&required));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: topic_map(&[("/joint_states", &["sensor_msgs/msg/JointState"])]),
+                completeness: GatherCompleteness::Incomplete {
+                    live_writers: 1,
+                    writers_heard: 0,
+                },
+            }
+        );
+
+        fold.ingest(make_frame(
+            10,
+            1,
+            0,
+            2,
+            &[("/clock", "rosgraph_msgs/msg/Clock")],
+        ));
+        assert!(fold.is_writer_complete(10));
+        assert!(fold.is_settled(&required));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: topic_map(&[
+                    ("/clock", &["rosgraph_msgs/msg/Clock"]),
+                    ("/joint_states", &["sensor_msgs/msg/JointState"]),
+                ]),
+                completeness: GatherCompleteness::Settled,
+            }
+        );
+    }
+
+    #[test]
+    fn fold_lost_part_reports_incomplete_and_keeps_heard_entries() {
+        let required = BTreeSet::from([10u128, 20]);
+        let mut fold = RmwGraphGatherFold::new();
+
+        fold.ingest(make_frame(10, 1, 0, 1, &[("/a", "pkg/msg/A")]));
+        fold.ingest(make_frame(20, 1, 0, 2, &[("/stale", "pkg/msg/Stale")]));
+        fold.ingest(make_frame(20, 2, 0, 2, &[("/b", "pkg/msg/B")]));
+
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: topic_map(&[("/a", &["pkg/msg/A"]), ("/b", &["pkg/msg/B"])]),
+                completeness: GatherCompleteness::Incomplete {
+                    live_writers: 2,
+                    writers_heard: 1,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn fold_uses_newest_complete_generation_and_handles_withdrawal() {
+        let required = BTreeSet::from([10u128]);
+        let mut fold = RmwGraphGatherFold::new();
+
+        // Incomplete gen 1 is superseded once gen 2 completes.
+        fold.ingest(make_frame(10, 1, 0, 2, &[("/partial1", "pkg/msg/P1")]));
+        fold.ingest(make_frame(10, 2, 0, 1, &[("/old", "pkg/msg/Old")]));
+        // Gen 3 starts (part 0 of 2) but does not complete: gen 2 stays authoritative.
+        fold.ingest(make_frame(10, 3, 0, 2, &[("/mid", "pkg/msg/Mid")]));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: topic_map(&[("/old", &["pkg/msg/Old"])]),
+                completeness: GatherCompleteness::Settled,
+            }
+        );
+
+        // Gen 3 completes and supersedes gen 2; delayed stale gen 2 is ignored.
+        fold.ingest(make_frame(10, 3, 1, 2, &[("/new", "pkg/msg/New")]));
+        fold.ingest(make_frame(10, 2, 0, 1, &[("/old", "pkg/msg/Old")]));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: topic_map(&[("/mid", &["pkg/msg/Mid"]), ("/new", &["pkg/msg/New"])]),
+                completeness: GatherCompleteness::Settled,
+            }
+        );
+
+        // Gen 4 is an empty snapshot (writer removed its last endpoint).
+        fold.ingest(make_frame(10, 4, 0, 1, &[]));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: BTreeMap::new(),
+                completeness: GatherCompleteness::Settled,
+            }
+        );
+    }
+
+    #[test]
+    fn fold_rejects_conflicting_part_counts_and_invalid_bounds() {
+        let required = BTreeSet::from([10u128]);
+        let mut fold = RmwGraphGatherFold::new();
+
+        fold.ingest(make_frame(10, 1, 0, 0, &[("/bad", "pkg/msg/Bad")]));
+        fold.ingest(make_frame(10, 1, 1, 1, &[("/bad", "pkg/msg/Bad")]));
+        assert!(!fold.is_writer_complete(10));
+
+        // Conflicting part_count for the same generation must not settle.
+        fold.ingest(make_frame(10, 2, 0, 2, &[("/ok", "pkg/msg/Ok")]));
+        fold.ingest(make_frame(10, 2, 0, 1, &[("/spoof", "pkg/msg/Spoof")]));
+        fold.ingest(make_frame(10, 2, 1, 2, &[("/late", "pkg/msg/Late")]));
+        assert!(!fold.is_writer_complete(10));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: topic_map(&[("/ok", &["pkg/msg/Ok"])]),
+                completeness: GatherCompleteness::Incomplete {
+                    live_writers: 1,
+                    writers_heard: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn fold_empty_required_set_settles_and_excludes_unrequired_writers() {
+        let mut fold = RmwGraphGatherFold::new();
+        fold.ingest(make_frame(99, 1, 0, 1, &[("/dead", "pkg/msg/Dead")]));
+
+        assert!(fold.is_settled(&BTreeSet::new()));
+        assert_eq!(
+            fold.finish(&BTreeSet::new()),
+            RmwGraphGather {
+                topics: BTreeMap::new(),
+                completeness: GatherCompleteness::Settled,
+            }
+        );
+
+        let required = BTreeSet::from([10u128]);
+        assert!(!fold.is_settled(&required));
+        assert_eq!(
+            fold.finish(&required),
+            RmwGraphGather {
+                topics: BTreeMap::new(),
+                completeness: GatherCompleteness::Incomplete {
+                    live_writers: 1,
+                    writers_heard: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn fold_multi_writer_multi_type_is_deterministic_across_arrival_orders() {
+        let required = BTreeSet::from([10u128, 20]);
+        let frames = vec![
+            make_frame(10, 1, 0, 2, &[("/shared", "pkg/msg/ZType")]),
+            make_frame(10, 1, 1, 2, &[("/only_one", "pkg/msg/One")]),
+            make_frame(
+                20,
+                4,
+                0,
+                1,
+                &[("/shared", "pkg/msg/AType"), ("/only_two", "pkg/msg/Two")],
+            ),
+            make_frame(10, 1, 0, 2, &[("/shared", "pkg/msg/ZType")]),
+        ];
+
+        let mut forward = RmwGraphGatherFold::new();
+        for f in frames.iter().cloned() {
+            forward.ingest(f);
+        }
+        let mut reverse = RmwGraphGatherFold::new();
+        for f in frames.into_iter().rev() {
+            reverse.ingest(f);
+        }
+
+        let expected = RmwGraphGather {
+            topics: topic_map(&[
+                ("/only_one", &["pkg/msg/One"]),
+                ("/only_two", &["pkg/msg/Two"]),
+                ("/shared", &["pkg/msg/AType", "pkg/msg/ZType"]),
+            ]),
+            completeness: GatherCompleteness::Settled,
+        };
+        assert_eq!(forward.finish(&required), expected);
+        assert_eq!(reverse.finish(&required), expected);
     }
 }
