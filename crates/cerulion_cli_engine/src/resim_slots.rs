@@ -176,6 +176,15 @@ impl ResimSweepReport {
             && self.registry_errors == 0
             && !self.truncated
     }
+
+    /// Total failure count across node cleanups, segment removals, and
+    /// lock/registry/directory errors, without double-counting segment
+    /// failures that are also recorded in [`Self::errors`].
+    #[must_use]
+    pub fn total_failures(&self) -> u64 {
+        self.failed_node_cleanups
+            .saturating_add(self.segments_failed.max(self.errors.len() as u64))
+    }
 }
 
 /// A resim namespace slot this process holds: its lock file stays open, and
@@ -335,8 +344,8 @@ fn log_passed_over_slot(
             segments_failed,
             error = %passed,
             "replay: passed over a resim namespace slot whose lock could not be taken or whose \
-             namespace did not reclaim clean; the slot keeps its files and the resim tries the \
-             next one"
+             namespace did not reclaim clean; the slot keeps what could not be removed and the \
+             resim tries the next one"
         ),
         RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
             slot,
@@ -511,8 +520,9 @@ fn is_segment_file(path: &Path) -> bool {
     #[cfg(target_os = "macos")]
     let is_segment = is_file
         && path
-            .to_str()
-            .is_some_and(|p| p.ends_with(crate::shm_state::SHM_STATE_SUFFIX));
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(crate::shm_state::SHM_STATE_SUFFIX));
     #[cfg(not(target_os = "macos"))]
     let is_segment = is_file;
     is_segment
@@ -591,10 +601,20 @@ pub(crate) fn reclaim_resim_slot(
             return reclaim;
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
         if started.elapsed() >= budget {
             break;
         }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                reclaim.segments_failed += 1;
+                reclaim
+                    .first_segment_error
+                    .get_or_insert_with(|| format!("{}: {error}", dir.display()));
+                continue;
+            }
+        };
         if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
             continue;
         }
@@ -981,7 +1001,7 @@ mod tests {
         let cfg = root.config();
         let locks_path = locks.path().to_path_buf();
         let segs_path = segments.path().to_path_buf();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let sweep = sweep_resim_slots(
                 &cfg,
                 &locks_path,
@@ -995,6 +1015,7 @@ mod tests {
         let (sweep, claimed) = rx
             .recv_timeout(Duration::from_secs(10))
             .expect("FIFO lock file must not block sweep or claim");
+        handle.join().expect("fifo worker thread panicked");
         assert_eq!(sweep.slots_checked, 0);
         assert_eq!(sweep.errors.len(), 1, "{sweep:?}");
         assert!(
@@ -1007,5 +1028,30 @@ mod tests {
             Ok(1),
             "claim must pass over the FIFO at slot 0 and take slot 1"
         );
+    }
+
+    #[test]
+    fn total_failures_does_not_double_count_segment_errors() {
+        let seg_only = ResimSweepReport {
+            segments_failed: 1,
+            errors: vec!["seg: EACCES".to_string()],
+            ..ResimSweepReport::default()
+        };
+        assert_eq!(seg_only.total_failures(), 1);
+
+        let mixed = ResimSweepReport {
+            failed_node_cleanups: 2,
+            segments_failed: 1,
+            errors: vec!["seg: EACCES".to_string(), "lock: ELOOP".to_string()],
+            ..ResimSweepReport::default()
+        };
+        assert_eq!(mixed.total_failures(), 4);
+
+        let synthetic_no_errors = ResimSweepReport {
+            failed_node_cleanups: 1,
+            segments_failed: 2,
+            ..ResimSweepReport::default()
+        };
+        assert_eq!(synthetic_no_errors.total_failures(), 3);
     }
 }

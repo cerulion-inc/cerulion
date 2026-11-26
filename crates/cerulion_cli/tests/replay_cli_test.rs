@@ -2908,7 +2908,10 @@ fn resim_with_external_input_delivers_nothing_to_shared_namespace_in_verify_and_
     let mut boundaries = Vec::new();
     for step in 0..3u64 {
         let x = (step + 1) as f64;
-        let frame = hand_vector3_frame(step as u32, (step + 1) * 50_000_000, x);
+        // Stamp with the pre-step clock (`0`, `50 ms`, `100 ms`), strictly
+        // before the step boundary (`50 ms`, `100 ms`, `150 ms`), matching
+        // how a live run stamps frames that arrive before each step.
+        let frame = hand_vector3_frame(step as u32, clock.now_ns(), x);
         ext_pub
             .publish_raw(&frame)
             .expect("publish external input frame");

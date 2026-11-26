@@ -1284,10 +1284,7 @@ where
     // exit hygiene budget, before the global `.shm_state` pass.
     let resim = sweep_resim(budget.saturating_sub(started.elapsed()));
     steps.push(HygieneStep::SweptResimSlots);
-    let resim_failures = resim
-        .failed_node_cleanups
-        .saturating_add(resim.segments_failed)
-        .saturating_add(resim.errors.len() as u64);
+    let resim_failures = resim.total_failures();
     if resim_failures > 0 {
         tracing::warn!(
             cleaned_nodes = resim.cleaned_nodes,
