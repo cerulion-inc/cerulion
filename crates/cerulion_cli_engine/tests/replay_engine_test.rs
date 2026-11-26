@@ -36813,7 +36813,7 @@ fn a_declined_pass_stands_down_every_topic_it_would_have_steered() {
 // ===========================================================================
 // The THREE RECORD-BUDGET declines, made reachable
 //
-// `DEFAULT_VERIFIER_RECORD_BUDGET` is 5_000_000 records. No bag this file can
+// `DEFAULT_VERIFIER_RECORD_BUDGET` is 3_000_000 records. No bag this file can
 // craft comes near it, so without the `test-seams` override the three budget
 // causes — `ReadLogBudget`, `FrameIndexBudget` and `ScheduleBudget` — are
 // reachable by NO test: their variants, their `code()` tokens, the
@@ -37733,6 +37733,345 @@ fn a_hostile_run_count_in_the_census_is_counted_whole() {
          into the rank's 0.055 s of recording. This replay holds each rank's read log in memory \
          up to this budget; raise it with `--verifier-record-budget <COUNT>`, bound the replay \
          with `--duration`, or replay a shorter recording of this graph."
+    );
+}
+
+/// **The configured `verifier_record_budget` option admits recordings at or
+/// under its budget, refuses one read over it without creating `--record-out`,
+/// scopes the read-log census to `--duration`, and handles `u64::MAX`.**
+#[test]
+#[serial]
+fn the_configured_record_budget_admits_at_its_count_and_scopes_to_duration() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_cli_budget.mcap");
+
+    // One read under (25 vs 26): refused with exit 2 and no `--record-out`
+    // file created.
+    let refused_out = dir.path().join("refused_out.mcap");
+    let (over, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(LS_READS - 1),
+        None,
+        Some(refused_out.clone()),
+    );
+    let err = over.expect_err("26 reads exceeds budget 25");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert_eq!(err.to_string(), LS_READ_LOG_REFUSAL);
+    assert!(
+        !refused_out.exists(),
+        "pre-step-1 budget refusal must leave no --record-out bag"
+    );
+
+    // Exact budget (26) and `u64::MAX`: admitted, fed all 24 reads, exit 0.
+    for budget in [LS_READS, u64::MAX] {
+        let (ok, _) = ri_replay_with_verifier_budget(
+            &bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            Some(budget),
+            None,
+            None,
+        );
+        let outcome = ok.unwrap_or_else(|e| panic!("budget {budget} must verify: {e}"));
+        assert_eq!(ri_assert_fed(&outcome), (24, 24), "budget {budget}");
+        assert!(outcome.passed, "budget {budget}: {:?}", outcome.violations);
+        assert_eq!(outcome.ticks_replayed, LS_STEPS, "budget {budget}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 2),
+            "budget {budget}"
+        );
+        assert_eq!(resim_exit(&outcome, true), 0, "budget {budget}");
+    }
+
+    // `--duration` cutting before step 11 (`11 * DELTA_MS` = 55 ms, half-open)
+    // leaves 24 reads in steps 0..11, so budget 24 admits the prefix while
+    // budget 23 refuses naming 24 reads and step 10.
+    let prefix_ns = 11 * DELTA_MS * 1_000_000;
+    let (bounded_ok, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+        Some(prefix_ns),
+        Some(LS_READS - 2),
+        None,
+        None,
+    );
+    let bounded = bounded_ok.expect("24 prefix reads fit budget 24");
+    assert_eq!(ri_assert_fed(&bounded), (22, 22));
+    assert_eq!(bounded.ticks_replayed, 11);
+    assert!(
+        bounded.trace_divergence.is_none() && bounded.read_log_divergence.is_none(),
+        "{:?} {:?}",
+        bounded.trace_divergence,
+        bounded.read_log_divergence
+    );
+
+    let (bounded_neutral, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Resim,
+        Some(prefix_ns),
+        Some(LS_READS - 2),
+        None,
+        None,
+    );
+    let bounded_neutral = bounded_neutral.expect("neutral resim fits 24 prefix reads");
+    assert_eq!(resim_exit(&bounded_neutral, false), 0);
+    assert_eq!(bounded_neutral.ticks_replayed, 11);
+
+    let (bounded_over, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+        Some(prefix_ns),
+        Some(LS_READS - 3),
+        None,
+        None,
+    );
+    let bounded_err = bounded_over.expect_err("24 prefix reads exceed budget 23");
+    assert_eq!(bounded_err.exit_code(), 2, "{bounded_err}");
+    let bounded_msg = bounded_err.to_string();
+    assert!(
+        bounded_msg.contains("it holds 24 reads, more than the verifier's budget of 23 reads")
+            && bounded_msg.contains("at step 10"),
+        "bounded refusal must count only prefix reads and name step 10: {bounded_msg}"
+    );
+}
+
+/// **`--verify --report --record-out` runs produce byte-identical `--report`
+/// JSON and `--record-out` frame streams: twice in a row under the default,
+/// once more under `u64::MAX`, and twice in a row under a budget of exactly the
+/// 26 reads.**
+///
+/// A budget that every structure fits never reaches what the run writes. A
+/// budget of 26 fits the read log but not the recorded schedule (its fires plus
+/// its reads), so its report carries the schedule stand-down note the default's
+/// does not, and only its own twin is compared to it.
+#[test]
+#[serial]
+fn verifier_budget_two_runs_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_budget_det.mcap");
+
+    type RecordedFrame = (String, u32, u64, Vec<u8>);
+    let mut report_bytes: Vec<Vec<u8>> = Vec::new();
+    let mut bag_frames: Vec<Vec<RecordedFrame>> = Vec::new();
+    let report_path = dir.path().join("det_report.json");
+    let record_out_path = dir.path().join("det_out.mcap");
+
+    let runs = [None, None, Some(u64::MAX), Some(LS_READS), Some(LS_READS)];
+    for (run, budget) in runs.into_iter().enumerate() {
+        let _ = std::fs::remove_file(&report_path);
+        let _ = std::fs::remove_file(&record_out_path);
+        let (res, _) = ri_replay_with_verifier_budget(
+            &bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            budget,
+            Some(report_path.clone()),
+            Some(record_out_path.clone()),
+        );
+        let outcome = res.unwrap_or_else(|e| panic!("run {run} must pass: {e}"));
+        assert!(outcome.passed, "run {run}: {:?}", outcome.violations);
+        report_bytes.push(std::fs::read(&report_path).expect("read report"));
+
+        let reader = BagReader::open(&record_out_path).expect("open record_out");
+        let frames: Vec<(String, u32, u64, Vec<u8>)> = reader
+            .messages()
+            .expect("messages")
+            .map(|m| {
+                let m = m.expect("message");
+                (m.topic, m.sequence, m.log_time, m.data)
+            })
+            .collect();
+        assert!(!frames.is_empty(), "run {run} wrote frames");
+        bag_frames.push(frames);
+    }
+
+    for (first, run) in [(0, 1), (0, 2), (3, 4)] {
+        assert_eq!(
+            report_bytes[first], report_bytes[run],
+            "run {run} ({:?}) must write run {first}'s --report JSON byte for byte",
+            runs[run]
+        );
+        assert_eq!(
+            bag_frames[first], bag_frames[run],
+            "run {run} ({:?}) must write run {first}'s --record-out frames byte for byte",
+            runs[run]
+        );
+    }
+    let tight = String::from_utf8(report_bytes[3].clone()).expect("the report is UTF-8");
+    assert!(
+        tight.contains("verifier_declined_schedule_budget")
+            && !String::from_utf8_lossy(&report_bytes[0]).contains("verifier_declined"),
+        "only the 26-record budget stands the schedule down:\n{tight}"
+    );
+    assert_eq!(
+        bag_frames[0], bag_frames[3],
+        "the schedule stand-down is report-only: the --record-out frames do not change"
+    );
+}
+
+/// **A `--duration` cut before a consumed topic's first recorded read arms the
+/// topic's gate with empty schedules instead of refusing it as uncovered.**
+///
+/// The read-log census counts only the steps inside `--duration`. On the
+/// never-failing bag with every read record before step 6 removed, a cut at
+/// `6 * DELTA_MS` (steps 0 to 5, half-open) leaves the census EMPTY while the
+/// recording still reads the counter's topic from step 6 on. Inside the window
+/// the recording read nothing, so the gate is armed over both of the sink's
+/// stages (body and drain) and admits nothing: `enforced` with 2 stages and 0
+/// frames admitted, over 6 ticks. Without the later-read probe the same run is
+/// refused before its first step as a topic with no read-log coverage, and
+/// without the pending admission it reports `not_enforced`.
+#[test]
+#[serial]
+fn a_duration_cut_before_a_topics_first_read_arms_its_gate_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rec = ls_never_failing_reference();
+    rec.trace
+        .retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step < 6));
+    assert!(
+        rec.trace
+            .iter()
+            .any(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 6),
+        "the recording still reads from step 6 on"
+    );
+    let bag = dir.path().join("ls_reads_from_step_6.mcap");
+    write_ls_free_run_bag(&rec, &bag);
+
+    let (res, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Resim,
+        Some(6 * DELTA_MS * 1_000_000),
+        None,
+        None,
+        None,
+    );
+    let outcome = res.unwrap_or_else(|e| panic!("the cut before the first read must run: {e}"));
+    assert_eq!(outcome.ticks_replayed, 6);
+    assert!(
+        matches!(
+            outcome.read_log_enforcement,
+            replay_engine::ReadLogEnforcement::Enforced {
+                stages: 2,
+                frames_admitted: 0,
+                ..
+            }
+        ),
+        "the gate is armed over both stages and admits nothing: {:?}",
+        outcome.read_log_enforcement
+    );
+}
+
+/// **Every budget refusal and stand-down arm reads the configured budget and
+/// names it, the count, the step (where applicable), and the
+/// `--verifier-record-budget` remedy.**
+#[test]
+#[serial]
+fn verifier_budget_overrun_names_flag_count_step_and_remedy() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ls_never_failing_bag(&dir, "ls_budget_arms.mcap");
+
+    // 1. Fed verify read-log overrun (`read_identity_unplanned`).
+    let (fed_err, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(LS_READS - 1),
+        None,
+        None,
+    );
+    let fed_err = fed_err.expect_err("fed read-log overrun");
+    assert_eq!(fed_err.exit_code(), 2);
+    assert_eq!(fed_err.to_string(), LS_READ_LOG_REFUSAL);
+
+    // 2. Neutral gated read-log overrun (`read_log_budget_declined`).
+    let (neutral_err, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Resim,
+        None,
+        Some(LS_READS - 1),
+        None,
+        None,
+    );
+    let neutral_err = neutral_err.expect_err("neutral gated read-log overrun");
+    assert_eq!(neutral_err.exit_code(), 2);
+    let neutral_msg = neutral_err.to_string();
+    assert!(
+        neutral_msg.contains("read_log_budget_declined")
+            && neutral_msg.contains("verifier_declined_read_log_budget")
+            && neutral_msg.contains("it holds 26 reads, more than the verifier's budget of 25")
+            && neutral_msg.contains("at step 11")
+            && neutral_msg.contains("--verifier-record-budget <COUNT>")
+            && neutral_msg.contains("--duration"),
+        "neutral read-log refusal: {neutral_msg}"
+    );
+
+    // 3. Gated frame-index overrun (`read_log_budget_declined`,
+    //    `verifier_declined_frame_index_budget`) under the CONFIGURED budget:
+    //    the read-log seam alone is raised so the 26 reads pass and the census
+    //    reaches the frame index, which must read the configured 11.
+    let frame_err = {
+        let _reads = replay_engine::override_read_log_record_budget(1000);
+        ri_replay_with_verifier_budget(
+            &bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            Some(LS_FRAMES - 1),
+            None,
+            None,
+        )
+        .0
+        .expect_err("frame-index overrun")
+    };
+    assert_eq!(frame_err.exit_code(), 2);
+    let frame_msg = frame_err.to_string();
+    assert!(
+        frame_msg.contains("read_log_budget_declined")
+            && frame_msg.contains("verifier_declined_frame_index_budget")
+            && frame_msg
+                .contains("it consumes 12 recorded frames, more than the verifier's budget of 11")
+            && frame_msg.contains("--verifier-record-budget <COUNT>"),
+        "frame-index refusal: {frame_msg}"
+    );
+
+    // 4. Mid-loop schedule budget stand-down (`verifier_declined_schedule_budget`)
+    //    under the CONFIGURED budget: the read-log and frame-index seams are
+    //    raised so both prepare-time sites pass, and the schedule must read the
+    //    configured 10.
+    let _reads = replay_engine::override_read_log_record_budget(1000);
+    let _frames = replay_engine::override_frame_index_record_budget(1000);
+    let (sched_ok, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(10),
+        None,
+        None,
+    );
+    let sched_outcome = sched_ok.expect("schedule overrun stands down rather than refusing");
+    assert_eq!(
+        verifier_decline_codes(&sched_outcome),
+        vec![(0, "verifier_declined_schedule_budget".to_string())]
+    );
+    let note = sole_verifier_decline_note(&sched_outcome);
+    assert!(
+        note.detail
+            .contains("its recorded schedule exceeds the verifier's 10-record budget"),
+        "schedule stand-down note must carry the configured budget: {}",
+        note.detail
     );
 }
 
@@ -49756,6 +50095,55 @@ fn ri_replay_stamped(
     record_health: RecordHealthReport,
     record_out: Option<std::path::PathBuf>,
 ) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_full(
+        bag,
+        make,
+        purpose,
+        duration_bound_ns,
+        feed_index_budget,
+        None,
+        report_path,
+        record_health,
+        record_out,
+    )
+}
+
+/// [`ri_replay_stamped`] with an explicit `--verifier-record-budget`.
+#[allow(clippy::too_many_arguments)]
+fn ri_replay_with_verifier_budget(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    verifier_record_budget: Option<u64>,
+    report_path: Option<std::path::PathBuf>,
+    record_out: Option<std::path::PathBuf>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_full(
+        bag,
+        make,
+        purpose,
+        duration_bound_ns,
+        None,
+        verifier_record_budget,
+        report_path,
+        RecordHealthReport::Absent,
+        record_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ri_replay_full(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+    verifier_record_budget: Option<u64>,
+    report_path: Option<std::path::PathBuf>,
+    record_health: RecordHealthReport,
+    record_out: Option<std::path::PathBuf>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
     ri_take();
     // The plan `run_replay` builds: the input bag's user channels and catalog,
     // and no current-workspace schema, so each channel's hash comes from the
@@ -49798,7 +50186,7 @@ fn ri_replay_stamped(
         record_health,
         duration_bound_ns,
         feed_index_budget,
-        verifier_record_budget: None,
+        verifier_record_budget,
         report_path,
         fire_tap: None,
         tolerance: None,

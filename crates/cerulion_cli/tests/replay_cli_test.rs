@@ -546,6 +546,22 @@ fn illegal_flag_combinations_are_refused_by_name_and_never_as_a_violation() {
             ],
             "--tolerance",
         ),
+        (
+            &["bag", "play", "x.mcap", "--verifier-record-budget", "100"],
+            "--verifier-record-budget",
+        ),
+        (
+            &[
+                "bag",
+                "play",
+                "x.mcap",
+                "--resim",
+                "all",
+                "--verifier-record-budget",
+                "0",
+            ],
+            "--verifier-record-budget",
+        ),
     ];
     for (argv, flag) in cases {
         let out = run_bin(argv);
