@@ -291,7 +291,7 @@ fn tutorial_drive_base_example_compiles_and_reports_ports() {
 // watchdog; `DeadlineWatcherNode` below pins that decomposition.
 // ----------------------------------------------------------------------
 
-#[cerulion_node(sync_window_ms = 50)]
+#[cerulion_node(sync_window_ms = 15)]
 #[derive(Default)]
 struct SyncFusionNode {
     #[input(trigger)]
@@ -328,8 +328,8 @@ fn macro_sync_window_ms_compiles_and_reports_ports() {
     // would otherwise pass silently).
     assert_eq!(
         info.policy(),
-        Some(MacroPolicy::Sync { window_ms: 50 }),
-        "macro must encode `sync_window_ms = 50` as `MacroPolicy::Sync {{ window_ms: 50 }}`"
+        Some(MacroPolicy::Sync { window_ms: 15 }),
+        "macro must encode `sync_window_ms = 15` as `MacroPolicy::Sync {{ window_ms: 15 }}`"
     );
 }
 

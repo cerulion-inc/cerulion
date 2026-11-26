@@ -1112,6 +1112,15 @@ pub struct WorkerPlan {
     /// view. `#[serde(default)]`: a plan file without the key carries none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paced_topic_warnings: Vec<cerulion_core::graph::PacedTopicWarning>,
+    /// The sync-window period warnings this worker logs at its build: one per
+    /// Sync node in this worker's subgraph whose window is at or above its
+    /// slowest resolved trigger-input period (or that uses `unbounded_sync` on
+    /// periodic inputs) in the WHOLE graph. The supervisor derives them from
+    /// its loaded full-graph topology, so producers in other process groups are
+    /// resolved. The worker logs exactly this list, not its own subgraph's
+    /// view. `#[serde(default)]`: a plan file without the key carries none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_window_period_warnings: Vec<cerulion_core::graph::SyncWindowPeriodWarning>,
     /// Multi-process recording: the trace-ring tag this worker
     /// creates its scheduler-trace ring under
     /// (`cerulion_core::trace_ring::TraceRingOwner::create`), set by the
@@ -2424,6 +2433,10 @@ pub fn plan_deployment(
             // (`graph_cmd::stamp_paced_topic_warnings`); the pure planner
             // cannot see a `block` policy, so it derives none.
             paced_topic_warnings: Vec::new(),
+            // Derived by the supervisor from the loaded full-graph topology
+            // (`graph_cmd::stamp_sync_window_period_warnings`); the pure
+            // planner holds no `NodeInfo`s, so it derives none.
+            sync_window_period_warnings: Vec::new(),
             // The supervisor stamps the recording-ring tag
             // post-plan when `--record` is active; the pure planner
             // leaves it None (not recording).

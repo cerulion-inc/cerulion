@@ -1069,8 +1069,8 @@ Two categories of attributes: **trigger policy** (exactly one must apply, or inf
 | Attribute | Meaning |
 |---|---|
 | `period_ms = N` | Fire every `N` milliseconds. |
-| `sync_window_ms = N` | Bounded sync: fire ONCE PER COMPLETE ALIGNED SET, in set order, when all of the node's `#[input(trigger)]`-marked inputs have a message within an `N`-ms window (Sync aligns ONLY trigger-marked inputs; a plain `#[input]` is a latest-value read that never gates the fire and HOLDS its last value across steps, exactly like a data-trigger node's non-trigger inputs). **Each trigger message is consumed by at most one set** (per-message FIFO consumption. This is the semantic, not a knob: `consume = latest` on a Sync node's trigger input is a compile error), so a burst holding k complete sets yields k fires, each tick reading exactly ITS set's members. A sync attribute only means something with two or more `#[input(trigger)]` fields: with none it is a compile error, and with exactly ONE it compiles but is ignored (the node fires as a plain data trigger on that input, and the graph build says so with one `warn!` naming the node). Every trigger-marked port must be wired in the graph YAML: an unwired trigger port fails the graph build loudly (it would silently shrink the alignment set), and a sync node whose trigger set resolves empty is rejected by the scheduler with the cause + fix named. |
-| `unbounded_sync` | Unbounded sync (loose AND): fire ONCE PER COMPLETE ALIGNED SET the moment every `#[input(trigger)]`-marked input has an unconsumed message, with no timing bound (plain `#[input]`s are latest-value reads that never gate the fire). **Each trigger message is consumed by at most one set**, and the set is the closest-in-time combination among the frames that have ARRIVED: it fires IMMEDIATELY rather than waiting for a possibly-nearer frame (the chosen trade: latency over retrospective optimality). Mutually exclusive with `sync_window_ms`. Needs two or more `#[input(trigger)]` fields, under the same rule as `sync_window_ms` (none is a compile error; exactly one compiles, is ignored, and warns at graph build). Every trigger-marked port must be wired in the graph YAML: an unwired trigger port fails the graph build loudly (same guard as `sync_window_ms`), and an empty trigger set is rejected by the scheduler with the cause + fix named. **Not recommended for control loops**: worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops. |
+| `sync_window_ms = N` | Bounded sync: fire ONCE PER COMPLETE ALIGNED SET, in set order, when all of the node's `#[input(trigger)]`-marked inputs have a message within an `N`-ms window (Sync aligns ONLY trigger-marked inputs; a plain `#[input]` is a latest-value read that never gates the fire and HOLDS its last value across steps, exactly like a data-trigger node's non-trigger inputs). **Each trigger message is consumed by at most one set** (per-message FIFO consumption. This is the semantic, not a knob: `consume = latest` on a Sync node's trigger input is a compile error), so a burst holding k complete sets yields k fires, each tick reading exactly ITS set's members. Keep `N` strictly below `input_period - skew` (a window at or above that bound can silently lock onto off-by-one pairs after a single dropped frame; graph build and `cerulion graph validate` emit an advisory warning when `N` is at or above the slowest resolved trigger-input period). A sync attribute only means something with two or more `#[input(trigger)]` fields: with none it is a compile error, and with exactly ONE it compiles but is ignored (the node fires as a plain data trigger on that input, and the graph build says so with one `warn!` naming the node). Every trigger-marked port must be wired in the graph YAML: an unwired trigger port fails the graph build loudly (it would silently shrink the alignment set), and a sync node whose trigger set resolves empty is rejected by the scheduler with the cause + fix named. |
+| `unbounded_sync` | Unbounded sync (loose AND): fire ONCE PER COMPLETE ALIGNED SET the moment every `#[input(trigger)]`-marked input has an unconsumed message, with no timing bound (plain `#[input]`s are latest-value reads that never gate the fire). **Each trigger message is consumed by at most one set**, and the set is the closest-in-time combination among the frames that have ARRIVED: it fires IMMEDIATELY rather than waiting for a possibly-nearer frame (the chosen trade: latency over retrospective optimality). Mutually exclusive with `sync_window_ms`. Needs two or more `#[input(trigger)]` fields, under the same rule as `sync_window_ms` (none is a compile error; exactly one compiles, is ignored, and warns at graph build). Every trigger-marked port must be wired in the graph YAML: an unwired trigger port fails the graph build loudly (same guard as `sync_window_ms`), and an empty trigger set is rejected by the scheduler with the cause + fix named. **Not recommended for control loops**: worst-case fire latency is the slowest publisher's inter-arrival interval, unbounded if it stops, and a single dropped frame on an earlier-arriving periodic stream can silently lock every later pair onto the previous period (graph build and `cerulion graph validate` emit an advisory warning when `unbounded_sync` aligns resolved periodic inputs). |
 | `external` | Self-triggering **ingress / driver** node: watches a non-Cerulion signal and fires itself on the live path. Requires an `external_source()` method returning an `ExternalSource` (`Fd` / `Blocking` / `HostDriven`); see [External nodes (ingress / drivers)](#external-nodes-ingress-and-driver-policy). |
 
 (If none of these are set, you must mark exactly one input as `#[input(trigger)]`. With 2+ trigger inputs, you must pick `sync_window_ms` or `unbounded_sync` explicitly; the validator rejects the ambiguous combination.)
@@ -1119,22 +1119,55 @@ which is the one the window governs. (The runtime keeps a third counter,
 directly; a graph run by `cerulion graph run` never moves it, so it is not a
 diagnostic for your node.)
 
-A climbing UNMATCHABLE count has three fixes, in the order worth trying: widen
-`sync_window_ms`; fix a stalled or skewed producer; or **raise the fast input's
-`depth`**. That last one is not obvious and applies to graphs that look
-perfectly healthy: a trigger input's queue is bounded by its declared `depth`
-(default 10) with `drop_oldest` reclaim UPSTREAM of the alignment, so once the
-fast:slow rate ratio exceeds that depth the intervening frames are evicted
-before the matcher ever sees them, the fast head lands NEWER than the slow head,
-and the slow frame is never matched. At the headline 200/20 Hz that ratio is exactly 10,
-the default, with zero jitter margin, so declare `#[input(depth = 16)]` on the
-fast port.
+A climbing UNMATCHABLE count has three fixes, in the order worth trying: fix a
+stalled or skewed producer; **raise the fast input's `depth`**; or raise
+`sync_window_ms` while keeping it **strictly below `input_period - skew`**. The
+`depth` fix is not obvious and applies to graphs that look perfectly healthy: a
+trigger input's queue is bounded by its declared `depth` (default 10) with
+`drop_oldest` reclaim UPSTREAM of the alignment, so once the fast:slow rate
+ratio exceeds that depth the intervening frames are evicted before the matcher
+ever sees them, the fast head lands NEWER than the slow head, and the slow
+frame is never matched. At the headline 200/20 Hz that ratio is exactly 10, the
+default, with zero jitter margin, so declare `#[input(depth = 16)]` on the fast
+port.
 
-Under `#[input(backpressure = block)]` that failure mode does not exist, because
-there is no eviction to cause it; the fast **producer** is deferred instead. An
-under-provisioned depth then costs the producer's rate (loud, counted, lossless)
-rather than an unmatched slow frame, so the remedy inverts: raise `depth` to
-restore the producer's rate, not to stop the evictions.
+Under `#[input(backpressure = block)]` that eviction failure mode does not
+exist, because there is no queue eviction to cause it; the fast **producer** is
+deferred instead. An under-provisioned depth then costs the producer's rate
+(loud, counted, lossless) rather than an unmatched slow frame, so the remedy
+inverts: raise `depth` to restore the producer's rate, not to stop the
+evictions. (`block` prevents queue eviction only; it does not prevent the
+wrong-period pairing described below if a producer drops or omits a frame while
+`sync_window_ms >= input_period - skew` or `unbounded_sync` is used.)
+
+**Window ceiling (`sync_window_ms < input_period - skew`).** Do not widen
+`sync_window_ms` to or above the slowest trigger input's period minus the
+inter-input arrival skew (or switch periodic streams to `unbounded_sync`).
+Because the matcher fires immediately once a complete in-window pair has
+arrived, a single dropped frame on the earlier-arriving stream leaves its
+previous partner queued; when the next frame arrives within `period - skew`,
+a window at or above that bound pairs `(A_{k+1}, B_k)` and silently phase-locks
+every subsequent pair off by one full period while both
+`sync_unmatched_discard_count` and `sync_closer_skip_count` stay at zero. When
+every trigger input of a Sync node resolves statically to a declared period
+(through single-producer `period_ms` or transitive `DataTrigger` chains, taking
+`throttle_ms` into account), both graph build (`tracing::warn!`) and `cerulion
+graph validate` (non-fatal warning check) warn when `sync_window_ms` is at or
+above the slowest resolved trigger-input period, or when `unbounded_sync` aligns
+resolved periodic inputs. Graphs with an `external`, multi-publisher, or
+external-topic trigger input are skipped to avoid false positives.
+
+A `sample(N)` gate on a trigger input does not raise this ceiling, and the
+warning compares against the producer's period, not the gate's spacing. Each
+input's gate admits a frame when its stamp is at least `N` ms after the last
+frame that gate admitted, so the gate's phase comes from its own first admitted
+frame and moves after a dropped frame. Two 30 ms producers with `sample(31)` on
+both inputs admit every second frame in step; when one frame is lost, that gate
+moves to the other producer ticks, no same-tick pair is admitted again, and a
+32 ms window pairs frames 30 ms minus skew apart with both counters at zero.
+With `sample(N)` on one input only, the plain input still delivers every frame,
+so the same pairing needs no drop. To align at a lower rate, sample the Sync
+node's output, or lower the producers' rate with `period_ms`.
 
 A complete set that sits unfired (a burst that stopped at its per-step cap, or a
 set held at a pre-fire defer) is a carried backlog: the live loop sizes its next
@@ -2027,10 +2060,11 @@ nodes:
 
   - id: sync_consumer
     type: sync_consumer
-                                # `#[cerulion_node(sync_window_ms = 50)]` on the macro
+                                # `#[cerulion_node(sync_window_ms = 15)]` on the macro
                                 # fuses the `#[input(trigger)]`-marked ports within the
-                                # window (a plain `#[input]` rides along as
-                                # latest-value context and never gates the fire)
+                                # window (keep it strictly below input_period - skew;
+                                # a plain `#[input]` rides along as latest-value
+                                # context and never gates the fire)
     inputs:
       - name: image
         source: camera/image
