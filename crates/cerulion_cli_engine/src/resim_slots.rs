@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -396,6 +396,7 @@ const MAX_SLOT_LOCK_BYTES: u64 = 16 * 1024;
 /// stranded without their name mappings.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SlotOwnerRecord {
     version: u32,
     root_path: String,
@@ -934,6 +935,9 @@ fn reclaim_resim_slot_with_ops(
     let Some(dir) = segment_dir else {
         return reclaim;
     };
+    if started.elapsed() >= budget {
+        return reclaim;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) => {
@@ -976,21 +980,82 @@ fn reclaim_resim_slot_with_ops(
     reclaim
 }
 
-/// Count segment files belonging to `slot` in `segment_dir` without mutating them.
-/// Returns `Err` if the directory cannot be listed (except `NotFound`, which is 0).
+/// Why a bounded segment-directory scan for legacy empty slot locks could not
+/// finish.
 #[cfg(unix)]
-fn count_slot_segments(segment_dir: Option<&Path>, slot: u32) -> Result<u64, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SegmentScanError {
+    /// The shared startup cleanup budget expired before the scan finished.
+    BudgetExhausted,
+    /// Opening or reading `segment_dir` failed.
+    Io(String),
+}
+
+/// Scan `segment_dir` once and count segment files per resim slot without
+/// mutating them, stopping with [`SegmentScanError::BudgetExhausted`] as soon
+/// as `budget_expired()` returns `true` (checked before `read_dir` and before
+/// every entry).
+#[cfg(unix)]
+fn scan_all_slot_segments_bounded(
+    segment_dir: Option<&Path>,
+    mut budget_expired: impl FnMut() -> bool,
+) -> Result<BTreeMap<u32, u64>, SegmentScanError> {
+    let Some(dir) = segment_dir else {
+        return Ok(BTreeMap::new());
+    };
+    if budget_expired() {
+        return Err(SegmentScanError::BudgetExhausted);
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(SegmentScanError::Io(format!("{}: {error}", dir.display()))),
+    };
+    let mut counts = BTreeMap::new();
+    for entry in entries {
+        if budget_expired() {
+            return Err(SegmentScanError::BudgetExhausted);
+        }
+        let entry =
+            entry.map_err(|error| SegmentScanError::Io(format!("{}: {error}", dir.display())))?;
+        let Some(slot) = entry.file_name().to_str().and_then(resim_namespace_slot) else {
+            continue;
+        };
+        if is_segment_file(&entry.path()) {
+            *counts.entry(slot).or_insert(0) += 1;
+        }
+    }
+    Ok(counts)
+}
+
+/// Count segment files belonging to `slot` in `segment_dir` without mutating
+/// them, stopping with [`SegmentScanError::BudgetExhausted`] as soon as
+/// `budget_expired()` returns `true` (checked before `read_dir` and before
+/// every entry).
+#[cfg(unix)]
+fn count_slot_segments_bounded(
+    segment_dir: Option<&Path>,
+    slot: u32,
+    mut budget_expired: impl FnMut() -> bool,
+) -> Result<u64, SegmentScanError> {
     let Some(dir) = segment_dir else {
         return Ok(0);
     };
+    if budget_expired() {
+        return Err(SegmentScanError::BudgetExhausted);
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(format!("{}: {error}", dir.display())),
+        Err(error) => return Err(SegmentScanError::Io(format!("{}: {error}", dir.display()))),
     };
     let mut count = 0u64;
     for entry in entries {
-        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        if budget_expired() {
+            return Err(SegmentScanError::BudgetExhausted);
+        }
+        let entry =
+            entry.map_err(|error| SegmentScanError::Io(format!("{}: {error}", dir.display())))?;
         if entry.file_name().to_str().and_then(resim_namespace_slot) != Some(slot) {
             continue;
         }
@@ -999,6 +1064,84 @@ fn count_slot_segments(segment_dir: Option<&Path>, slot: u32) -> Result<u64, Str
         }
     }
     Ok(count)
+}
+
+/// Injectable legacy segment scan seam so tests can verify scan counts and
+/// race behavior through the real `claim_and_reclaim_resim_slot_in_range`
+/// logic without sleeps.
+#[cfg(unix)]
+trait LegacySegmentScanOps {
+    fn scan_all(
+        &self,
+        segment_dir: Option<&Path>,
+        started: Instant,
+        budget: Duration,
+    ) -> Result<BTreeMap<u32, u64>, SegmentScanError>;
+
+    fn count_slot(
+        &self,
+        segment_dir: Option<&Path>,
+        slot: u32,
+        started: Instant,
+        budget: Duration,
+    ) -> Result<u64, SegmentScanError>;
+}
+
+#[cfg(unix)]
+struct RealLegacySegmentScanOps;
+
+#[cfg(unix)]
+impl LegacySegmentScanOps for RealLegacySegmentScanOps {
+    fn scan_all(
+        &self,
+        segment_dir: Option<&Path>,
+        started: Instant,
+        budget: Duration,
+    ) -> Result<BTreeMap<u32, u64>, SegmentScanError> {
+        scan_all_slot_segments_bounded(segment_dir, || started.elapsed() >= budget)
+    }
+
+    fn count_slot(
+        &self,
+        segment_dir: Option<&Path>,
+        slot: u32,
+        started: Instant,
+        budget: Duration,
+    ) -> Result<u64, SegmentScanError> {
+        count_slot_segments_bounded(segment_dir, slot, || started.elapsed() >= budget)
+    }
+}
+
+#[cfg(unix)]
+fn legacy_budget_exhausted_refusal(reclaim: SlotReclaim) -> SlotPassedOver {
+    SlotPassedOver::Reclaim {
+        reclaim,
+        reason: "legacy slot lock records no owning registry and the startup cleanup budget \
+                 expired before the segment directory scan finished"
+            .to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn legacy_leftover_segments_refusal(reclaim: SlotReclaim, leftover: u64) -> SlotPassedOver {
+    SlotPassedOver::Reclaim {
+        reclaim,
+        reason: format!(
+            "legacy slot lock records no owning registry and {leftover} leftover segment(s) \
+             remain; preserving mappings to avoid stranding another registry"
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn legacy_scan_io_refusal(reclaim: SlotReclaim, err: &str) -> SlotPassedOver {
+    SlotPassedOver::Reclaim {
+        reclaim,
+        reason: format!(
+            "legacy slot lock records no owning registry and segment directory could not be \
+             inspected ({err})"
+        ),
+    }
 }
 
 /// Claim and reclaim a resim namespace slot against explicit `lock_dir` and
@@ -1022,10 +1165,32 @@ fn claim_and_reclaim_resim_slot_in_range(
     slots: Range<u32>,
     budget: Duration,
 ) -> Result<ResimSlot, String> {
+    claim_and_reclaim_resim_slot_with_scanner(
+        base,
+        lock_dir,
+        segment_dir,
+        slots,
+        budget,
+        &RealLegacySegmentScanOps,
+    )
+}
+
+#[cfg(unix)]
+fn claim_and_reclaim_resim_slot_with_scanner(
+    base: &Config,
+    lock_dir: &Path,
+    segment_dir: Option<&Path>,
+    slots: Range<u32>,
+    budget: Duration,
+    scanner: &dyn LegacySegmentScanOps,
+) -> Result<ResimSlot, String> {
     let started = Instant::now();
     let _ = std::fs::create_dir_all(lock_dir);
     let base_owner = SlotOwnerRecord::from_config(base);
     let (mut cleanups, mut deferred, mut segments, mut total_failures) = (0u64, 0u64, 0u64, 0u64);
+    // Lazily populated single bounded scan of `segment_dir` shared across all
+    // legacy 0-byte locks encountered during this claim pass.
+    let mut legacy_segment_scan: Option<Result<BTreeMap<u32, u64>, SegmentScanError>> = None;
     let claimed = claim_resim_slot_in_range(lock_dir, slots, |slot, lock, created_fresh| {
         let ix_config = resim_ix_config(base, slot).map_err(SlotPassedOver::Config)?;
         let prior_owner = if created_fresh {
@@ -1063,10 +1228,30 @@ fn claim_and_reclaim_resim_slot_in_range(
             }
             SlotLockOwner::Recorded(_) => {}
             SlotLockOwner::LegacyEmpty if !created_fresh => {
-                // Existing 0-byte lock file without owner metadata: sweep our own
-                // registry first without unlinking segments. If our registry had no
-                // dead nodes here and segments exist, we cannot prove another
-                // registry does not still need those mappings, so pass over the slot.
+                // Existing 0-byte lock file without owner metadata: if the
+                // shared startup budget is already spent, refuse immediately
+                // without walking the registry or segment directory.
+                if segment_dir.is_some()
+                    && (started.elapsed() >= budget
+                        || matches!(
+                            legacy_segment_scan,
+                            Some(Err(SegmentScanError::BudgetExhausted))
+                        ))
+                {
+                    let skipped = SlotReclaim {
+                        cleaned: cerulion_core::transport::dead_node_sweep::BoundedCleanup::default(
+                        ),
+                        nodes_left: Err("startup cleanup budget expired".to_string()),
+                        segments_removed: 0,
+                        segments_failed: 0,
+                        first_segment_error: None,
+                    };
+                    return Err(legacy_budget_exhausted_refusal(skipped));
+                }
+                // Sweep our own registry first without unlinking segments. If
+                // our registry had no dead nodes here and segments exist, we
+                // cannot prove another registry does not still need those
+                // mappings, so pass over the slot.
                 reclaim_segments = false;
             }
             SlotLockOwner::LegacyEmpty => {}
@@ -1093,23 +1278,43 @@ fn claim_and_reclaim_resim_slot_in_range(
                     reclaim.first_segment_error = seg_reclaim.first_segment_error;
                 }
                 reclaim.nodes_left = seg_reclaim.nodes_left;
-            } else {
-                match count_slot_segments(segment_dir, slot) {
-                    Ok(0) => {}
-                    Ok(leftover) => {
-                        let reason = format!(
-                            "legacy slot lock records no owning registry and {leftover} leftover \
-                             segment(s) remain; preserving mappings to avoid stranding another \
-                             registry"
-                        );
-                        return Err(SlotPassedOver::Reclaim { reclaim, reason });
+            } else if segment_dir.is_some() {
+                let fresh_scan = legacy_segment_scan.is_none();
+                if fresh_scan {
+                    legacy_segment_scan = Some(scanner.scan_all(segment_dir, started, budget));
+                }
+                let cached = match legacy_segment_scan.as_ref() {
+                    Some(Ok(counts)) => counts.get(&slot).copied().unwrap_or(0),
+                    Some(Err(SegmentScanError::BudgetExhausted)) => {
+                        return Err(legacy_budget_exhausted_refusal(reclaim));
                     }
-                    Err(err) => {
-                        let reason = format!(
-                            "legacy slot lock records no owning registry and segment directory \
-                             could not be inspected ({err})"
-                        );
-                        return Err(SlotPassedOver::Reclaim { reclaim, reason });
+                    Some(Err(SegmentScanError::Io(err))) => {
+                        return Err(legacy_scan_io_refusal(reclaim, err));
+                    }
+                    None => unreachable!("legacy_segment_scan populated above"),
+                };
+                if cached > 0 {
+                    return Err(legacy_leftover_segments_refusal(reclaim, cached));
+                }
+                if !fresh_scan {
+                    // This slot was not locked during the earlier shared scan;
+                    // confirm while holding its lock so a racing legacy binary
+                    // cannot hide newly created segments.
+                    match scanner.count_slot(segment_dir, slot, started, budget) {
+                        Ok(0) => {}
+                        Ok(leftover) => {
+                            if let Some(Ok(counts)) = legacy_segment_scan.as_mut() {
+                                counts.insert(slot, leftover);
+                            }
+                            return Err(legacy_leftover_segments_refusal(reclaim, leftover));
+                        }
+                        Err(SegmentScanError::BudgetExhausted) => {
+                            legacy_segment_scan = Some(Err(SegmentScanError::BudgetExhausted));
+                            return Err(legacy_budget_exhausted_refusal(reclaim));
+                        }
+                        Err(SegmentScanError::Io(err)) => {
+                            return Err(legacy_scan_io_refusal(reclaim, &err));
+                        }
                     }
                 }
             }
@@ -1803,6 +2008,464 @@ mod tests {
         assert_eq!(swept.registry_errors, 1, "{swept:?}");
         assert!(!swept.nodes_converged(), "{swept:?}");
         assert!(seg.exists(), "corrupt lock metadata must preserve segments");
+    }
+
+    #[test]
+    fn unknown_key_in_slot_lock_metadata_fails_closed_without_removing_segments() {
+        let root = IsolatedRoot::mint("rslotunkkey");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let owner = SlotOwnerRecord::from_config(&root.config());
+        let raw_with_unknown = format!(
+            "{{\"version\":{},\"root_path\":{},\"node_dir\":{},\"service_dir\":{},\"extra_key\":\"unexpected\"}}",
+            owner.version,
+            serde_json::to_string(&owner.root_path).expect("quote root_path"),
+            serde_json::to_string(&owner.node_dir).expect("quote node_dir"),
+            serde_json::to_string(&owner.service_dir).expect("quote service_dir"),
+        );
+        let lock_path = locks.path().join("cer_resim_00000000.lock");
+        std::fs::write(&lock_path, raw_with_unknown.as_bytes()).expect("write lock with extra key");
+        let seg = segments
+            .path()
+            .join(format!("{}seg.shm_state", resim_namespace_prefix(0)));
+        std::fs::write(&seg, b"").expect("plant segment");
+
+        let report_only = sweep_resim_slots(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            SweepMode::ReportOnly,
+            None,
+        );
+        assert_eq!(report_only.registry_errors, 1, "{report_only:?}");
+        assert!(!report_only.nodes_converged(), "{report_only:?}");
+        assert!(
+            report_only
+                .errors
+                .iter()
+                .any(|e| e.contains("unknown field")),
+            "expected unknown field error, got: {:?}",
+            report_only.errors
+        );
+        assert!(seg.exists(), "ReportOnly must preserve segments");
+
+        let removed = sweep_resim_slots(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            SweepMode::Remove,
+            None,
+        );
+        assert_eq!(removed.registry_errors, 1, "{removed:?}");
+        assert_eq!(removed.segments_removed, 0, "{removed:?}");
+        assert!(!removed.nodes_converged(), "{removed:?}");
+        assert!(
+            seg.exists(),
+            "unknown key in lock metadata must fail closed without removing segments"
+        );
+        // Determinism: repeated sweeps return identical error reports.
+        let removed_again = sweep_resim_slots(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            SweepMode::Remove,
+            None,
+        );
+        assert_eq!(removed, removed_again);
+
+        // Claiming must pass over slot 0 (leaving its lock and segment untouched) and take slot 1.
+        let claimed = claim_and_reclaim_resim_slot_in_range(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..2,
+            Duration::from_secs(10),
+        )
+        .expect("claim skips slot with unknown lock key and takes slot 1");
+        assert_eq!(claimed.slot, 1);
+        assert!(seg.exists(), "claim must preserve slot 0 segment");
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).expect("read slot 0 lock"),
+            raw_with_unknown,
+            "passing over slot 0 must not overwrite its lock file"
+        );
+        drop(claimed);
+
+        // With only slot 0 in range, claim refuses naming the unknown field.
+        let err = claim_and_reclaim_resim_slot_in_range(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..1,
+            Duration::from_secs(10),
+        )
+        .expect_err("slot 0 with unknown key must be refused");
+        assert!(
+            err.contains("unknown field"),
+            "claim refusal must name unknown field: {err}"
+        );
+        assert!(seg.exists(), "refused claim must preserve slot 0 segment");
+    }
+
+    #[test]
+    fn legacy_empty_slot_locks_respect_startup_budget_without_removing_segments() {
+        let root = IsolatedRoot::mint("rslotbudget");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let legacy_slots = 16u32;
+        for slot in 0..legacy_slots {
+            let lock_path = locks
+                .path()
+                .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+            std::fs::write(&lock_path, b"").expect("write legacy empty lock");
+        }
+
+        // Case 1: zero budget with legacy empty locks and NO leftover segments must still
+        // refuse because the segment directory scan cannot complete within the budget.
+        let err_empty = claim_and_reclaim_resim_slot_in_range(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..legacy_slots,
+            Duration::ZERO,
+        )
+        .expect_err("zero startup budget must refuse legacy empty locks");
+        assert!(
+            err_empty.contains("budget"),
+            "refusal must explain startup budget expiry: {err_empty}"
+        );
+        for slot in 0..legacy_slots {
+            let lock_path = locks
+                .path()
+                .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+            assert_eq!(
+                std::fs::read(&lock_path).expect("read legacy lock"),
+                b"",
+                "refused legacy lock must not be overwritten"
+            );
+        }
+
+        // Case 2: zero budget with legacy empty locks AND leftover segments must refuse due
+        // to budget expiry without removing any segment.
+        let mut planted = Vec::new();
+        for slot in 0..legacy_slots {
+            let seg = segments
+                .path()
+                .join(format!("{}seg.shm_state", resim_namespace_prefix(slot)));
+            std::fs::write(&seg, b"").expect("plant legacy segment");
+            planted.push(seg);
+        }
+        let err_with_segs = claim_and_reclaim_resim_slot_in_range(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..legacy_slots,
+            Duration::ZERO,
+        )
+        .expect_err("zero startup budget must refuse legacy empty locks with segments");
+        assert!(
+            err_with_segs.contains("budget"),
+            "refusal must explain startup budget expiry: {err_with_segs}"
+        );
+        for seg in &planted {
+            assert!(seg.exists(), "budget-refused slot must preserve segment");
+        }
+    }
+
+    #[test]
+    fn legacy_empty_locks_share_one_bounded_segment_scan() {
+        use std::cell::Cell;
+
+        struct CountingScanner {
+            scan_all_calls: Cell<usize>,
+            count_slot_calls: Cell<usize>,
+            plant_on_confirm: Option<(u32, PathBuf)>,
+            force_budget_exhausted: bool,
+        }
+
+        impl LegacySegmentScanOps for CountingScanner {
+            fn scan_all(
+                &self,
+                segment_dir: Option<&Path>,
+                started: Instant,
+                budget: Duration,
+            ) -> Result<BTreeMap<u32, u64>, SegmentScanError> {
+                self.scan_all_calls.set(self.scan_all_calls.get() + 1);
+                if self.force_budget_exhausted {
+                    return Err(SegmentScanError::BudgetExhausted);
+                }
+                RealLegacySegmentScanOps.scan_all(segment_dir, started, budget)
+            }
+
+            fn count_slot(
+                &self,
+                segment_dir: Option<&Path>,
+                slot: u32,
+                started: Instant,
+                budget: Duration,
+            ) -> Result<u64, SegmentScanError> {
+                self.count_slot_calls.set(self.count_slot_calls.get() + 1);
+                if let Some((target_slot, ref seg_path)) = self.plant_on_confirm {
+                    if slot == target_slot {
+                        std::fs::write(seg_path, b"").expect("plant racing segment");
+                    }
+                }
+                RealLegacySegmentScanOps.count_slot(segment_dir, slot, started, budget)
+            }
+        }
+
+        let root = IsolatedRoot::mint("rslotshare");
+
+        // Arm A: 20 legacy empty locks with leftover segments share ONE scan,
+        // preserve every segment, and claim fresh slot 20.
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let mut planted = Vec::new();
+        for slot in 0..20u32 {
+            let lock_path = locks
+                .path()
+                .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock"));
+            std::fs::write(&lock_path, b"").expect("write legacy lock");
+            let seg = segments
+                .path()
+                .join(format!("{}seg.shm_state", resim_namespace_prefix(slot)));
+            std::fs::write(&seg, b"").expect("plant segment");
+            planted.push(seg);
+        }
+        let scanner = CountingScanner {
+            scan_all_calls: Cell::new(0),
+            count_slot_calls: Cell::new(0),
+            plant_on_confirm: None,
+            force_budget_exhausted: false,
+        };
+        let claimed = claim_and_reclaim_resim_slot_with_scanner(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..21,
+            Duration::from_secs(10),
+            &scanner,
+        )
+        .expect("fresh slot 20 claimed after skipping 20 legacy locks");
+        assert_eq!(claimed.slot, 20);
+        assert_eq!(
+            scanner.scan_all_calls.get(),
+            1,
+            "all 20 legacy empty locks must share one segment directory scan"
+        );
+        assert_eq!(scanner.count_slot_calls.get(), 0);
+        for seg in &planted {
+            assert!(seg.exists(), "legacy segment must remain intact");
+        }
+        drop(claimed);
+
+        // Arm B: legacy slot 0 has a segment and legacy slot 1 has none ->
+        // one shared scan plus one locked confirmation on slot 1, then slot 1 is claimed.
+        let locks_b = tempfile::tempdir().expect("lock dir b");
+        let segments_b = tempfile::tempdir().expect("segment dir b");
+        for slot in 0..2u32 {
+            std::fs::write(
+                locks_b
+                    .path()
+                    .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock")),
+                b"",
+            )
+            .expect("write legacy lock");
+        }
+        let seg0 = segments_b
+            .path()
+            .join(format!("{}seg.shm_state", resim_namespace_prefix(0)));
+        std::fs::write(&seg0, b"").expect("plant slot 0 segment");
+        let scanner_b = CountingScanner {
+            scan_all_calls: Cell::new(0),
+            count_slot_calls: Cell::new(0),
+            plant_on_confirm: None,
+            force_budget_exhausted: false,
+        };
+        let claimed_b = claim_and_reclaim_resim_slot_with_scanner(
+            &root.config(),
+            locks_b.path(),
+            Some(segments_b.path()),
+            0..2,
+            Duration::from_secs(10),
+            &scanner_b,
+        )
+        .expect("clean legacy slot 1 claimed");
+        assert_eq!(claimed_b.slot, 1);
+        assert_eq!(scanner_b.scan_all_calls.get(), 1);
+        assert_eq!(scanner_b.count_slot_calls.get(), 1);
+        assert!(seg0.exists(), "slot 0 segment must remain intact");
+        drop(claimed_b);
+
+        // Arm C: legacy slot 0 itself has 0 segments -> one scan while holding
+        // slot 0's lock is sufficient (zero extra confirmation scans).
+        let locks_c = tempfile::tempdir().expect("lock dir c");
+        let segments_c = tempfile::tempdir().expect("segment dir c");
+        std::fs::write(locks_c.path().join("cer_resim_00000000.lock"), b"")
+            .expect("write legacy lock 0");
+        let scanner_c = CountingScanner {
+            scan_all_calls: Cell::new(0),
+            count_slot_calls: Cell::new(0),
+            plant_on_confirm: None,
+            force_budget_exhausted: false,
+        };
+        let claimed_c = claim_and_reclaim_resim_slot_with_scanner(
+            &root.config(),
+            locks_c.path(),
+            Some(segments_c.path()),
+            0..2,
+            Duration::from_secs(10),
+            &scanner_c,
+        )
+        .expect("clean legacy slot 0 claimed");
+        assert_eq!(claimed_c.slot, 0);
+        assert_eq!(scanner_c.scan_all_calls.get(), 1);
+        assert_eq!(scanner_c.count_slot_calls.get(), 0);
+        drop(claimed_c);
+
+        // Arm D (adversarial race): segment appears on slot 1 between the shared
+        // scan and locking slot 1 -> locked confirmation catches it, preserves it,
+        // and claims slot 2.
+        let locks_d = tempfile::tempdir().expect("lock dir d");
+        let segments_d = tempfile::tempdir().expect("segment dir d");
+        for slot in 0..2u32 {
+            std::fs::write(
+                locks_d
+                    .path()
+                    .join(format!("{RESIM_NAMESPACE_MARKER}{slot:08x}.lock")),
+                b"",
+            )
+            .expect("write legacy lock");
+        }
+        let seg_d0 = segments_d
+            .path()
+            .join(format!("{}seg.shm_state", resim_namespace_prefix(0)));
+        std::fs::write(&seg_d0, b"").expect("plant slot 0 segment");
+        let seg_d1 = segments_d
+            .path()
+            .join(format!("{}race.shm_state", resim_namespace_prefix(1)));
+        let scanner_d = CountingScanner {
+            scan_all_calls: Cell::new(0),
+            count_slot_calls: Cell::new(0),
+            plant_on_confirm: Some((1, seg_d1.clone())),
+            force_budget_exhausted: false,
+        };
+        let claimed_d = claim_and_reclaim_resim_slot_with_scanner(
+            &root.config(),
+            locks_d.path(),
+            Some(segments_d.path()),
+            0..3,
+            Duration::from_secs(10),
+            &scanner_d,
+        )
+        .expect("raced slot 1 skipped and slot 2 claimed");
+        assert_eq!(claimed_d.slot, 2);
+        assert_eq!(scanner_d.scan_all_calls.get(), 1);
+        assert_eq!(scanner_d.count_slot_calls.get(), 1);
+        assert!(seg_d0.exists());
+        assert!(seg_d1.exists(), "racing legacy segment must be preserved");
+        drop(claimed_d);
+
+        // Arm E (error arm): unreadable/non-dir segment_dir caches Io error across
+        // legacy locks and fails closed on one scan.
+        let not_a_dir = locks_d.path().join("regular_file_not_a_dir");
+        std::fs::write(&not_a_dir, b"x").expect("write non-dir");
+        let scanner_e = CountingScanner {
+            scan_all_calls: Cell::new(0),
+            count_slot_calls: Cell::new(0),
+            plant_on_confirm: None,
+            force_budget_exhausted: false,
+        };
+        let err_e = claim_and_reclaim_resim_slot_with_scanner(
+            &root.config(),
+            locks_d.path(),
+            Some(&not_a_dir),
+            0..2,
+            Duration::from_secs(10),
+            &scanner_e,
+        )
+        .expect_err("non-directory segment_dir must fail closed");
+        assert!(
+            err_e.contains("segment directory could not be inspected"),
+            "{err_e}"
+        );
+        assert_eq!(scanner_e.scan_all_calls.get(), 1);
+
+        // Arm F (budget expiry cached across remaining legacy locks): once
+        // scan_all reports BudgetExhausted on slot 0, remaining legacy locks
+        // short-circuit without rescanning.
+        let scanner_f = CountingScanner {
+            scan_all_calls: Cell::new(0),
+            count_slot_calls: Cell::new(0),
+            plant_on_confirm: None,
+            force_budget_exhausted: true,
+        };
+        let err_f = claim_and_reclaim_resim_slot_with_scanner(
+            &root.config(),
+            locks.path(),
+            Some(segments.path()),
+            0..20,
+            Duration::from_secs(10),
+            &scanner_f,
+        )
+        .expect_err("budget exhaustion must refuse all legacy locks");
+        assert!(err_f.contains("budget"), "{err_f}");
+        assert_eq!(scanner_f.scan_all_calls.get(), 1);
+        assert_eq!(scanner_f.count_slot_calls.get(), 0);
+    }
+
+    #[test]
+    fn bounded_segment_scan_stops_early_when_budget_expires_mid_directory() {
+        let dir = tempfile::tempdir().expect("segment dir");
+        for i in 0..64u32 {
+            let name = format!("unrelated_entry_{i:03}.tmp");
+            std::fs::write(dir.path().join(name), b"").expect("write entry");
+        }
+        std::fs::write(
+            dir.path()
+                .join(format!("{}seg.shm_state", resim_namespace_prefix(0))),
+            b"",
+        )
+        .expect("write slot segment");
+
+        // Mid-directory expiry: stops after 4 entries instead of scanning all 65.
+        let mut checks_all = 0usize;
+        let res_all = scan_all_slot_segments_bounded(Some(dir.path()), || {
+            checks_all += 1;
+            checks_all >= 5
+        });
+        assert_eq!(res_all, Err(SegmentScanError::BudgetExhausted));
+        assert_eq!(
+            checks_all, 5,
+            "scan_all must stop immediately on budget expiry"
+        );
+
+        let mut checks_one = 0usize;
+        let res_one = count_slot_segments_bounded(Some(dir.path()), 0, || {
+            checks_one += 1;
+            checks_one >= 5
+        });
+        assert_eq!(res_one, Err(SegmentScanError::BudgetExhausted));
+        assert_eq!(
+            checks_one, 5,
+            "count_slot must stop immediately on budget expiry"
+        );
+
+        // Pre-open expiry: refuses before opening read_dir even on a non-dir path.
+        let not_a_dir = dir.path().join("unrelated_entry_000.tmp");
+        let mut pre_checks = 0usize;
+        let res_pre = scan_all_slot_segments_bounded(Some(&not_a_dir), || {
+            pre_checks += 1;
+            true
+        });
+        assert_eq!(res_pre, Err(SegmentScanError::BudgetExhausted));
+        assert_eq!(pre_checks, 1);
+
+        // Unexpired scan sees exact hand-written count.
+        let full = scan_all_slot_segments_bounded(Some(dir.path()), || false)
+            .expect("unexpired scan succeeds");
+        assert_eq!(full.get(&0), Some(&1));
+        assert_eq!(full.len(), 1);
     }
 
     #[test]
