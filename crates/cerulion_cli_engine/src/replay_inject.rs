@@ -2591,6 +2591,24 @@ fn record_is_batch(body: &RecordedReadBody) -> bool {
 /// and nothing is logged.
 #[must_use]
 pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    plan_edge_admission_inner(topic, stages, false)
+}
+
+/// [`plan_edge_admission`] when a `--duration` bound truncated the read-log
+/// census before this topic's first recorded read, and the caller has already
+/// confirmed that the recording carries read-log records for this topic at or
+/// after the bound. Keeps every wiring and skew refusal intact while arming
+/// gateable stages with empty schedules instead of refusing `NoCoverage`.
+#[must_use]
+pub fn plan_edge_admission_covered(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    plan_edge_admission_inner(topic, stages, true)
+}
+
+fn plan_edge_admission_inner(
+    topic: &TopicAdmission,
+    stages: &StageTable,
+    covered_outside_window: bool,
+) -> AdmissionPlan {
     let refused = |reason: AdmissionRefusalReason| {
         AdmissionPlan::Refused(AdmissionRefusal {
             topic: topic.topic.clone(),
@@ -2888,7 +2906,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
     if planned.is_empty() {
         return AdmissionPlan::NotGateable(ungateable);
     }
-    if !any_records {
+    if !any_records && !covered_outside_window {
         return refused(AdmissionRefusalReason::NoCoverage { keys: offered });
     }
     AdmissionPlan::Enforced {
@@ -5700,5 +5718,56 @@ mod tests {
             drain.per_step.iter().map(|s| s.step).collect::<Vec<_>>(),
             vec![0, 1]
         );
+    }
+
+    /// `plan_edge_admission_covered` arms empty schedules when `--duration`
+    /// excludes every read on a covered topic, while still refusing wiring and
+    /// stage-set skew errors.
+    #[test]
+    fn covered_outside_window_arms_empty_schedule_without_hiding_skew() {
+        let single = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let empty = one_edge(vec![]);
+        assert!(matches!(
+            plan_edge_admission(&empty, &single),
+            AdmissionPlan::Refused(AdmissionRefusal {
+                reason: AdmissionRefusalReason::NoCoverage { .. },
+                ..
+            })
+        ));
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission_covered(&empty, &single)
+        else {
+            panic!("covered outside window must arm empty schedules");
+        };
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].per_step.is_empty());
+
+        // Skew still refuses even when covered outside the window.
+        let skewed = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages(vec![
+            StageKey {
+                node: "relay".into(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            StageKey {
+                node: "relay".into(),
+                input_idx: 0,
+                role: ReadStageRole::Drain,
+            },
+        ]);
+        assert!(matches!(
+            plan_edge_admission_covered(&empty, &skewed),
+            AdmissionPlan::Refused(AdmissionRefusal {
+                reason: AdmissionRefusalReason::StageSetSkew { .. },
+                ..
+            })
+        ));
     }
 }

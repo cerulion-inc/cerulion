@@ -1036,6 +1036,7 @@ fn engine_options(o: ResimOptions, verify: bool) -> replay_cmd::ReplayOptions {
     replay_cmd::ReplayOptions {
         duration_bound_ns,
         feed_index_budget,
+        verifier_record_budget: None,
         report_path,
         tolerance_path,
         strict_state,

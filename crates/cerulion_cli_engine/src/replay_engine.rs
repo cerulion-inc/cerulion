@@ -4773,6 +4773,11 @@ pub struct ReplayInputs {
     /// `None` = [`crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET`]. A replay
     /// whose selected reads need more is refused with exit 2.
     pub feed_index_budget: Option<u64>,
+    /// Records each rank's read log, consumed-topic frame index and recorded
+    /// schedule may hold in memory on a free-run recording
+    /// (`--verifier-record-budget`). `None` = [`DEFAULT_VERIFIER_RECORD_BUDGET`].
+    /// Does not change the per-step hostile-run fold bound.
+    pub verifier_record_budget: Option<u64>,
     /// Write the [`ReplayOutcome`] JSON here (`--report`), if set.
     pub report_path: Option<PathBuf>,
     /// Diagnostic observer over the fire streams: invoked for every
@@ -4912,6 +4917,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         record_health,
         duration_bound_ns,
         feed_index_budget,
+        verifier_record_budget,
         report_path,
         mut fire_tap,
         tolerance,
@@ -5458,6 +5464,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // bag's own staging rows and refuses here, before rank 0 has run a step.
     // What stays per rank is the pair that needs a built runtime (see
     // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
+    let verifier_record_budget = verifier_record_budget.unwrap_or(DEFAULT_VERIFIER_RECORD_BUDGET);
     let bag_side = plan_bag_side_admissions(
         &plans,
         &trace,
@@ -5471,6 +5478,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         fed.then_some(&recorded_messages),
         duration_bound_ns.map(|d| (run_epoch_ns, d)),
         feed_index_budget.unwrap_or(crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET),
+        verifier_record_budget,
         crate::replay_feed::FeedBagFacts {
             begins_mid_run: resume.is_some(),
             trace_format: recorder.as_ref().map(|r| r.trace_format),
@@ -5539,6 +5547,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 multi_output_nodes: &multi_output_nodes,
                 duration_bound_ns,
                 run_epoch_ns,
+                verifier_record_budget,
                 node_infos: &node_infos,
                 bag_side: &bag_side,
                 node_info_notes,
@@ -10284,6 +10293,10 @@ struct PassInputs<'a> {
     /// The lowest first-boundary target across every rank — the recorded
     /// instant `duration_bound_ns` is measured from.
     run_epoch_ns: u64,
+    /// Configured whole-recording record budget for this run's read log,
+    /// consumed-topic frame index and schedule (`--verifier-record-budget`,
+    /// defaulting to [`DEFAULT_VERIFIER_RECORD_BUDGET`]).
+    verifier_record_budget: u64,
     /// The DECLARED metadata of this pass's nodes, read out of
     /// the factory map before the runtime took them (see
     /// [`collect_pass_node_infos`]). The candidate's side of the re-derivation
@@ -11190,23 +11203,52 @@ fn fifo_trailing_refills(
     out
 }
 
-/// The verifier's record budget: how many records one rank, or one pass, may
-/// hold in memory at each site [`verifier_record_budget`] is read at.
+/// The default of [`ReplayInputs::verifier_record_budget`]
+/// (`--verifier-record-budget`): how many records the verifier may hold in
+/// memory for one rank, or one pass, of a free-run recording. One count bounds
+/// three structures separately: the rank's read log, the recorded frames it
+/// consumes, and the pass's recorded schedule.
 ///
-/// One count bounds five sites, three of them whole-recording:
+/// # Why 3000000
+///
+/// At its peak the verifier holds about 330 bytes per read: a census entry
+/// (72 bytes plus its input name) at prepare, then two copies of the 96-byte
+/// `RecordedRead` with its two strings, one per step for the re-derivation and
+/// one cloned into the schedule. 3000000 reads therefore take about 1 GiB, the
+/// size of [`crate::replay_feed::DEFAULT_FEED_INDEX_BUDGET`], the other
+/// whole-recording index a free-run `--verify` builds. The frame index and the
+/// schedule's fires take memory on top of that.
+pub const DEFAULT_VERIFIER_RECORD_BUDGET: u64 = 3_000_000;
+
+/// Per-step hostile-run expansion ceiling for the per-edge read-log verifier
+/// ([`pull_step_outcomes`] and the replayed half of the per-edge compare).
+/// Kept independent of `--verifier-record-budget` so raising the
+/// whole-recording budget never lets a corrupt single-step fold count allocate
+/// millions of records per step.
+const REPLAY_PER_STEP_FOLD_BUDGET: usize = 200_000;
+
+/// WHICH of the verifier's three whole-recording record budgets a call site is
+/// asking for.
+///
+/// The verifier's whole-recording record budget
+/// ([`ReplayInputs::verifier_record_budget`], default
+/// [`DEFAULT_VERIFIER_RECORD_BUDGET`]) bounds three sites, each read through
+/// [`verifier_record_budget`]:
 ///
 /// * the read-log census ([`collect_rank_read_log`]): the reads of ONE rank's
-///   kind-6 stream, cumulative over the whole recording, a folded record of N
-///   counting N ([`BudgetTally`]);
+///   kind-6 stream inside `--duration` when given (otherwise the whole
+///   recording), a folded record of N counting N ([`BudgetTally`]);
 /// * the frame index ([`collect_topic_frame_index`]): the recorded frames with
 ///   a wire header on the topics one rank consumes;
 /// * the schedule: the fires and reads one pass accumulates for the
-///   re-derivation verdict, checked step by step inside the pass loop;
+///   re-derivation verdict, checked step by step inside the pass loop.
 ///
-/// and two per step, a bound against a hostile run count that does not grow
-/// with the recording ([`expand_run`]): the per-step pull of the per-edge
-/// verifier, which counts one step's expansion, and its replayed half, which
-/// counts one edge's within one step.
+/// Two separate per-step sites stay capped at [`REPLAY_PER_STEP_FOLD_BUDGET`]
+/// (a bound against a hostile run count that does not grow with the recording,
+/// [`expand_run`]): the per-step pull of the per-edge verifier, which counts
+/// one step's expansion, and its replayed half, which counts one edge's within
+/// one step. Raising `--verifier-record-budget` never raises that per-step
+/// bound.
 ///
 /// A LOCKSTEP pass plans no read from the recording
 /// ([`PassVerification::inert`]): it takes no census, builds no frame index of
@@ -11235,28 +11277,24 @@ fn fifo_trailing_refills(
 /// the first read past it and that step's time in the rank's recording
 /// ([`ReadLogOverrun`]); a frame-index refusal names the frames and the budget
 /// ([`FrameIndexOverrun`]).
-const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
-
-/// WHICH of the verifier's three record budgets a call site is asking for.
 ///
-/// Production answers all three with the ONE
-/// [`REPLAY_VERIFIER_RECORD_BUDGET`], so the site is inert there. It exists
-/// because the three budget causes are SEPARATE reported outcomes —
+/// Production answers all three with the run's configured whole-recording
+/// budget ([`ReplayInputs::verifier_record_budget`], defaulting to
+/// [`DEFAULT_VERIFIER_RECORD_BUDGET`]), so the site is inert there. It exists
+/// because the three budget causes are SEPARATE reported outcomes,
 /// [`VerifierDecline::ReadLogBudget`], [`VerifierDecline::FrameIndexBudget`]
-/// and [`VerifierDecline::ScheduleBudget`] each carry their own token — while
+/// and [`VerifierDecline::ScheduleBudget`] each carry their own token, while
 /// the sites are checked in a FIXED order: the read log is collected first, the
 /// frame index second, and the schedule accumulates only on a pass that got
 /// past both. A test able to move one global number could therefore only ever
 /// reach the FIRST of the three, and the other two arms would be unwritable.
 /// Naming the site lets one budget drop while the other two stay at the
-/// production value.
+/// configured value.
 #[derive(Clone, Copy)]
 enum BudgetSite {
-    /// [`collect_rank_read_log`]: this rank's kind-6 records. The per-step
-    /// pull and the replayed half of the per-edge verifier read this site too,
-    /// each against its own per-step count ([`expand_run`]).
+    /// [`collect_rank_read_log`]: this rank's kind-6 records.
     ReadLog,
-    /// [`collect_topic_frame_index`] — recorded frames on the topics this
+    /// [`collect_topic_frame_index`]: recorded frames on the topics this
     /// rank consumes.
     FrameIndex,
     /// The mid-loop per-step accumulation (fires + reads) behind
@@ -11266,22 +11304,22 @@ enum BudgetSite {
 
 /// The record budget `site` must respect.
 ///
-/// # This is a plain constant read in a shipped build
-///
-/// The override state below is not merely left unread in production — the
-/// `thread_local!`, its accessors and the setters are behind the same `cfg`, so
-/// none of it is COMPILED. What remains is this body: a constant, returned from
-/// a private single-expression function with an unused argument, which folds at
-/// every call site exactly as the direct `REPLAY_VERIFIER_RECORD_BUDGET` reads
-/// it replaced did. The `BudgetSite` argument is a fieldless enum passed by
-/// value and never inspected.
+/// In a shipped build, the test-only override state below is not compiled and
+/// this returns `configured` saturated to `usize::MAX`.
 #[cfg(not(any(test, feature = "test-seams")))]
-fn verifier_record_budget(_site: BudgetSite) -> usize {
-    REPLAY_VERIFIER_RECORD_BUDGET
+fn verifier_record_budget(_site: BudgetSite, configured: u64) -> usize {
+    usize::try_from(configured).unwrap_or(usize::MAX)
 }
 
-/// Test-only override state — one slot per [`BudgetSite`], `None` meaning
-/// "use [`REPLAY_VERIFIER_RECORD_BUDGET`]".
+/// The per-step hostile-run fold bound for the per-edge read-log verifier.
+/// Never raised by the whole-recording `--verifier-record-budget` knob.
+#[cfg(not(any(test, feature = "test-seams")))]
+fn per_step_fold_budget() -> usize {
+    REPLAY_PER_STEP_FOLD_BUDGET
+}
+
+/// Test-only override state, one slot per [`BudgetSite`], `None` meaning
+/// "use the configured whole-recording budget".
 ///
 /// THREAD-LOCAL rather than a process-wide static, and that is a fact about
 /// this engine rather than a precaution: `replay_engine` spawns no threads, so
@@ -11317,10 +11355,22 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-seams"))]
-fn verifier_record_budget(site: BudgetSite) -> usize {
+fn verifier_record_budget(site: BudgetSite, configured: u64) -> usize {
     VERIFIER_BUDGET_OVERRIDES
         .with(|o| o.slot(site).get())
-        .unwrap_or(REPLAY_VERIFIER_RECORD_BUDGET)
+        .unwrap_or_else(|| usize::try_from(configured).unwrap_or(usize::MAX))
+}
+
+/// The per-step hostile-run fold bound for the per-edge read-log verifier.
+/// A test seam lowering the read-log budget can lower this ceiling for fast
+/// hostile-run tests, but it never rises above [`REPLAY_PER_STEP_FOLD_BUDGET`].
+#[cfg(any(test, feature = "test-seams"))]
+fn per_step_fold_budget() -> usize {
+    VERIFIER_BUDGET_OVERRIDES
+        .with(|o| o.read_log.get())
+        .map_or(REPLAY_PER_STEP_FOLD_BUDGET, |b| {
+            b.min(REPLAY_PER_STEP_FOLD_BUDGET)
+        })
 }
 
 /// **Test-only.** The handle the budget setters return: it restores the
@@ -11349,10 +11399,9 @@ fn install_budget_override(site: BudgetSite, budget: usize) -> VerifierBudgetGua
 /// ordinary crafted bag blows it and the pass declines with
 /// [`VerifierDecline::ReadLogBudget`].
 ///
-/// A real bag big enough to reach the shipped 200_000 is not something a test
-/// can craft, so without this seam that decline — and the two below — are
-/// reachable by no test at all: the variant, its token, and the stand-downs it
-/// emits go unpinned.
+/// A real bag big enough to reach [`DEFAULT_VERIFIER_RECORD_BUDGET`] is not
+/// something a test can craft, so without this seam that decline (and the two
+/// below) would be awkward to isolate independently.
 #[cfg(any(test, feature = "test-seams"))]
 pub fn override_read_log_record_budget(budget: usize) -> VerifierBudgetGuard {
     install_budget_override(BudgetSite::ReadLog, budget)
@@ -11541,16 +11590,20 @@ impl BudgetTally {
 /// Walk ONE rank's kind-6 stream front to back, resolving each record's node
 /// and input name through the rank manifest tables.
 ///
+/// When `step_end` is `Some(end)` (from `--duration`), records at `step >= end`
+/// are skipped: they are neither counted against the budget nor stored.
+///
 /// [`ReadLogCensus::Declined`] names why the census was declined: over the
 /// budget, or records the rank's manifest cannot place. Over the budget the
-/// walk holds no read past it and counts the rest of the stream, then walks the
-/// rank's step boundaries once, so [`VerifierDecline::ReadLogBudget`] carries
-/// every read the rank holds, the step of the first read past the budget and
-/// that step's time. Whether the caller then refuses or stands down is the
-/// pass's gating ([`REPLAY_VERIFIER_RECORD_BUDGET`]). A record whose node or
-/// `input_idx` the manifest cannot resolve is skipped rather than given an
-/// invented name, and is not counted against the budget; a census within the
-/// budget that skipped one is declined as [`VerifierDecline::ReadLogUnplaceable`].
+/// walk holds no read past it and counts the rest of the stream inside
+/// `step_end`, then walks the rank's step boundaries once, so
+/// [`VerifierDecline::ReadLogBudget`] carries every read the rank holds inside
+/// the window, the step of the first read past the budget and that step's time.
+/// Whether the caller then refuses or stands down is the pass's gating. A
+/// record whose node or `input_idx` the manifest cannot resolve is skipped
+/// rather than given an invented name, and is not counted against the budget;
+/// a census within the budget that skipped one is declined as
+/// [`VerifierDecline::ReadLogUnplaceable`].
 ///
 /// # The KIND field is as wide as the bag's format says it is
 ///
@@ -11586,20 +11639,26 @@ fn collect_rank_read_log(
     // How wide this bag says its kind field is. NOT the same
     // question as whether the ROLE may be believed — see [`KindFieldWidth`].
     width: KindFieldWidth,
+    // Exclusive upper step bound from `--duration` (`None` = whole recording).
+    step_end: Option<u64>,
+    // Run-configured whole-recording record budget.
+    configured_budget: u64,
 ) -> Result<ReadLogCensus, ReplayError> {
     let Some(table) = rank_tables.get(rank as usize) else {
         return Ok(ReadLogCensus::Collected(Vec::new()));
     };
     let mut cursor = trace.cursor()?;
-    // Read ONCE, outside the walk: the answer cannot change mid-stream, and in a
-    // shipped build this is the constant itself (see `verifier_record_budget`).
-    let budget = verifier_record_budget(BudgetSite::ReadLog);
+    // Read ONCE, outside the walk: the answer cannot change mid-stream.
+    let budget = verifier_record_budget(BudgetSite::ReadLog, configured_budget);
     let mut out: Vec<CollectedRead> = Vec::new();
     let mut tally = BudgetTally::default();
     // Read records this rank's own tables cannot place.
     let mut unresolvable: usize = 0;
     while let Some(r) = cursor.consume_next()? {
         if r.record_type != RECORD_TYPE_READ_OUTCOME || r.rank() != rank {
+            continue;
+        }
+        if step_end.is_some_and(|end| r.step >= end) {
             continue;
         }
         let Some(node_id) = table.get(r.node_idx as usize).cloned() else {
@@ -11807,6 +11866,7 @@ enum FrameIndexCensus {
 fn collect_topic_frame_index(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
+    configured_budget: u64,
 ) -> Result<FrameIndexCensus, ReplayError> {
     let mut out: BTreeMap<String, TopicFrameIndex> = topics
         .iter()
@@ -11827,7 +11887,7 @@ fn collect_topic_frame_index(
     // Recorded frames with a wire header on `topics`, counted past the budget.
     let mut total: u64 = 0;
     // Same hoist, same reason as the read-log walk above.
-    let budget = verifier_record_budget(BudgetSite::FrameIndex) as u64;
+    let budget = verifier_record_budget(BudgetSite::FrameIndex, configured_budget) as u64;
     rm.for_each_frame(&mut |topic: &str, frame: &[u8]| {
         let Some(idx) = out.get_mut(topic) else {
             return;
@@ -11846,7 +11906,7 @@ fn collect_topic_frame_index(
             idx.headerless += 1;
             return;
         };
-        total += 1;
+        total = total.saturating_add(1);
         if total > budget {
             return;
         }
@@ -12994,8 +13054,9 @@ enum VerifierDecline {
     /// This rank consumes more recorded frames than the record budget,
     /// carrying the count the frame index took past it.
     FrameIndexBudget(FrameIndexOverrun),
-    /// The per-step accumulation blew the budget MID-PASS (fires + reads).
-    ScheduleBudget,
+    /// The per-step accumulation blew the budget MID-PASS (fires + reads),
+    /// carrying the budget the pass read.
+    ScheduleBudget(u64),
     /// This rank carries read records its own manifest cannot
     /// place — no such node, or an input index past that node's input table.
     ///
@@ -13044,7 +13105,7 @@ impl VerifierDecline {
             Self::InputTables => "verifier_declined_input_tables",
             Self::ReadLogBudget(_) => "verifier_declined_read_log_budget",
             Self::FrameIndexBudget(_) => "verifier_declined_frame_index_budget",
-            Self::ScheduleBudget => "verifier_declined_schedule_budget",
+            Self::ScheduleBudget(_) => "verifier_declined_schedule_budget",
             Self::ReadLogUnplaceable => "verifier_declined_read_log_unplaceable",
             Self::StagingRegime => "verifier_declined_staging_regime",
         }
@@ -13061,8 +13122,7 @@ impl VerifierDecline {
             // In a shipped build the two are the same value.
             Self::ReadLogBudget(overrun) => overrun.sentence(),
             Self::FrameIndexBudget(overrun) => overrun.sentence(),
-            Self::ScheduleBudget => {
-                let budget = verifier_record_budget(BudgetSite::Schedule);
+            Self::ScheduleBudget(budget) => {
                 format!(
                     "its recorded schedule exceeds the verifier's \
                      {budget}-record budget"
@@ -13104,16 +13164,19 @@ impl VerifierDecline {
     fn remedy(self) -> Option<&'static str> {
         match self {
             Self::ReadLogBudget(_) => Some(
-                "This replay holds each rank's read log in memory up to this budget, so \
-                 replay a recording of this graph no longer than that",
+                "This replay holds each rank's read log in memory up to this budget; raise it \
+                 with `--verifier-record-budget <COUNT>`, bound the replay with `--duration`, or \
+                 replay a shorter recording of this graph",
             ),
             Self::FrameIndexBudget(_) => Some(
-                "This replay holds the frames each rank consumes in memory up to this budget, \
-                 so replay a shorter recording of this graph",
+                "This replay holds the frames each rank consumes in memory up to this budget; \
+                 raise it with `--verifier-record-budget <COUNT>` or replay a shorter recording \
+                 of this graph",
             ),
-            Self::ScheduleBudget => Some(
-                "This replay holds each pass's recorded schedule in memory up to this budget, \
-                 so replay a shorter recording of this graph",
+            Self::ScheduleBudget(_) => Some(
+                "This replay holds each pass's recorded schedule in memory up to this budget; \
+                 raise it with `--verifier-record-budget <COUNT>`, bound the replay with \
+                 `--duration`, or replay a shorter recording of this graph",
             ),
             Self::InputTables | Self::ReadLogUnplaceable | Self::StagingRegime => None,
         }
@@ -14187,8 +14250,8 @@ fn render_ungateable(
 /// The ONE question a degraded manifest still leaves answerable: the record's
 /// rank rides in the record header, while placing it on an input needs the
 /// manifest's own name table. Walked only when the rank holds a
-/// produced-and-consumed edge AND the manifest was refused, which is why a full
-/// trace walk here costs nothing on the shipped paths.
+/// produced-and-consumed edge AND either the manifest was refused or a
+/// `--duration` bound left the read-log census empty.
 fn rank_has_read_records(trace: &RecordedTrace, rank: u32) -> Result<bool, ReplayError> {
     let mut cursor = trace.cursor()?;
     while let Some(r) = cursor.consume_next()? {
@@ -14212,7 +14275,8 @@ fn rank_has_read_records(trace: &RecordedTrace, rank: u32) -> Result<bool, Repla
 /// which keeps every shipped rank split and every lockstep bag on today's path.
 ///
 /// The refusal ends with the cause's own remedy ([`VerifierDecline::remedy`]):
-/// a shorter recording for a budget cause, a re-record for any other.
+/// `--verifier-record-budget`, `--duration` or a shorter recording for a budget
+/// cause, a re-record for any other.
 fn enforcement_blocked_by_decline(
     enforce_topics: &[String],
     cause: VerifierDecline,
@@ -14361,7 +14425,7 @@ struct RankBagSide {
 
 /// The detail of a fed replay's refusal of `rank`, whose read-log census was
 /// declined for `cause`: the cause's token and sentence, then its remedy when
-/// a shorter recording cures it ([`VerifierDecline::remedy`]).
+/// the cause is a budget ([`VerifierDecline::remedy`]).
 fn declined_census_detail(rank: u32, cause: VerifierDecline) -> String {
     let detail = format!(
         "rank {rank}'s read log was declined ({}): {}",
@@ -14593,6 +14657,110 @@ fn rank_step_targets(
     Ok(BTreeMap::new())
 }
 
+/// Does `rank`'s recorded kind-6 stream hold at least one read record for any
+/// edge in `edges` at `step >= from_step`?
+///
+/// Called ONLY when `--duration` truncated the read-log census at `from_step`
+/// and `plan_edge_admission` saw zero reads for a topic inside `[0, from_step)`.
+/// Distinguishes a topic whose consumer did not read before the `--duration`
+/// cut from a recording that has no read-log coverage for that topic. Only the
+/// five READ kinds count: the annotation kinds and batch frames never reach a
+/// stage's schedule, so they never make [`replay_inject::plan_edge_admission`]
+/// see a record either.
+fn rank_has_read_for_edges_from(
+    trace: &RecordedTrace,
+    rank: u32,
+    rank_tables: &[Vec<Arc<str>>],
+    recorded_inputs: &BTreeMap<String, Vec<String>>,
+    width: KindFieldWidth,
+    edges: &[replay_inject::AdmissionEdge],
+    from_step: u64,
+) -> Result<bool, ReplayError> {
+    let Some(table) = rank_tables.get(rank as usize) else {
+        return Ok(false);
+    };
+    let wanted: BTreeSet<(&str, &str)> = edges
+        .iter()
+        .map(|e| (e.node_id.as_str(), e.input.as_str()))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(false);
+    }
+    let mut cursor = trace.cursor()?;
+    while let Some(r) = cursor.consume_next()? {
+        if r.record_type != RECORD_TYPE_READ_OUTCOME || r.rank() != rank || r.step < from_step {
+            continue;
+        }
+        let Some(node_id) = table.get(r.node_idx as usize) else {
+            continue;
+        };
+        let (input_idx, kind, _) = decode_read_outcome_meta(r.global_level, width);
+        if !matches!(
+            read_outcome_kind_from_wire(kind),
+            Some(
+                ReadOutcomeKind::Served
+                    | ReadOutcomeKind::Held
+                    | ReadOutcomeKind::NoFrame
+                    | ReadOutcomeKind::DrainedBatch
+                    | ReadOutcomeKind::Decimated
+            )
+        ) {
+            continue;
+        }
+        let Some(input) = recorded_inputs
+            .get(node_id.as_ref())
+            .and_then(|names| names.get(input_idx as usize))
+        else {
+            continue;
+        };
+        if wanted.contains(&(node_id.as_ref(), input.as_str())) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Plan one topic's stage admissions, accounting for a `--duration` census cut.
+///
+/// When `step_end` is `Some(end)` and `plan_edge_admission` refuses with
+/// `NoCoverage` because every read on the topic sits at `step >= end`, probe
+/// the stream from `end` onward so a covered topic whose first read lies past
+/// `--duration` arms empty schedules rather than refusing as uncovered.
+#[allow(clippy::too_many_arguments)]
+fn plan_topic_admission_in_window(
+    planned: &replay_inject::TopicAdmission,
+    stages: &replay_inject::StageTable,
+    trace: &RecordedTrace,
+    rank: u32,
+    rank_tables: &[Vec<Arc<str>>],
+    recorded_inputs: &BTreeMap<String, Vec<String>>,
+    width: KindFieldWidth,
+    step_end: Option<u64>,
+) -> Result<replay_inject::AdmissionPlan, ReplayError> {
+    let plan = replay_inject::plan_edge_admission(planned, stages);
+    if let (
+        Some(end),
+        replay_inject::AdmissionPlan::Refused(replay_inject::AdmissionRefusal {
+            reason: replay_inject::AdmissionRefusalReason::NoCoverage { .. },
+            ..
+        }),
+    ) = (step_end, &plan)
+    {
+        if rank_has_read_for_edges_from(
+            trace,
+            rank,
+            rank_tables,
+            recorded_inputs,
+            width,
+            &planned.edges,
+            end,
+        )? {
+            return Ok(replay_inject::plan_edge_admission_covered(planned, stages));
+        }
+    }
+    Ok(plan)
+}
+
 /// Plan the BAG SIDE of every rank's read-log enforcement BEFORE pass 0, and
 /// refuse the whole run there.
 ///
@@ -14617,15 +14785,15 @@ fn rank_step_targets(
 /// decline, its own warn and its own report field, and reproducing them here
 /// would be a second spelling of each; the pass plans for itself only in the
 /// no-rows case, where there was nothing to plan from before pass 0.
-// THIRTEEN arguments, every one a BAG or GRAPH fact this planning needs and none
+// FOURTEEN arguments, every one a BAG or GRAPH fact this planning needs and none
 // of them derivable from another: the plans, the trace and its rank tables, the
 // graph config, the factories the declared node metadata is read from, the topic
 // classes, the three per-bag contract terms (the coordination mode, whether the
 // role bits may be believed, and the kind field's width), the recorded messages a
-// fed replay reads, the `--duration` bound, the feed index budget, and the bag
-// facts a feed refusal names (whether the bag begins mid-run, and its format).
-// Bundling them into a struct only to satisfy the ceiling would name the same
-// thirteen values twice.
+// fed replay reads, the `--duration` bound, the feed index budget, the
+// whole-recording verifier record budget, and the bag facts a feed refusal names
+// (whether the bag begins mid-run, and its format). Bundling them into a struct
+// only to satisfy the ceiling would name the same fourteen values twice.
 #[allow(clippy::too_many_arguments)]
 fn plan_bag_side_admissions(
     plans: &[RankPlan],
@@ -14641,10 +14809,12 @@ fn plan_bag_side_admissions(
     // identity (see `crate::replay_feed`), and anything that cannot be is
     // refused here by name. `false` keeps the queue re-creation path.
     fed: Option<&RecordedMessages>,
-    // `(run epoch, --duration)` in ns: steps past the bound are not fed.
+    // `(run epoch, --duration)` in ns: steps past the bound are not censused or fed.
     duration_bound: Option<(u64, u64)>,
     // Bytes the feed index may take.
     feed_index_budget: u64,
+    // Configured whole-recording record budget.
+    verifier_record_budget: u64,
     // What a feed refusal names about the bag as a whole.
     bag_facts: crate::replay_feed::FeedBagFacts,
 ) -> Result<BTreeMap<u32, RankBagSide>, ReplayError> {
@@ -14692,6 +14862,7 @@ fn plan_bag_side_admissions(
     // Every rank's admissions, fed after all are planned so the frame index is
     // built once over the reads they name.
     let mut planned: Vec<(u32, BTreeMap<String, Vec<replay_inject::StageAdmission>>)> = Vec::new();
+    let mut step_ends: BTreeMap<u32, Option<u64>> = BTreeMap::new();
     // ONE read of the drain-discipline knob for the whole pre-pass, through the
     // core's own reader, as the graph build takes one per build.
     let force_separate_discipline =
@@ -14707,12 +14878,16 @@ fn plan_bag_side_admissions(
         if enforce_topics.is_empty() {
             continue;
         }
+        let step_end = fed_step_end(trace, plan.rank(), duration_bound)?;
+        step_ends.insert(plan.rank(), step_end);
         let reads = match collect_rank_read_log(
             trace,
             plan.rank(),
             rank_tables,
             &recorded_inputs,
             kind_width,
+            step_end,
+            verifier_record_budget,
         )? {
             ReadLogCensus::Collected(reads) => reads,
             ReadLogCensus::Declined(cause) if fed.is_some() => {
@@ -14795,7 +14970,16 @@ fn plan_bag_side_admissions(
         let mut admission: BTreeMap<String, Vec<replay_inject::StageAdmission>> = BTreeMap::new();
         for topic in &enforce_topics {
             let planned = topic_admission_for(topic, &consumed, &node_infos, &per_input, config);
-            match replay_inject::plan_edge_admission(&planned, &stages) {
+            match plan_topic_admission_in_window(
+                &planned,
+                &stages,
+                trace,
+                plan.rank(),
+                rank_tables,
+                &recorded_inputs,
+                kind_width,
+                step_end,
+            )? {
                 // A FED replay reads every stage through its private feed, so a
                 // stage the gate cannot drive is a read nothing can feed.
                 replay_inject::AdmissionPlan::Enforced { ungateable, .. }
@@ -14874,11 +15058,9 @@ fn plan_bag_side_admissions(
     let every_read_edges = multi_writer_edges(config);
     let topics: BTreeSet<String> = plans.iter().flat_map(rank_consumed_topics).collect();
     let (labels, labels_unread) = feed_topic_labels(rm, &topics);
-    let mut step_ends: BTreeMap<u32, Option<u64>> = BTreeMap::new();
     let mut need = crate::replay_feed::FeedNeed::default();
     for (rank, admission) in &planned {
-        let step_end = fed_step_end(trace, *rank, duration_bound)?;
-        step_ends.insert(*rank, step_end);
+        let step_end = step_ends.get(rank).copied().flatten();
         need.add(
             &fed_stages_of(admission, &recorded_inputs, &every_read_edges),
             &labels,
@@ -15128,6 +15310,10 @@ fn prepare_pass_verification(
     recorded_queues: Option<&RecordedInputQueues>,
     // Does the bag's trace hold every node stop (`trace_format` 12 or later)?
     stops_recorded: bool,
+    // Exclusive upper step bound from `--duration` (`None` = whole recording).
+    step_end: Option<u64>,
+    // Configured whole-recording record budget.
+    verifier_record_budget: u64,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -15210,6 +15396,8 @@ fn prepare_pass_verification(
         rank_tables,
         &recorded_inputs,
         kind_width,
+        step_end,
+        verifier_record_budget,
     )? {
         ReadLogCensus::Collected(reads) => reads,
         // Report the cause the census carried, not a fixed one.
@@ -15268,7 +15456,11 @@ fn prepare_pass_verification(
     for (topic, _, _) in &consumed {
         consumed_topics.insert(topic.clone());
     }
-    let frame_index = match collect_topic_frame_index(recorded_messages, &consumed_topics)? {
+    let frame_index = match collect_topic_frame_index(
+        recorded_messages,
+        &consumed_topics,
+        verifier_record_budget,
+    )? {
         FrameIndexCensus::Indexed(index) => index,
         FrameIndexCensus::OverBudget(overrun) => {
             tracing::warn!(
@@ -15916,7 +16108,11 @@ fn prepare_pass_verification(
     // enforce and nothing to refuse. It is NOT `not_applicable`, which claims
     // no such edge exists: the edge exists and nothing gated it, which is what
     // the warn below and `ReadLogEnforcement::NotEnforced` state.
-    if !enforce_topics.is_empty() && reads.is_empty() {
+    let has_later_reads = !enforce_topics.is_empty()
+        && reads.is_empty()
+        && step_end.is_some()
+        && rank_has_read_records(trace, plan.rank())?;
+    if !enforce_topics.is_empty() && reads.is_empty() && !has_later_reads {
         tracing::warn!(
             rank = plan.rank(),
             topics = %enforce_topics.join(", "),
@@ -15933,8 +16129,8 @@ fn prepare_pass_verification(
     }
     // The CENSUS half is planned once this pass's runtime exists
     // (`plan_pass_admission`): what it needs from the bag is kept here.
-    let pending_admission =
-        (!enforce_topics.is_empty() && !reads.is_empty()).then(|| PendingAdmission {
+    let pending_admission = (!enforce_topics.is_empty() && (!reads.is_empty() || has_later_reads))
+        .then(|| PendingAdmission {
             recorded_inputs: recorded_inputs.clone(),
             recorded_stages: recorded_rims
                 .per_edge
@@ -15943,6 +16139,7 @@ fn prepare_pass_verification(
                 .collect(),
             consumed: consumed.clone(),
             per_input: std::mem::take(&mut per_input),
+            step_end,
         });
 
     // ── the rank's declarations, reads and block edges ───────────────────
@@ -16178,6 +16375,8 @@ struct PendingAdmission {
     consumed: Vec<(String, String, String)>,
     /// The enforcement stream per `(node, input)`, in record order.
     per_input: BTreeMap<(String, String), Vec<replay_inject::SitedRead>>,
+    /// Exclusive upper step bound from `--duration` (`None` = whole recording).
+    step_end: Option<u64>,
 }
 
 /// The recorded ADMISSIONS of each graph-produced edge, planned against this
@@ -16196,9 +16395,13 @@ type PassAdmission = (
 /// topic THIS rank produces and consumes has no feed to inject from, so its
 /// plan places the recorded READS onto steps and the core's gate holds the
 /// producer's live frame back until the step the recording read it at.
+#[allow(clippy::too_many_arguments)]
 fn plan_pass_admission(
     pending: PendingAdmission,
     plan: &RankPlan,
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    kind_width: KindFieldWidth,
     config: &GraphConfig,
     node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
     enforce_topics: &[String],
@@ -16210,6 +16413,7 @@ fn plan_pass_admission(
         recorded_stages,
         consumed,
         per_input,
+        step_end,
     } = pending;
     let mut admission: std::collections::HashMap<String, Vec<replay_inject::StageAdmission>> =
         std::collections::HashMap::new();
@@ -16292,7 +16496,16 @@ fn plan_pass_admission(
             Some(stages) => stages.clone(),
             None => {
                 let planned = topic_admission_for(topic, &consumed, node_infos, &per_input, config);
-                match replay_inject::plan_edge_admission(&planned, &stages) {
+                match plan_topic_admission_in_window(
+                    &planned,
+                    &stages,
+                    trace,
+                    plan.rank(),
+                    rank_tables,
+                    &recorded_inputs,
+                    kind_width,
+                    step_end,
+                )? {
                     replay_inject::AdmissionPlan::Enforced { stages, .. } => stages,
                     replay_inject::AdmissionPlan::NotGateable(_) => Vec::new(),
                     replay_inject::AdmissionPlan::Refused(refusal) => {
@@ -16405,7 +16618,16 @@ fn plan_pass_admission(
             .collect();
         if !missing.is_empty() {
             let planned = topic_admission_for(topic, &consumed, node_infos, &per_input, config);
-            match replay_inject::plan_edge_admission(&planned, &stages) {
+            match plan_topic_admission_in_window(
+                &planned,
+                &stages,
+                trace,
+                plan.rank(),
+                rank_tables,
+                &recorded_inputs,
+                kind_width,
+                step_end,
+            )? {
                 replay_inject::AdmissionPlan::Enforced { stages: full, .. } => {
                     for stage in full {
                         if missing.contains(&stage.key) {
@@ -16575,6 +16797,11 @@ fn plan_pass_verification(
         return Ok(PassVerification::inert());
     }
     let plan = pass.plan;
+    let step_end = fed_step_end(
+        pass.trace,
+        plan.rank(),
+        pass.duration_bound_ns.map(|d| (pass.run_epoch_ns, d)),
+    )?;
     let verification = prepare_pass_verification(
         plan,
         pass.trace,
@@ -16592,6 +16819,8 @@ fn plan_pass_verification(
         pass.record_health,
         pass.recorded_queues,
         pass.stops_recorded,
+        step_end,
+        pass.verifier_record_budget,
     )?;
     Ok(verification)
 }
@@ -16822,6 +17051,9 @@ fn run_rank_pass(
         let (admission, ungateable) = plan_pass_admission(
             pending,
             plan,
+            pass.trace,
+            pass.rank_tables,
+            pass.kind_width,
             pass.config,
             pass.node_infos,
             &enforce_topics,
@@ -16998,6 +17230,7 @@ fn run_rank_pass(
         plan.members(),
         pass.driver_nodes,
         &injectors,
+        pass.verifier_record_budget,
     )?;
     let mut captures_owned = open_captures(
         transport,
@@ -17364,7 +17597,9 @@ fn run_rank_pass(
             rederive_records = rederive_records
                 .saturating_add(rec_step_fires.len())
                 .saturating_add(reads.len());
-            if rederive_records > verifier_record_budget(BudgetSite::Schedule) {
+            if rederive_records
+                > verifier_record_budget(BudgetSite::Schedule, pass.verifier_record_budget)
+            {
                 rederive_over_budget = true;
                 rederive_steps.clear();
                 rederive_steps.shrink_to_fit();
@@ -18113,9 +18348,14 @@ fn run_rank_pass(
         // blow-out. `.or()` and not a boolean OR: the note names the cause, and
         // a prepare-time decline never even reaches the accumulation the
         // mid-loop cause describes.
-        let decline = verification
-            .declined
-            .or_else(|| rederive_over_budget.then_some(VerifierDecline::ScheduleBudget));
+        let decline = verification.declined.or_else(|| {
+            rederive_over_budget.then(|| {
+                VerifierDecline::ScheduleBudget(verifier_record_budget(
+                    BudgetSite::Schedule,
+                    pass.verifier_record_budget,
+                ) as u64)
+            })
+        });
         if let Some(cause) = decline {
             rederivation_notes.push(RederivationNote {
                 rank: plan.rank(),
@@ -21591,6 +21831,8 @@ fn build_capture_partitionings(
     // This pass's injectors, for the id of the publisher that re-publishes
     // a split topic's foreign writers' recorded frames.
     injectors: &IndexMap<String, Injector>,
+    // Configured whole-recording record budget.
+    verifier_record_budget: u64,
 ) -> Result<BTreeMap<String, CapturePartitioning>, ReplayError> {
     let mut out: BTreeMap<String, CapturePartitioning> = BTreeMap::new();
     let candidates = partitionable_produced_topics(config, produced);
@@ -21651,20 +21893,21 @@ fn build_capture_partitionings(
     let tokens = load_recorded_publisher_tokens(trace);
     let topics: BTreeSet<String> = candidates.keys().cloned().collect();
     let sidecar = read_producer_sidecar(&trace.reader, &topics);
-    let frame_index = match collect_topic_frame_index(recorded_messages, &topics)? {
-        FrameIndexCensus::Indexed(index) => index,
-        FrameIndexCensus::OverBudget(overrun) => {
-            tracing::warn!(
-                frames = overrun.frames,
-                budget = overrun.budget,
-                "replay: this pass's co-located multi-publisher topics carry more recorded \
+    let frame_index =
+        match collect_topic_frame_index(recorded_messages, &topics, verifier_record_budget)? {
+            FrameIndexCensus::Indexed(index) => index,
+            FrameIndexCensus::OverBudget(overrun) => {
+                tracing::warn!(
+                    frames = overrun.frames,
+                    budget = overrun.budget,
+                    "replay: this pass's co-located multi-publisher topics carry more recorded \
                  frames than the verifier's record budget, so their capture diff falls back \
                  to the single-stream path (which cannot tell two writers' sequence streams \
                  apart)"
-            );
-            return Ok(out);
-        }
-    };
+                );
+                return Ok(out);
+            }
+        };
 
     for topic in candidates.keys() {
         // (2) every producer THIS PASS publishes through its own publishers
@@ -28893,7 +29136,7 @@ impl<'a> RankedReadOutcomeCursors<'a> {
         out: &mut Vec<RecordedReadOutcome>,
         over_budget: &mut Vec<(Arc<str>, u16, u32)>,
     ) -> Result<(), ReplayError> {
-        let budget = verifier_record_budget(BudgetSite::ReadLog);
+        let budget = per_step_fold_budget();
         for (idx, cursor) in self.cursors.iter_mut().enumerate() {
             let rank = self.ranks[idx] as usize;
             while let Some(next) = cursor.peek()? {
@@ -31205,7 +31448,7 @@ impl ActiveReadLog<'_> {
             // compare equal. Comparing `(record, run_count)` tuples instead
             // would have been cheaper and WRONG for exactly that reason — it
             // would make the switch verdict-affecting on a mixed pair.
-            let budget = verifier_record_budget(BudgetSite::ReadLog);
+            let budget = per_step_fold_budget();
             let plan = expand_run(p.outcome.run_count, entry.1.len(), budget);
             for _ in 0..plan.take {
                 entry.1.push(ReadCmp {
@@ -38359,7 +38602,8 @@ mod frame_ordinal_collection_tests {
         let rm = RecordedMessages::from_owned_frames(frames);
         let topics: BTreeSet<String> = [topic.to_string()].into_iter().collect();
         let FrameIndexCensus::Indexed(index) =
-            collect_topic_frame_index(&rm, &topics).expect("the walk succeeds")
+            collect_topic_frame_index(&rm, &topics, DEFAULT_VERIFIER_RECORD_BUDGET)
+                .expect("the walk succeeds")
         else {
             panic!("and stays inside the budget");
         };
@@ -38398,7 +38642,8 @@ mod frame_ordinal_collection_tests {
         let rm = RecordedMessages::from_owned_frames(frames);
         let topics: BTreeSet<String> = [topic.to_string()].into_iter().collect();
         let FrameIndexCensus::Indexed(index) =
-            collect_topic_frame_index(&rm, &topics).expect("the walk succeeds")
+            collect_topic_frame_index(&rm, &topics, DEFAULT_VERIFIER_RECORD_BUDGET)
+                .expect("the walk succeeds")
         else {
             panic!("and stays inside the budget");
         };
@@ -44269,8 +44514,9 @@ mod verifier_budget_overrun_tests {
             "rank 0's read log was declined (verifier_declined_read_log_budget): it holds 26 \
              reads, more than the verifier's budget of 25 reads per rank, and reaches the \
              budget at step 11, 0.055 s into the rank's 0.055 s of recording. This replay \
-             holds each rank's read log in memory up to this budget, so replay a recording of \
-             this graph no longer than that."
+             holds each rank's read log in memory up to this budget; raise it with \
+             `--verifier-record-budget <COUNT>`, bound the replay with `--duration`, or replay a \
+             shorter recording of this graph."
         );
         let untimed = ReadLogOverrun {
             time: None,
@@ -44339,7 +44585,9 @@ mod verifier_budget_overrun_tests {
         let topics: BTreeSet<String> = ["/a", "/b"].into_iter().map(str::to_string).collect();
         let census = |budget: usize| {
             let _guard = override_frame_index_record_budget(budget);
-            match collect_topic_frame_index(&rm, &topics).expect("the walk succeeds") {
+            match collect_topic_frame_index(&rm, &topics, DEFAULT_VERIFIER_RECORD_BUDGET)
+                .expect("the walk succeeds")
+            {
                 FrameIndexCensus::OverBudget(o) => Err((o.frames, o.budget)),
                 FrameIndexCensus::Indexed(index) => Ok(index),
             }
@@ -44360,12 +44608,16 @@ mod verifier_budget_overrun_tests {
                                  CERULION_EXECUTION_MODE=lockstep, whose one gating clock \
                                  orders every publish against every step";
         const READ_LOG: &str = "This replay holds each rank's read log in memory up to this \
-                                budget, so replay a recording of this graph no longer than \
-                                that";
+                                budget; raise it with `--verifier-record-budget <COUNT>`, bound \
+                                the replay with `--duration`, or replay a shorter recording of \
+                                this graph";
         const FRAMES: &str = "This replay holds the frames each rank consumes in memory up to \
-                              this budget, so replay a shorter recording of this graph";
+                              this budget; raise it with `--verifier-record-budget <COUNT>` or \
+                              replay a shorter recording of this graph";
         const SCHEDULE: &str = "This replay holds each pass's recorded schedule in memory up \
-                                to this budget, so replay a shorter recording of this graph";
+                                to this budget; raise it with `--verifier-record-budget <COUNT>`, \
+                                bound the replay with `--duration`, or replay a shorter recording \
+                                of this graph";
         let read_log = ReadLogOverrun {
             reads: 26,
             budget: 25,
@@ -44381,7 +44633,7 @@ mod verifier_budget_overrun_tests {
             VerifierDecline::InputTables,
             VerifierDecline::ReadLogBudget(read_log),
             VerifierDecline::FrameIndexBudget(frames),
-            VerifierDecline::ScheduleBudget,
+            VerifierDecline::ScheduleBudget(25),
             VerifierDecline::ReadLogUnplaceable,
             VerifierDecline::StagingRegime,
         ] {
@@ -44390,7 +44642,7 @@ mod verifier_budget_overrun_tests {
             let (remedy, ends_with) = match cause {
                 VerifierDecline::ReadLogBudget(_) => (Some(READ_LOG), READ_LOG),
                 VerifierDecline::FrameIndexBudget(_) => (Some(FRAMES), FRAMES),
-                VerifierDecline::ScheduleBudget => (Some(SCHEDULE), SCHEDULE),
+                VerifierDecline::ScheduleBudget(_) => (Some(SCHEDULE), SCHEDULE),
                 VerifierDecline::InputTables
                 | VerifierDecline::ReadLogUnplaceable
                 | VerifierDecline::StagingRegime => (None, RE_RECORD),
@@ -44436,6 +44688,341 @@ mod verifier_budget_overrun_tests {
             assert_eq!(seconds_text(ns), want, "{ns} ns");
             assert_eq!(seconds_text(ns), seconds_text(ns), "two calls agree");
         }
+    }
+
+    /// Hand-counted 26-read and 12-frame oracles are admitted at exact budget
+    /// (26 / 12) and refused at one under (25 / 11), `step_end` cutting at the
+    /// overrun step admits the prefix, and `u64::MAX` saturates and admits.
+    #[test]
+    fn verifier_budget_exact_boundary_admits_at_and_refuses_one_over() {
+        use cerulion_bag::{BagWriter, BagWriterConfig};
+
+        // 12 headered frames on `/a`.
+        let frame_list: Vec<Vec<u8>> = (0..12).map(framed).collect();
+        let frames: IndexMap<String, Vec<Vec<u8>>> =
+            [("/a".to_string(), frame_list)].into_iter().collect();
+        let rm = RecordedMessages::from_owned_frames(frames);
+        let topics: BTreeSet<String> = ["/a".to_string()].into_iter().collect();
+
+        match collect_topic_frame_index(&rm, &topics, 12).expect("exact budget") {
+            FrameIndexCensus::Indexed(index) => assert_eq!(index["/a"].sequences.len(), 12),
+            FrameIndexCensus::OverBudget(o) => panic!("12 frames fit budget 12: {o:?}"),
+        }
+        match collect_topic_frame_index(&rm, &topics, 11).expect("one under") {
+            FrameIndexCensus::OverBudget(o) => {
+                assert_eq!(
+                    o,
+                    FrameIndexOverrun {
+                        frames: 12,
+                        budget: 11
+                    }
+                );
+            }
+            FrameIndexCensus::Indexed(_) => panic!("12 frames must refuse at budget 11"),
+        }
+        match collect_topic_frame_index(&rm, &topics, u64::MAX).expect("u64::MAX saturates") {
+            FrameIndexCensus::Indexed(index) => assert_eq!(index["/a"].sequences.len(), 12),
+            FrameIndexCensus::OverBudget(o) => panic!("u64::MAX must admit: {o:?}"),
+        }
+
+        // 26 reads on rank 0: 2 reads per step for steps 0..10 (20 reads) and
+        // 6 reads at step 11 (26 total).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bag = dir.path().join("census_boundary.mcap");
+        let mut writer = BagWriter::create(&bag, BagWriterConfig::default(), &[]).expect("writer");
+        let meta = cerulion_core::trace_ring::pack_read_outcome_meta(
+            0,
+            READ_OUTCOME_SERVED,
+            ReadSiteRole::Body,
+        );
+        let aux = cerulion_core::trace_ring::pack_read_outcome_aux_run(1, 1);
+        writer
+            .write_chunk(|c| {
+                let mut seq = 0u32;
+                for step in 0..12u64 {
+                    let t = 1_000_000_000 + step * 5_000_000;
+                    let boundary = TraceRingRecord {
+                        step,
+                        fire_time_ns: t,
+                        duration_ns: 0,
+                        node_idx: 0,
+                        global_level: 0,
+                        record_type: RECORD_TYPE_STEP_BOUNDARY,
+                        reserved: 0,
+                    };
+                    c.write_scheduler_trace(seq, t, t, &boundary)?;
+                    seq += 1;
+                    let count = if step < 10 {
+                        2
+                    } else if step == 10 {
+                        0
+                    } else {
+                        6
+                    };
+                    for _ in 0..count {
+                        let rec = TraceRingRecord {
+                            step,
+                            fire_time_ns: u64::from(seq),
+                            duration_ns: aux,
+                            node_idx: 0,
+                            global_level: meta,
+                            record_type: RECORD_TYPE_READ_OUTCOME,
+                            reserved: 0,
+                        };
+                        c.write_scheduler_trace(seq, t, t, &rec)?;
+                        seq += 1;
+                    }
+                }
+                Ok(())
+            })
+            .expect("chunk");
+        writer.finalize().expect("finalize");
+
+        let trace = RecordedTrace::new(Arc::new(BagReader::open(&bag).expect("open")));
+        let rank_tables = vec![vec![Arc::<str>::from("sink")]];
+        let recorded_inputs = BTreeMap::from([("sink".to_string(), vec!["in0".to_string()])]);
+
+        match collect_rank_read_log(
+            &trace,
+            0,
+            &rank_tables,
+            &recorded_inputs,
+            KindFieldWidth::Narrow,
+            None,
+            26,
+        )
+        .expect("exact 26")
+        {
+            ReadLogCensus::Collected(reads) => assert_eq!(reads.len(), 26),
+            ReadLogCensus::Declined(c) => panic!("26 reads fit budget 26: {c:?}"),
+        }
+
+        match collect_rank_read_log(
+            &trace,
+            0,
+            &rank_tables,
+            &recorded_inputs,
+            KindFieldWidth::Narrow,
+            None,
+            25,
+        )
+        .expect("one under")
+        {
+            ReadLogCensus::Declined(VerifierDecline::ReadLogBudget(overrun)) => {
+                assert_eq!(overrun.reads, 26);
+                assert_eq!(overrun.budget, 25);
+                assert_eq!(overrun.step, 11);
+                assert_eq!(
+                    overrun.time,
+                    Some(RunOutTime {
+                        at_ns: 55_000_000,
+                        span_ns: 55_000_000,
+                    })
+                );
+            }
+            other => panic!(
+                "expected ReadLogBudget overrun, got {}",
+                match other {
+                    ReadLogCensus::Collected(r) => format!("Collected({})", r.len()),
+                    ReadLogCensus::Declined(c) => format!("Declined({c:?})"),
+                }
+            ),
+        }
+
+        // `--duration` cutting at step 11 excludes the 6 reads at step 11, so
+        // the 20 reads in steps 0..11 fit a budget of 20 (and 25).
+        match collect_rank_read_log(
+            &trace,
+            0,
+            &rank_tables,
+            &recorded_inputs,
+            KindFieldWidth::Narrow,
+            Some(11),
+            20,
+        )
+        .expect("prefix within budget")
+        {
+            ReadLogCensus::Collected(reads) => assert_eq!(reads.len(), 20),
+            ReadLogCensus::Declined(c) => panic!("20 prefix reads fit budget 20: {c:?}"),
+        }
+
+        // `u64::MAX` saturates to `usize::MAX` and admits.
+        match collect_rank_read_log(
+            &trace,
+            0,
+            &rank_tables,
+            &recorded_inputs,
+            KindFieldWidth::Narrow,
+            None,
+            u64::MAX,
+        )
+        .expect("u64::MAX saturates")
+        {
+            ReadLogCensus::Collected(reads) => assert_eq!(reads.len(), 26),
+            ReadLogCensus::Declined(c) => panic!("u64::MAX must admit: {c:?}"),
+        }
+
+        // ScheduleBudget carries and renders its configured budget.
+        assert_eq!(
+            VerifierDecline::ScheduleBudget(3_000_000).reason(),
+            "its recorded schedule exceeds the verifier's 3000000-record budget"
+        );
+        assert_eq!(
+            VerifierDecline::ScheduleBudget(25).reason(),
+            "its recorded schedule exceeds the verifier's 25-record budget"
+        );
+    }
+
+    /// Raising the whole-recording verifier budget (via the raised default or a
+    /// configured value) never raises the 200,000 per-step hostile-run bound.
+    #[test]
+    fn per_step_fold_budget_stays_capped_when_whole_run_budget_is_raised() {
+        assert_eq!(DEFAULT_VERIFIER_RECORD_BUDGET, 3_000_000);
+        assert_eq!(REPLAY_PER_STEP_FOLD_BUDGET, 200_000);
+        assert_eq!(
+            verifier_record_budget(BudgetSite::ReadLog, DEFAULT_VERIFIER_RECORD_BUDGET),
+            3_000_000
+        );
+        assert_eq!(
+            verifier_record_budget(BudgetSite::FrameIndex, 10_000_000),
+            10_000_000
+        );
+        assert_eq!(
+            verifier_record_budget(BudgetSite::Schedule, u64::MAX),
+            usize::MAX
+        );
+        assert_eq!(per_step_fold_budget(), 200_000);
+        assert_eq!(
+            expand_run(200_000, 0, per_step_fold_budget()),
+            RunExpansion {
+                take: 200_000,
+                over_budget: false,
+            }
+        );
+        assert_eq!(
+            expand_run(200_001, 0, per_step_fold_budget()),
+            RunExpansion {
+                take: 200_000,
+                over_budget: true,
+            }
+        );
+        // Even an explicit test override above 200,000 never raises the
+        // per-step ceiling, while a lower override still shrinks it for fast
+        // hostile-run tests.
+        {
+            let _high = override_read_log_record_budget(10_000_000);
+            assert_eq!(
+                verifier_record_budget(BudgetSite::ReadLog, DEFAULT_VERIFIER_RECORD_BUDGET),
+                10_000_000
+            );
+            assert_eq!(per_step_fold_budget(), 200_000);
+        }
+        {
+            let _low = override_read_log_record_budget(64);
+            assert_eq!(per_step_fold_budget(), 64);
+        }
+        assert_eq!(per_step_fold_budget(), 200_000);
+    }
+
+    /// The `--duration` probe ([`rank_has_read_for_edges_from`]) finds a READ
+    /// on a wanted edge at or past `from_step`, and nothing for a later
+    /// `from_step`, an annotation-only tail, an edge with no record, no edge, or
+    /// another rank.
+    #[test]
+    fn the_duration_probe_counts_only_later_reads_on_its_own_edges() {
+        use cerulion_bag::{BagWriter, BagWriterConfig};
+
+        // Rank 0, node `sink`: one `Served` read on `in0` at step 3 and one
+        // `Producer` annotation on `in0` at step 5, under one boundary per step.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bag = dir.path().join("later_reads.mcap");
+        let mut writer = BagWriter::create(&bag, BagWriterConfig::default(), &[]).expect("writer");
+        let served = cerulion_core::trace_ring::pack_read_outcome_meta(
+            0,
+            READ_OUTCOME_SERVED,
+            ReadSiteRole::Body,
+        );
+        let producer = cerulion_core::trace_ring::pack_read_outcome_meta(
+            0,
+            cerulion_core::trace_ring::READ_OUTCOME_PRODUCER,
+            ReadSiteRole::Body,
+        );
+        let aux = cerulion_core::trace_ring::pack_read_outcome_aux_run(1, 1);
+        writer
+            .write_chunk(|c| {
+                let mut seq = 0u32;
+                for step in 0..6u64 {
+                    let t = 1_000_000_000 + step * 5_000_000;
+                    let boundary = TraceRingRecord {
+                        step,
+                        fire_time_ns: t,
+                        duration_ns: 0,
+                        node_idx: 0,
+                        global_level: 0,
+                        record_type: RECORD_TYPE_STEP_BOUNDARY,
+                        reserved: 0,
+                    };
+                    c.write_scheduler_trace(seq, t, t, &boundary)?;
+                    seq += 1;
+                    let meta = match step {
+                        3 => served,
+                        5 => producer,
+                        _ => continue,
+                    };
+                    let rec = TraceRingRecord {
+                        step,
+                        fire_time_ns: u64::from(seq),
+                        duration_ns: aux,
+                        node_idx: 0,
+                        global_level: meta,
+                        record_type: RECORD_TYPE_READ_OUTCOME,
+                        reserved: 0,
+                    };
+                    c.write_scheduler_trace(seq, t, t, &rec)?;
+                    seq += 1;
+                }
+                Ok(())
+            })
+            .expect("chunk");
+        writer.finalize().expect("finalize");
+
+        let trace = RecordedTrace::new(Arc::new(BagReader::open(&bag).expect("open")));
+        let rank_tables = vec![vec![Arc::<str>::from("sink")]];
+        let recorded_inputs = BTreeMap::from([(
+            "sink".to_string(),
+            vec!["in0".to_string(), "in1".to_string()],
+        )]);
+        let edge = |input: &str| replay_inject::AdmissionEdge {
+            node_id: "sink".to_string(),
+            input: input.to_string(),
+            mode: replay_inject::ConsumeMode::Latest,
+            reads: Vec::new(),
+        };
+        let probe = |rank: u32, edges: &[replay_inject::AdmissionEdge], from_step: u64| {
+            rank_has_read_for_edges_from(
+                &trace,
+                rank,
+                &rank_tables,
+                &recorded_inputs,
+                KindFieldWidth::Narrow,
+                edges,
+                from_step,
+            )
+            .expect("the walk succeeds")
+        };
+
+        assert!(
+            probe(0, &[edge("in0")], 0),
+            "the step-3 read is past step 0"
+        );
+        assert!(probe(0, &[edge("in0")], 3), "a read AT the cut counts");
+        assert!(
+            !probe(0, &[edge("in0")], 4),
+            "past the read only the step-5 annotation is left, and it is not a read"
+        );
+        assert!(!probe(0, &[edge("in1")], 0), "no record names `in1`");
+        assert!(!probe(0, &[], 0), "no edge is never covered");
+        assert!(!probe(1, &[edge("in0")], 0), "rank 1 has no table");
     }
 }
 

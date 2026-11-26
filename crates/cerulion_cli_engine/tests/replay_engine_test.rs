@@ -2406,6 +2406,7 @@ fn replay_inner_with_transport(
         record_health,
         duration_bound_ns,
         feed_index_budget: None,
+        verifier_record_budget: None,
         report_path,
         fire_tap,
         tolerance,
@@ -11548,6 +11549,7 @@ fn replay_probing_reader(
         record_health: RecordHealthReport::Absent,
         duration_bound_ns: None,
         feed_index_budget: None,
+        verifier_record_budget: None,
         report_path: None,
         fire_tap: None,
         tolerance: None,
@@ -36811,7 +36813,7 @@ fn a_declined_pass_stands_down_every_topic_it_would_have_steered() {
 // ===========================================================================
 // The THREE RECORD-BUDGET declines, made reachable
 //
-// `REPLAY_VERIFIER_RECORD_BUDGET` is 200_000 records. No bag this file can
+// `DEFAULT_VERIFIER_RECORD_BUDGET` is 5_000_000 records. No bag this file can
 // craft comes near it, so without the `test-seams` override the three budget
 // causes — `ReadLogBudget`, `FrameIndexBudget` and `ScheduleBudget` — are
 // reachable by NO test: their variants, their `code()` tokens, the
@@ -37484,8 +37486,9 @@ const LS_READ_LOG_REFUSAL: &str = "this recording's read log cannot be enforced 
      [read_identity_unplanned]: rank 0's read log was declined \
      (verifier_declined_read_log_budget): it holds 26 reads, more than the verifier's budget of \
      25 reads per rank, and reaches the budget at step 11, 0.055 s into the rank's 0.055 s of \
-     recording. This replay holds each rank's read log in memory up to this budget, so replay \
-     a recording of this graph no longer than that.";
+     recording. This replay holds each rank's read log in memory up to this budget; raise it \
+     with `--verifier-record-budget <COUNT>`, bound the replay with `--duration`, or replay a \
+     shorter recording of this graph.";
 
 /// `--verify` replays of the never-failing bag under each read-log or
 /// frame-index budget in `budgets` verify, each fed the sink's 24 reads (12
@@ -37510,9 +37513,9 @@ fn assert_ls_verifies_under(bag: &std::path::Path, budgets: &[(Option<usize>, Op
 ///
 /// The never-failing bag holds 26 reads on rank 0 ([`LS_READS`]), so a budget
 /// of 25 is one short. The 26th read is at step 11, the last step, 55 ms
-/// after the rank's first boundary in a 55 ms recording. The remedy is a
-/// shorter recording; the refusal names neither `--duration` nor a re-record,
-/// which would not help.
+/// after the rank's first boundary in a 55 ms recording. The remedy names
+/// `--verifier-record-budget`, `--duration`, and a shorter recording, never a
+/// re-record, which would not help.
 ///
 /// CONTROL, on the same bag: at the shipped budget, one read under the budget
 /// (27) and exactly at it (26, the side a `>` / `>=` slip moves) the replay
@@ -37538,8 +37541,10 @@ fn a_verify_one_read_over_the_read_log_budget_is_refused_naming_both_numbers() {
     let msg = err.to_string();
     assert_eq!(msg, LS_READ_LOG_REFUSAL);
     assert!(
-        !msg.contains("--duration") && !msg.contains("Re-record"),
-        "no remedy that does not help: {msg}"
+        msg.contains("--verifier-record-budget")
+            && msg.contains("--duration")
+            && !msg.contains("Re-record"),
+        "names the budget flag and duration bound, never a re-record: {msg}"
     );
 }
 
@@ -37593,8 +37598,9 @@ fn a_neutral_resim_of_a_rank_that_reads_its_own_topic_names_the_budget_and_a_sho
          built from was declined before the first step (verifier_declined_read_log_budget): it \
          holds 26 reads, more than the verifier's budget of 25 reads per rank, and reaches the \
          budget at step 11, 0.055 s into the rank's 0.055 s of recording. This replay holds \
-         each rank's read log in memory up to this budget, so replay a recording of this graph \
-         no longer than that"
+         each rank's read log in memory up to this budget; raise it with \
+         `--verifier-record-budget <COUNT>`, bound the replay with `--duration`, or replay a \
+         shorter recording of this graph"
     );
     assert!(
         !detail.contains("Re-record the bag with this binary"),
@@ -37638,8 +37644,8 @@ fn a_verify_one_frame_over_the_frame_index_budget_is_refused_naming_both_numbers
          reads the replay must admit at their recorded steps, and the read log they would be \
          built from was declined before the first step (verifier_declined_frame_index_budget): \
          it consumes 12 recorded frames, more than the verifier's budget of 11 frames per rank. \
-         This replay holds the frames each rank consumes in memory up to this budget, so replay \
-         a shorter recording of this graph"
+         This replay holds the frames each rank consumes in memory up to this budget; raise it \
+         with `--verifier-record-budget <COUNT>` or replay a shorter recording of this graph"
     );
     assert!(
         logs_contain("rank=0 frames=12 budget=11"),
@@ -37725,7 +37731,8 @@ fn a_hostile_run_count_in_the_census_is_counted_whole() {
          log was declined (verifier_declined_read_log_budget): it holds 4121 reads, more than \
          the verifier's budget of 64 reads per rank, and reaches the budget at step 0, 0.000 s \
          into the rank's 0.055 s of recording. This replay holds each rank's read log in memory \
-         up to this budget, so replay a recording of this graph no longer than that."
+         up to this budget; raise it with `--verifier-record-budget <COUNT>`, bound the replay \
+         with `--duration`, or replay a shorter recording of this graph."
     );
 }
 
@@ -49791,6 +49798,7 @@ fn ri_replay_stamped(
         record_health,
         duration_bound_ns,
         feed_index_budget,
+        verifier_record_budget: None,
         report_path,
         fire_tap: None,
         tolerance: None,
@@ -50531,6 +50539,7 @@ fn two_concurrent_fed_replays_sharing_an_iceoryx2_config_do_not_cross_feeds() {
                     record_health: RecordHealthReport::Absent,
                     duration_bound_ns: None,
                     feed_index_budget: None,
+                    verifier_record_budget: None,
                     report_path: None,
                     fire_tap: None,
                     tolerance: None,
