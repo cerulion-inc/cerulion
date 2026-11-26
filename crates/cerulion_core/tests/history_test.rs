@@ -319,6 +319,48 @@ fn a_publisher_that_asks_for_history_carries_the_retaining_mark_until_it_drops()
     );
 }
 
+/// On a service created with a history floor (`create_history_floor`, what
+/// every `rmw_cerulion` endpoint creates a ROS topic with) a publisher retains
+/// only the history it asked for: none at history 0, 5 at history 5, though
+/// the service's history is 16. On a service created at history 16 WITHOUT a
+/// floor, a later publisher that asks for 5 still retains 16, the creator's
+/// history. Two runs give the same four numbers.
+#[test]
+fn a_publisher_on_a_floored_service_retains_only_its_own_history() {
+    let run = || {
+        let tt = cerulion_core::testing::TestTransport::with_buffer_size(32);
+        let mgr = tt.manager();
+        let msl = MaxSliceLen::const_new(256);
+        let floored = unique_topic("floored_retention");
+        let mut cfg = mgr.default_topic_config();
+        cfg.create_history_floor = Some(16);
+        let asks_none = mgr
+            .create_publisher_with_topic_config(&floored, msl, 0, cfg)
+            .expect("the history-0 publisher creates the floored service");
+        cfg.history_size = 5;
+        let asks_five = mgr
+            .create_publisher_with_topic_config(&floored, msl, 5, cfg)
+            .expect("the history-5 publisher opens it");
+        let deep = unique_topic("deep_retention");
+        let creator = tt.publisher(&deep, msl, 16);
+        let opener = tt.publisher(&deep, msl, 5);
+        [
+            asks_none.provisioned_history_size(),
+            asks_five.provisioned_history_size(),
+            creator.provisioned_history_size(),
+            opener.provisioned_history_size(),
+        ]
+    };
+    let first = run();
+    assert_eq!(
+        first,
+        [0, 5, 16, 16],
+        "floored: each publisher retains its own 0 and 5; not floored: the history-5 \
+         opener retains the creator's 16"
+    );
+    assert_eq!(run(), first, "a second run retains the same");
+}
+
 /// Each publisher on a topic is listed with the name of the node its
 /// transport runs under, and its id is the origin of every frame it
 /// commits, so a reader can name the node a frame came from. A dropped

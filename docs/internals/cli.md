@@ -10,6 +10,31 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 `docs/multi_process.md`, `docs/auto_partitioning.md`, `docs/networking.md`,
 `docs/replay_determinism_footguns.md`, `docs/user-api.md`.
 
+The `remote_shell::session_plan` library function prepares paired session helper
+arguments without spawning a process. It accepts a `connect_cmd::plan` result, retains its
+identity and route options, and puts exec arguments literally after `--`. Shell and
+exec witness paths must be nonempty UTF-8 without NUL; policy requests use no witness
+path. Callers must check `require_network` before identity lookup or helper resolution.
+Its typed refusal and the pure `network_refusal` diagnostic share the query-side
+network rules: `CERULION_NETWORK` uses the fail-closed parse, and
+`CERULION_NETD_NETWORK` disables access only for the exact value `off`.
+`CliError::RemoteShellNetworkRefused(String)` carries that diagnostic. Rust callers
+with exhaustive matches on `CliError` must handle the new variant or a fallback arm.
+
+`remote_shell::run` resolves explicit pins and endpoint IDs locally. Other selectors
+use the owned account catalog, with canonical `account:<robot-id>` routes; duplicate
+names and collisions with cached LAN names require an explicit selector. Account
+login/key identity is checked before and after the bounded revocation-refresh
+wait, and cancellation prevents helper startup. A failed refresh is reported;
+timeout does not cancel its request worker, which may later replace the epoch
+cache atomically. A changed login or key refuses the operation.
+Only public account/key context and locked-store paths enter the helper arguments.
+The helper owns proof handling and returns its actual exit status to the caller.
+Account-session tests forward real loopback account responses, observe requests
+before mutating identity or cancellation, and assert helper refusal and unchanged
+cache bytes after a real HTTP refusal. Both network switches are tested before
+lookup, with a successful request through the same observer after re-enabling.
+
 ---
 
 ## 1. `cerulion bag play --resim`: exit-code contract
@@ -1096,6 +1121,10 @@ dependency-trimming change touching either must re-check the pair.
 All paths under `crates/cerulion_cli_engine/tests/`. "Serial" means run that binary
 individually with `-- --test-threads=1`; everything else is parallel-safe within its
 own binary.
+
+Unit tests in `src/remote_shell.rs` use literal argv and diagnostic oracles for
+session planning, identity and path refusals, and network-disable precedence.
+They perform no helper execution or network access.
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|

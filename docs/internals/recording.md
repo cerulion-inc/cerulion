@@ -15,9 +15,11 @@ User-facing recording docs live in `docs/bag.md`.
   (`cerulion trace inspect`).
 - Bags carry attachments under the reserved `__cerulion/` prefix:
   `recorder.json` (host identity: arch/os/version, used by replay's
-  cross-host advisory, plus the contract keys `trace_format`, `coordination`
-  and `node_external`, each native node's driver flag from its loaded
-  metadata, and `env_names_left_out`, the count of names `env.json` left out
+  cross-host advisory, plus the contract keys `trace_format`, `coordination`,
+  `node_external`, each native node's driver flag from its loaded
+  metadata, and `node_inputs`, each native node's inputs with the
+  backpressure and depth the run's topology reads them with
+  (`replay_engine::node_input_queues`), and `env_names_left_out`, the count of names `env.json` left out
   for not being valid UTF-8), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.

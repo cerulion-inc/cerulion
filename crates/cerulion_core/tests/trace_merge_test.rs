@@ -25,6 +25,7 @@ fn e(node: &str, step: u64, gl: usize, t: u64) -> TraceEntry {
         global_level: gl,
         duration_ns: 0,
         discarded: false,
+        stop: None,
     }
 }
 

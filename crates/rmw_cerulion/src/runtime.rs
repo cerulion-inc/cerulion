@@ -900,8 +900,24 @@ pub struct SubscriptionInner {
     /// one unit of the service's `subscriber_max_borrowed_samples` budget is
     /// consumed. Dropping the entry (return, or subscription destroy)
     /// releases both — and, for a forged take, un-forges + destroys the
-    /// shadow FIRST (field order below is load-bearing).
+    /// shadow FIRST (field order below is load-bearing). Never longer than
+    /// the subscription's borrow ceiling less one: a take past that is served
+    /// by copy (`copied_takes`).
     pub pending_takes: Vec<PendingTake>,
+    /// Outstanding loaned takes served by COPY because the subscription
+    /// already held every zero-copy loan its borrow ceiling allows, keyed by
+    /// the pointer handed to the caller. Each entry owns private heap memory
+    /// and holds NO iceoryx2 sample (the borrow it was received into was
+    /// released before the take returned), so the reserve counts
+    /// `pending_takes` alone. Returned through the same call as a loan;
+    /// dropped (freed) at subscription destroy.
+    pub copied_takes: Vec<CopiedTake>,
+    /// Whether the served-by-copy regime is open: set by a take served by
+    /// copy, cleared by the first take served zero-copy with no copy
+    /// outstanding, which is the only take that reports to the copy latch's
+    /// success side. A zero-copy take while it is clear reads only this flag
+    /// of the copy bookkeeping.
+    pub copy_regime_open: bool,
     /// The recyclable shadow messages the forged take hands
     /// out, sized to the loan budget. Empty (nothing built) until the first
     /// forged take; never touched by a fixed type's take.
@@ -935,6 +951,53 @@ pub struct PendingTake {
     pub sample: cerulion_core::transport::subscriber::OwnedInboundSample,
 }
 
+/// One loaned take served by COPY past the borrow ceiling's zero-copy loans.
+///
+/// Its key, what the caller holds and later returns, is the address of the
+/// copy's own memory, derived from the copy itself so the two cannot
+/// disagree.
+pub struct CopiedTake {
+    copy: TakeCopy,
+}
+
+impl CopiedTake {
+    /// Track `copy`.
+    pub(crate) fn new(copy: TakeCopy) -> Self {
+        Self { copy }
+    }
+
+    /// The pointer handed to the caller (the copy's address, mutable: the
+    /// memory is private to this take).
+    pub(crate) fn loaned_ptr(&mut self) -> *mut std::os::raw::c_void {
+        match &mut self.copy {
+            TakeCopy::Fixed(words) => words.as_mut_ptr() as *mut std::os::raw::c_void,
+            TakeCopy::Shadow(shadow) => shadow.as_ptr(),
+        }
+    }
+
+    /// The return's key: the copy's address.
+    pub fn key(&self) -> usize {
+        match &self.copy {
+            TakeCopy::Fixed(words) => words.as_ptr() as usize,
+            TakeCopy::Shadow(shadow) => shadow.as_ptr() as usize,
+        }
+    }
+}
+
+/// The private memory a copied take hands out. Moving it (into the table of
+/// copies, or as that table grows) never moves the memory the caller's
+/// pointer aims at: both variants own a heap allocation.
+pub(crate) enum TakeCopy {
+    /// A FIXED type: the frame's fixed section (the C struct, byte for byte)
+    /// in heap words, so the struct is 8-aligned (`WireLayout::fixed_align`
+    /// is at most 8).
+    Fixed(Vec<u64>),
+    /// A type with a forgeable sequence: an unpooled shadow filled by the
+    /// copying decode, so every member owns its storage and nothing aliases
+    /// shared memory. Dropping it runs the typesupport's `fini`.
+    Shadow(TakeShadow),
+}
+
 /// One rmw-owned SHADOW message — the object a forged
 /// loaned take hands to rclcpp in place of a copy. Its fixed fields,
 /// strings and nested containers are real, rmw-filled members on the
@@ -966,10 +1029,14 @@ pub struct TakeShadow {
 unsafe impl Send for TakeShadow {}
 
 impl TakeShadow {
-    fn build(bridge: &Arc<crate::bridge::AnyBridge>) -> Option<Self> {
-        // SAFETY: the pool only builds shadows for a bridge whose
-        // `can_loan_take()` holds with a nonzero forged-sequence count (the
-        // forged-take arm is the sole caller).
+    /// Build one shadow through the typesupport's own `init_function`:
+    /// pooled by [`TakeShadowPool::acquire`], or unpooled for a take served by
+    /// copy ([`TakeCopy::Shadow`]), which is filled by the copying decode and
+    /// destroyed when the copy is returned. `None` only on allocation failure.
+    pub(crate) fn build(bridge: &Arc<crate::bridge::AnyBridge>) -> Option<Self> {
+        // SAFETY: shadows are built only for a bridge whose `can_loan_take()`
+        // holds with a nonzero forged-sequence count (the forged arm of the
+        // loaned take is the sole caller, through the pool or for a copy).
         let ptr = unsafe { bridge.new_shadow() }?;
         Some(Self {
             ptr: std::ptr::NonNull::new(ptr)?,
@@ -1018,10 +1085,11 @@ impl Drop for TakeShadow {
 
 /// The per-subscription pool of recyclable shadows.
 ///
-/// Sized to the loan budget: a consumer can hold at most `capacity` forged
-/// loans at once, and the (`capacity + 1`)th take is REFUSED before any
-/// frame is consumed — the loud, latched budget arm (see
-/// [`crate::loan_refusal_latch`]). Shadows are built LAZILY (a subscription
+/// Sized to the loan budget. The loaned take keeps zero-copy loans one below
+/// the subscription's borrow ceiling (a take past it is served by copy
+/// through an unpooled shadow), so retained loans cannot drain the pool; the
+/// exhausted arm, refused before any frame is consumed and latched through
+/// [`crate::loan_refusal_latch`], stays as the bound. Shadows are built LAZILY (a subscription
 /// that never takes a loan builds none) and then RECYCLED, so a steady-state
 /// forged take allocates nothing on the rmw side.
 pub struct TakeShadowPool {
@@ -1114,12 +1182,12 @@ pub struct SubscriptionData {
     pub hash_mismatches: crate::gated_latch::GatedLatch<
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
     >,
-    /// Forged loaned take: flood-suppressed loudness + an unconditional counter
-    /// for loaned takes REFUSED on a budget (the shadow pool, or the
-    /// transport's borrow budget) — see [`crate::loan_refusal_latch`].
-    /// Its own latch: a refused take is the CONSUMER retaining loans, a
-    /// different condition with a different remedy from a bad frame
-    /// (`decode_failures`) or a skewed type (`hash_mismatches`).
+    /// Loaned take: flood-suppressed loudness + an unconditional counter for
+    /// loaned takes REFUSED because nothing could serve them (the transport
+    /// refused the receive, or a shadow could not be had); see
+    /// [`crate::loan_refusal_latch`]. Its own latch: a different condition
+    /// with a different remedy from a bad frame (`decode_failures`), a skewed
+    /// type (`hash_mismatches`) or a take served by copy (`loan_copies`).
     pub loan_refusals: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
     /// Forged loaned take: flood-suppressed loudness + an unconditional counter
     /// for forged takes that had to COPY a sequence whose entry sat below the
@@ -1128,6 +1196,14 @@ pub struct SubscriptionData {
     /// remedy is on the PRODUCER's side, so it must not share the refusal
     /// regime.
     pub forge_fallbacks: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
+    /// Loaned take: flood-suppressed loudness + an unconditional counter for
+    /// loaned takes SERVED BY COPY because the subscription already holds
+    /// every zero-copy loan its borrow ceiling allows
+    /// (`loan_refusal_latch::report_loan_copied`). Its own latch: the take
+    /// SUCCEEDED (a degrade, not a refusal), so it must not share the
+    /// refusal regime, and it recovers on the first take served zero-copy
+    /// with no copy outstanding.
+    pub loan_copies: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
     /// Adopt-take (`--adopt-take`): `Some` iff the env gate
     /// was armed at CREATE, the heap-hook grant was constructible, AND the
     /// type carries at least one forgeable sequence — the witness plus the
@@ -1151,6 +1227,15 @@ impl SubscriptionData {
     /// [`PublisherData::malformed_header_reject_count`]).
     pub fn loan_refusal_count(&self) -> u64 {
         cerulion_core::transport::failure_regime_latch::lock_regime_latch(&self.loan_refusals)
+            .total_failures()
+    }
+
+    /// Unconditional running total of loaned takes served by copy past the
+    /// zero-copy loans the borrow ceiling allows: independent of log level
+    /// and never reset by recovery (Principle #3). Reachable only from Rust,
+    /// like [`Self::loan_refusal_count`].
+    pub fn loan_copy_count(&self) -> u64 {
+        cerulion_core::transport::failure_regime_latch::lock_regime_latch(&self.loan_copies)
             .total_failures()
     }
 }

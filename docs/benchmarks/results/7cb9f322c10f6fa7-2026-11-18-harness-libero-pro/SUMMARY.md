@@ -219,6 +219,29 @@ Wall seconds are wall clock from the episode's start to its end, tool execution 
 
 USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing here is a billed amount. USD per solved start state is the spend of the arm's scored episodes over the start states it solved: the 28 episodes that ended without a score and the other attempts in lost_attempts.csv are not in it (223.00 USD in all), and no figure counts the robot's calibration episodes or the two attempts lost with the stopped machines. Part of the gap in USD between the arms is caching, not only fewer requests: cached input is priced lower, and the arm without Cerulion had the lower cached share of input tokens for 16 of the 16 models. Where an arm's prompt changes near its start from turn to turn, as the published interface's does when its oldest images drop out, less of it can be read from a cache. Tokens in counts every prompt token, cached ones included; tokens out counts reasoning tokens.
 
+## Model cost and wall time per scored episode, without and with Cerulion (descriptive)
+
+| model | USD an episode without Cerulion | with Cerulion | cost with Cerulion | wall seconds an episode without Cerulion | with Cerulion | time with Cerulion |
+|---|---|---|---|---|---|---|
+| Gemini 3.8 Flash | 1.666 | 0.348 | 4.8 times cheaper | 846.6 | 258.7 | 3.3 times faster |
+| GPT-6 Astra | 4.183 | 2.387 | 1.8 times cheaper | 787.9 | 289.4 | 2.7 times faster |
+| Claude Opus 5.5 | 8.235 | 0.614 | 13 times cheaper | 902.1 | 242.9 | 3.7 times faster |
+| Claude Sonnet 5.5 | 3.509 | 0.366 | 9.6 times cheaper | 533.2 | 233.5 | 2.3 times faster |
+| Claude Haiku 5.5 | 0.256 | 0.023 | 11 times cheaper | 1,102.7 | 190.0 | 5.8 times faster |
+| Claude Fable 5.2 | 1.503 | 1.822 | 1.2 times dearer | 250.4 | 485.8 | 1.9 times slower |
+| Gemini 4 Carbon | 2.239 | 1.286 | 1.7 times cheaper | 1,887.3 | 1,092.3 | 1.7 times faster |
+| Gemini 4 Argon | 5.425 | 1.368 | 4.0 times cheaper | 1,883.8 | 610.8 | 3.1 times faster |
+| Gemini 4 Hydrogen | 7.633 | 1.155 | 6.6 times cheaper | 1,007.0 | 296.9 | 3.4 times faster |
+| GPT-6.2 Astra | 3.193 | 2.453 | 1.3 times cheaper | 636.6 | 261.6 | 2.4 times faster |
+| GPT-6.2 Sol | 1.890 | 1.128 | 1.7 times cheaper | 983.1 | 340.6 | 2.9 times faster |
+| GPT-6.1 Sol | 1.353 | 0.382 | 3.5 times cheaper | 1,100.1 | 290.2 | 3.8 times faster |
+| GPT-6 Luna | 0.259 | 0.037 | 7.0 times cheaper | 1,733.2 | 401.2 | 4.3 times faster |
+| Grok 4.7 | 2.570 | 1.347 | 1.9 times cheaper | 2,257.5 | 816.2 | 2.8 times faster |
+| GPT-6.1 Terra | 1.104 | 0.286 | 3.9 times cheaper | 773.9 | 220.0 | 3.5 times faster |
+| Gemini 4 Neon | 4.014 | 1.246 | 3.2 times cheaper | 552.2 | 190.8 | 2.9 times faster |
+
+Each figure is the arm's USD or wall seconds column in the means table above, a mean over its scored episodes, with what the notes under that table say about each: USD at list price, leaving out what the USD note names, and part of the gap in it caching; wall seconds carrying each endpoint's stalls and failed requests, so a statement about speed is read with them in mind (RULES.md section 6). Each factor is the larger mean of its pair over the smaller, to two decimals under 1.1, one under 10 and a whole number from 10. RULES.md section 3 declares 'Episodes with Cerulion use fewer requests and cost less', which becomes per model when a model's column with Cerulion costs more; this table prints the cost half per model. No rule declared these factors or a statement about speed.
+
 ## How the replies ended (finish reason), scored episodes
 
 | model | arm | replies | tool_calls | stop | length | content_filter | other | requests with no reply | scored episodes with a content_filter reply | ended on content_filter replies |

@@ -68,7 +68,7 @@
 34 crates/cerulion_cli_engine/src/partition_emit.rs
 1 crates/cerulion_cli_engine/src/peer_cache.rs
 39 crates/cerulion_cli_engine/src/replay_cmd.rs
-178 crates/cerulion_cli_engine/src/replay_engine.rs
+177 crates/cerulion_cli_engine/src/replay_engine.rs
 8 crates/cerulion_cli_engine/src/replay_field_registry.rs
 7 crates/cerulion_cli_engine/src/replay_inject.rs
 11 crates/cerulion_cli_engine/src/replay_rank.rs
@@ -250,7 +250,7 @@
 8 crates/rmw_cerulion/src/api/guard_wait.rs
 4 crates/rmw_cerulion/src/api/init.rs
 1 crates/rmw_cerulion/src/api/misc.rs
-28 crates/rmw_cerulion/src/api/pubsub.rs
+26 crates/rmw_cerulion/src/api/pubsub.rs
 8 crates/rmw_cerulion/src/borrow_degrade_latch.rs
 13 crates/rmw_cerulion/src/decode_failure_latch.rs
 5 crates/rmw_cerulion/src/era.rs
@@ -258,7 +258,7 @@
 11 crates/rmw_cerulion/src/ffi/era_pins.rs
 1 crates/rmw_cerulion/src/ffi/introspection_cpp.rs
 8 crates/rmw_cerulion/src/heaphook.rs
-31 crates/rmw_cerulion/src/loan_refusal_latch.rs
+28 crates/rmw_cerulion/src/loan_refusal_latch.rs
 4 crates/rmw_cerulion/src/publish_reject_latch.rs
 2 crates/rmw_cerulion/src/runtime.rs
 3 crates/rmw_cerulion/src/take_gate.rs

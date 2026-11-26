@@ -20,7 +20,7 @@ Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep thei
 
 ## Try it in simulation
 
-The [README quickstart](../README.md#quickstart) walks through this simulated robot and the runtime, from one coding-agent prompt or by commands.
+The README's [harness trial](../README.md#try-the-harness) runs this simulated robot by commands, and its [quickstart](../README.md#quickstart) runs it from one coding-agent prompt.
 
 `cerulion rcp --sim` serves the tools of the [Cerulion harness](harness.md) with a simulated robot on your
 machine, to any MCP client. It needs no robot, and with a release package no source build: every release package

@@ -121,9 +121,14 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   recipe.
 - A data service created with a history floor (`TopicServiceConfig::create_history_floor`,
   set by every `rmw_cerulion` endpoint) also carries the attribute `cerulion.history_floor`.
-  Its history then holds what every publisher sent, VOLATILE ones included, so a subscriber
-  port that asks for no particular history (a graph input, a Python subscriber, `topic echo`
-  and `hz`) takes none from it; on any other service it takes the service history, capped at
+  Its history is room for the deepest publisher that may open, not a request: a publisher
+  port on it retains only its own history (`retain_own_history`, through the fork's
+  `PortFactoryPublisher::history_size`; `cerulion_core`'s build script sets the cfg
+  `iceoryx2_publisher_history` when the iceoryx2 it builds against reports that method;
+  under an iceoryx2 without it, the released 0.10.0 or an earlier fork revision, every port
+  retains the whole floor and the publisher warns once per topic). A subscriber port
+  that asks for no particular history (a graph input, a Python subscriber, `topic echo` and
+  `hz`) takes none from it; on any other service it takes the service history, capped at
   its buffer. An rmw subscription asks for its own: 0 when VOLATILE, its depth when
   TRANSIENT_LOCAL. The attribute marks the whole service, so on a topic an rmw endpoint
   created, a native publisher's declared history does not reach native subscribers either.
@@ -136,7 +141,7 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   `TransportManager::topic_publisher_retain_marks` reads one flag per live publisher from
   any process, and the publisher's drop (or iceoryx2's dead-node cleanup, for a crashed
   process) removes it. It exists because the service history cannot say which publisher
-  retains: every publisher's ring is sized from the service. `rmw_cerulion` resolves a
+  retains: it is the most any publisher on the topic may retain. `rmw_cerulion` resolves a
   BEST_AVAILABLE subscription from these flags. A publisher from a build without the
   name reads as one that retains nothing.
 - Writer cursor contract (for anyone writing an independent frame reader): the
@@ -238,7 +243,9 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
 - Android event-trigger datagram sockets use the abstract Unix-domain namespace;
   SELinux governs access rather than filesystem permissions.
 - iceoryx2 pool formula (`service/static_config/publish_subscribe.rs`):
-  `samples_per_segment = max_subscribers × (buffer + borrowed) + history + loaned`.
+  `samples_per_segment = max_subscribers × (buffer + borrowed) + retained history + loaned`,
+  where the retained history is the service's history, or with the workspace's fork the
+  publisher's own (`PortFactoryPublisher::history_size`).
   Slots are refcount-shared across connections; the `× max_subscribers` term is a
   worst-case wait-free bound.
 - Declared `#[input(depth = N)]` buffers are behaviorally REAL (a 16-buffer retains 16
