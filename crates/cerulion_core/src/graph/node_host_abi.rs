@@ -3015,7 +3015,7 @@ mod tests {
         assert_eq!(word.outstanding(), 0);
 
         // (d) + (g): Next fire resets the guard. A successful submit_spill sets
-        // the guard, so a follow-up normal commit_output in the same fire is refused.
+        // the guard, so a second normal commit_output in the same fire is refused.
         with_context(handle, HostContext::begin_fire).unwrap();
         let spill_ok = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
         assert!(spill_ok.capacity < 3040);

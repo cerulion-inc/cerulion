@@ -317,8 +317,11 @@ The slot is released, and holds nothing from then on:
 The consecutive-panic breaker releases no slot. After a stop that releases
 the slot, the two releases with no record do not apply. `#[cerulion_node]`
 sets that metadata, a `--raw-ffi` node may set it by hand, and a Python node
-cannot. Without it, a count past the depth is no release, since a `--raw-ffi`
-node can send several frames in one fire. A step excused only by holds is a
+cannot. Current builds also refuse a second commit per output per fire on a
+`block` topic at the host commit site, naming the node, output, topic and
+`block` consumer without sending the frame; without that metadata, a count
+past the depth is still no release, so older recordings written before the
+commit-site refusal remain valid. A step excused only by holds is a
 divergence, and the finding says why, if every slot that excused it shows a
 release with no record before its consumer next reads it.
 
