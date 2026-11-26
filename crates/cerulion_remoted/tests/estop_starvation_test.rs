@@ -1051,12 +1051,13 @@ async fn bootstrap_first_frame_error_arms() {
             .write_all(&huge_len.to_be_bytes())
             .await
             .expect("write oversized length prefix");
-        // The server closes the stream / connection immediately after cerud
-        // rejects FrameTooLarge, without waiting for 16 MiB of payload.
+        // The server closes the stream without sending any Ack bytes after
+        // cerud rejects FrameTooLarge, without waiting for 16 MiB of payload.
         let mut buf = [0u8; 64];
-        let huge_closed = tokio::time::timeout(Duration::from_secs(3), r_huge.read(&mut buf))
-            .await
-            .is_ok();
+        let huge_closed = matches!(
+            tokio::time::timeout(Duration::from_secs(3), r_huge.read(&mut buf)).await,
+            Ok(Ok(None)) | Ok(Err(_))
+        );
 
         // 3. ReceiptSinkPoisoned on a bootstrap connection still closes with
         //    `ops receipt sink poisoned` after preloading a valid Hello frame.

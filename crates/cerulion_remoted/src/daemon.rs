@@ -1987,82 +1987,48 @@ mod tests {
     #[test]
     fn unpaired_session_permit_predicate_exempts_paired_planes_and_caps_bootstrap_refused_and_skeleton(
     ) {
-        let decisions = [
-            AcceptDecision::OpsAdmit,
-            AcceptDecision::OpsBootstrapOnly,
-            AcceptDecision::WireAdmit,
-            AcceptDecision::RcpAdmit,
-            AcceptDecision::Refuse {
-                reason: "unpaired".into(),
-            },
-            AcceptDecision::UnknownAlpn {
-                alpn: b"cerulion/bogus/1".to_vec(),
-            },
+        let refuse = AcceptDecision::Refuse {
+            reason: "unpaired".into(),
+        };
+        let unknown = AcceptDecision::UnknownAlpn {
+            alpn: b"cerulion/bogus/1".to_vec(),
+        };
+        // Hand-written oracle table: (decision, ops_wired, wire_wired, rcp_wired, needs_permit).
+        let rows: &[(&AcceptDecision, bool, bool, bool, bool)] = &[
+            // OpsAdmit is exempt iff ops is wired; other plane flags do not matter.
+            (&AcceptDecision::OpsAdmit, true, false, false, false),
+            (&AcceptDecision::OpsAdmit, true, true, true, false),
+            (&AcceptDecision::OpsAdmit, false, false, false, true),
+            (&AcceptDecision::OpsAdmit, false, true, true, true),
+            // WireAdmit is exempt iff wire is wired.
+            (&AcceptDecision::WireAdmit, false, true, false, false),
+            (&AcceptDecision::WireAdmit, true, true, true, false),
+            (&AcceptDecision::WireAdmit, false, false, false, true),
+            (&AcceptDecision::WireAdmit, true, false, true, true),
+            // RcpAdmit is exempt iff rcp is wired.
+            (&AcceptDecision::RcpAdmit, false, false, true, false),
+            (&AcceptDecision::RcpAdmit, true, true, true, false),
+            (&AcceptDecision::RcpAdmit, false, false, false, true),
+            (&AcceptDecision::RcpAdmit, true, true, false, true),
+            // OpsBootstrapOnly is always capped regardless of wired planes.
+            (&AcceptDecision::OpsBootstrapOnly, false, false, false, true),
+            (&AcceptDecision::OpsBootstrapOnly, true, false, false, true),
+            (&AcceptDecision::OpsBootstrapOnly, true, true, true, true),
+            // Refuse is always capped regardless of wired planes.
+            (&refuse, false, false, false, true),
+            (&refuse, true, false, false, true),
+            (&refuse, true, true, true, true),
+            // UnknownAlpn is always capped regardless of wired planes.
+            (&unknown, false, false, false, true),
+            (&unknown, true, true, true, true),
         ];
-        for decision in &decisions {
-            for ops_wired in [false, true] {
-                for wire_wired in [false, true] {
-                    for rcp_wired in [false, true] {
-                        let expected = match decision {
-                            AcceptDecision::OpsAdmit => !ops_wired,
-                            AcceptDecision::WireAdmit => !wire_wired,
-                            AcceptDecision::RcpAdmit => !rcp_wired,
-                            AcceptDecision::OpsBootstrapOnly
-                            | AcceptDecision::Refuse { .. }
-                            | AcceptDecision::UnknownAlpn { .. } => true,
-                        };
-                        assert_eq!(
-                            needs_unpaired_session_permit(
-                                decision, ops_wired, wire_wired, rcp_wired
-                            ),
-                            expected,
-                            "decision={decision:?} ops={ops_wired} wire={wire_wired} rcp={rcp_wired}"
-                        );
-                    }
-                }
-            }
+        for &(decision, ops_wired, wire_wired, rcp_wired, expected) in rows {
+            assert_eq!(
+                needs_unpaired_session_permit(decision, ops_wired, wire_wired, rcp_wired),
+                expected,
+                "decision={decision:?} ops={ops_wired} wire={wire_wired} rcp={rcp_wired}"
+            );
         }
-        // Explicit spot-checks on the production all-wired daemon posture.
-        assert!(!needs_unpaired_session_permit(
-            &AcceptDecision::OpsAdmit,
-            true,
-            true,
-            true
-        ));
-        assert!(!needs_unpaired_session_permit(
-            &AcceptDecision::WireAdmit,
-            true,
-            true,
-            true
-        ));
-        assert!(!needs_unpaired_session_permit(
-            &AcceptDecision::RcpAdmit,
-            true,
-            true,
-            true
-        ));
-        assert!(needs_unpaired_session_permit(
-            &AcceptDecision::OpsBootstrapOnly,
-            true,
-            true,
-            true
-        ));
-        assert!(needs_unpaired_session_permit(
-            &AcceptDecision::Refuse {
-                reason: "denied".into(),
-            },
-            true,
-            true,
-            true
-        ));
-        assert!(needs_unpaired_session_permit(
-            &AcceptDecision::UnknownAlpn {
-                alpn: b"other".to_vec(),
-            },
-            true,
-            true,
-            true
-        ));
     }
 
     #[test]
