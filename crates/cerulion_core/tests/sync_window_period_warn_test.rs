@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Integration tests for build-time sync window period warnings and the
-//! reworded runtime UNMATCHABLE discard warning (issue #993).
+//! reworded runtime UNMATCHABLE discard warning.
 //!
 //! Uses `GraphRuntime::build_for_test` (per-test isolated SHM root; does not
 //! touch the process-global `TransportManager` singleton), so every test here

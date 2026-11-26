@@ -2630,6 +2630,65 @@ nodes:
                 slowest_period_ms: 33,
             }]
         );
+
+        // A non-trigger External input does not participate in Sync alignment
+        // and must NOT suppress the period warning on the two periodic triggers.
+        let yaml_plain = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: cfg
+    type: cfg
+    outputs:
+      - name: params
+        schema: std_msgs/Int32
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: imu
+        source: imu/sample
+      - name: image
+        source: cam/image
+      - name: cfg
+        source: cfg/params
+"#;
+        let config_plain = parse_graph(yaml_plain).unwrap();
+        let mut infos_plain = make_infos(33);
+        infos_plain.insert(
+            "cfg".to_string(),
+            swp_node_info(vec![], vec!["params"], MacroPolicy::External),
+        );
+        infos_plain.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("cfg", false, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 33 },
+            ),
+        );
+        let topo_plain = GraphTopology::build(&config_plain, &infos_plain).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config_plain, &topo_plain, &infos_plain),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 33 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 33,
+            }]
+        );
     }
 
     #[test]
@@ -2747,6 +2806,47 @@ nodes:
                 kind: SyncWindowKind::Bounded { window_ms: 50 },
                 slowest_input: "imu".to_string(),
                 slowest_period_ms: 50,
+            }]
+        );
+
+        // throttle_ms on intermediate DataTrigger `rect` lifts `image` period
+        // from 33 ms to 60 ms, so window 50 < 60 is silent while window 60 warns.
+        infos.insert(
+            "rect".to_string(),
+            swp_node_info(
+                vec![swp_input_meta("raw", true, BackpressurePolicy::DropOldest)],
+                vec!["rect_img"],
+                MacroPolicy::DataTrigger {
+                    input_name: "raw".to_string(),
+                },
+            )
+            .with_throttle_ms(60),
+        );
+        let topo_throttled_ok = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo_throttled_ok, &infos),
+            vec![]
+        );
+
+        infos.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("imu", true, BackpressurePolicy::Sample(50)),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 60 },
+            ),
+        );
+        let topo_throttled_warn = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo_throttled_warn, &infos),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 60 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 60,
             }]
         );
     }

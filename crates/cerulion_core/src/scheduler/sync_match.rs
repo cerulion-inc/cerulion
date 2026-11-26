@@ -719,7 +719,7 @@ mod tests {
         );
     }
 
-    // ---- issue #993: 30 Hz loss, period-minus-skew bound, and recovery ----
+    // ---- 30 Hz frame loss, period-minus-skew bound, and recovery ----------
 
     /// Minimal hand-driven two-input driver over an arrival schedule: each
     /// arrival pushes a frame to input 0 or 1, fills empty/emitted heads, and
