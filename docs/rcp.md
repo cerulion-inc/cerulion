@@ -158,7 +158,10 @@ order:
    that failed.
 3. A call whose frame would exceed 63 KiB is refused (`args_too_large`).
 4. While the e-stop is engaged a `reversible` or `irreversible` tool is
-   refused (`estopped`) and receipted `denied`. `read` tools skip this step.
+   refused (`estopped`) and receipted `denied`; the message says how the
+   latch clears: with `estop_clear` under `limits.estop_clear: agent`, by an
+   operator under `operator`, where it does not name `estop_clear`. `read`
+   tools skip this step.
 5. A `reversible` or `irreversible` tool appends an `intent` receipt and
    syncs it to disk.
 6. The call is published on `journal.calls_topic` as one `std_msgs/String`
@@ -182,16 +185,21 @@ are handled one at a time, in the order they arrive.
 `estop` takes an optional `reason` (cut to 200 characters). It closes the
 latch before anything else, without waiting for a call in flight; publishes
 its own frame, `{"call_id": N, "tool": "estop", "args": {"reason": ...}}`,
-ahead of anything queued; and returns `estopped: true` with
-`graph_acknowledged` saying whether the graph answered. Its `intent` receipt
-is closed by `ok` when the graph answered, otherwise by
-`error:graph_unacknowledged`. While the latch is
+ahead of anything queued; and returns `estopped: true`, `graph_acknowledged`
+saying whether the graph answered, `call_id` (its frame's), `receipt` (its
+`intent` receipt, `{"seq", "hash", "prev"}`, `null` when it could not be
+written) and `result` (the graph's answer, `null` when none came). Its
+`intent` receipt is closed by `ok` when the graph answered, otherwise by
+`error:graph_unacknowledged`. Its description in `tools/list` names
+`estop_clear` under `limits.estop_clear: agent`; under `operator` it says an
+operator clears the latch and does not name `estop_clear`. While the latch is
 closed, `reversible` and `irreversible` calls are refused, including one
 already accepted but not yet published. A `reversible` or `irreversible`
 call whose MCP request is cancelled before it is published is never
-published. The latch is also written to `<receipts>.estop`, and a daemon
-that starts and finds that file starts with the latch closed (so does one
-that cannot tell whether the file exists).
+published. The latch is also written to `<receipts>.estop`, a file holding
+the `reason` of the `estop` that wrote it (cut to 200 characters), then a
+newline, and a daemon that starts and finds that file starts with the latch
+closed (so does one that cannot tell whether the file exists).
 
 `estop_clear` takes the same optional `reason` (at most 200 characters; any
 other argument is refused as `invalid_args`, receipted
@@ -212,9 +220,12 @@ other argument is refused as `invalid_args`, receipted
    before the frame was published, which returns the `estop_overtaken` error and leaves the
    `estop` frame as the graph's last.
 
-It returns `estopped` (the latch after the clear), `was_estopped`, and
-`graph_acknowledged`; the latch stays open whether or not the graph
-answered. A later `estop` closes the latch and writes the file again.
+It returns `estopped` (the latch after the clear), `was_estopped`,
+`graph_acknowledged`, `receipt` (its `intent` receipt) and, when it
+published its frame, that frame's `call_id` and the graph's answer as
+`result` (both `null` when it published nothing); the latch stays open
+whether or not the graph answered. A later `estop` closes the latch and writes
+the file again.
 `estop` closes the latch, then, inside a lock, closes it again, writes the
 file and its `intent` receipt, and queues its frame ahead of everything else,
 so a clear that follows it publishes after that frame; `estop_clear` writes
