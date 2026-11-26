@@ -953,6 +953,33 @@ mod tests {
     }
 
     #[test]
+    fn encode_refuses_a_snapshot_that_needs_more_parts_than_u16() {
+        // A 256-byte topic and a 256-byte type make a 516-byte entry, so a
+        // 2048-byte frame holds three (30 + 3 * 516 = 1578; four would be
+        // 2094). 65535 parts hold 196605 entries; one more needs part 65536.
+        const ENTRIES: usize = 196_606;
+        let type_name = "t".repeat(MAX_RMW_GRAPH_TYPE_LEN);
+        let mut topics = String::with_capacity(ENTRIES * MAX_RMW_GRAPH_TOPIC_LEN);
+        for i in 0..ENTRIES {
+            let head = format!("/{i:06}");
+            topics.push_str(&head);
+            topics.push_str(&"x".repeat(MAX_RMW_GRAPH_TOPIC_LEN - head.len()));
+        }
+        let entries = (0..ENTRIES).map(|i| {
+            let start = i * MAX_RMW_GRAPH_TOPIC_LEN;
+            (
+                &topics[start..start + MAX_RMW_GRAPH_TOPIC_LEN],
+                type_name.as_str(),
+            )
+        });
+
+        assert_eq!(
+            encode_snapshot(1, 1, entries),
+            Err(RmwGraphFrameError::TooManyParts { count: 65_536 })
+        );
+    }
+
+    #[test]
     fn required_writers_filters_dead_and_own_and_keeps_absent_owners() {
         let listed = [
             (10u128, 100u64), // alive owner
