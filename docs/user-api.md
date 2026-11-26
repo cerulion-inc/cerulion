@@ -1122,6 +1122,15 @@ frame is never matched. At the headline 200/20 Hz that ratio is exactly 10, the
 default, with zero jitter margin, so declare `#[input(depth = 16)]` on the fast
 port.
 
+Under `#[input(backpressure = block)]` that eviction failure mode does not
+exist, because there is no queue eviction to cause it; the fast **producer** is
+deferred instead. An under-provisioned depth then costs the producer's rate
+(loud, counted, lossless) rather than an unmatched slow frame, so the remedy
+inverts: raise `depth` to restore the producer's rate, not to stop the
+evictions. (`block` prevents queue eviction only; it does not prevent the
+wrong-period pairing described below if a producer drops or omits a frame while
+`sync_window_ms >= input_period - skew` or `unbounded_sync` is used.)
+
 **Window ceiling (`sync_window_ms < input_period - skew`).** Do not widen
 `sync_window_ms` to or above the slowest trigger input's period minus the
 inter-input arrival skew (or switch periodic streams to `unbounded_sync`).
@@ -1133,18 +1142,12 @@ every subsequent pair off by one full period while both
 `sync_unmatched_discard_count` and `sync_closer_skip_count` stay at zero. When
 every trigger input of a Sync node resolves statically to a declared period
 (through single-producer `period_ms` or transitive `DataTrigger` chains, taking
-`sample(N)` and `throttle_ms` into account), both graph build (`tracing::warn!`)
-and `cerulion graph validate` (non-fatal warning check) warn when
-`sync_window_ms` is at or above the slowest resolved trigger-input period, or
-when `unbounded_sync` aligns resolved periodic inputs. Graphs with an
-`external`, multi-publisher, or external-topic trigger input are skipped to
-avoid false positives.
-
-Under `#[input(backpressure = block)]` that failure mode does not exist, because
-there is no eviction to cause it; the fast **producer** is deferred instead. An
-under-provisioned depth then costs the producer's rate (loud, counted, lossless)
-rather than an unmatched slow frame, so the remedy inverts: raise `depth` to
-restore the producer's rate, not to stop the evictions.
+`sample(N)` admission rounding up to the next producer tick and `throttle_ms`
+into account), both graph build (`tracing::warn!`) and `cerulion graph validate`
+(non-fatal warning check) warn when `sync_window_ms` is at or above the slowest
+resolved trigger-input period, or when `unbounded_sync` aligns resolved periodic
+inputs. Graphs with an `external`, multi-publisher, or external-topic trigger
+input are skipped to avoid false positives.
 
 A complete set that sits unfired (a burst that stopped at its per-step cap, or a
 set held at a pre-fire defer) is a carried backlog: the live loop sizes its next
