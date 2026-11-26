@@ -72,6 +72,61 @@ pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Ve
     }
 }
 
+/// A name the manifest does not declare, and arguments outside a tool's
+/// schema, are refused and receipted; none reaches the graph.
+///
+/// docs/rcp.md, Tools, step 1: "A name the manifest does not declare is
+/// refused (`not_in_manifest`) and receipted `denied`"; step 2: "The arguments
+/// are checked against `input_schema` (`invalid_args`, receipted
+/// `error:invalid_args`)". The manifest: `minItems` holds the array length,
+/// and `additionalProperties` is `false` by default. The page's opening:
+/// "refused calls are in the receipt log only". Safety classes: "Every result
+/// of a manifest tool call after the name lookup, success or refusal, carries
+/// `"safety_class"`". AGENTS.md: "Any other name is receipted `denied` and
+/// never reaches the graph".
+pub fn an_undeclared_tool_and_bad_arguments_never_reach_the_graph() -> Vector {
+    Vector {
+        events: vec![
+            call(1, "arm.fly", json!({})),
+            call(2, "arm.step", json!({ "q": [1.0] })),
+            call(3, "arm.step", json!({ "q": [1.0, 2.0], "speed": 3 })),
+        ],
+        expect: vec![
+            entry("arm.fly", Stage::Denied),
+            reply(1, Outcome::Refused("not_in_manifest")),
+            entry("arm.step", Stage::Error("invalid_args")),
+            reply(2, Outcome::Refused("invalid_args"))
+                .carrying("/safety_class", json!("reversible")),
+            entry("arm.step", Stage::Error("invalid_args")),
+            reply(3, Outcome::Refused("invalid_args"))
+                .carrying("/safety_class", json!("reversible")),
+        ],
+    }
+}
+
+/// A name no tool can have, too long or with a character outside the rule, is
+/// refused like any undeclared name, and its receipt names a fixed verb in
+/// its place.
+///
+/// docs/rcp.md, Tools, step 1: "A name outside the tool name rule (1 to 128
+/// characters from `[A-Za-z0-9_.-]`) is receipted under the verb
+/// `<invalid-tool-name>`"; it is still a name the manifest does not declare
+/// (`not_in_manifest`, receipted `denied`).
+pub fn a_name_no_tool_can_have_is_receipted_under_a_fixed_verb() -> Vector {
+    Vector {
+        events: vec![
+            call(1, "x".repeat(300), json!({})),
+            call(2, "arm/step", json!({})),
+        ],
+        expect: vec![
+            entry("<invalid-tool-name>", Stage::Denied),
+            reply(1, Outcome::Refused("not_in_manifest")),
+            entry("<invalid-tool-name>", Stage::Denied),
+            reply(2, Outcome::Refused("not_in_manifest")),
+        ],
+    }
+}
+
 /// A call the graph never answers times out, says it may have run, and is
 /// receipted `intent` then `error:timeout`.
 ///

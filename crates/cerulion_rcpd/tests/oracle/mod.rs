@@ -151,6 +151,8 @@ pub fn call(req: Req, tool: impl Into<String>, args: Value) -> Event {
 pub enum Outcome {
     /// `isError` is not set.
     Ran,
+    /// `isError: true` with this `error.code`.
+    Refused(&'static str),
     /// `isError: true`, `error.code` `timeout` and `may_have_executed: true`.
     TimedOut,
 }
@@ -160,6 +162,7 @@ pub enum Outcome {
 pub enum Stage {
     Intent,
     Ok,
+    Denied,
     /// `error:<class>`.
     Error(&'static str),
 }
@@ -170,6 +173,7 @@ impl Stage {
         match self {
             Self::Intent => String::from("intent"),
             Self::Ok => String::from("ok"),
+            Self::Denied => String::from("denied"),
             Self::Error(class) => format!("error:{class}"),
         }
     }
@@ -395,6 +399,10 @@ fn check(expect: &[Effect], trace: &Trace) {
         let (is_error, body) = &trace.replies[&req];
         match outcome {
             Outcome::Ran => assert!(!is_error, "request {req} ran: {body}"),
+            Outcome::Refused(code) => {
+                assert!(is_error, "request {req} is refused: {body}");
+                assert_eq!(body["error"]["code"], *code, "request {req}: {body}");
+            }
             Outcome::TimedOut => {
                 assert!(is_error, "request {req} timed out: {body}");
                 assert_eq!(body["error"]["code"], "timeout", "request {req}: {body}");

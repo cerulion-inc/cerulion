@@ -101,6 +101,8 @@ macro_rules! vectors {
 vectors!(
     the_tool_list_is_the_manifest_then_estop_then_estop_clear,
     each_call_is_published_once_answered_by_its_call_id_and_receipted,
+    an_undeclared_tool_and_bad_arguments_never_reach_the_graph,
+    a_name_no_tool_can_have_is_receipted_under_a_fixed_verb,
     a_silent_graph_times_out_and_the_call_may_have_run,
 );
 
@@ -285,41 +287,6 @@ fn open_host_as_configured(
     )?;
     ToolHost::open(loaded.tools.clone(), journal, latch, receipts, lock)
         .map(|host| Arc::new(host.with_estop_clear(loaded.limits.estop_clear)))
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn undeclared_tools_and_bad_args_never_reach_the_graph() {
-    let mut f = Fixture::new("deny", true).await;
-    let (is_error, body) = f.call("arm.fly", json!({})).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("not_in_manifest"));
-    let (is_error, _) = f.call(&"x".repeat(300), json!({})).await;
-    assert!(is_error);
-    let (is_error, body) = f.call("arm.step", json!({ "q": [1.0] })).await;
-    assert!(is_error);
-    assert_eq!(body["error"]["code"], json!("invalid_args"));
-    let (is_error, body) = f
-        .call("arm.step", json!({ "q": [1.0, 2.0], "speed": 3 }))
-        .await;
-    assert!(is_error);
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("speed"),
-        "{body}"
-    );
-
-    assert!(f.stop_graph().is_empty(), "nothing was journaled");
-    assert_eq!(
-        f.receipts(),
-        pairs(&[
-            ("arm.fly", "denied"),
-            ("<invalid-tool-name>", "denied"),
-            ("arm.step", "error:invalid_args"),
-            ("arm.step", "error:invalid_args"),
-        ])
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
