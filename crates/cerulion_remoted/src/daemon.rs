@@ -1101,18 +1101,20 @@ async fn handle_accepted_planes_inner(
     );
 
     // ── The ops-ALPN dispatch arm ───────────────────────────
-    // Ops plane → the real cerud ops server (per-verb authz is the enforcement).
-    if matches!(
-        decision,
-        AcceptDecision::OpsAdmit | AcceptDecision::OpsBootstrapOnly
-    ) {
-        if let Some(ops) = ops {
+    // Ops plane -> the real cerud ops server (per-verb authz is the enforcement).
+    // Paired OpsAdmit runs under the normal session deadline with no unpaired
+    // permit; unpaired OpsBootstrapOnly runs under the held unpaired permit and
+    // the shorter opening-frame deadline.
+    match (&decision, ops) {
+        (AcceptDecision::OpsAdmit, Some(ops)) => {
             ops.serve_session(accepted).await;
             return;
         }
-        // No ops-serving context wired (accept-classification test harness) → fall
-        // through to the skeleton decision frame so the classification stays
-        // observable.
+        (AcceptDecision::OpsBootstrapOnly, Some(ops)) => {
+            ops.serve_bootstrap_session(accepted).await;
+            return;
+        }
+        _ => {}
     }
 
     // ── The wire-ALPN dispatch arm ──────────────────────────

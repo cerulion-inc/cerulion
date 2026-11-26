@@ -63,10 +63,14 @@
 //! Each session is still BOUNDED by [`OPS_SESSION_DEADLINE`] (an authed-then-
 //! stalled peer's connection is CLOSED at the deadline, unwedging its blocking
 //! read so its task ends and its resources free) — a per-session resource bound,
-//! not a serialization point. A GLOBAL concurrency cap with a RESERVED
-//! safety-floor slot (to bound the total blocking-task footprint under a flood
-//! while keeping `engage-estop` always admissible) is not implemented; neither is
-//! the daemon's accept-loop concurrency cap.
+//! not a serialization point. Unpaired `OpsBootstrapOnly`, refused, and
+//! skeleton connections share a 64-permit concurrency cap in [`crate::daemon`],
+//! and unpaired bootstrap sessions must also deliver their opening frame within
+//! [`OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE`] (5 s) before entering the blocking
+//! pool. Paired `OpsAdmit` sessions are exempt from that 64-permit cap so
+//! throwaway peers cannot fill the runtime's blocking pool ahead of a paired
+//! `engage-estop`; paired sessions still share the runtime's 512-thread
+//! blocking pool with one another.
 //!
 //! ## Fail-closed on a poisoned receipt sink
 //!
@@ -81,11 +85,13 @@
 //! not a recoverable condition — the daemon must restart (a fresh
 //! `ReceiptLog::open` recovers the torn tail).
 
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use cerulion_link::{accept_frame_stream, Accepted, Connection, QuicOpsStream};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use cerud::authz::Authorizer;
 use cerud::error::{CerudError, CerudResult};
@@ -110,14 +116,6 @@ use crate::shutdown::ShutdownStage;
 use crate::trust::SharedTrust;
 use crate::verbs;
 
-/// Sentinel returned by the blocking session task when the shared [`OpsServer`]'s
-/// hash-chained receipt SINK is POISONED (a prior session panicked mid receipt
-/// write): the NEW session is refused fail-closed — with an accurate QUIC close
-/// reason — rather than risk appending to a possibly-corrupt audit log. `cerud`'s
-/// `record_receipt` ALSO fails EACH append closed, so no session ever silently
-/// corrupts the chain; this is the session-level fast-fail + the operator signal.
-struct ReceiptSinkPoisoned;
-
 /// Per-session wall bound. An authed-then-stalled peer must not hold a session's
 /// blocking task + connection indefinitely (a resource-hold DoS on the always-on
 /// daemon — the bootstrap surface admits any TLS-authed key). Generous for a real
@@ -126,6 +124,122 @@ struct ReceiptSinkPoisoned;
 /// longer gates OTHER sessions (serving is concurrent), so it never delays the
 /// `engage-estop` safety floor.
 pub const OPS_SESSION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Wall bound for an unpaired `OpsBootstrapOnly` session to open its bidi
+/// stream and deliver its opening `cerud` frame before entering the blocking
+/// pool. A throwaway peer that opens a connection and stalls on 0 or 1 byte is
+/// closed at this deadline without occupying a blocking-pool thread.
+pub const OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Chunk size used when reading a bootstrap session's opening frame payload so
+/// a peer advertising a large frame length and stalling allocates at most one
+/// chunk before timing out.
+const FIRST_FRAME_CHUNK_BYTES: usize = 4096;
+
+/// Synchronous `Read + Write` adapter that drains preloaded first-frame bytes
+/// before delegating subsequent reads to `inner`, while passing writes through.
+struct PreloadedRead<S> {
+    preloaded: Vec<u8>,
+    offset: usize,
+    inner: S,
+}
+
+impl<S> PreloadedRead<S> {
+    fn new(preloaded: Vec<u8>, inner: S) -> Self {
+        Self {
+            preloaded,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl<S: Read> Read for PreloadedRead<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.offset < self.preloaded.len() {
+            let remaining = &self.preloaded[self.offset..];
+            let n = remaining.len().min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.offset += n;
+            if self.offset == self.preloaded.len() {
+                self.preloaded = Vec::new();
+                self.offset = 0;
+            }
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for PreloadedRead<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[derive(Debug)]
+enum FirstFrameError {
+    /// Peer closed the stream before delivering the complete first frame.
+    UnexpectedEof,
+    /// Underlying stream read failed (for example, stream reset).
+    Io(io::Error),
+}
+
+/// Read the opening `cerud` frame (`[u32 BE len][payload]`) asynchronously
+/// before spawning a blocking session task.
+///
+/// If the declared length exceeds [`cerud::protocol::MAX_FRAME_BYTES`], returns
+/// only the 4-byte length prefix without allocating `len` bytes or waiting for
+/// payload bytes so `cerud::protocol::read_frame` still rejects the frame with
+/// `FrameTooLarge`.
+async fn read_first_ops_frame<R: AsyncRead + Unpin>(
+    recv: &mut R,
+) -> Result<Vec<u8>, FirstFrameError> {
+    let mut len_buf = [0u8; 4];
+    let mut read_len = 0;
+    while read_len < len_buf.len() {
+        let n = recv
+            .read(&mut len_buf[read_len..])
+            .await
+            .map_err(FirstFrameError::Io)?;
+        if n == 0 {
+            return Err(FirstFrameError::UnexpectedEof);
+        }
+        read_len += n;
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > cerud::protocol::MAX_FRAME_BYTES {
+        return Ok(len_buf.to_vec());
+    }
+
+    let mut out = Vec::with_capacity(4 + len.min(FIRST_FRAME_CHUNK_BYTES));
+    out.extend_from_slice(&len_buf);
+    let mut remaining = len;
+    let mut chunk = [0u8; FIRST_FRAME_CHUNK_BYTES];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        let n = recv
+            .read(&mut chunk[..want])
+            .await
+            .map_err(FirstFrameError::Io)?;
+        if n == 0 {
+            return Err(FirstFrameError::UnexpectedEof);
+        }
+        out.extend_from_slice(&chunk[..n]);
+        remaining -= n;
+    }
+    Ok(out)
+}
+
+enum BootstrapPreloadError {
+    Accept(cerulion_link::LinkError),
+    FirstFrame(FirstFrameError),
+}
 
 /// The daemon's `restart` refusal when the robot's e-stop holds after the
 /// verb's stop command ran: the start command does not run. The verb's
@@ -149,6 +263,10 @@ pub struct OpsServing {
     /// tests via [`OpsServing::with_deadline_for_test`] so the stalled-session
     /// unwedge can be pinned without a 2-minute wait.
     deadline: Duration,
+    /// The opening-frame wall bound for unpaired `OpsBootstrapOnly` sessions
+    /// (see [`OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE`]). Overridable in tests via
+    /// [`OpsServing::with_bootstrap_first_frame_deadline_for_test`].
+    bootstrap_first_frame_deadline: Duration,
     /// The stage the serving loop runs after its accept loop stops and before
     /// the daemon tears down ([`crate::shutdown`]).
     shutdown: ShutdownStage,
@@ -225,6 +343,7 @@ impl OpsServing {
             serving_holds: None,
             server: Arc::new(server),
             deadline: OPS_SESSION_DEADLINE,
+            bootstrap_first_frame_deadline: OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE,
             shutdown,
         })
     }
@@ -256,6 +375,15 @@ impl OpsServing {
     #[doc(hidden)]
     pub fn with_deadline_for_test(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// Override the bootstrap first-frame deadline (tests only) so the
+    /// first-frame timeout and permit-release path can be pinned in
+    /// milliseconds instead of 5 seconds.
+    #[doc(hidden)]
+    pub fn with_bootstrap_first_frame_deadline_for_test(mut self, deadline: Duration) -> Self {
+        self.bootstrap_first_frame_deadline = deadline;
         self
     }
 
@@ -296,6 +424,23 @@ impl OpsServing {
     /// closed with the accurate reason `ops receipt sink poisoned` — appending to a
     /// possibly-corrupt audit log is never attempted.
     pub async fn serve_session(self: Arc<Self>, accepted: Accepted) {
+        self.serve_session_with_first_frame_deadline(accepted, None)
+            .await;
+    }
+
+    /// Serve ONE accepted unpaired `OpsBootstrapOnly` connection with a short
+    /// opening-frame deadline before spawning onto the blocking pool.
+    pub(crate) async fn serve_bootstrap_session(self: Arc<Self>, accepted: Accepted) {
+        let first_frame_deadline = self.bootstrap_first_frame_deadline;
+        self.serve_session_with_first_frame_deadline(accepted, Some(first_frame_deadline))
+            .await;
+    }
+
+    async fn serve_session_with_first_frame_deadline(
+        self: Arc<Self>,
+        accepted: Accepted,
+        first_frame_deadline: Option<Duration>,
+    ) {
         let Accepted {
             connection,
             remote_id,
@@ -308,68 +453,110 @@ impl OpsServing {
         let overall = tokio::time::sleep(deadline);
         tokio::pin!(overall);
 
-        // 1) Accept the ONE bidi stream (a peer that opens the connection but
-        //    never opens a stream is dropped at the deadline — a resource bound,
-        //    concurrent with every other session).
-        let (send, recv) = tokio::select! {
-            r = accept_frame_stream(&connection) => match r {
-                Ok(pair) => pair,
-                Err(e) => {
+        // 1) Accept the ONE bidi stream. For unpaired bootstrap sessions, also
+        //    read the opening cerud frame asynchronously under the shorter
+        //    first-frame deadline so 0-byte and 1-byte stallers never occupy a
+        //    blocking-pool thread.
+        let (send, recv, preloaded) = if let Some(ff_deadline) = first_frame_deadline {
+            let ff_budget = ff_deadline.min(deadline);
+            match tokio::time::timeout(ff_budget, async {
+                let (send, mut recv) = accept_frame_stream(&connection)
+                    .await
+                    .map_err(BootstrapPreloadError::Accept)?;
+                let first_frame = read_first_ops_frame(&mut recv)
+                    .await
+                    .map_err(BootstrapPreloadError::FirstFrame)?;
+                Ok::<_, BootstrapPreloadError>((send, recv, first_frame))
+            })
+            .await
+            {
+                Ok(Ok((send, recv, first_frame))) => (send, recv, first_frame),
+                Ok(Err(BootstrapPreloadError::Accept(e))) => {
                     tracing::warn!(remote_id = %remote_id, error = %e,
                         "cerulion_remoted ops: failed to accept the bidi stream; closing");
                     close(&connection);
                     return;
                 }
-            },
-            _ = &mut overall => {
-                tracing::warn!(remote_id = %remote_id, deadline_secs = deadline.as_secs(),
-                    "cerulion_remoted ops: no bidi stream within the deadline; closing");
-                close(&connection);
-                return;
+                Ok(Err(BootstrapPreloadError::FirstFrame(FirstFrameError::UnexpectedEof))) => {
+                    tracing::debug!(
+                        remote_id = %remote_id,
+                        "cerulion_remoted ops: bootstrap peer closed before completing its first frame"
+                    );
+                    connection.close(0u32.into(), b"ops bootstrap incomplete first frame");
+                    return;
+                }
+                Ok(Err(BootstrapPreloadError::FirstFrame(FirstFrameError::Io(e)))) => {
+                    tracing::warn!(
+                        remote_id = %remote_id,
+                        error = %e,
+                        "cerulion_remoted ops: bootstrap first-frame read failed; closing"
+                    );
+                    connection.close(0u32.into(), b"ops bootstrap first-frame error");
+                    return;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        remote_id = %remote_id,
+                        deadline_secs = ff_budget.as_secs(),
+                        "cerulion_remoted ops: bootstrap session exceeded first-frame deadline; closing"
+                    );
+                    close_bootstrap_first_frame(&connection);
+                    return;
+                }
             }
+        } else {
+            let (send, recv) = tokio::select! {
+                r = accept_frame_stream(&connection) => match r {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(remote_id = %remote_id, error = %e,
+                            "cerulion_remoted ops: failed to accept the bidi stream; closing");
+                        close(&connection);
+                        return;
+                    }
+                },
+                _ = &mut overall => {
+                    tracing::warn!(remote_id = %remote_id, deadline_secs = deadline.as_secs(),
+                        "cerulion_remoted ops: no bidi stream within the deadline; closing");
+                    close(&connection);
+                    return;
+                }
+            };
+            (send, recv, Vec::new())
         };
 
-        // 2) Bridge async QUIC → cerud's SYNC seam on a blocking task. cerud frames
-        //    its own bytes inside the stream; QuicOpsStream is a raw byte pipe. The
-        //    shared server is served via `&self`, so this session runs concurrently
-        //    with every other — the brief receipt-append `Mutex` (in cerud) is the
-        //    only serialization, and only for the append.
+        // Fail closed before spawning a blocking task if the shared receipt
+        // sink mutex is poisoned (a prior session panicked mid hash-chain
+        // write). `cerud::record_receipt` also fails each append closed; this
+        // gives an immediate refusal with an accurate QUIC close reason.
+        if self.server.receipt_sink_poisoned() {
+            tracing::error!(remote_id = %remote_id,
+                "cerulion_remoted ops: REFUSING to serve — the receipt sink mutex is POISONED \
+                 (a prior session panicked mid hash-chain write); appending now could corrupt \
+                 the audit log. Fail-closed; restart the daemon to recover the chain tail.");
+            connection.close(0u32.into(), b"ops receipt sink poisoned");
+            return;
+        }
+
+        // 2) Bridge async QUIC -> cerud's SYNC seam on a blocking task. cerud
+        //    frames its own bytes inside the stream; QuicOpsStream is a raw
+        //    byte pipe (wrapped in PreloadedRead when the opening frame was
+        //    already read asynchronously).
         let ops_stream = QuicOpsStream::new(send, recv);
+        let stream: Box<dyn cerud::transport::OpsStream> = if preloaded.is_empty() {
+            Box::new(ops_stream)
+        } else {
+            Box::new(PreloadedRead::new(preloaded, ops_stream))
+        };
         let server = self.server.clone();
         let mut join = tokio::task::spawn_blocking(move || {
-            // FAIL-CLOSED on a POISONED receipt sink: a poisoned receipt `Mutex`
-            // (inside the shared OpsServer) means a prior session PANICKED mid
-            // hash-chain write — exactly when the audit log could be half-written.
-            // Refuse to serve THIS session rather than risk appending to a
-            // possibly-inconsistent chain; the daemon must restart (a fresh
-            // `ReceiptLog::open` recovers the torn tail). The accurate cause is
-            // named on the QUIC close below. cerud's `record_receipt` ALSO fails
-            // each append closed, so an in-flight CONCURRENT session already past
-            // this check never silently corrupts the chain either — this is the
-            // session-level fast-fail + the accurate operator signal.
-            if server.receipt_sink_poisoned() {
-                Err(ReceiptSinkPoisoned)
-            } else {
-                Ok(server.serve_connection(OpsConnection {
-                    stream: Box::new(ops_stream),
-                    caller,
-                }))
-            }
+            server.serve_connection(OpsConnection { stream, caller })
         });
 
         tokio::select! {
             res = &mut join => match res {
-                Ok(Ok(Ok(()))) => tracing::debug!(remote_id = %remote_id, "cerulion_remoted ops: session ended cleanly"),
-                Ok(Ok(Err(e))) => tracing::warn!(remote_id = %remote_id, error = %e, "cerulion_remoted ops: session ended with error"),
-                Ok(Err(ReceiptSinkPoisoned)) => {
-                    tracing::error!(remote_id = %remote_id,
-                        "cerulion_remoted ops: REFUSING to serve — the receipt sink mutex is POISONED \
-                         (a prior session panicked mid hash-chain write); appending now could corrupt \
-                         the audit log. Fail-closed; restart the daemon to recover the chain tail.");
-                    // Name the ACTUAL cause on the QUIC close reason (NOT the generic
-                    // deadline helper) so peer-side/operator diagnostics are accurate.
-                    connection.close(0u32.into(), b"ops receipt sink poisoned");
-                }
+                Ok(Ok(())) => tracing::debug!(remote_id = %remote_id, "cerulion_remoted ops: session ended cleanly"),
+                Ok(Err(e)) => tracing::warn!(remote_id = %remote_id, error = %e, "cerulion_remoted ops: session ended with error"),
                 Err(join_err) => tracing::error!(remote_id = %remote_id, error = %join_err, "cerulion_remoted ops: session task panicked"),
             },
             _ = &mut overall => {
@@ -551,6 +738,10 @@ impl VerbHandler for DaemonOnlyVerb {
 /// inference, so this needs no direct `iroh` dependency.
 fn close(connection: &Connection) {
     connection.close(0u32.into(), b"ops session deadline");
+}
+
+fn close_bootstrap_first_frame(connection: &Connection) {
+    connection.close(0u32.into(), b"ops bootstrap first-frame deadline");
 }
 
 #[cfg(test)]
@@ -847,6 +1038,197 @@ mod verb_set_tests {
                 )),
                 "{verb}: {err}"
             );
+        }
+    }
+
+    struct DuplexIo {
+        read_data: io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Read for DuplexIo {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            Read::read(&mut self.read_data, buf)
+        }
+    }
+
+    impl Write for DuplexIo {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn preloaded_read_replays_exact_bytes_across_chunk_sizes() {
+        let preloaded = b"HELLO-PRELOAD!".to_vec();
+        let tail = b"TAIL-STREAM-BYTES".to_vec();
+        let expected: Vec<u8> = [preloaded.as_slice(), tail.as_slice()].concat();
+
+        // 1-byte reads, partial reads, boundary reads, and overflow reads must
+        // all yield the exact concatenation of preloaded + inner.
+        for chunk_size in [1, 3, 7, 14, 15, 64] {
+            let mut adapter = PreloadedRead::new(
+                preloaded.clone(),
+                DuplexIo {
+                    read_data: io::Cursor::new(tail.clone()),
+                    written: Vec::new(),
+                    flushes: 0,
+                },
+            );
+            // Zero-length read must not consume preloaded bytes.
+            assert_eq!(adapter.read(&mut []).unwrap(), 0);
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; chunk_size];
+            loop {
+                let n = adapter.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected, "chunk_size={chunk_size}");
+            // Preload buffer is released after draining.
+            assert!(adapter.preloaded.is_empty(), "chunk_size={chunk_size}");
+
+            // Write and flush pass straight through to inner.
+            adapter.write_all(b"reply-bytes").unwrap();
+            adapter.flush().unwrap();
+            assert_eq!(adapter.inner.written, b"reply-bytes");
+            assert_eq!(adapter.inner.flushes, 1);
+        }
+
+        // Empty preload delegates directly to inner.
+        let mut empty = PreloadedRead::new(
+            Vec::new(),
+            DuplexIo {
+                read_data: io::Cursor::new(b"only-inner".to_vec()),
+                written: Vec::new(),
+                flushes: 0,
+            },
+        );
+        let mut out = Vec::new();
+        empty.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"only-inner");
+    }
+
+    struct FailingAsyncRead {
+        prefix: Vec<u8>,
+        offset: usize,
+        error_kind: io::ErrorKind,
+    }
+
+    impl AsyncRead for FailingAsyncRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.offset < self.prefix.len() {
+                let rem = &self.prefix[self.offset..];
+                let n = rem.len().min(buf.remaining());
+                buf.put_slice(&rem[..n]);
+                self.offset += n;
+                return std::task::Poll::Ready(Ok(()));
+            }
+            std::task::Poll::Ready(Err(io::Error::new(self.error_kind, "injected read error")))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_first_frame_error_arms() {
+        use tokio::io::AsyncWriteExt;
+
+        // 1. Valid frame across split writes leaves trailing bytes on the stream.
+        let payload = br#"{"min_version":1,"max_version":2}"#;
+        let len_prefix = (payload.len() as u32).to_be_bytes();
+        let expected_frame: Vec<u8> = [len_prefix.as_slice(), payload.as_slice()].concat();
+        let (mut writer, mut reader) = tokio::io::duplex(256);
+        let write_task = tokio::spawn(async move {
+            writer.write_all(&len_prefix[..1]).await.unwrap();
+            writer.write_all(&len_prefix[1..]).await.unwrap();
+            writer.write_all(&payload[..10]).await.unwrap();
+            writer.write_all(&payload[10..]).await.unwrap();
+            writer.write_all(b"NEXT").await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+        let got = read_first_ops_frame(&mut reader).await.unwrap();
+        assert_eq!(got, expected_frame);
+        let mut trailing = Vec::new();
+        reader.read_to_end(&mut trailing).await.unwrap();
+        assert_eq!(trailing, b"NEXT");
+        write_task.await.unwrap();
+
+        // 2. Zero-length frame returns the 4-byte prefix without consuming tail.
+        let mut zero_cursor = io::Cursor::new([0u8, 0, 0, 0, 9, 9]);
+        assert_eq!(
+            read_first_ops_frame(&mut zero_cursor).await.unwrap(),
+            vec![0, 0, 0, 0]
+        );
+        assert_eq!(zero_cursor.position(), 4);
+
+        // 3. Declared length > MAX_FRAME_BYTES returns ONLY the 4-byte prefix
+        //    without allocating len bytes, and cerud::protocol::read_frame
+        //    rejects it with FrameTooLarge.
+        for huge in [(cerud::protocol::MAX_FRAME_BYTES as u32) + 1, u32::MAX] {
+            let prefix = huge.to_be_bytes();
+            let mut cursor = io::Cursor::new(prefix);
+            let preloaded = read_first_ops_frame(&mut cursor).await.unwrap();
+            assert_eq!(preloaded, prefix);
+            let mut replay = PreloadedRead::new(preloaded, io::Cursor::new(Vec::<u8>::new()));
+            let err = cerud::protocol::read_frame(&mut replay).unwrap_err();
+            assert!(
+                matches!(err, CerudError::FrameTooLarge { size, max }
+                    if size == huge as usize && max == cerud::protocol::MAX_FRAME_BYTES),
+                "huge={huge}: got {err:?}"
+            );
+        }
+
+        // 4. Clean EOF at 0 bytes and mid-prefix (1, 2, 3 bytes) -> UnexpectedEof.
+        for truncated in [
+            Vec::new(),
+            vec![0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00, 0x00],
+        ] {
+            let mut cursor = io::Cursor::new(truncated.clone());
+            let err = read_first_ops_frame(&mut cursor).await.unwrap_err();
+            assert!(
+                matches!(err, FirstFrameError::UnexpectedEof),
+                "prefix {truncated:?}: got {err:?}"
+            );
+        }
+
+        // 5. Clean EOF mid-payload -> UnexpectedEof.
+        let mut short_payload = io::Cursor::new(vec![0, 0, 0, 10, b'a', b'b', b'c']);
+        let err = read_first_ops_frame(&mut short_payload).await.unwrap_err();
+        assert!(matches!(err, FirstFrameError::UnexpectedEof), "{err:?}");
+
+        // 6. Underlying I/O error mid-prefix and mid-payload -> FirstFrameError::Io.
+        let mut fail_prefix = FailingAsyncRead {
+            prefix: vec![0x00],
+            offset: 0,
+            error_kind: io::ErrorKind::ConnectionReset,
+        };
+        match read_first_ops_frame(&mut fail_prefix).await.unwrap_err() {
+            FirstFrameError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::ConnectionReset),
+            other => panic!("expected Io error, got {other:?}"),
+        }
+
+        let mut fail_payload = FailingAsyncRead {
+            prefix: vec![0, 0, 0, 8, b'x', b'y'],
+            offset: 0,
+            error_kind: io::ErrorKind::BrokenPipe,
+        };
+        match read_first_ops_frame(&mut fail_payload).await.unwrap_err() {
+            FirstFrameError::Io(e) => assert_eq!(e.kind(), io::ErrorKind::BrokenPipe),
+            other => panic!("expected Io error, got {other:?}"),
         }
     }
 }
