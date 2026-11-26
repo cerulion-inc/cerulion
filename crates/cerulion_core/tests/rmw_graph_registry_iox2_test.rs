@@ -2,12 +2,14 @@
 //! The rmw graph registry `/__cerulion/rmw_graph` over real shared memory.
 //!
 //! Each arm builds its own managers on an isolated iceoryx2 root, so two
-//! managers stand in for two processes on one host. Hostile and blocking
-//! peers are raw iceoryx2 ports opened with the module's public constants.
+//! managers stand in for two processes on one host. Hostile and silent peers
+//! are raw iceoryx2 ports opened with the module's public constants; the
+//! failed-open arm opens a service with a different config on purpose.
 //! The killed-writer arm runs a real child process and kills it, because a
 //! `Dead` owner node exists only after its process is gone.
 //!
-//! Expected maps are written by hand in each arm. Every arm is `#[serial]`.
+//! Expected maps are written by hand in each arm. Every arm except the child
+//! entry point is `#[serial]`.
 //! Root tags stay short: on macOS a doorbell listener is a socket whose path
 //! holds the root, and a long root makes the listener fail to open.
 //!
@@ -205,6 +207,15 @@ fn refcounts_keep_a_pair_until_its_last_endpoint_is_removed() {
     // The last endpoint goes: the writer is still heard, with nothing to list.
     writer.remove("/scan", "sensor_msgs/msg/LaserScan");
     assert_eq!(gather(&reader, None, SETTLE_WINDOW), settled(&[]));
+
+    // A new pair after that is a newer generation, and a gather sees it.
+    writer
+        .add("/cloud", "sensor_msgs/msg/PointCloud2")
+        .expect("pair");
+    assert_eq!(
+        gather(&reader, None, SETTLE_WINDOW),
+        settled(&[("/cloud", &["sensor_msgs/msg/PointCloud2"])])
+    );
 }
 
 #[test]
@@ -320,9 +331,22 @@ fn a_lone_writer_settles_at_once_and_a_ring_is_answered_when_one_is_needed() {
     let writer = tm.open_rmw_graph_writer();
     writer.add("/tf", "tf2_msgs/msg/TFMessage").expect("pair");
 
+    // A raw listener on the doorbell sees a ring the moment it is sent, so
+    // its count does not depend on when the writer's pump runs.
+    let node = raw_node(&root.config());
+    let doorbell_name: ServiceName = RMW_GRAPH_DOORBELL_SERVICE_NAME
+        .try_into()
+        .expect("service name");
+    let doorbell = node
+        .service_builder(&doorbell_name)
+        .event()
+        .open()
+        .expect("the writer created the doorbell");
+    let rings = doorbell.listener_builder().create().expect("raw listener");
+
     assert_eq!(gather(&tm, writer.writer_id(), SETTLE_WINDOW), settled(&[]));
     assert_eq!(
-        writer.doorbell_rings_answered(),
+        rings.try_wait(|_| {}).expect("read the doorbell"),
         0,
         "a gather with nobody to hear must not ring"
     );
@@ -340,6 +364,10 @@ fn a_lone_writer_settles_at_once_and_a_ring_is_answered_when_one_is_needed() {
     assert!(
         writer.doorbell_rings_answered() > 0,
         "the ring was answered"
+    );
+    assert!(
+        rings.try_wait(|_| {}).expect("read the doorbell") > 0,
+        "the gather rang"
     );
 }
 
@@ -458,12 +486,19 @@ fn hostile_frames_are_skipped_and_the_frames_after_them_still_count() {
         .create()
         .expect("raw publisher");
     let raw_id = raw.id().value();
+    let real_id = writer.writer_id().expect("the writer is live");
+    // A frame that claims the real writer's id, with a newer generation than
+    // the real writer will ever send.
+    let forged = encode_snapshot(real_id, u32::MAX, [("/forged", "pkg/msg/Forged")])
+        .expect("encode")[0]
+        .clone();
     let mut bad_magic =
         encode_snapshot(raw_id, 1, [("/x", "pkg/msg/X")]).expect("encode")[0].clone();
     bad_magic[0..2].copy_from_slice(&[0xCE, 0x37]);
     let hostile: Vec<Vec<u8>> = vec![
         vec![0xCE, 0x52, 0x01],
         bad_magic,
+        forged,
         // Header for part 0 of 1 claiming 65535 entries, with no entry bytes.
         vec![
             0xCE, 0x52, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -499,6 +534,7 @@ fn hostile_frames_are_skipped_and_the_frames_after_them_still_count() {
     );
     assert!(logs_contain("rmw graph registry degraded"));
     assert!(logs_contain("what=\"decode\""));
+    assert!(logs_contain("what=\"writer_id\""));
 }
 
 #[test]
