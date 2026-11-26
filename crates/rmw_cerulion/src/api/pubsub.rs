@@ -52,32 +52,38 @@ const BRIDGED_VARIABLE_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(128 * 102
 /// Each outstanding take loan is one live borrow on the subscription's
 /// connection. The budget is sized for the real rclcpp shapes:
 ///
-/// - `SingleThreadedExecutor`: at most 1 loan held at a time (the loaned
-///   callback returns before the next take);
+/// - `SingleThreadedExecutor` on rclcpp 28.1.22 and earlier: at most 1 loan
+///   held at a time (the loan is returned when the callback returns, before
+///   the next take); on 28.1.23 and later see the last bullet;
 /// - `MultiThreadedExecutor` with a reentrant callback group: one loan per
 ///   concurrently-executing callback — bounded in practice by the executor's
 ///   thread count, but not by the rmw;
 /// - plus 1 transient for the `receive()` in progress on a plain `rmw_take`
-///   racing held loans.
+///   racing held loans;
+/// - from rclcpp 28.1.23 (Jazzy), which returns a loan when the application
+///   drops its last reference rather than right after the callback, one
+///   loan per received message the application keeps (a `message_filters`
+///   cache), which no budget bounds; the reserve below serves those by copy.
 ///
 /// 4 = 3 concurrently-held loans + 1 transient headroom — enough for the
 /// STE (1) and a small MTE, without inflating every rmw topic's publisher
 /// pool (the pool grows by `max_subscribers × borrow` slots at create;
 /// Unused slots are demand-paged, so the cost is address space).
 ///
-/// Exhaustion is LOUD and bounded, never silent loss and never a hang: a take
-/// past the budget fails with iceoryx2's `ExceedsMaxBorrows`, surfaced as
-/// `RMW_RET_ERROR` plus an `error!` naming the outstanding-loan count and the
-/// remedy (`rmw_return_loaned_message_from_subscription`); returning any one
-/// loan recovers the next take.
+/// A consumer that RETAINS loans past the budget keeps receiving rather than
+/// being refused, and never hangs: the loaned take keeps one borrow of
+/// `min(budget, the service's max_borrowed_samples)` in reserve, and a take
+/// made while every other one is held as a zero-copy loan receives into it,
+/// copies the message into private memory and releases the borrow before it
+/// returns (served by copy, a loud-once `warn!` naming the held count and the
+/// ceiling; returning loans brings zero-copy takes back).
 ///
 /// Applied as [`TopicServiceConfig::create_borrow_floor`] — a CREATE-leg-only
 /// floor (create provisions, open tolerates), so an rmw create never
 /// refuses a pre-existing smaller service (e.g. one minted first by a native
 /// `cerulion topic echo` at the iceoryx2 default of 2, or by a graph at the
 /// HOLD floor of 3); against such a service the loan budget is simply
-/// the smaller created value, and the loud `ExceedsMaxBorrows` arm binds
-/// earlier.
+/// the smaller created value, and takes are served by copy earlier.
 ///
 /// [`TopicServiceConfig::create_borrow_floor`]: cerulion_core::transport::TopicServiceConfig::create_borrow_floor
 pub(crate) const RMW_TAKE_LOAN_BORROW_BUDGET: usize = 4;
@@ -117,8 +123,12 @@ pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
 /// created buffer ceiling to `(16 * 4).div_ceil(3)` = 22. The publisher and
 /// the subscription both carry it, so the first opener of a topic creates the
 /// service any later rmw opener needs, and open order cannot refuse a deeper
-/// TRANSIENT_LOCAL publisher. A late joiner's share of the retained frames is
-/// set per subscription by its history request (see `rmw_create_subscription`).
+/// TRANSIENT_LOCAL publisher. The history is room, not a retention: each
+/// publisher on such a topic retains only its own clamped depth (VOLATILE
+/// none), so a VOLATILE publisher's loans keep reusing the slot its
+/// subscriptions just released. A late joiner's share of the retained frames
+/// is set per subscription by its history request (see
+/// `rmw_create_subscription`).
 /// Types whose slice ceiling exceeds [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`] take
 /// [`ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH`] instead; see
 /// [`ros_topic_history_depth`].
@@ -663,12 +673,11 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // `topic_config.subscriber_max_buffer_size` computed below and NOT
         // the service history. A TRANSIENT_LOCAL depth-1000 publisher of a
         // small type reports 16 (the clamp), a depth-5 one reports 5, and a
-        // VOLATILE one reports 0. The service history is the topic's limit for
-        // every publisher (iceoryx2 sizes a publisher's retained ring from the
-        // service), and a late joiner takes up to its own history request from
-        // that ring, so a subscription deeper than this publisher's depth can
-        // receive more than the reported depth. The 22 ceiling stays pinned by
-        // the require-N probes in `rmw_transient_local_ceiling_test.rs`.
+        // VOLATILE one reports 0. On a topic an rmw endpoint created the port
+        // retains exactly that many frames (cerulion_core bounds a publisher on
+        // a floored service to its own history), and a late joiner takes up to
+        // its own history request of them. The 22 ceiling stays pinned by the
+        // require-N probes in `rmw_transient_local_ceiling_test.rs`.
         let requested_depth = (*qos).depth;
         // A TRANSIENT_LOCAL publisher makes its own history request SATISFIABLE
         // by provisioning the
@@ -785,12 +794,12 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // depth-N reports N clamped to the type's limit (KEEP_ALL reports the
         // limit), VOLATILE reports 0.
         // Every rmw endpoint creates the service at that limit
-        // (`create_history_floor`), so the retained ring is that deep whatever
-        // this publisher asked; what a late joiner takes from it is its own
-        // history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth or, when
-        // KEEP_ALL, the limit), set in
-        // `rmw_create_subscription`. The open requirement is at-least, so an
-        // opened service always holds at least `history` frames.
+        // (`create_history_floor`), and on such a service the port retains
+        // exactly `history` frames; what a late joiner takes from them is its
+        // own history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth or,
+        // when KEEP_ALL, the limit), set in `rmw_create_subscription`. The open
+        // requirement is at-least, so an opened service always has room for
+        // `history` frames.
         let provisioned_depth = history;
 
         // Say LOUDLY, at create time, that the ask was not what the
@@ -2558,8 +2567,8 @@ pub unsafe extern "C" fn rmw_create_subscription(
             // at 2-3 borrows (1 and 2 are discarded by
             // `effective_create_borrow_floor` as not exceeding the iceoryx2
             // default), and the independent `rmw_take_loaned_message` path on
-            // that same subscription then fails `ExceedsMaxBorrows` one or
-            // two loans early. The cost of the max is APPARENT bytes only
+            // that same subscription then serves takes by copy one or two
+            // loans early. The cost of the max is APPARENT bytes only
             // (demand-paged slots), which is the wrong thing to save.
             topic_config.create_borrow_floor = Some(if can_loan_take {
                 state.budget.max(RMW_TAKE_LOAN_BORROW_BUDGET)
@@ -2672,15 +2681,16 @@ pub unsafe extern "C" fn rmw_create_subscription(
             inner: std::sync::Mutex::new(SubscriptionInner {
                 subscriber,
                 // No outstanding take loans yet. Reserved UP FRONT to
-                // the borrow budget so every in-budget loaned take is
+                // the borrow budget so every zero-copy loaned take is
                 // allocation-free on the receive path — a `Vec::new()` here
-                // would make the FIRST successful take allocate. The budget
-                // already bounds outstanding loans on an rmw-created service
-                // (iceoryx2 refuses the next receive past it); only a
-                // pre-existing service created with a LARGER budget (a graph's
-                // `--record` raise) could ever push past this reservation,
-                // and that is a one-time cold growth, not a per-take cost.
+                // would make the FIRST successful take allocate. The take
+                // keeps zero-copy loans below `min(budget, the service's
+                // ceiling)`, so this reservation is never outgrown.
                 pending_takes: Vec::with_capacity(RMW_TAKE_LOAN_BORROW_BUDGET),
+                // Takes served by copy past that reserve; empty (and
+                // unallocated) until a consumer retains loans.
+                copied_takes: Vec::new(),
+                copy_regime_open: false,
                 // Shadows for the forged take, built lazily
                 // up to the loan budget and then recycled (see
                 // `TakeShadowPool`); a fixed type never touches it.
@@ -2702,6 +2712,9 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             ),
             forge_fallbacks: std::sync::Mutex::new(
+                cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
+            ),
+            loan_copies: std::sync::Mutex::new(
                 cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
             ),
             adopt,
@@ -2823,15 +2836,22 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
             // will not re-enter torn state just to log a number) but the Box
             // drop still releases every held sample — Mutex::drop drops its
             // contents whether or not it is poisoned.
+            //
+            // Takes served by copy are freed by the same drop (each copy's
+            // `fini` runs for a forged type) and counted on the same line:
+            // their pointers dangle from here on just as the loans' do.
             if let Some(inner) = runtime::lock_unpoisoned(&data.inner) {
                 let outstanding = inner.pending_takes.len();
-                if outstanding > 0 {
+                let copied = inner.copied_takes.len();
+                if outstanding > 0 || copied > 0 {
                     tracing::warn!(
                         topic = %data.topic,
                         outstanding,
-                        "subscription destroyed with outstanding loaned takes — \
-                         releasing their SHM borrows now; the loaned pointers \
-                         are dangling"
+                        copied,
+                        "subscription destroyed with outstanding loaned takes: \
+                         releasing the SHM borrows of the outstanding loans and \
+                         freeing the copied ones now; every loaned pointer is \
+                         dangling"
                     );
                 }
             }
@@ -4084,6 +4104,155 @@ pub unsafe extern "C" fn rmw_take_sequence(
     })
 }
 
+/// Report the served-by-copy regime to its latch, under its own panic guard: a
+/// copy opens or repeats it, otherwise this take closes it (the recovery line
+/// prints when anything was suppressed). Out of line and cold: the common
+/// zero-copy take never calls it. A panic comes back as `Err` so the caller
+/// untracks the take, as it does for the serve report.
+#[cold]
+#[inline(never)]
+fn report_copy_regime(
+    data: &SubscriptionData,
+    by_copy: bool,
+    held_loans: usize,
+    ceiling: usize,
+) -> std::thread::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if by_copy {
+            crate::loan_refusal_latch::report_loan_copied(
+                &data.loan_copies,
+                &data.topic,
+                held_loans,
+                ceiling,
+            );
+        } else {
+            crate::loan_refusal_latch::report_loan_served_zero_copy(&data.loan_copies, &data.topic);
+        }
+        // The serve-report seam, after the last report of a take that has one.
+        #[cfg(feature = "test-seams")]
+        crate::test_seams::maybe_panic_in_loaned_serve_report();
+    }))
+}
+
+/// A loaned take whose RECEIVE the transport refused: who else holds borrows
+/// (adopted messages of this subscription, none unless adopt-take is armed)
+/// goes into the line's remedy. Out of line and cold, as the copy helpers.
+#[cold]
+#[inline(never)]
+fn report_receive_refused(
+    data: &SubscriptionData,
+    held_loans: usize,
+    ceiling: usize,
+    error: &dyn std::fmt::Display,
+) {
+    let adopted_outstanding = data.adopt.as_ref().map_or(0, |adopt| {
+        adopt.stats.outstanding.load(Ordering::Relaxed) as usize
+    });
+    crate::loan_refusal_latch::report_loan_refused(
+        &data.loan_refusals,
+        &data.topic,
+        crate::loan_refusal_latch::LoanRefusal::ReceiveFailed,
+        held_loans,
+        adopted_outstanding,
+        ceiling,
+        &error.to_string(),
+    );
+}
+
+/// Untrack a take whose serve reporting panicked: dropping the entry releases
+/// the borrow (and its shadow), or frees the copy.
+#[cold]
+#[inline(never)]
+fn untrack_take(inner: &mut SubscriptionInner, key: usize, by_copy: bool) {
+    if by_copy {
+        inner.copied_takes.retain(|c| c.key() != key);
+    } else {
+        inner.pending_takes.retain(|p| p.key != key);
+    }
+}
+
+/// The unpooled shadow a FORGED take past the reserve is served into. Out of
+/// line and marked cold, with the other copy-regime helpers around it, so the
+/// zero-copy take keeps its own code compact.
+#[cold]
+#[inline(never)]
+fn build_copy_shadow(
+    bridge: &Arc<crate::bridge::AnyBridge>,
+) -> Result<runtime::TakeShadow, crate::loan_refusal_latch::LoanRefusal> {
+    // Allocates (the shadow and, in the decode, its members) only on the
+    // degraded path of a consumer that retains loans; a zero-copy take
+    // recycles pooled shadows and never reaches this.
+    runtime::TakeShadow::build(bridge)
+        .ok_or(crate::loan_refusal_latch::LoanRefusal::ShadowAllocationFailed)
+}
+
+/// A FORGED take served by COPY (past the reserve). The unpooled shadow is
+/// filled by the copying decode, the one `rmw_take` runs into a caller's
+/// message, so every member owns its storage and nothing aliases the sample,
+/// which is released before the take returns. `None` when the decode refuses
+/// the frame: it is consumed and dropped through the same latch as the forged
+/// arm, `taken` false, and the shadow's `fini` frees whatever the decode copied
+/// before it stopped. The shadow was built for `data.bridge`.
+#[cold]
+#[inline(never)]
+unsafe fn serve_forged_copy(
+    data: &SubscriptionData,
+    inner: &mut SubscriptionInner,
+    owned: cerulion_core::transport::subscriber::OwnedInboundSample,
+    copy_shadow: runtime::TakeShadow,
+) -> Option<*mut c_void> {
+    let body = &owned.payload()[WireHeader::SIZE..];
+    if !data.bridge.unflatten(body, copy_shadow.as_ptr()) {
+        crate::decode_failure_latch::report_decode_failure(
+            &data.decode_failures,
+            crate::decode_failure_latch::DecodeSite::Subscription,
+            &data.topic,
+            &data.type_name,
+            body.len(),
+        );
+        return None;
+    }
+    drop(owned);
+    Some(hold_copy(inner, runtime::TakeCopy::Shadow(copy_shadow)))
+}
+
+/// A FIXED take served by COPY (past the reserve): the fixed section, which IS
+/// the C struct, into heap words (8-aligned, and `fixed_align` is at most 8),
+/// then the sample is released before the take returns. At least one word, so
+/// every copy has its own address. The caller has already passed the framing
+/// gate: the frame's body is exactly `fixed_size` bytes.
+#[cold]
+#[inline(never)]
+unsafe fn serve_fixed_copy(
+    inner: &mut SubscriptionInner,
+    owned: cerulion_core::transport::subscriber::OwnedInboundSample,
+    fixed_size: usize,
+) -> *mut c_void {
+    // hot-path-alloc-ok: a take past the reserve is the degraded path of a
+    // consumer that retains loans; a zero-copy take never reaches this.
+    let mut words = vec![0u64; fixed_size.div_ceil(8).max(1)];
+    std::ptr::copy_nonoverlapping(
+        owned.payload().as_ptr().add(WireHeader::SIZE),
+        words.as_mut_ptr() as *mut u8,
+        fixed_size,
+    );
+    drop(owned);
+    hold_copy(inner, runtime::TakeCopy::Fixed(words))
+}
+
+/// Track a take served by copy and return the pointer handed to the caller
+/// (the copy's own address, so it is the return's key).
+#[cold]
+#[inline(never)]
+fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_void {
+    let mut take = runtime::CopiedTake::new(copy);
+    let ptr = take.loaned_ptr();
+    // The table of copies grows only on the degraded path past the reserve,
+    // where the copy itself has just been allocated.
+    inner.copied_takes.push(take);
+    ptr
+}
+
 /// The zero-copy loaned TAKE — the read-side mirror of
 /// `rmw_borrow_loaned_message`. Receives ONE owned iceoryx2 sample off the
 /// SAME queue receive as `take_impl` (`try_receive_one_owned` — the
@@ -4114,10 +4283,23 @@ pub unsafe extern "C" fn rmw_take_sequence(
 ///   return un-forges it before the sample is released and recycles it.
 ///
 /// Everything else returns `RMW_RET_UNSUPPORTED` and rclcpp falls back to
-/// the copying take. Both shapes share one budget arm: a take refused by
-/// the shadow pool or by the transport's borrow budget is loud once per
-/// regime (`loan_refusal_latch`), consumes no frame, and recovers on the
-/// first served take after a return.
+/// the copying take.
+///
+/// Both shapes keep one borrow in reserve, so a consumer that RETAINS loans
+/// keeps receiving: with `ceiling = min(RMW_TAKE_LOAN_BORROW_BUDGET, the
+/// service's max_borrowed_samples)`, a take made while `ceiling - 1`
+/// zero-copy loans are held is served by COPY (`take_gate::
+/// loaned_take_serves_copy`). It receives into the reserved borrow, copies
+/// the message into private memory (the fixed section into heap words, or a
+/// forged type through the copying decode into an unpooled shadow), drops
+/// the sample before returning and hands out the copy, tracked in
+/// `copied_takes` and returned through the same call as a loan. Loud once
+/// per regime on its own latch (`loan_refusal_latch::report_loan_copied`),
+/// recovered by the first take served zero-copy with no copy outstanding. A
+/// take that cannot get a
+/// borrow or a shadow at all (a transport refusal, a failed shadow
+/// allocation) is refused, loud once per regime, consumes no frame, and
+/// recovers on the first served take.
 unsafe fn take_loaned_impl(
     subscription: *const ffi::rmw_subscription_t,
     loaned_message: *mut *mut c_void,
@@ -4169,21 +4351,45 @@ unsafe fn take_loaned_impl(
         tracing::error!("entity wedged by an earlier panic; failing call");
         return RMW_RET_ERROR;
     };
+    // The reserve: the borrows this subscription may hold are the loan
+    // budget, or fewer on a pre-existing service created smaller. A take that
+    // would hold the last of them as a zero-copy loan is served by copy
+    // instead, so retained loans never reach the refusal arms below.
+    let ceiling = RMW_TAKE_LOAN_BORROW_BUDGET.min(inner.subscriber.max_borrowed_samples());
+    let held_loans = inner.pending_takes.len();
+    let by_copy = crate::take_gate::loaned_take_serves_copy(held_loans, ceiling);
     // A forged take needs its shadow BEFORE the receive: a refusal here
-    // consumes NO frame, so the queued frame is served by the take that
-    // follows a return. Pool exhaustion is the shadow-side face of the same
-    // budget the transport enforces below — one latch, one regime.
+    // consumes NO frame, so the queued frame is served by a later take. A
+    // zero-copy take recycles one from the pool; a take served by copy builds
+    // a fresh, unpooled one, which drops (and runs `fini`) on every early
+    // return below. The copy's shadow is built before the receive on
+    // purpose, for that same guarantee (a failed allocation consumes no
+    // frame); the price is one build and destroy per take past the reserve
+    // that finds the queue empty.
     let mut shadow = None;
+    let mut copy_shadow = None;
     if forged {
-        match inner.shadows.acquire(&data.bridge) {
+        let acquired = if by_copy {
+            build_copy_shadow(&data.bridge)
+        } else {
+            inner.shadows.acquire(&data.bridge)
+        };
+        match acquired {
+            Ok(s) if by_copy => copy_shadow = Some(s),
             Ok(s) => shadow = Some(s),
             Err(kind) => {
+                let budget = if by_copy {
+                    ceiling
+                } else {
+                    inner.shadows.capacity()
+                };
                 crate::loan_refusal_latch::report_loan_refused(
                     &data.loan_refusals,
                     &data.topic,
                     kind,
-                    inner.pending_takes.len(),
-                    inner.shadows.capacity(),
+                    held_loans,
+                    0,
+                    budget,
                     "",
                 );
                 return RMW_RET_ERROR;
@@ -4196,23 +4402,17 @@ unsafe fn take_loaned_impl(
     {
         Ok(o) => o,
         Err(e) => {
-            // The transport-side budget arm lands here: with
-            // RMW_TAKE_LOAN_BORROW_BUDGET loans outstanding, iceoryx2 refuses
-            // the next receive with `ExceedsMaxBorrows` — loud once per
-            // regime and bounded (never silent loss, never a hang); returning
-            // any one loan recovers. Other receive failures share the arm;
-            // the reason carries the iceoryx2 cause verbatim.
+            // A transport refusal of the receive. The reserve keeps this
+            // subscription's own loans one borrow short of the ceiling, so
+            // `ExceedsMaxBorrows` here means borrows held elsewhere on the
+            // same subscription (adopted messages); any other reason is the
+            // transport's own condition, carried verbatim. Loud once per
+            // regime and bounded (never silent loss, never a hang); the next
+            // served take recovers.
             if let Some(s) = shadow.take() {
                 inner.shadows.release(s);
             }
-            crate::loan_refusal_latch::report_loan_refused(
-                &data.loan_refusals,
-                &data.topic,
-                crate::loan_refusal_latch::LoanRefusal::ReceiveFailed,
-                inner.pending_takes.len(),
-                RMW_TAKE_LOAN_BORROW_BUDGET,
-                &e.to_string(),
-            );
+            report_receive_refused(data, held_loans, ceiling, &e);
             return RMW_RET_ERROR;
         }
     };
@@ -4298,7 +4498,12 @@ unsafe fn take_loaned_impl(
     let seq = header.sequence as u64;
     // Delivery log: the body this take hands out (kept only if it is taken).
     crate::replay::capture_take_body(&owned.payload()[WireHeader::SIZE..], seq as i64, ts as i64);
-    let loaned_ptr: *mut c_void = if let Some(mut shadow) = shadow {
+    let loaned_ptr: *mut c_void = if let Some(copy_shadow) = copy_shadow {
+        match serve_forged_copy(data, &mut inner, owned, copy_shadow) {
+            Some(ptr) => ptr,
+            None => return RMW_RET_OK,
+        }
+    } else if let Some(mut shadow) = shadow {
         // FORGED shape. The bridge validates the frame (entries in bounds,
         // element-multiple lengths, element-aligned forge targets) and
         // fills the shadow all-or-nothing; a malformed frame is a framing
@@ -4347,8 +4552,9 @@ unsafe fn take_loaned_impl(
         // subscriber side (iceoryx2 opens data segments `AccessMode::Read`):
         // a caller writing through a forged `data()` faults LOUDLY, never
         // silently and never into another subscriber's view — the documented
-        // loaned-take contract (message valid only inside the callback,
-        // read-only). The shadow's own fields are ordinary heap memory.
+        // loaned-take contract (message valid until the loan is returned, which
+        // rclcpp before 28.1.23 does right after the callback; read-only). The
+        // shadow's own fields are ordinary heap memory.
         let ptr = shadow.as_ptr();
         inner.pending_takes.push(runtime::PendingTake {
             key: ptr as usize,
@@ -4392,50 +4598,56 @@ unsafe fn take_loaned_impl(
             );
             return RMW_RET_OK;
         }
-        // Alignment gate (fail closed — never hand out a misaligned struct
-        // pointer). Expected to ALWAYS hold: the sample header is align 8 and
-        // its size is a multiple of 8 (measured, see
-        // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
-        // `[u8]` payload has align 1, so the payload starts 8-aligned; +32
-        // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen static
-        // assert. But that is DE FACTO, not an iceoryx2 API guarantee, and
-        // the service builder's `.payload_alignment()` override is
-        // deliberately NOT used (it would change the slot layout the
-        // `iceoryx2_slot_bytes` closed form documents as exact for
-        // exactly-this builder shape) — so THIS assert is the guard: an
-        // iceoryx2 bump that moves the payload offset fails loudly here
-        // instead of handing rclcpp UB.
-        let ros_ptr = frame.as_ptr().add(WireHeader::SIZE);
-        if !(ros_ptr as usize).is_multiple_of(fixed_align) {
-            tracing::error!(
-                topic = %data.topic,
-                ptr = ros_ptr as usize,
-                fixed_align,
-                "loaned take: SHM payload pointer is misaligned for the message \
-                 struct — refusing to hand it out (the iceoryx2 payload offset \
-                 moved?)"
-            );
-            return RMW_RET_ERROR;
+        if by_copy {
+            serve_fixed_copy(&mut inner, owned, fixed_size)
+        } else {
+            // Alignment gate (fail closed: never hand out a misaligned struct
+            // pointer). Expected to ALWAYS hold: the sample header is align 8 and
+            // its size is a multiple of 8 (measured, see
+            // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
+            // `[u8]` payload has align 1, so the payload starts 8-aligned; +32
+            // (WireHeader) keeps it, and `fixed_align <= 8` by the codegen static
+            // assert. But that is DE FACTO, not an iceoryx2 API guarantee, and
+            // the service builder's `.payload_alignment()` override is
+            // deliberately NOT used (it would change the slot layout the
+            // `iceoryx2_slot_bytes` closed form documents as exact for
+            // exactly-this builder shape), so THIS assert is the guard: an
+            // iceoryx2 bump that moves the payload offset fails loudly here
+            // instead of handing rclcpp UB.
+            let ros_ptr = frame.as_ptr().add(WireHeader::SIZE);
+            if !(ros_ptr as usize).is_multiple_of(fixed_align) {
+                tracing::error!(
+                    topic = %data.topic,
+                    ptr = ros_ptr as usize,
+                    fixed_align,
+                    "loaned take: SHM payload pointer is misaligned for the message \
+                     struct, refusing to hand it out (the iceoryx2 payload offset \
+                     moved?)"
+                );
+                return RMW_RET_ERROR;
+            }
+            // Hand-out. The pointer is `*mut` because the rmw ABI is non-const,
+            // but the subscriber-side loan contract is read-only: the mapping IS
+            // read-only (iceoryx2 opens subscriber data segments
+            // `AccessMode::Read`), so a caller writing through it faults loudly
+            // rather than corrupting the frame every other subscriber reads,
+            // which is inherent to the rmw loan ABI, not specific to this
+            // implementation.
+            inner.pending_takes.push(runtime::PendingTake {
+                key: ros_ptr as usize,
+                shadow: None,
+                sample: owned,
+            });
+            ros_ptr as *mut c_void
         }
-        // Hand-out. The pointer is `*mut` because the rmw ABI is non-const,
-        // but the subscriber-side loan contract is read-only: the mapping IS
-        // read-only (iceoryx2 opens subscriber data segments
-        // `AccessMode::Read`), so a caller writing through it faults loudly
-        // rather than corrupting the frame every other subscriber reads —
-        // inherent to the rmw loan ABI, not specific to this implementation.
-        inner.pending_takes.push(runtime::PendingTake {
-            key: ros_ptr as usize,
-            shadow: None,
-            sample: owned,
-        });
-        ros_ptr as *mut c_void
     };
     // A served take closes any open refusal regime (recovery is logged once,
     // only if something was suppressed).
     //
-    // This reporter runs
-    // with the loan ALREADY tracked in `pending_takes` — both arms above
-    // pushed it — but BEFORE `*loaned_message` and `*taken` are written. A
+    // These reporters run
+    // with the loan ALREADY tracked (in `pending_takes`, or in `copied_takes`
+    // for a copy; every arm above pushed it) but BEFORE `*loaned_message` and
+    // `*taken` are written. A
     // panic here (a host `tracing` subscriber's `on_event`) would therefore leave
     // the sample borrowed and the slot consumed while `ffi_guard` returns
     // `RMW_RET_ERROR` and the caller never receives the pointer: with no
@@ -4447,19 +4659,41 @@ unsafe fn take_loaned_impl(
     // The rollback keeps the same invariant as that path: on failure
     // the caller holds nothing of ours and we hold nothing of the caller's.
     // Dropping the `PendingTake` releases the borrow (and its shadow).
+    // The served-by-copy regime: a copy opens (or repeats) it, and the first
+    // take served zero-copy with no copy outstanding closes it. Only a copy and
+    // the closing take report to the copy latch; every other zero-copy take
+    // skips it.
+    let close_copy_regime = !by_copy && inner.copy_regime_open && inner.copied_takes.is_empty();
+    if by_copy {
+        inner.copy_regime_open = true;
+    } else if close_copy_regime {
+        inner.copy_regime_open = false;
+    }
     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::loan_refusal_latch::report_loan_served(
             &data.loan_refusals,
             &data.topic,
             crate::loan_refusal_latch::LoanServed::Loaned,
         );
-        // The seam travels WITH this reporter, inside the guarded window.
+        // The seam fires after the last report of this take: here, unless
+        // the copy-regime report below runs, which then carries it.
         #[cfg(feature = "test-seams")]
-        crate::test_seams::maybe_panic_in_loaned_serve_report();
+        if !(by_copy || close_copy_regime) {
+            crate::test_seams::maybe_panic_in_loaned_serve_report();
+        }
     }));
+    // The copy-regime report runs under its own guard, out of line, so the
+    // common take's guarded window holds only `report_loan_served`.
+    let served = match served {
+        Ok(()) if by_copy || close_copy_regime => {
+            report_copy_regime(data, by_copy, held_loans, ceiling)
+        }
+        other => other,
+    };
     if let Err(payload) = served {
-        let key = loaned_ptr as usize;
-        inner.pending_takes.retain(|p| p.key != key);
+        // Dropping the entry releases the borrow (and its shadow), or frees
+        // the copy.
+        untrack_take(&mut inner, loaned_ptr as usize, by_copy);
         std::panic::resume_unwind(payload);
     }
     *loaned_message = loaned_ptr;
@@ -4541,7 +4775,8 @@ pub unsafe extern "C" fn rmw_take_loaned_message_with_info(
 
 /// Return a loaned take — pop the held sample by its loaned pointer
 /// and drop it, releasing the iceoryx2 borrow (the publisher-pool slot and
-/// the `subscriber_max_borrowed_samples` unit).
+/// the `subscriber_max_borrowed_samples` unit). A take served by copy is
+/// looked up next and freed.
 ///
 /// # Safety
 /// `loaned_message` must come from `rmw_take_loaned_message[_with_info]` on
@@ -4570,18 +4805,23 @@ pub unsafe extern "C" fn rmw_return_loaned_message_from_subscription(
             tracing::error!("entity wedged by an earlier panic; failing call");
             return RMW_RET_ERROR;
         };
-        match inner.pending_takes.iter().position(|t| t.key == key) {
+        if let Some(pos) = inner.pending_takes.iter().position(|t| t.key == key) {
+            let runtime::PendingTake { shadow, sample, .. } = inner.pending_takes.swap_remove(pos);
+            // Ordering, load-bearing: the shadow is
+            // UN-FORGED (inside `release`) and back in the pool BEFORE
+            // the sample's SHM borrow is released: nothing in the rmw
+            // references the frame once the transport may reclaim it.
+            if let Some(shadow) = shadow {
+                inner.shadows.release(shadow);
+            }
+            drop(sample);
+            return RMW_RET_OK;
+        }
+        // A take served by copy holds no sample: dropping it frees the copy
+        // (a forged type's through its typesupport `fini`).
+        match inner.copied_takes.iter().position(|c| c.key() == key) {
             Some(pos) => {
-                let runtime::PendingTake { shadow, sample, .. } =
-                    inner.pending_takes.swap_remove(pos);
-                // Ordering, load-bearing: the shadow is
-                // UN-FORGED (inside `release`) and back in the pool BEFORE
-                // the sample's SHM borrow is released — nothing in the rmw
-                // references the frame once the transport may reclaim it.
-                if let Some(shadow) = shadow {
-                    inner.shadows.release(shadow);
-                }
-                drop(sample);
+                drop(inner.copied_takes.swap_remove(pos));
                 RMW_RET_OK
             }
             None => {

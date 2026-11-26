@@ -387,8 +387,11 @@ unknown-git = "deny"
 # notified with nothing to read and no later notify would wake it.
 # The revision also adds Android support: filesystem paths, file-backed named
 # shared memory with private-directory checks, abstract-namespace Unix datagram
-# sockets and POSIX timers for the watchdog. PRUNE this the moment an iceoryx2
-# release carries all four fixes and the Android support.
+# sockets and POSIX timers for the watchdog, and a per-publisher history size,
+# so a publisher can retain less history than its service.
+# PRUNE this the moment an iceoryx2 release carries all four fixes, the Android
+# support and the per-publisher history size (and then drop the
+# `iceoryx2_publisher_history` probe in `crates/cerulion_core/build.rs`).
 allow-git = [
     "https://github.com/cerulion-inc/re_grpc_server",
     "https://github.com/cerulion-inc/iceoryx2",

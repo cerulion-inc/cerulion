@@ -285,6 +285,45 @@ def means_notes(cols, name, uns, lost):
     return T
 
 
+def episode_factor(c, key, better, worse):
+    """(the mean without, the mean with, the factor, the word) for one per-episode mean of stats(): the two arms'
+    means over scored episodes, and the larger over the smaller, printed as the charts print a factor. The word is
+    `better` when the mean with Cerulion is the smaller, `worse` when it is the larger, "the same" when equal."""
+    wo, wi = c.stats("without")[key], c.stats("with")[key]
+    if not wo or not wi:
+        return wo, wi, None, None
+    if wo == wi:
+        return wo, wi, times(1.0), "the same"
+    return (wo, wi, times(wo / wi), better) if wo > wi else (wo, wi, times(wi / wo), worse)
+
+
+def episode_cost_factor(c):
+    """Model cost per scored episode at list price: "cheaper" or "dearer" with Cerulion."""
+    return episode_factor(c, "usd", "cheaper", "dearer")
+
+
+def episode_time_factor(c):
+    """Wall seconds per scored episode: "faster" or "slower" with Cerulion."""
+    return episode_factor(c, "wall_s", "faster", "slower")
+
+
+def episode_factor_table(cols, name):
+    """The model cost and the wall time of one scored episode, without and with, and the factor between each pair
+    (descriptive)."""
+    def cell(f, word):
+        return "" if f is None else "the same" if word == "the same" else f"{f} times {word}"
+
+    L = [f"| model | USD an episode without {name} | with {name} | cost with {name} | wall seconds an episode "
+         f"without {name} | with {name} | time with {name} |",
+         "|---|---|---|---|---|---|---|"]
+    for c in cols:
+        uo, ui, uf, uw = episode_cost_factor(c)
+        so, si, sf, sw = episode_time_factor(c)
+        L.append(f"| {c.model}{'' if c.complete else '*'} | {fnum(uo, 3)} | {fnum(ui, 3)} | "
+                 f"{cell(uf, uw)} | {fnum(so)} | {fnum(si)} | {cell(sf, sw)} |")
+    return L
+
+
 def write(path, text, check, changed):
     old = open(path).read() if os.path.exists(path) else None
     if old != text:
@@ -1075,6 +1114,16 @@ def grid(name, check, changed):
     L += [""] + cross_table(cols, name)
     L += ["## Means per scored episode", ""] + means_table(cols, name) + [""]
     L += means_notes(cols, name, uns, lost)
+    L += [f"## Model cost and wall time per scored episode, without and with {name} (descriptive)", ""]
+    L += episode_factor_table(cols, name) + [""]
+    L += [f"Each figure is the arm's USD or wall seconds column in the means table above, a mean over its scored "
+          f"episodes, with what the notes under that table say about each: USD at list price, leaving out what the USD "
+          f"note names, and part of the gap in it caching; wall seconds carrying each endpoint's stalls and failed "
+          f"requests, so a statement about speed is read with them in mind (RULES.md section 6). Each factor is the "
+          f"larger mean of its pair over the smaller, to two decimals under 1.1, one under 10 and a whole number from "
+          f"10. RULES.md section 3 declares 'Episodes with {name} use fewer requests and cost less', which becomes per "
+          f"model when a model's column with {name} costs more; this table prints the cost half per model. No rule "
+          f"declared these factors or a statement about speed.", ""]
     L += ["## How the replies ended (finish reason), scored episodes", ""] + finish_table(cols, name)
     L += ["## Episodes that ended without a score", ""]
     if uns:

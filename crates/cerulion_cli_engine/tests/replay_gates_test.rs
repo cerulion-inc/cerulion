@@ -834,11 +834,12 @@ fn zeroed_record_type_is_trace_record_unsupported_exit_2() {
 fn reserved_record_type_is_trace_record_unsupported_exit_2() {
     let (_dir, path) = tmp_bag("reserved_rec.mcap");
     // record_type 4/5 are RESERVED (keyframe = kind 4 / nondeterminism =
-    // kind 5), as are 7+ — a bag carrying one was written by a newer/foreign
-    // writer. (Kind 3 is STEP_BOUNDARY and kind 6 is READ_OUTCOME, and both
-    // are accepted: see
-    // `step_boundary_records_pass_the_record_type_gate` /
-    // `read_outcome_records_pass_the_record_type_gate`.)
+    // kind 5), as are 8+; a bag carrying one was written by a newer/foreign
+    // writer. (Kind 3 is STEP_BOUNDARY, kind 6 is READ_OUTCOME and kind 7 is
+    // NODE_STOP, and all three are accepted: see
+    // `step_boundary_records_pass_the_record_type_gate`,
+    // `read_outcome_records_pass_the_record_type_gate` and
+    // `a_node_stop_record_on_a_node_stops_format_bag_passes_the_gates`.)
     write_bag(
         &path,
         &[fire(0, 1), fire(0, 2), trace_rec(4, 0, 3)],
@@ -950,6 +951,153 @@ fn read_outcome_records_pass_the_record_type_gate() {
          (NodeLoad for the missing cdylib); got {err:?}"
     );
     assert_eq!(err.exit_code(), 3);
+}
+
+/// A NODE-STOP record (kind 7) on a bag stamped at the node-stops format
+/// (`NODE_STOPS_MIN_TRACE_FORMAT`) passes the record-type gate and the version
+/// gate: the bag reaches the engine and fails at cdylib load (exit 3, no
+/// `test_pub` in this crate's tree), not with the exit-2
+/// `TraceRecordUnsupported` a gate unaware of kind 7 raises or the upgrade
+/// refusal a reader below that format raises. The record is spelled by hand: the
+/// stopping fire's step, instant and node, the fatal cause code (1) in
+/// `duration_ns`.
+#[test]
+fn a_node_stop_record_on_a_node_stops_format_bag_passes_the_gates() {
+    let (_dir, path) = tmp_bag("node_stop_ok.mcap");
+    let mut atts = replay_grade_attachments(&["node0"]);
+    atts.push(recorder_att(Some(
+        cerulion_cli_engine::replay_engine::NODE_STOPS_MIN_TRACE_FORMAT,
+    )));
+    let stop = TraceRingRecord {
+        step: 2,
+        fire_time_ns: 1002,
+        duration_ns: 1,
+        node_idx: 0,
+        global_level: 0,
+        record_type: 7,
+        reserved: 0,
+    };
+    write_bag(&path, &[fire(0, 1), fire(0, 2), stop], &atts, true);
+    let err = gate(&path);
+    assert!(
+        matches!(err, ReplayError::NodeLoad { .. }),
+        "a node-stops format bag carrying a stop record must pass both gates and reach the \
+         engine (NodeLoad for the missing cdylib); got {err:?}"
+    );
+    assert_eq!(err.exit_code(), 3);
+}
+
+/// A bag holding a NODE-STOP record of cause 9 under `stamp`, refused by the
+/// record gate.
+fn gate_unknown_stop_cause(name: &str, stamp: u32) -> ReplayError {
+    let (_dir, path) = tmp_bag(name);
+    let mut atts = replay_grade_attachments(&["node0"]);
+    atts.push(recorder_att(Some(stamp)));
+    let stop = TraceRingRecord {
+        step: 2,
+        fire_time_ns: 1002,
+        duration_ns: 9,
+        node_idx: 0,
+        global_level: 0,
+        record_type: 7,
+        reserved: 0,
+    };
+    write_bag(&path, &[fire(0, 1), fire(0, 2), stop], &atts, true);
+    gate(&path)
+}
+
+/// At the format this build reads up to, every stop cause is defined, so a
+/// stop record of an unknown cause is a corrupt bag (exit 2) naming the
+/// record, its rank, the code and the stamp.
+#[test]
+fn a_stop_cause_unknown_at_the_supported_format_is_a_corrupt_bag_exit_2() {
+    let supported = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT;
+    let err = gate_unknown_stop_cause("stop_cause_supported.mcap", supported);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "bag internal consistency check failed: trace record 2 is a NODE-STOP record of \
+             rank 0 that carries stop cause 9, which trace format {supported} does not define \
+             \u{2014} the recording is corrupt or hand-edited; re-record with `cerulion graph run \
+             --record`"
+        )
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// One format past what this build reads, a newer or foreign writer added the
+/// cause: the record gate, which walks the records before the version gate,
+/// refuses it with the upgrade remedy the unknown record kind gets (exit 2).
+#[test]
+fn a_stop_cause_unknown_past_the_supported_format_names_a_newer_writer_exit_2() {
+    let past = cerulion_cli_engine::replay_engine::SUPPORTED_TRACE_FORMAT + 1;
+    let err = gate_unknown_stop_cause("stop_cause_newer.mcap", past);
+    assert_eq!(
+        err.to_string(),
+        "scheduler-trace record 2: a NODE-STOP record of rank 0 carries stop cause 9, which \
+         this Cerulion version does not define; the bag was written by a newer or foreign \
+         writer; upgrade cerulion to replay it"
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A NODE-STOP record's `node_idx` is manifest-indexed like a FIRE's, and one
+/// past the table is refused naming the record kind (exit 2).
+#[test]
+fn a_node_stop_record_past_its_manifest_is_exit_2() {
+    let (_dir, path) = tmp_bag("node_stop_idx.mcap");
+    let stop = TraceRingRecord {
+        step: 2,
+        fire_time_ns: 1002,
+        duration_ns: 1,
+        node_idx: 1,
+        global_level: 0,
+        record_type: 7,
+        reserved: 0,
+    };
+    write_bag(
+        &path,
+        &[fire(0, 2), stop],
+        &replay_grade_attachments(&["a"]),
+        true,
+    );
+    let err = gate(&path);
+    match &err {
+        ReplayError::BagInvalidAttachment { name, reason } => {
+            assert!(name.contains("trace_manifest_rank0"), "got {name}");
+            assert_eq!(
+                reason,
+                "a scheduler-trace NODE-STOP record references node_idx 1 but the manifest \
+                 lists only 1 node id(s)"
+            );
+        }
+        other => panic!("expected BagInvalidAttachment (stop node_idx), got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// The version gate sits at the node-stops format: a bag stamped one past it
+/// is refused up front with the upgrade message (exit 2), whatever its records.
+#[test]
+fn a_bag_stamped_past_the_node_stops_format_is_refused_with_the_upgrade_message() {
+    let (_dir, path) = tmp_bag("format_past_node_stops.mcap");
+    let past = cerulion_cli_engine::replay_engine::NODE_STOPS_MIN_TRACE_FORMAT + 1;
+    let mut atts = replay_grade_attachments(&["node0"]);
+    atts.push(recorder_att(Some(past)));
+    write_bag(&path, &[fire(0, 1), fire(0, 2)], &atts, true);
+    let err = gate(&path);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => {
+            assert!(
+                detail.contains(&format!("version {past}"))
+                    && detail.to_lowercase().contains("newer")
+                    && detail.to_lowercase().contains("upgrade"),
+                "expected the upgrade message for format {past}, got: {detail}"
+            );
+        }
+        other => panic!("expected RecordingInconsistent (format {past}), got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
 }
 
 #[test]
@@ -1463,6 +1611,7 @@ fn production_recorder_att(coordination: CoordinationMode) -> Att {
             std::time::Duration::from_nanos(1_783_092_278_948_123_456),
             coordination,
             &std::collections::BTreeMap::from([("pub1".to_string(), false)]),
+            &std::collections::BTreeMap::new(),
             0,
         ),
     )

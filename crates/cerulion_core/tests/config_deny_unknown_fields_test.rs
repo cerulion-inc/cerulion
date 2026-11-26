@@ -711,6 +711,12 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
     ),
     (
         "cerulion_cli_engine/src/replay_engine.rs",
+        "InputQueue",
+        Classification::ExemptWithReason,
+        "not user-authored: an entry of the `node_inputs` map this build WRITES into a bag's `__cerulion/recorder.json` and reads back, inside `RecorderInfo`, which is exempt for the same reason: denying here would make an old build refuse a new bag whose recorder adds a field to an input's queue",
+    ),
+    (
+        "cerulion_cli_engine/src/replay_engine.rs",
         "CoveredRangeReport",
         Classification::ExemptWithReason,
         "not user-authored: a manifest/report this build WRITES into a bag (or beside one) and reads back. Leniency is deliberate and already load-bearing elsewhere — `read_record_coverage` WARNS and READS a manifest from a newer recorder rather than refusing — so denying here would make an old build refuse a new bag (the `--report` JSON)",

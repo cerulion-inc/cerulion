@@ -46,7 +46,7 @@ directory. See [Build and run from inside the example](../README.md#build-and-ru
 
 ## Run it
 
-The same sequence as the [quickstart](../../README.md#quickstart), from the repository root:
+The same sequence as the README's [runtime trial](../../README.md#try-the-runtime), from the repository root:
 
 ```bash
 cd examples/obstacle_avoidance

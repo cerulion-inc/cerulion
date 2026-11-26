@@ -90,10 +90,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU32;
 
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
 use cerulion_core::replay_feed::EdgeIdentity;
 use cerulion_core::scheduler::catchup_clamp::{derive_catchup_cap_override, effective_max_catchup};
+use cerulion_core::scheduler::NodeStopCause;
 
 use crate::replay_engine::DivergenceClass;
 
@@ -289,10 +291,12 @@ impl PassRestore {
     }
 }
 
-/// Where each node of the pass was STOPPED ([`StopPoint`]): either at the
-/// checkpoint a resumed pass began from, as that checkpoint states it, or by
-/// a fire the re-execution performed (a `NodeError::Fatal` return or the
-/// panic breaker), with the stopping fire's position in that step's burst.
+/// Where each node of the pass was STOPPED ([`StopPoint`]): at the checkpoint
+/// a resumed pass began from, as that checkpoint states it; by a fire the
+/// recording's trace states stopped it (a NODE-STOP record, on a bag at the
+/// node-stops `trace_format` or later); or by a fire the re-execution performed (a
+/// `NodeError::Fatal` return or the panic breaker), with the stopping fire's
+/// position in that step's burst and its cause.
 ///
 /// A stopped node never fires again, so the recording holds no fire of it
 /// after the stop, and every decider must stop predicting there: the clock
@@ -302,6 +306,9 @@ impl PassRestore {
 /// recording, so a recording that kept firing past the stop is still a
 /// finding. Replay = Live puts the re-executed stop on the recorded one, and
 /// a stop at the checkpoint on the stop the recorded run had made before it.
+/// A recorded stop is noted before the step's re-execution, so the recording's
+/// own stop is the one every rule judges by, and a re-executed stop that
+/// disagrees with it is a finding of its own ([`first_stop_disagreement`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PassStops {
     stopped_at: BTreeMap<String, StopPoint>,
@@ -317,9 +324,9 @@ pub(crate) enum StopPoint {
         /// The checkpoint's step, `S`.
         anchor_step: u64,
     },
-    /// The re-execution stopped the node at `step`, and `fires` is how many
-    /// fires of the node that step's re-execution performed, the stopping
-    /// fire included (`1` = the first fire of the burst stopped it).
+    /// The re-execution stopped the node at `step` with `cause`, and `fires`
+    /// is how many fires of the node that step's re-execution performed, the
+    /// stopping fire included (`1` = the first fire of the burst stopped it).
     ///
     /// The position is what holds a stop INSIDE a burst to the recording: a
     /// replay that stops on the first of three recorded fires skips the other
@@ -330,6 +337,23 @@ pub(crate) enum StopPoint {
         step: u64,
         /// The stopping fire's position in that step's burst.
         fires: u32,
+        /// Why the node stopped: a fatal error or the consecutive-panic
+        /// breaker, the two stops that disable a node.
+        cause: NodeStopCause,
+    },
+    /// The recording's trace states that the `fires`-th fire of the node at
+    /// `step` stopped it, with `cause`. A stop whose cause leaves the node
+    /// firing ([`NodeStopCause::fires_again`]: a poisoned entry, whose later
+    /// fires skip its tick) changes no rule's expectation; any other is judged
+    /// as [`Self::InPass`] is.
+    Recorded {
+        /// The step whose fire stopped the node.
+        step: u64,
+        /// The stopping fire's position among the node's fires of that step,
+        /// from 1.
+        fires: NonZeroU32,
+        /// Why the node stopped.
+        cause: NodeStopCause,
     },
 }
 
@@ -339,6 +363,33 @@ impl StopPoint {
         match self {
             Self::AtAnchor { anchor_step } => step > anchor_step,
             Self::InPass { step: stop, .. } => step > stop,
+            Self::Recorded {
+                step: stop, cause, ..
+            } => !cause.fires_again() && step > stop,
+        }
+    }
+
+    /// Is `step` after a stop that released the node's `block` slots? A stop
+    /// at the checkpoint released them before it, and a fatal error or a
+    /// poisoned entry releases them at the stopping fire
+    /// (`release_held_block_slots`), though a poisoned node keeps firing; the
+    /// consecutive-panic breaker releases none, in the re-execution as in the
+    /// recording.
+    fn slots_released_after(self, step: u64) -> bool {
+        match self {
+            Self::AtAnchor { anchor_step } => step > anchor_step,
+            Self::InPass {
+                step: stop, cause, ..
+            }
+            | Self::Recorded {
+                step: stop, cause, ..
+            } => {
+                let releases = match cause {
+                    NodeStopCause::FatalError | NodeStopCause::EntryPoisoned => true,
+                    NodeStopCause::DisabledAfterPanics => false,
+                };
+                releases && step > stop
+            }
         }
     }
 
@@ -347,8 +398,15 @@ impl StopPoint {
     /// at every step for a stop at the checkpoint.
     fn burst_at(self, step: u64) -> Option<u32> {
         match self {
-            Self::InPass { step: stop, fires } if stop == step => Some(fires),
-            Self::InPass { .. } | Self::AtAnchor { .. } => None,
+            Self::InPass {
+                step: stop, fires, ..
+            } if stop == step => Some(fires),
+            Self::Recorded {
+                step: stop,
+                fires,
+                cause,
+            } if stop == step && !cause.fires_again() => Some(fires.get()),
+            Self::InPass { .. } | Self::AtAnchor { .. } | Self::Recorded { .. } => None,
         }
     }
 }
@@ -375,14 +433,26 @@ impl PassStops {
         }
     }
 
-    /// Note that `node_id` was stopped by a fire at `step`, the `fires`-th
-    /// fire of the node in that step (the stopping fire included). The FIRST
-    /// stop wins: a node is stopped once, and a node stopped at the
+    /// Note that `node_id` was stopped with `cause` by a fire at `step`, the
+    /// `fires`-th fire of the node in that step (the stopping fire included).
+    /// The FIRST stop wins: a node is stopped once, and a node stopped at the
     /// checkpoint keeps that stop.
-    pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32) {
+    pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32, cause: NodeStopCause) {
         self.stopped_at
             .entry(node_id.to_string())
-            .or_insert(StopPoint::InPass { step, fires });
+            .or_insert(StopPoint::InPass { step, fires, cause });
+    }
+
+    /// Note the stop the recording's trace states at `step` ([`StopPoint::Recorded`]).
+    /// The FIRST stop wins, as for [`Self::note`].
+    pub(crate) fn note_recorded(&mut self, step: u64, stop: &StepStop) {
+        self.stopped_at
+            .entry(stop.node_id.clone())
+            .or_insert(StopPoint::Recorded {
+                step,
+                fires: stop.fires,
+                cause: stop.cause,
+            });
     }
 
     /// Is `node_id` stopped, at the checkpoint or by a noted fire?
@@ -394,6 +464,150 @@ impl PassStops {
     fn stop_point(&self, node_id: &str) -> Option<StopPoint> {
         self.stopped_at.get(node_id).copied()
     }
+}
+
+/// One node's stop at one step, as the recording's trace holds it (a
+/// NODE-STOP record) or as the re-execution made it (the stopping fire's trace
+/// entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StepStop {
+    /// The stopped node.
+    pub(crate) node_id: String,
+    /// The rank the node ran on in the recording: its record's rank, or the
+    /// rank the recorded manifests give the re-executed node.
+    pub(crate) rank: u32,
+    /// The stopping fire's position among the node's fires of the step, the
+    /// stopping fire included (`1` = its first fire stopped it).
+    pub(crate) fires: NonZeroU32,
+    /// Why the node stopped.
+    pub(crate) cause: NodeStopCause,
+}
+
+/// A step at which the re-execution's stop of one node differs from the stop
+/// the recording's trace holds. Each stop is `(fires, cause)`: the stopping
+/// fire's position among the node's fires of the step, and why. `rank` is the
+/// rank the node ran on in the recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StopDisagreement {
+    /// The recording stops the node at the step; the re-execution does not.
+    NotReExecuted {
+        /// The node.
+        node_id: String,
+        /// Its recorded rank.
+        rank: u32,
+        /// The recording's stop.
+        recorded: (NonZeroU32, NodeStopCause),
+    },
+    /// The re-execution stops the node at the step; the recording does not.
+    NotRecorded {
+        /// The node.
+        node_id: String,
+        /// Its recorded rank.
+        rank: u32,
+        /// The re-execution's stop.
+        replayed: (NonZeroU32, NodeStopCause),
+    },
+    /// Both stop the node at the step, at another fire or for another cause.
+    Differs {
+        /// The node.
+        node_id: String,
+        /// Its recorded rank.
+        rank: u32,
+        /// The recording's stop.
+        recorded: (NonZeroU32, NodeStopCause),
+        /// The re-execution's stop.
+        replayed: (NonZeroU32, NodeStopCause),
+    },
+}
+
+impl StopDisagreement {
+    /// The rank the node ran on in the recording.
+    pub(crate) fn rank(&self) -> u32 {
+        match self {
+            Self::NotReExecuted { rank, .. }
+            | Self::NotRecorded { rank, .. }
+            | Self::Differs { rank, .. } => *rank,
+        }
+    }
+}
+
+impl fmt::Display for StopDisagreement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cause = |c: NodeStopCause| c.death_cause().as_wire();
+        match self {
+            Self::NotReExecuted {
+                node_id,
+                recorded: (fires, c),
+                ..
+            } => write!(
+                f,
+                "the recording stops node '{node_id}' at its fire {fires} of the step ({}), and \
+                 this re-execution does not stop it there",
+                cause(*c)
+            ),
+            Self::NotRecorded {
+                node_id,
+                replayed: (fires, c),
+                ..
+            } => write!(
+                f,
+                "this re-execution stops node '{node_id}' at its fire {fires} of the step ({}), \
+                 and the recording holds no stop of it there",
+                cause(*c)
+            ),
+            Self::Differs {
+                node_id,
+                recorded: (rf, rc),
+                replayed: (pf, pc),
+                ..
+            } => write!(
+                f,
+                "the recording stops node '{node_id}' at its fire {rf} of the step ({}), and \
+                 this re-execution stops it at its fire {pf} ({})",
+                cause(*rc),
+                cause(*pc)
+            ),
+        }
+    }
+}
+
+/// PURE: the first node at one step whose re-executed stop differs from the
+/// recorded one, or `None` when the two agree. The recorded stops are asked
+/// first, in the order the trace holds them, then the re-executed stops the
+/// recording does not hold, in the order the re-execution made them.
+pub(crate) fn first_stop_disagreement(
+    recorded: &[StepStop],
+    replayed: &[StepStop],
+) -> Option<StopDisagreement> {
+    let side = |s: &StepStop| (s.fires, s.cause);
+    for r in recorded {
+        match replayed.iter().find(|p| p.node_id == r.node_id) {
+            None => {
+                return Some(StopDisagreement::NotReExecuted {
+                    node_id: r.node_id.clone(),
+                    rank: r.rank,
+                    recorded: side(r),
+                })
+            }
+            Some(p) if side(p) != side(r) => {
+                return Some(StopDisagreement::Differs {
+                    node_id: r.node_id.clone(),
+                    rank: r.rank,
+                    recorded: side(r),
+                    replayed: side(p),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    replayed
+        .iter()
+        .find(|p| !recorded.iter().any(|r| r.node_id == p.node_id))
+        .map(|p| StopDisagreement::NotRecorded {
+            node_id: p.node_id.clone(),
+            rank: p.rank,
+            replayed: side(p),
+        })
 }
 
 /// At the step a node was stopped in the pass, the recording holds the
@@ -410,6 +624,24 @@ fn is_stop_step_burst(expected: &StepFires, recorded: &StepFires, fires: u32) ->
     // both carry instants or neither does.
     let want = expected.instants();
     want.is_empty() || want.get(..n as usize) == Some(recorded.instants())
+}
+
+/// A `period_ms` node that a `block` edge can hold ([`NodeDecl::may_be_held_by`])
+/// fired a strict PREFIX of the burst `derived` owed at this step: fewer
+/// fires, the `j`-th at `first_fire_ns + j * interval_ns`. That is what the
+/// hold records, and nothing else: the pre-fire check defers the whole tick
+/// (no fire) or stops the catch-up burst before its next fire, and every
+/// fire it lets through is the next owed instant. `recorded_at` carries the
+/// recorded instants whatever the burst's size, so a burst past
+/// [`PERIOD_BURST_RENDER_CAP`] is checked fire by fire too.
+fn is_block_held_period_burst(derived: &PeriodStep, interval_ns: u64, recorded_at: &[u64]) -> bool {
+    u32::try_from(recorded_at.len()).is_ok_and(|n| n < derived.fire_count)
+        && recorded_at.iter().enumerate().all(|(j, &at)| {
+            let j = u64::try_from(j).unwrap_or(u64::MAX);
+            at == derived
+                .first_fire_ns
+                .saturating_add(j.saturating_mul(interval_ns))
+        })
 }
 
 /// After `node`'s stop, it fires no more: the expectation is
@@ -440,6 +672,7 @@ fn recorded_fire_after_stop(
         expected: StepFires::none(),
         recorded,
         unread: None,
+        caveat: None,
     });
     true
 }
@@ -589,6 +822,8 @@ pub enum TriggerDecl {
     Data {
         /// The `#[input(trigger)]`-marked inputs, in declaration order.
         trigger_inputs: Vec<String>,
+        /// How the live graph read the trigger input.
+        drain: FifoDrain,
     },
     /// A data-trigger node whose trigger input declares `consume = latest`.
     DataLatest {
@@ -673,6 +908,215 @@ pub enum LatestDrain {
     Unrecorded,
 }
 
+/// How the live graph read a FIFO data-trigger input, for the FIFO carry
+/// rule ([`TriggerDecl::Data`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FifoDrain {
+    /// One subscriber: the step boundary's drain pops one frame into the
+    /// frozen slot, or re-offers the frame a deferred fire left there, and
+    /// the burst refills the slot after each fire, so at most one popped
+    /// frame is left unfired at a step, and the replay pops it after the
+    /// step's last fire, as the live burst did. The recording staged no
+    /// trigger-drain (`Drain`) read stage for the input.
+    Unified,
+    /// Two subscribers: the trigger subscriber counts every frame it pops
+    /// into the node's pending signals and each fire spends one, so a burst a
+    /// pre-fire check stops leaves every unspent signal to later steps, up to
+    /// the scheduler's clamp. The recording staged a trigger-drain read
+    /// stage for the input, or, on a bag that states no per-input stage set,
+    /// the input declares `block` or `sample(N)`, which never read through
+    /// one subscriber.
+    Separate,
+    /// The bag states no per-input stage set and the declaration does not
+    /// settle the drain: a `drop_oldest` input, which the core reads through
+    /// one subscriber when the node can, and two when it cannot or the run
+    /// sets `CERULION_DRAIN_DISCIPLINE=separate`
+    /// (`NodeInfo::unifies_data_trigger` unifies only `drop_oldest`, so a
+    /// `block` or `sample(N)` input on such a bag is [`Self::Separate`] by
+    /// declaration). Judged on the one-frame carry, where only a declared
+    /// throttle can leave a frame unfired below the cap, at any step: a
+    /// `block` hold is not allowed for, so a held node can be convicted, and
+    /// a short step at which its slot was full by the bag's own record says so
+    /// ([`FindingCaveat::DrainUnrecordedHold`]).
+    Unrecorded,
+}
+
+/// One `block` input in a node's rank that reads a topic the node produces:
+/// the consumer's credit slot, and what the bag records of what fills and
+/// empties it.
+///
+/// The rank's runtime installs a pre-fire check on every producer of a topic
+/// that a `block` input in the rank reads (`graph/runtime.rs`, the producer
+/// block edges, by `TopicFlow::holds_its_producers`), and the check holds the
+/// producer while the slot counts `depth` frames published and not drained
+/// (`scheduler::block::judge_slot`: `outstanding >= depth`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockHoldEdge {
+    /// The consuming node.
+    pub consumer_node: String,
+    /// Its `block` input.
+    pub consumer_input: String,
+    /// The input's depth: the slot's defer line.
+    pub depth: u64,
+    /// The frames sent to the slot, as far as the bag accounts for them.
+    pub record: SlotRecord,
+    /// The inputs the consumer's tick reads before this one at every fire.
+    pub reads_before: ReadsBefore,
+    /// How many frames one fire of the edge's producer can send on the topic.
+    pub producer_sends: SendsPerFire,
+}
+
+/// How many frames one fire of a `block` edge's producer can send on the
+/// slot's topic, as the producer's node info says
+/// ([`BlockHoldEdge::producer_sends`]). The bag cannot say: a FIRE record
+/// counts no frames, and the frames at a stamp do not say which of the fires
+/// at that stamp sent them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendsPerFire {
+    /// At most one: the producer's info says it needs a publisher for every
+    /// output it declares, which the `#[cerulion_node]` macro sets. Its
+    /// generated tick loans each output at most once, on its first write, and
+    /// sends it at most once, when the loan drops. A raw FFI info block that
+    /// sets the flag is read the same way.
+    AtMostOne,
+    /// Any number: the producer's info does not set the flag. A raw FFI node
+    /// can commit several frames on one output in one fire. A Python node
+    /// sends at most one, but its info cannot set the flag.
+    Unbounded,
+}
+
+/// What a bag records of the frames sent to one `block` slot.
+///
+/// A frame's wire stamp is the gating clock of the step that sent it: the
+/// loan stamps the transport clock's `now_ns()`, which a deterministic run
+/// holds fixed through a step (`graph::node::LazyOutput`), the placement the
+/// replay's covered range reads frames by (`CoveredRangeReport`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotRecord {
+    /// The bag records every frame on the topic: the wire stamp of each,
+    /// ascending. The slot's consumer drains it only at its body reads, as
+    /// `drain` says.
+    Counted {
+        /// Every recorded frame's wire stamp, ascending.
+        frame_stamps: Vec<u64>,
+        /// How one of the consumer's body reads drains the input.
+        drain: BodyDrain,
+    },
+    /// The bag cannot account for every frame sent to the slot: it records no
+    /// frames of the topic or a frame header it records does not parse; its
+    /// record-health stamp is absent or malformed, keeps no entry for the
+    /// topic, reports the topic lossy (frames lost, a wire-sequence anomaly or
+    /// a reset sequence baseline) or written by several publishers (declared
+    /// or observed), or any frame drained and never written; or the graph lists
+    /// the topic in `multi_publisher_topics`. Or the bag does not pin the
+    /// input's `block` policy and depth: its `recorder.json` names the input's
+    /// queue with another policy or depth than the replayed build gives it, or,
+    /// on a bag that names no queues, its graph does not set both
+    /// `backpressure: block` and `depth:` for the input. Or the consumer's input
+    /// sets `block_timeout_ms`, whose release forgives the slot's frames with no
+    /// record; or the bag's fire records do not put the consumer on a later
+    /// level than the producer (the same level, an earlier one, either node at
+    /// more than one level, or either with no recorded fire), so its read can
+    /// drain the slot before the producer decides in the same step, or the bag
+    /// does not show the order; or the consumer drains the slot outside its
+    /// body reads (a Sync node's trigger input, which its matcher pops). Or
+    /// the bag's trace does not hold its node stops (a `trace_format` below
+    /// 12, or none), so a consumer's stop, which releases its slot live,
+    /// leaves no record. Such a slot never explains a step.
+    Unaccounted,
+}
+
+/// How one body read of a `block` consumer's input drains the input's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyDrain {
+    /// One frame per read: a FIFO trigger input, which takes the frame the
+    /// read records as popped.
+    PerFrame,
+    /// To empty: a latest-value input (`consume = latest`, or any input that
+    /// is not a FIFO trigger), whose read drains the queue to its newest frame
+    /// and resyncs the slot: the tick's live read of a `block` input
+    /// (`CerulionSubscriber::try_view`).
+    ToEmpty,
+}
+
+/// The inputs a `block` consumer's tick reads before the edge's input at every
+/// fire ([`BlockHoldEdge::reads_before`]): they say whether a consumer fire
+/// with no read of the input recorded reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadsBefore {
+    /// The inputs a consumer whose info says it needs a publisher for every
+    /// output it declares views before the edge's input, in declaration order.
+    /// The `#[cerulion_node]` macro sets that flag, and its generated tick
+    /// views each input once per fire in that order (an accumulate port is
+    /// served from the node's own buffer, not viewed), the first that serves
+    /// nothing ending the tick before any later input is read. A raw FFI info
+    /// block or a hand-written entry that sets the flag is read the same way.
+    Known(Vec<ViewedInput>),
+    /// Replay cannot know which inputs the consumer's tick reads, or in what
+    /// order: its info does not set the flag.
+    Unknown,
+}
+
+/// One input a consumer's tick views before a `block` input
+/// ([`ReadsBefore::Known`]), and how the tick reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewedInput {
+    /// An input that wakes the node: its data trigger input, a Sync node's
+    /// trigger-marked inputs, or every input of a node with no trigger
+    /// policy. A fire can pass it with no body read recorded (the frame a
+    /// single-subscriber drain froze), and a body read of it that served
+    /// nothing ends that fire: a `NoFrame`, or a `Decimated` read, whose
+    /// `sample(N)` gate dropped the frame it popped.
+    Trigger(String),
+    /// Any other input, frozen at the step's boundary or read live. A fire
+    /// passes it only on a frame a body read of it at that step records, and a
+    /// `NoFrame` ends the fire. A `Decimated` read does not: a frozen input
+    /// still serves the frame it held.
+    Context(String),
+}
+
+/// The `block` edges that MAY hold a node's fire after its trigger drain
+/// popped, with no record of the hold in the bag.
+///
+/// The check runs after the step's trigger drain has popped, and the
+/// recording keeps no record of its answer, so a step can pop a trigger frame
+/// and record no fire with nothing in the bag to say why. Whether a hold was
+/// possible at a given step is bounded from the recording, from each edge's
+/// depth, the stamps of the frames recorded on its topic and its consumer's
+/// body drains ([`SlotRecord`]). The FIFO, `period_ms` and Sync rules read
+/// that bound; the `consume = latest` rule asks only whether an edge exists
+/// ([`Self::any`]). A `block` edge is counted only where the bag's fire
+/// records put its consumer on a later level than its producer: on any other
+/// the consumer's read can drain the slot before the producer decides, or the
+/// bag does not show the order, and the replay gives it
+/// [`SlotRecord::Unaccounted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockHoldEdges {
+    edges: Vec<BlockHoldEdge>,
+}
+
+impl BlockHoldEdges {
+    /// No `block` input in the node's rank reads a topic the node produces.
+    pub fn none() -> Self {
+        Self { edges: Vec::new() }
+    }
+
+    /// The `block` inputs in the node's rank that read a topic it produces.
+    pub fn new(edges: Vec<BlockHoldEdge>) -> Self {
+        Self { edges }
+    }
+
+    /// Does any `block` edge read a topic the node produces?
+    pub fn any(&self) -> bool {
+        !self.edges.is_empty()
+    }
+
+    /// The edges, in the rank topology's order.
+    pub fn edges(&self) -> &[BlockHoldEdge] {
+        &self.edges
+    }
+}
+
 /// One node's declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDecl {
@@ -685,22 +1129,27 @@ pub struct NodeDecl {
     /// time), so a `Period` node carrying one is a declaration this module
     /// judges on the Period rule alone.
     pub throttle_ns: Option<u64>,
-    /// Does this node produce a topic that a `block` input in its rank reads,
-    /// whatever the topic's other consumers declare?
-    ///
-    /// The rank's runtime installs a pre-fire check on every producer of such
-    /// a topic (`graph/runtime.rs`, the producer block edges, by
-    /// `TopicFlow::holds_its_producers`), and the check
-    /// holds the node's fire while a consumer's queue is at its declared
-    /// depth. It runs after the step's trigger drain has popped, and the
-    /// recording keeps no record of its answer, so a step can pop a trigger
-    /// frame and record no fire with nothing in the bag to say why. A `block`
-    /// edge across ranks reaches this module as a [`BlockEdgeObservation`];
-    /// one inside the rank reaches it only as this flag. The
+    /// The `block` edges in the node's rank that may hold its fire with no
+    /// record in the bag ([`BlockHoldEdges`]). A `block` edge across ranks
+    /// reaches this module as a [`BlockEdgeObservation`]; one inside the rank
+    /// reaches it only as this field. Where the node's drain is known (the bag
+    /// states it, or a `block` or `sample(N)` declaration settles it), the FIFO
+    /// rule lets such a node leave a popped frame or a signal unfired at a step
+    /// where an edge's slot was full by the bag's own record
+    /// (`PreFireDeferral`), as a throttle lets it at a step its throttle window
+    /// covers, and the replay pops a frame left in the slot after the step's
+    /// last fire, as the live burst did. For a `drop_oldest` input on a bag
+    /// with no stage set ([`FifoDrain::Unrecorded`]) the hold is not allowed
+    /// for. The `period_ms` rule judges a step at which an edge's slot was
+    /// full by the bag's own record on the first fires it owed, and the Sync
+    /// rule does not convict an aligned set left unfired there; each notes the
+    /// node at most once ([`HoldAllowedForNote`]). The
     /// `consume = latest` rule holds such a node to no fire it did not
     /// record: the first step that would owe one stands the rule down
-    /// ([`StandDownReason::LatestBlockHeld`]).
-    pub feeds_local_block_edge: bool,
+    /// ([`StandDownReason::LatestBlockHeld`]). A `block` edge is counted only
+    /// where the bag's fire records put its consumer on a later level than its
+    /// producer; any other is [`SlotRecord::Unaccounted`].
+    pub may_be_held_by: BlockHoldEdges,
     /// Does this node wire any input that is NOT
     /// `#[input(trigger)]`-marked?
     ///
@@ -921,6 +1370,52 @@ pub struct ScheduleFinding {
     /// The counted frames behind a [`Decider::LatestFire`] finding on an
     /// input read through two subscribers; `None` on every other finding.
     pub unread: Option<UnreadFrames>,
+    /// What the finding cannot rule out, said with it; `None` on most.
+    pub caveat: Option<FindingCaveat>,
+}
+
+/// What a [`ScheduleFinding`] cannot rule out, rendered after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingCaveat {
+    /// A FIFO node fired fewer times than its pops owed at a step where the
+    /// bag shows the slot of a `block` edge in its rank full
+    /// (`PreFireDeferral`), on a bag that does not record how its
+    /// `drop_oldest` trigger input was read
+    /// ([`FifoDrain::Unrecorded`]): the hold is not allowed for there, so the
+    /// step can be the hold.
+    DrainUnrecordedHold,
+    /// The step was excused as a hold by `block` slots that the bag shows
+    /// released, the last of them at `release_step`, with no read of any of
+    /// them by their consumers in between: the slot's producer fired while it
+    /// counted its depth, or a producer that sends at most one frame per fire
+    /// took its count past the depth. A slot that holds allows neither, so
+    /// each was released with no record before then, and the hold is not
+    /// allowed for.
+    UnrecordedRelease {
+        /// The step at which the last of those slots showed its release.
+        release_step: u64,
+    },
+}
+
+impl fmt::Display for FindingCaveat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DrainUnrecordedHold => f.write_str(
+                "the bag does not record whether this node's trigger input was read through one \
+                 subscriber or two, so a hold by a `block` input in its rank is not allowed for and \
+                 can read as this divergence; a bag that records how a FIFO input was read is \
+                 judged with the hold",
+            ),
+            Self::UnrecordedRelease { release_step } => write!(
+                f,
+                "the recording shows every `block` slot that excused this step released, the \
+                 last of them at step {release_step}, with no read by their consumers in between: \
+                 its producer fired while it counted its depth, or a producer that sends at most \
+                 one frame per fire took it past its depth; a slot that holds allows neither, so \
+                 each was released with no record and the hold is not allowed for"
+            ),
+        }
+    }
 }
 
 /// The frames behind a [`Decider::LatestFire`] finding on an input read
@@ -1019,8 +1514,11 @@ impl fmt::Display for ScheduleFinding {
             self.expected,
             self.recorded,
         )?;
-        match &self.unread {
-            Some(frames) => write!(f, "; {frames}"),
+        if let Some(frames) = &self.unread {
+            write!(f, "; {frames}")?;
+        }
+        match &self.caveat {
+            Some(caveat) => write!(f, "; {caveat}"),
             None => Ok(()),
         }
     }
@@ -1308,7 +1806,7 @@ pub enum StandDownReason {
     /// is named is judged again and can be a finding.
     LatestWritersUnnamed,
     /// A `consume = latest` node produces a topic a `block` input in its own
-    /// rank reads ([`NodeDecl::feeds_local_block_edge`]), and a step owed it a
+    /// rank reads ([`NodeDecl::may_be_held_by`]), and a step owed it a
     /// fire it did not record: a step whose drain popped a frame on one
     /// subscriber, or a step whose counted frames outran the reads and the
     /// frames in delivery on two. The pre-fire check that holds such a node's
@@ -1663,6 +2161,82 @@ impl fmt::Display for LatestBeforeFirstFireNote {
     }
 }
 
+/// Which rule judged a node with a hold allowed for ([`HoldAllowedForNote`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldRule {
+    /// The `period_ms` schedule.
+    Period,
+    /// The Sync alignment's owed fire.
+    Sync,
+}
+
+impl HeldRule {
+    /// The stable machine token of a note of this rule, a closed set:
+    /// `period_block_held` or `sync_block_held`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Period => "period_block_held",
+            Self::Sync => "sync_block_held",
+        }
+    }
+}
+
+/// A `period_ms` or Sync node that a `block` input in its own rank can hold
+/// ([`NodeDecl::may_be_held_by`]) was judged with that hold allowed for, at the
+/// steps where the bag shows the edge's slot full. The pre-fire check that
+/// holds such a node leaves no record, so the Period rule judges such a step
+/// on the first fires it owed and moves the deadline to the first owed instant
+/// it did not fire, and the Sync rule does not convict an aligned set left
+/// unfired there. Every other step, and every fire the node recorded, is
+/// judged as before, and a step only the hold excused is still a finding where
+/// every slot that held there shows a release with no record before its
+/// consumer next reads it ([`FindingCaveat::UnrecordedRelease`]).
+///
+/// It is NOT a [`StandDown`], for the reason a [`CarriedHeadsNote`] is not:
+/// the rule judged the node, on an allowance that can only drop a finding, so
+/// a stand-down would tell a reader the node went unjudged. Report-only and
+/// never a gate: [`RederivationReport::is_clean`] ignores it. Emitted once per
+/// node, at its first held step, and withdrawn when a stand-down then stops
+/// the rule for the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldAllowedForNote {
+    /// The held node.
+    pub node_id: String,
+    /// The rule that judged it with the hold allowed for.
+    pub rule: HeldRule,
+}
+
+impl fmt::Display for HoldAllowedForNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.rule {
+            HeldRule::Period => write!(
+                f,
+                "node '{}' {}: judged with a hold allowed for, since a block input in its own \
+                 rank reads a topic the node produces and its pre-fire check can hold the period \
+                 fires a step owed with no record in the bag; at a step where the bag shows the \
+                 slot full the node is judged on the first fires it owed, unless every slot that \
+                 held it there shows a release with no record before its consumer next reads it, \
+                 and the rest of its schedule is still judged (report-only; the allowance can \
+                 only drop a finding, never invent one)",
+                self.node_id,
+                Decider::Period
+            ),
+            HeldRule::Sync => write!(
+                f,
+                "node '{}' {}: judged with a hold allowed for, since a block input in its own \
+                 rank reads a topic the node produces and its pre-fire check can hold an aligned \
+                 set's fire with no record in the bag; at a step where the bag shows the slot \
+                 full an aligned set left unfired is not convicted, unless every slot that held \
+                 it there shows a release with no record before its consumer next reads it, and \
+                 every other step and every set the node fired is still judged (report-only; the \
+                 allowance can only drop a finding, never invent one)",
+                self.node_id,
+                Decider::Sync
+            ),
+        }
+    }
+}
+
 /// Everything one rank's re-derivation concluded.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RederivationReport {
@@ -1683,6 +2257,9 @@ pub struct RederivationReport {
     /// their node's first fire. Never a gate, see
     /// [`LatestBeforeFirstFireNote`].
     pub before_first_fire: Vec<LatestBeforeFirstFireNote>,
+    /// The `period_ms` and Sync nodes judged with a hold by a `block` input in
+    /// their rank allowed for. Never a gate, see [`HoldAllowedForNote`].
+    pub holds_allowed_for: Vec<HoldAllowedForNote>,
 }
 
 impl RederivationReport {
@@ -2020,6 +2597,8 @@ pub(crate) fn verify(
                         *max_catchup,
                         *arm_onset,
                         block_gated,
+                        trust,
+                        PreFireDeferral::new(node, restore.resumed, stops),
                         stops.stop_point(&node.node_id),
                         &mut report,
                     );
@@ -2036,19 +2615,24 @@ pub(crate) fn verify(
                         block_gated,
                         trust,
                         restore.sync_heads_for(&node.node_id),
+                        PreFireDeferral::new(node, restore.resumed, stops),
                         stops.stop_point(&node.node_id),
                         owed_fire,
                         &mut report,
                     );
                 }
-                TriggerDecl::Data { trigger_inputs } => {
+                TriggerDecl::Data {
+                    trigger_inputs,
+                    drain,
+                } => {
                     verify_fifo(
                         node,
                         steps,
                         trigger_inputs,
+                        *drain,
                         block_gated,
                         trust,
-                        restore.resumed,
+                        FifoCarry::new(node, *drain, restore.resumed, stops),
                         stops.stop_point(&node.node_id),
                         owed_fire,
                         &mut report,
@@ -2153,7 +2737,7 @@ fn census_read_sites(
         let inputs = match &node.trigger {
             TriggerDecl::Sync { trigger_inputs, .. }
             | TriggerDecl::SyncOnCaptureTime { trigger_inputs }
-            | TriggerDecl::Data { trigger_inputs }
+            | TriggerDecl::Data { trigger_inputs, .. }
             | TriggerDecl::DataLatest { trigger_inputs, .. } => trigger_inputs.clone(),
             _ => continue,
         };
@@ -2237,9 +2821,10 @@ fn recorded_fires(step: &RecordedStep, node_id: &str, with_instants: bool) -> St
     }
 }
 
-// Eight inputs, each a distinct fact about ONE node's Period rule: the
-// declaration's three fields, the block gate, and where the node was
-// stopped. Bundling them would only rename the list.
+// Ten inputs, each a distinct fact about ONE node's Period rule: the
+// declaration's three fields, the block gate, the read-site trust and the
+// hold bound's walk from the pass's start, and where the node was stopped.
+// Bundling them would only rename the list.
 #[allow(clippy::too_many_arguments)]
 fn verify_period(
     node: &NodeDecl,
@@ -2248,6 +2833,8 @@ fn verify_period(
     max_catchup: Option<u32>,
     arm_onset: Option<cerulion_core::scheduler::catchup_clamp::ArmOnset>,
     block_gated: bool,
+    trust: RoleTrust,
+    mut deferral: PreFireDeferral,
     stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
@@ -2304,7 +2891,34 @@ fn verify_period(
         .map(|f| f.fire_time_ns)
         .expect("the anchor step contains a fire of this node (position() found one)");
 
-    for step in &steps[anchor_idx..] {
+    // The first step a hold shortened notes the node, once.
+    let mut held_noted = false;
+    // The steps only a hold shortened, each until a consumer's read confirms
+    // it or a release with no record voids it ([`PendingExcuse`]), with what
+    // each re-derived and recorded.
+    let mut excuses: Vec<PendingExcuse> = Vec::new();
+    let mut excused: Vec<(u64, StepFires, StepFires)> = Vec::new();
+    // Whether the bag shows a `block` slot full at a step, counted over every
+    // step of the pass, the ones before the anchor included.
+    for (at, step) in steps[..anchor_idx].iter().enumerate() {
+        deferral.step(
+            step.step,
+            step.clock_ns,
+            next_clock_ns(steps, at),
+            &step_fire_instants(step),
+            &step.reads,
+            trust,
+        );
+    }
+    for (at, step) in steps.iter().enumerate().skip(anchor_idx) {
+        let StepDeferral { hold_possible, .. } = deferral.step(
+            step.step,
+            step.clock_ns,
+            next_clock_ns(steps, at),
+            &step_fire_instants(step),
+            &step.reads,
+            trust,
+        );
         // After the step that stopped the node, it fires no more: the
         // expectation is NO fire, whatever the clock says, and a recorded
         // fire there is a finding.
@@ -2341,11 +2955,53 @@ fn verify_period(
             StepFires::count(derived.fire_count)
         };
         let recorded = recorded_fires(step, &node.node_id, render_instants);
+        let stop_burst = stop.and_then(|s| s.burst_at(step.step));
+        // A step at which the bag shows the slot full that fired fewer fires
+        // than it owed, none or the first of them at their instants, is the
+        // hold, and the node's next deadline is the first owed instant it did
+        // not fire: the decide gate defers before the advance, so the deadline
+        // stays, and a catch-up burst the check stops leaves it at the first
+        // owed instant it did not fire.
+        let held_fires = (stop_burst.is_none() && hold_possible)
+            .then(|| recorded_fires(step, &node.node_id, true))
+            .filter(|at| is_block_held_period_burst(&derived, interval_ns, at.instants()));
         // The stopping step's burst ends at the stopping fire.
-        let agrees = match stop.and_then(|s| s.burst_at(step.step)) {
+        let agrees = match stop_burst {
             Some(fires) => is_stop_step_burst(&expected, &recorded, fires),
-            None => expected == recorded,
+            None => held_fires.is_some() || expected == recorded,
         };
+        // A held step waits on the slots that held there, as a FIFO node's
+        // does: a step at which every one of them shows a release with no
+        // record before its consumer next reads it voids the step's excuse,
+        // and the held step is the finding.
+        if held_fires.is_some() {
+            excuses.push(PendingExcuse::held(
+                step.step,
+                derived.fire_count,
+                deferral.slot_steps(),
+            ));
+            excused.push((step.step, expected.clone(), recorded.clone()));
+        }
+        if let Some(void) = PendingExcuse::settle(&mut excuses, deferral.slot_steps(), step.step) {
+            let (expected, recorded) = excused
+                .iter()
+                .find(|(at, ..)| *at == void.step)
+                .map(|(_, expected, recorded)| (expected.clone(), recorded.clone()))
+                .expect("a voided excuse is a held step this rule kept");
+            report.findings.push(ScheduleFinding {
+                node_id: node.node_id.clone(),
+                step: void.step,
+                decider: Decider::Period,
+                expected,
+                recorded,
+                unread: None,
+                caveat: Some(FindingCaveat::UnrecordedRelease {
+                    release_step: void.release_step,
+                }),
+            });
+            return;
+        }
+        excused.retain(|(at, ..)| excuses.iter().any(|e| e.step == *at));
 
         if !agrees {
             report.findings.push(ScheduleFinding {
@@ -2355,10 +3011,25 @@ fn verify_period(
                 expected,
                 recorded,
                 unread: None,
+                caveat: None,
             });
             return;
         }
-        next_fire_ns = derived.next_fire_ns;
+        next_fire_ns = match held_fires {
+            Some(at) => {
+                if !held_noted {
+                    report.holds_allowed_for.push(HoldAllowedForNote {
+                        node_id: node.node_id.clone(),
+                        rule: HeldRule::Period,
+                    });
+                    held_noted = true;
+                }
+                derived
+                    .first_fire_ns
+                    .saturating_add(u64::from(at.fire_count()).saturating_mul(interval_ns))
+            }
+            None => derived.next_fire_ns,
+        };
     }
 }
 
@@ -2389,6 +3060,7 @@ fn verify_throttle(
                     expected: StepFires::none(),
                     recorded: StepFires::at(vec![fire.fire_time_ns]),
                     unread: None,
+                    caveat: None,
                 });
                 return;
             }
@@ -2843,7 +3515,7 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 /// * [`ReadOutcomeKind::Decimated`] on a trigger input is ignored — a decimated
 ///   pop installs no head, so it moves none of the three arms (`verify_fifo`
 ///   declines on it for a different reason: pop counts).
-// Ten arguments. Bundling any subset into a struct would break the shape it
+// Eleven arguments. Bundling any subset into a struct would break the shape it
 // shares with `verify_period` / `verify_fifo` / `verify_throttle` — every one of
 // them is `(node, steps, its own declared parameters, the gates, report)` — and
 // a per-rule parameter bag for exactly ONE of the four is a worse boundary than
@@ -2859,6 +3531,7 @@ fn verify_sync(
     block_gated: bool,
     trust: RoleTrust,
     restored: Option<&BTreeMap<String, u64>>,
+    mut deferral: PreFireDeferral,
     stop: Option<StopPoint>,
     owed_fire: OwedFire,
     report: &mut RederivationReport,
@@ -2955,6 +3628,13 @@ fn verify_sync(
     // NARROW map: the head this rule believes the matcher was holding. Its own
     // carry is the ordinary `supply > k` rule — never the carry widening.
     let mut narrow: BTreeMap<String, u64> = BTreeMap::new();
+    // The first aligned step a `block` hold left unfired notes the node, once,
+    // and a stand-down below withdraws the note (`withdraw_hold_allowed_for`).
+    let mut held_noted = false;
+    let held_at = report.holds_allowed_for.len();
+    // The aligned steps only a hold left unfired, each until a consumer's read
+    // confirms it or a release with no record voids it ([`PendingExcuse`]).
+    let mut excuses: Vec<PendingExcuse> = Vec::new();
     // The highest NARROW stamp ever SEEN on each input, which is a different
     // quantity from the live head above and outlives it: the monotonicity guard is a claim
     // about the RECORD STREAM (head-naming stamps are non-decreasing within one
@@ -2983,7 +3663,16 @@ fn verify_sync(
         }
     }
 
-    for step in steps {
+    // Whether the bag shows a `block` slot full at a step.
+    for (at, step) in steps.iter().enumerate() {
+        let StepDeferral { hold_possible, .. } = deferral.step(
+            step.step,
+            step.clock_ns,
+            next_clock_ns(steps, at),
+            &step_fire_instants(step),
+            &step.reads,
+            trust,
+        );
         // After the step that stopped the node, no rule below applies: the
         // drain still aligns its heads, but a stopped node owes no fire.
         if stop.is_some_and(|s| s.is_after(step.step)) {
@@ -2991,6 +3680,25 @@ fn verify_sync(
                 return;
             }
             continue;
+        }
+        // A step whose slot answers void an earlier held step's excuse
+        // convicts that step, whatever this step's reads and fires give: the
+        // void rests on the slots alone, so it comes before a stand-down of
+        // the rule from this step's reads and before arms B and A.
+        if let Some(void) = PendingExcuse::voided(&excuses, deferral.slot_steps(), step.step) {
+            report.findings.push(ScheduleFinding {
+                node_id: node.node_id.clone(),
+                step: void.step,
+                decider: Decider::Sync,
+                expected: StepFires::count(void.supply),
+                // A held step fired no set.
+                recorded: StepFires::count(0),
+                unread: None,
+                caveat: Some(FindingCaveat::UnrecordedRelease {
+                    release_step: void.release_step,
+                }),
+            });
+            return;
         }
         // Per-step WIDE evidence. `records` is the SUPPLY scale (a count, never
         // stored) and `candidates` the FEASIBILITY scale (bounded by
@@ -3048,6 +3756,7 @@ fn verify_sync(
                 // is any longer the map the scheduler held.
                 ReadOutcomeKind::Truncated => {
                     withdraw_carried_heads(report, note_at);
+                    withdraw_hold_allowed_for(report, held_at);
                     report.stand_downs.push(StandDown {
                         node_id: node.node_id.clone(),
                         decider: Decider::Sync,
@@ -3082,6 +3791,7 @@ fn verify_sync(
                     // both in the convicting direction.
                     let Some(ts) = read.wire_stamp_ns else {
                         withdraw_carried_heads(report, note_at);
+                        withdraw_hold_allowed_for(report, held_at);
                         report.stand_downs.push(StandDown {
                             node_id: node.node_id.clone(),
                             decider: Decider::Sync,
@@ -3101,6 +3811,7 @@ fn verify_sync(
                         if let Some(prev) = narrow_floor.get(&read.input) {
                             if ts < *prev {
                                 withdraw_carried_heads(report, note_at);
+                                withdraw_hold_allowed_for(report, held_at);
                                 report.stand_downs.push(StandDown {
                                     node_id: node.node_id.clone(),
                                     decider: Decider::Sync,
@@ -3137,6 +3848,7 @@ fn verify_sync(
                 expected: StepFires::none(),
                 recorded,
                 unread: None,
+                caveat: None,
             });
             return;
         }
@@ -3169,6 +3881,7 @@ fn verify_sync(
                 expected: StepFires::count(expected_max),
                 recorded,
                 unread: None,
+                caveat: None,
             });
             return;
         }
@@ -3179,9 +3892,28 @@ fn verify_sync(
         // state, can be one stopped before the anchor, which owes no fire:
         // its first owed fire stands arm C down by name, once, and arm C
         // owes nothing at any later step. Arms B and A judge only recorded
-        // fires, and such a node has none.
+        // fires, and such a node has none. At a step where the bag shows a
+        // `block` slot full, the hold can defer the step's first aligned set,
+        // at the decide gate or the burst's first re-check, with no record:
+        // such a step owes no fire, the first one notes the node
+        // ([`HoldAllowedForNote`]), and the node is still judged on every other
+        // step and on arms A and B. Such a
+        // step waits on the slots that held there, as a FIFO node's does: a
+        // step at which every one of them shows a release with no record
+        // before its consumer next reads it voids the excuse, and the held
+        // step is the finding.
         if k == 0 && sync_aligned(&narrow, trigger_inputs, window_ns) && !suppressible {
             match owed_fire {
+                OwedFire::Judged if hold_possible => {
+                    if !held_noted {
+                        report.holds_allowed_for.push(HoldAllowedForNote {
+                            node_id: node.node_id.clone(),
+                            rule: HeldRule::Sync,
+                        });
+                        held_noted = true;
+                    }
+                    excuses.push(PendingExcuse::held(step.step, 1, deferral.slot_steps()));
+                }
                 OwedFire::Judged => {
                     report.findings.push(ScheduleFinding {
                         node_id: node.node_id.clone(),
@@ -3190,6 +3922,7 @@ fn verify_sync(
                         expected: StepFires::count(1),
                         recorded,
                         unread: None,
+                        caveat: None,
                     });
                     return;
                 }
@@ -3204,6 +3937,14 @@ fn verify_sync(
                 OwedFire::StandsDown => {}
             }
         }
+        // The step's own excuse waits on the slots that held there, and a
+        // read of a slot confirms every excuse it gave; the check above
+        // already reported any void this step's slots give.
+        let voided = PendingExcuse::settle(&mut excuses, deferral.slot_steps(), step.step);
+        debug_assert!(
+            voided.is_none(),
+            "the check before the step's reads reports every void its slots give"
+        );
 
         // ── carry forward ─────────────────────────────────────────────────
         //
@@ -3343,6 +4084,13 @@ fn withdraw_carried_heads(report: &mut RederivationReport, note_at: usize) {
     report.carried_heads.truncate(note_at);
 }
 
+/// Withdraw the [`HoldAllowedForNote`] `verify_sync` pushed for a node it then
+/// stood down on mid-loop, for the reason [`withdraw_carried_heads`] gives: the
+/// note says the rule judged the node, the stand-down that no rule did.
+fn withdraw_hold_allowed_for(report: &mut RederivationReport, note_at: usize) {
+    report.holds_allowed_for.truncate(note_at);
+}
+
 /// A trigger input's PHYSICAL carry ceiling — its effective
 /// capacity (declared depth × publisher connections,
 /// [`NodeDecl::trigger_input_capacities`]; an unnamed input reads as one
@@ -3382,15 +4130,16 @@ fn carried_heads(wide_carry: &BTreeMap<String, Vec<u64>>, input: &str) -> u32 {
         .map_or(0, |v| u32::try_from(v.len()).unwrap_or(u32::MAX))
 }
 
-// Nine parameters, mirroring the shape of `verify_sync`'s.
+// Ten parameters, in the shape of `verify_sync`'s.
 #[allow(clippy::too_many_arguments)]
 fn verify_fifo(
     node: &NodeDecl,
     steps: &[RecordedStep],
     trigger_inputs: &[String],
+    drain: FifoDrain,
     block_gated: bool,
     trust: RoleTrust,
-    resumed: bool,
+    mut carry: FifoCarry,
     stop: Option<StopPoint>,
     owed_fire: OwedFire,
     report: &mut RederivationReport,
@@ -3406,11 +4155,11 @@ fn verify_fifo(
         return;
     }
 
-    // A frame the previous step's burst popped and froze unfired (see
-    // `fifo_step_carry`): this step's first fire serves it without a pop.
-    let mut carried_in = false;
-    let mut first = true;
-    for step in steps {
+    // What each step left unfired, and whether a check could defer it there
+    // (`carry`, the walk the replay's refill plan takes too).
+    for (at, step) in steps.iter().enumerate() {
+        let next_clock = next_clock_ns(steps, at);
+        let fires = step_fire_instants(step);
         // After the step that stopped the node, the drain still pops its
         // inputs, but a stopped node owes no fire for them.
         if stop.is_some_and(|s| s.is_after(step.step)) {
@@ -3422,6 +4171,20 @@ fn verify_fifo(
         let popped = match fifo_step_pops(&node.node_id, trigger_inputs, &step.reads, trust) {
             Ok(popped) => popped,
             Err(reason) => {
+                // The step's slot answers can void an earlier held step's
+                // excuse, which convicts that step whatever this step's reads
+                // give its pop count: the void rests on the slots alone.
+                if let Some(void) = carry.voided_at(
+                    step.step,
+                    step.clock_ns,
+                    next_clock,
+                    &fires,
+                    &step.reads,
+                    trust,
+                ) {
+                    report_fifo_void(node, steps, void, owed_fire, report);
+                    return;
+                }
                 report.stand_downs.push(StandDown {
                     node_id: node.node_id.clone(),
                     decider: Decider::FifoPop,
@@ -3431,29 +4194,41 @@ fn verify_fifo(
             }
         };
         let recorded = recorded_fires(step, &node.node_id, false);
-        carried_in |= fifo_resume_seed(resumed && first, popped, recorded.count);
-        first = false;
-        let supply = popped.saturating_add(u32::from(carried_in));
+        let judged = carry.step(
+            popped,
+            recorded.count,
+            step.step,
+            step.clock_ns,
+            next_clock,
+            &fires,
+            &step.reads,
+            trust,
+        );
+        let supply = judged.supply;
+        if let Some(void) = judged.voided {
+            report_fifo_void(node, steps, void, owed_fire, report);
+            return;
+        }
 
         // The stopping step's burst ends at the stopping fire: one fire per
         // pop up to it, so exactly as many as the re-execution performed, at
         // least one and at most `supply`.
-        let agrees = match stop.and_then(|s| s.burst_at(step.step)) {
+        let stop_burst = stop.and_then(|s| s.burst_at(step.step));
+        let agrees = match stop_burst {
             Some(fires) => recorded.count == fires && (1..=supply).contains(&recorded.count),
-            None => match fifo_step_carry(
-                carried_in,
-                popped,
-                recorded.count,
-                node.throttle_ns.is_some(),
-            ) {
-                Ok(carried_out) => {
-                    carried_in = carried_out;
-                    true
-                }
-                Err(_) => false,
-            },
+            None => judged.outcome.is_ok(),
         };
         if !agrees {
+            // A `drop_oldest` node on a bag with no stage set is judged
+            // without the hold, so a short step at which the bag shows a slot
+            // full says so. A step that fired fewer than `supply` is the
+            // short one: the subtraction has no answer there.
+            let short = recorded.count.checked_sub(supply).is_none();
+            let caveat = (stop_burst.is_none()
+                && drain == FifoDrain::Unrecorded
+                && judged.hold_possible
+                && short)
+                .then_some(FindingCaveat::DrainUnrecordedHold);
             match owed_fire {
                 OwedFire::Judged => report.findings.push(ScheduleFinding {
                     node_id: node.node_id.clone(),
@@ -3462,6 +4237,7 @@ fn verify_fifo(
                     expected: StepFires::count(supply),
                     recorded,
                     unread: None,
+                    caveat,
                 }),
                 // A node the pass never ran, whose stop the checkpoint does
                 // not state, can be one stopped before the anchor, which owes
@@ -3474,6 +4250,43 @@ fn verify_fifo(
             }
             return;
         }
+    }
+}
+
+/// Report the FIFO step a later release voided ([`VoidedExcuse`]): a finding
+/// at that step, its supply against the fires it recorded, with the caveat
+/// that says why; or, for a node the pass never ran whose stop the checkpoint
+/// does not state, the rule's stand-down by name.
+fn report_fifo_void(
+    node: &NodeDecl,
+    steps: &[RecordedStep],
+    void: VoidedExcuse,
+    owed_fire: OwedFire,
+    report: &mut RederivationReport,
+) {
+    let excused = steps
+        .iter()
+        .find(|s| s.step == void.step)
+        .map_or(StepFires::count(0), |s| {
+            recorded_fires(s, &node.node_id, false)
+        });
+    match owed_fire {
+        OwedFire::Judged => report.findings.push(ScheduleFinding {
+            node_id: node.node_id.clone(),
+            step: void.step,
+            decider: Decider::FifoPop,
+            expected: StepFires::count(void.supply),
+            recorded: excused,
+            unread: None,
+            caveat: Some(FindingCaveat::UnrecordedRelease {
+                release_step: void.release_step,
+            }),
+        }),
+        OwedFire::StandsDown => report.stand_downs.push(StandDown {
+            node_id: node.node_id.clone(),
+            decider: Decider::FifoPop,
+            reason: StandDownReason::FifoUnfiredSinceAnchor,
+        }),
     }
 }
 
@@ -3516,7 +4329,8 @@ pub(crate) fn fifo_step_pops(
 /// A FIFO `Data` step whose recorded fires no carry rule explains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FifoCarryMismatch {
-    /// Frames the step had to fire on: its pops plus a frame carried in.
+    /// The frames, or signals, the step had to fire on: its pops plus what it
+    /// carried in, held to the clamp on two subscribers ([`fifo_supply`]).
     pub supply: u32,
     /// Fires the recording holds for the step.
     pub fires: u32,
@@ -3529,18 +4343,24 @@ pub(crate) struct FifoCarryMismatch {
 /// before it checks the [`cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP`]
 /// cap and the node's pre-fire check. When either stops the burst there, the
 /// refilled frame stays frozen unfired and the next step's first fire serves
-/// it without a pop; a throttle that defers the first fire leaves the boundary
-/// drain's frame frozen the same way. So with `supply = popped + carried_in`:
+/// it without a pop; a pre-fire check that defers the first fire (a throttle,
+/// or a `block` edge that holds the node) leaves the boundary drain's frame
+/// frozen the same way. So with `supply = popped + carried_in`:
 ///
 /// * `fires == supply`: nothing carries out (`Ok(false)`);
-/// * `supply == fires + 1`, and `fires` is the cap or the node is throttled
-///   (`deferrable`): one frame carries out (`Ok(true)`).
+/// * `supply == fires + 1`, and `fires` is the cap or the node has a pre-fire
+///   check that can defer a fire (`deferrable`, [`fifo_carry_deferrable`]):
+///   one frame carries out (`Ok(true)`).
+///
+/// This is the rule of a node read through one subscriber
+/// ([`FifoDrain::Unified`]); [`fifo_step_backlog`] is the rule of one read
+/// through two.
 ///
 /// # Errors
 ///
 /// [`FifoCarryMismatch`] for every other pair: more than one frame unfired, a
-/// frame unfired below the cap on a node with no throttle, or more fires than
-/// frames.
+/// frame unfired below the cap on a node no pre-fire check can defer, or more
+/// fires than frames.
 pub(crate) fn fifo_step_carry(
     carried_in: bool,
     popped: u32,
@@ -3555,6 +4375,860 @@ pub(crate) fn fifo_step_carry(
         Ok(true)
     } else {
         Err(FifoCarryMismatch { supply, fires })
+    }
+}
+
+/// PURE: the signals a FIFO `Data` node read through two subscribers
+/// ([`FifoDrain::Separate`]) carries OUT of one step.
+///
+/// The trigger subscriber signals every frame it pops, and each fire spends
+/// one signal. A burst that a pre-fire check stops gives the unspent signals
+/// back (`Scheduler::tick_data_burst`), and the scheduler holds no more than
+/// [`cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP`] signals for a node,
+/// the same number as the burst cap, so a burst never stops at the cap with a
+/// signal left. So with `supply = min(popped + carried_in, clamp)`:
+///
+/// * `fires == supply`: nothing carries out (`Ok(0)`);
+/// * `fires < supply` and `deferrable` ([`fifo_carry_deferrable`]): the rest
+///   carries out (`Ok(supply - fires)`).
+///
+/// # Errors
+///
+/// [`FifoCarryMismatch`] for every other pair: a signal unfired on a node no
+/// pre-fire check can defer, or more fires than signals.
+pub(crate) fn fifo_step_backlog(
+    carried_in: u32,
+    popped: u32,
+    fires: u32,
+    deferrable: bool,
+) -> Result<u32, FifoCarryMismatch> {
+    let clamp =
+        u32::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap_or(u32::MAX);
+    let supply = popped.saturating_add(carried_in).min(clamp);
+    match supply.checked_sub(fires) {
+        Some(0) => Ok(0),
+        Some(left) if deferrable => Ok(left),
+        _ => Err(FifoCarryMismatch { supply, fires }),
+    }
+}
+
+/// PURE: what a FIFO `Data` node read through `drain` carries OUT of one
+/// step, as a count: [`fifo_step_carry`]'s one frame (`0` or `1`) on
+/// [`FifoDrain::Unified`] and [`FifoDrain::Unrecorded`],
+/// [`fifo_step_backlog`]'s signals on [`FifoDrain::Separate`].
+///
+/// # Errors
+///
+/// The rule's [`FifoCarryMismatch`].
+pub(crate) fn fifo_carry_out(
+    drain: FifoDrain,
+    carried_in: u32,
+    popped: u32,
+    fires: u32,
+    deferrable: bool,
+) -> Result<u32, FifoCarryMismatch> {
+    match drain {
+        FifoDrain::Unified | FifoDrain::Unrecorded => {
+            fifo_step_carry(carried_in > 0, popped, fires, deferrable).map(u32::from)
+        }
+        FifoDrain::Separate => fifo_step_backlog(carried_in, popped, fires, deferrable),
+    }
+}
+
+/// PURE: can a pre-fire check have stopped a FIFO `Data` node's burst below
+/// the cap at this step and left a popped frame or a signal unfired? The
+/// `deferrable` of [`fifo_step_carry`] and [`fifo_step_backlog`].
+///
+/// Where the node's drain is known (the bag states it, or a `block` or
+/// `sample(N)` declaration settles it) it is the step's answer
+/// ([`PreFireDeferral::step`]): its throttle window covered the step, or a
+/// `block` slot was full by the bag's own record. On [`FifoDrain::Unrecorded`] (a
+/// `drop_oldest` input on a bag with no stage set) a declared throttle defers
+/// at any step, and a hold never does.
+pub(crate) fn fifo_carry_deferrable(
+    drain: FifoDrain,
+    throttle_declared: bool,
+    throttle_defers_now: bool,
+    hold_possible_now: bool,
+) -> bool {
+    match drain {
+        FifoDrain::Unified | FifoDrain::Separate => throttle_defers_now || hold_possible_now,
+        FifoDrain::Unrecorded => throttle_declared,
+    }
+}
+
+/// PURE: the frames, or signals, a FIFO `Data` node read through `drain` had
+/// to fire on at a step: its pops plus what it carried in, held to the
+/// scheduler's clamp on two subscribers ([`fifo_step_backlog`]).
+pub(crate) fn fifo_supply(drain: FifoDrain, carried_in: u32, popped: u32) -> u32 {
+    let clamp =
+        u32::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap_or(u32::MAX);
+    match drain {
+        FifoDrain::Unified | FifoDrain::Unrecorded => popped.saturating_add(carried_in),
+        FifoDrain::Separate => popped.saturating_add(carried_in).min(clamp),
+    }
+}
+
+/// One edge's slot, bounded from below.
+#[derive(Debug, Clone)]
+struct SlotBound {
+    consumer_node: String,
+    consumer_input: String,
+    depth: u64,
+    /// The recorded frames' stamps, ascending, and how the consumer's body
+    /// reads drain them; `None` once nothing bounds the slot: from the step
+    /// after a truncated read of the input, a drain whose site the read log
+    /// does not say, or, before any body read of the input is recorded, a
+    /// consumer fire the bag does not show ended before the input, the slot
+    /// allows for none. A resumed pass before the consumer
+    /// first reads its queue empty, and a latest-value input after a consumer
+    /// fire that can hide a drain of it, leave `frames` set and `queued`
+    /// unknown.
+    frames: Option<(Vec<u64>, BodyDrain)>,
+    /// The first stamp not yet folded in.
+    next_frame: usize,
+    /// The fewest frames the slot can count at the start of the next step:
+    /// `None` while it is unknown (a resumed pass, before the consumer first
+    /// reads its queue empty, or a latest-value input after a consumer fire
+    /// that can hide a drain of it, until the consumer next reads it).
+    queued: Option<u64>,
+    /// Drains inside the current shared clock past what the bound has
+    /// counted: they took frames stamped at that clock, which count only at
+    /// its last step, so they are owed against those frames there.
+    owed: u64,
+    /// An empty read inside the current shared clock: none of the frames
+    /// stamped at that clock is counted, since nothing places them before or
+    /// after the read.
+    clock_frames_void: bool,
+    /// Has the pass recorded a body read of the consumer's input yet?
+    read_seen: bool,
+    /// Is the next step the pass's first?
+    first: bool,
+    /// Where the consumer stopped: a stopped consumer releases its slot for
+    /// good (`release_held_block_slots`).
+    consumer_stop: Option<StopPoint>,
+    /// Has the slot shown a release the bag does not record ([`Self::step`])?
+    /// It holds nothing from then on.
+    unrecorded_release: bool,
+    /// The inputs the consumer's tick reads before this one.
+    reads_before: ReadsBefore,
+    /// How many frames one fire of the producer can send on the topic.
+    producer_sends: SendsPerFire,
+}
+
+/// One slot's answer at one step ([`SlotBound::step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SlotStep {
+    /// The bag shows the slot full at the step's pre-fire check.
+    pub hold: bool,
+    /// The slot showed a release the bag does not record at the step, which
+    /// a slot that holds never does ([`SlotBound::step`]): it holds nothing
+    /// from here on.
+    pub unrecorded_release: bool,
+    /// The consumer's body read the input at the step, after the producer's
+    /// checks, so the slot was still armed at every check up to them.
+    pub read: bool,
+}
+
+impl SlotBound {
+    /// Fold in one step: whether the bag shows the slot full at the step's
+    /// pre-fire check, then the step's sends and the consumer's drains. `next_clock_ns`
+    /// is the next step's gating clock (`None` on the pass's last step): a
+    /// frame whose stamp several steps share counts at the last of them.
+    /// `producer_fired` says whether the bag records a fire of the edge's
+    /// producer at the step.
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        step: u64,
+        clock_ns: u64,
+        next_clock_ns: Option<u64>,
+        producer_fired: bool,
+        fires: &[(&str, u64)],
+        reads: &[RecordedRead],
+        trust: RoleTrust,
+    ) -> SlotStep {
+        let Some((stamps, drain)) = &self.frames else {
+            return SlotStep::default();
+        };
+        let drain = *drain;
+        if self.first {
+            // Frames stamped before the pass's first step are not its sends.
+            self.next_frame = stamps.partition_point(|&at| at < clock_ns);
+            self.first = false;
+        }
+        let clock_continues = next_clock_ns == Some(clock_ns);
+        // A frame stamped between the step before and this one counts here.
+        // On a bag the replay accepts there is none: the recording
+        // consistency check refuses a frame of a graph-produced topic whose
+        // stamp is no step's clock (exit 2).
+        let older = stamps[self.next_frame..]
+            .iter()
+            .take_while(|&&at| at < clock_ns)
+            .count();
+        let at_clock = if clock_continues {
+            0
+        } else {
+            stamps[self.next_frame + older..]
+                .iter()
+                .take_while(|&&at| at == clock_ns)
+                .count()
+        };
+        self.next_frame += older + at_clock;
+        let counted = if self.clock_frames_void {
+            older
+        } else {
+            older + at_clock
+        };
+        let sent = u64::try_from(counted).unwrap_or(u64::MAX);
+        let released = self
+            .consumer_stop
+            .is_some_and(|s| s.slots_released_after(step));
+        let owed_now = if clock_continues { 0 } else { self.owed };
+        let count = self
+            .queued
+            .map(|q| q.saturating_add(sent).saturating_sub(owed_now));
+        // While it holds, a slot stops its producer at the depth. The producer
+        // is checked at the decide gate (`Scheduler::decide_node`) and before
+        // every fire of its burst, the first included (`Scheduler::tick_data_burst`
+        // for a Data node, the catch-up loop of `Scheduler::tick_node` for a
+        // `period_ms` node, `Scheduler::tick_sync_burst` for a Sync node), and
+        // the check holds it while the slot
+        // counts its depth (`scheduler::block::judge_slot`: `outstanding >=
+        // depth`); each frame counts on the slot when it is sent
+        // (`CerulionPublisher::send_counted`). A counted edge's consumer fires
+        // on a later level than its producer, and a step runs its levels in
+        // order, each deciding before it fires (`GraphRuntime::step_live`:
+        // `run_level`, or `run_level_snapshot_phase` and then
+        // `run_level_tick_phase` around a mid-level rendezvous), so no read or
+        // stop of the consumer comes between the step's start and the
+        // producer's first check: the count before the step's sends is at most
+        // the slot's there. So a producer that fires at a step whose slot
+        // already counts its depth before the step's sends was released with
+        // no record, whatever the fire sends. A producer that sends at most one
+        // frame per fire stops at the depth, so a slot that counts past it was
+        // released too; any other producer can send several frames in one fire
+        // from a slot below its depth, and its count past the depth shows
+        // nothing. A slot its consumer's stop already released shows both after
+        // the stop, and is skipped.
+        let before_sends = self.queued.map(|q| {
+            q.saturating_add(u64::try_from(older).unwrap_or(u64::MAX))
+                .saturating_sub(owed_now)
+        });
+        let fired_at_depth = producer_fired && before_sends.is_some_and(|c| c >= self.depth);
+        let past_depth =
+            self.producer_sends == SendsPerFire::AtMostOne && count.is_some_and(|c| c > self.depth);
+        let unrecorded_release =
+            !released && !self.unrecorded_release && (fired_at_depth || past_depth);
+        self.unrecorded_release |= unrecorded_release;
+        let hold = !released && !self.unrecorded_release && count.is_some_and(|c| c >= self.depth);
+        let mut removed = 0u64;
+        let mut emptied = false;
+        let mut lost = false;
+        let mut body_read = false;
+        for read in reads
+            .iter()
+            .filter(|r| r.node_id == self.consumer_node && r.input == self.consumer_input)
+        {
+            match read.kind {
+                ReadOutcomeKind::Truncated => lost = true,
+                ReadOutcomeKind::NoFrame => {
+                    if believed_role(read, trust) && read.role == ReadSiteRole::Body {
+                        emptied = true;
+                        body_read = true;
+                    }
+                }
+                // Minted only at a body read, on every format.
+                ReadOutcomeKind::Served | ReadOutcomeKind::Held => {
+                    removed = removed.saturating_add(u64::from(read.popped));
+                    emptied |= drain == BodyDrain::ToEmpty;
+                    body_read = true;
+                }
+                // Minted at both sites: a body drain only where the role says
+                // so, and one whose site the bag cannot say leaves the slot
+                // unbounded.
+                ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Decimated => {
+                    if !believed_role(read, trust) {
+                        lost = true;
+                    } else if read.role == ReadSiteRole::Body {
+                        removed = removed.saturating_add(u64::from(read.popped));
+                        emptied |= drain == BodyDrain::ToEmpty;
+                        body_read = true;
+                    }
+                }
+                ReadOutcomeKind::Producer | ReadOutcomeKind::BatchFrame => {}
+            }
+        }
+        self.read_seen |= body_read;
+        let consumer_fires = fires
+            .iter()
+            .filter(|(id, _)| *id == self.consumer_node)
+            .count();
+        // A `block` input is read only by its consumer's tick, which records
+        // the read unless its receive fails. A latest-value read whose receive
+        // fails can have popped first; a FIFO one has taken only frames too
+        // short for a wire header, which leave the edge unaccounted. So a
+        // consumer fire with no read of it recorded ended before the input,
+        // took nothing countable from a FIFO input, or, on a latest-value
+        // input, hid a drain the bag lost. A fire the bag shows ended at an
+        // input the tick reads earlier drained nothing (`fires_ended_before`);
+        // any other one is unexplained.
+        let unexplained = !body_read
+            && consumer_fires
+                > fires_ended_before(
+                    &self.reads_before,
+                    &self.consumer_node,
+                    consumer_fires,
+                    reads,
+                    trust,
+                );
+        // On a latest-value input such a drain follows the producer's checks
+        // of this step, so the step keeps its count, and the slot is unknown
+        // from the next step until the consumer next reads it. A body read of
+        // the input empties the slot whatever such a drain took, and a FIFO
+        // input drains only at the reads its consumer's body makes, so no read
+        // of it there is no drain.
+        let drain_unrecorded = drain == BodyDrain::ToEmpty && unexplained;
+        if let Some(q) = self.queued {
+            let available = q.saturating_add(sent);
+            if clock_continues {
+                self.queued = Some(available.saturating_sub(removed));
+                self.owed = self.owed.saturating_add(removed.saturating_sub(available));
+            } else {
+                self.queued = Some(available.saturating_sub(owed_now).saturating_sub(removed));
+                self.owed = 0;
+            }
+        }
+        if drain_unrecorded {
+            self.queued = None;
+            self.owed = 0;
+        }
+        if emptied {
+            // A body read that found the queue empty, or one that drains it
+            // to its newest frame, resyncs the slot's queued count and backlog
+            // to zero (`credit::CreditWord::record_drained_to_empty`). In a
+            // rank's step order a producer sends before its consumer reads (a
+            // counted edge's consumer fires on a later level than its producer
+            // by the bag's fire records), so nothing the step sent is left,
+            // and inside a shared clock none
+            // of the clock's frames can be placed after the read.
+            self.queued = Some(0);
+            self.owed = 0;
+            self.clock_frames_void = clock_continues;
+        } else if !clock_continues {
+            self.clock_frames_void = false;
+        }
+        // Before the bag records any body read of the input, an unexplained
+        // fire is one the read log may not record the input's reads of at
+        // all, so the slot allows for none.
+        if lost || (unexplained && !self.read_seen) {
+            self.frames = None;
+        }
+        SlotStep {
+            hold,
+            unrecorded_release,
+            read: body_read,
+        }
+    }
+}
+
+/// PURE: how many of a `block` consumer's `fires` at a step the bag shows
+/// ended before its tick reached the input, from the step's `reads` of the
+/// inputs `before` names ([`ViewedInput`]). A believed body read of one that
+/// served nothing ends the fire that made it: a `NoFrame`, and on a trigger
+/// input a `Decimated` read too. A fire reads each such input once, through a
+/// read that records each call, or a context input frozen at the step's
+/// boundary serves its one record to every fire of the step. So a context
+/// input whose only record at the step is a believed body `NoFrame` ended
+/// every fire there (all `fires`), and otherwise each empty read is one fire
+/// that ended there. Where the count reaches the step's fires, none of them
+/// read the input. A consumer whose tick replay cannot know shows none.
+/// `reads` holds one entry per read, a folded run expanded.
+fn fires_ended_before(
+    before: &ReadsBefore,
+    consumer: &str,
+    fires: usize,
+    reads: &[RecordedRead],
+    trust: RoleTrust,
+) -> usize {
+    let ReadsBefore::Known(inputs) = before else {
+        return 0;
+    };
+    let mut ended = 0;
+    for viewed in inputs {
+        let (name, trigger) = match viewed {
+            ViewedInput::Trigger(name) => (name, true),
+            ViewedInput::Context(name) => (name, false),
+        };
+        let mut recorded = 0;
+        let mut empty = 0;
+        for read in reads.iter().filter(|r| {
+            r.node_id == consumer && r.input == *name && r.kind != ReadOutcomeKind::Producer
+        }) {
+            recorded += 1;
+            let served_nothing = read.kind == ReadOutcomeKind::NoFrame
+                || (trigger && read.kind == ReadOutcomeKind::Decimated);
+            if served_nothing && believed_role(read, trust) && read.role == ReadSiteRole::Body {
+                empty += 1;
+            }
+        }
+        if !trigger && recorded == 1 && empty == 1 {
+            return fires;
+        }
+        ended += empty;
+    }
+    ended
+}
+
+/// What a node's pre-fire check can have done at a step ([`PreFireDeferral::step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StepDeferral {
+    /// The throttle window covered the step.
+    pub throttle_defers: bool,
+    /// A `block` slot was full by the bag's own record.
+    pub hold_possible: bool,
+}
+
+/// PURE state: whether a node's pre-fire check can have deferred its fire at
+/// each step of a pass, read off the recording alone. The FIFO rule reads both
+/// halves; the Period and Sync rules read the hold (the Period rule reads no
+/// throttle, which `#[cerulion_node]` refuses on a `period_ms` node, and a
+/// throttle stands the Sync rule's owed-fire arm down
+/// ([`StandDownReason::SuppressibleFire`])). A Period node's check runs
+/// at the decide gate and again before each catch-up fire, a Sync node's at
+/// the decide gate and before each aligned set it fires; a Period fire's
+/// instant is its deadline, not the step's clock, but the hold half reads only
+/// the slot, whose frames carry the step's clock, so the count is the step's
+/// either way.
+///
+/// Every check of a Data node's step runs at the step's gating clock, which
+/// every fire of the step records (`FireKind::Data` takes `current_time_ns`
+/// as its `fire_time_ns`): once at the decide gate (`Scheduler::decide_node`,
+/// before any trigger policy) and once before every fire of the burst,
+/// after its refill (`Scheduler::tick_data_burst`). Two checks can defer it:
+///
+/// * The node's `throttle_ms`, judged EXACTLY by the predicate the live check
+///   calls ([`throttle_defers`], strict: a gap of exactly the throttle fires)
+///   on the node's fire count and last fire instant: at the decide gate those
+///   of its fires before the step, and before a further fire those after the
+///   step's own fires, which is how a throttled node fires at most once per
+///   step. On a resumed pass the node's fires before the anchor are not
+///   recorded, and the last of them is at or before the pass's first step, so
+///   until its first fire in the pass the throttle can defer only while the
+///   current step's clock is within one throttle of the first step's clock.
+/// * A `block` edge ([`BlockHoldEdge`]), which holds the node while its slot
+///   counts `depth` frames (`scheduler::block::judge_slot`: `outstanding >=
+///   depth`). The recording keeps neither the slot nor its reading, so the
+///   rule counts the slot from the bag, and the count stays at or below the
+///   slot's: a step is excused only where that count reaches `depth`, and an
+///   under-count only convicts. The count after the step before, plus every
+///   frame the bag records on the topic at the step ([`SlotRecord::Counted`]),
+///   with none of the step's drains: in a rank's step order a producer sends
+///   before its consumer reads, since a `block` edge is counted only where the
+///   bag's fire records put its consumer on a later level than its producer
+///   (any other is [`SlotRecord::Unaccounted`]). A frame whose stamp several steps share counts
+///   at the last of them, and a drain at an earlier one is owed against it
+///   there. Each send counts one frame (`CerulionPublisher::record_block_published`),
+///   and each frame the consumer's body subscriber drains takes one off
+///   (`CerulionSubscriber::record_block_drained`). The frames a body read
+///   removes are its `popped`: a `Served` or `Held` read is minted only at a
+///   body site on every format ([`is_body_read`]), and a `DrainedBatch` or
+///   `Decimated` read, minted at both sites, is a body read where its role is
+///   believed and says so. A body read that finds the queue empty, where its
+///   role is believed, or any body read of an input that drains to its newest
+///   frame ([`BodyDrain::ToEmpty`]), leaves the slot empty, and inside a
+///   shared clock none of that clock's frames is counted. A consumer's stop
+///   releases its slot for good, so from the step after it the edge holds
+///   nothing: a fatal error, or a poisoned entry, whose node keeps firing
+///   with its tick skipped ([`StopPoint::slots_released_after`]); the
+///   consecutive-panic breaker releases none. While a slot holds, the check
+///   stops the producer at its depth before each of its fires, so a producer
+///   that fires at a step whose slot already counts its depth before the
+///   step's sends was released with no record. A producer whose info says it
+///   sends at most one frame per fire ([`SendsPerFire::AtMostOne`]) never
+///   takes a slot that holds past its depth either, so its count past the
+///   depth is a release too; any other producer can send several frames in
+///   one fire from a slot below its depth. From the step of such a release
+///   the slot holds nothing, and a step only it excused since its consumer
+///   last read it is voided ([`PendingExcuse::settle`]), a finding that says
+///   why ([`FindingCaveat::UnrecordedRelease`]). A slot its consumer's stop already
+///   released shows both after the stop, and is not held to them.
+///   Where the bag cannot account for every frame sent or drained,
+///   the edge explains no step: an unaccounted record
+///   ([`SlotRecord::Unaccounted`], which an input that sets
+///   `block_timeout_ms` always gives, since its release forgives the slot's
+///   frames with no record, one whose `block` policy and depth the bag does
+///   not pin, one whose producer the bag shows sending more frames at a stamp
+///   than it fired there, at a step the trace proves other than one that shares
+///   the clock of a last step it does not, and every edge of a bag whose trace
+///   does not hold its node stops); on the consumer's input, from the step
+///   after a truncated read stream's marker, a drain whose site the read log
+///   does not say, or, before any body read of the input is recorded, a
+///   consumer fire the bag does not show ended before the input; and on a
+///   latest-value input, from the step after a consumer
+///   fire that can hide a drain of it through the step at which the consumer
+///   next reads it. Such an input is read only by its consumer's tick, which
+///   records the read unless its receive fails, and a read whose receive
+///   fails can have popped first, so a fire with no read of it recorded can
+///   hide a drain unless the bag shows the tick ended at an input it reads
+///   earlier ([`ReadsBefore`]). A FIFO input drains only at its consumer's
+///   recorded reads: a FIFO read records the frame it takes before its view
+///   checks the frame, and one whose receive fails has taken only frames too
+///   short for a wire header, whose stamps the bag cannot read, so their edge
+///   is unaccounted; a fire with no read of the input recorded drains nothing. A
+///   resumed pass does not know what the slot held at its anchor,
+///   so the edge explains no step until the consumer first reads its queue
+///   empty. Frames stamped before the pass's first step are not its sends.
+#[derive(Debug, Clone)]
+pub(crate) struct PreFireDeferral {
+    node_id: String,
+    throttle_ns: Option<u64>,
+    prior_fires: u64,
+    last_fire_ns: u64,
+    resumed: bool,
+    first_clock_ns: Option<u64>,
+    slots: Vec<SlotBound>,
+    /// Each slot's answer at the last step folded in, in slot order.
+    slot_steps: Vec<SlotStep>,
+}
+
+impl PreFireDeferral {
+    /// The bounds of `node` at the start of a pass (`resumed` when it begins
+    /// at a checkpoint), with the stops of the pass's nodes.
+    pub(crate) fn new(node: &NodeDecl, resumed: bool, stops: &PassStops) -> Self {
+        let slots = node
+            .may_be_held_by
+            .edges()
+            .iter()
+            .map(|edge| SlotBound {
+                consumer_node: edge.consumer_node.clone(),
+                consumer_input: edge.consumer_input.clone(),
+                depth: edge.depth,
+                frames: match &edge.record {
+                    SlotRecord::Counted {
+                        frame_stamps,
+                        drain,
+                    } => Some((frame_stamps.clone(), *drain)),
+                    SlotRecord::Unaccounted => None,
+                },
+                next_frame: 0,
+                queued: (!resumed).then_some(0),
+                owed: 0,
+                clock_frames_void: false,
+                read_seen: false,
+                first: true,
+                consumer_stop: stops.stop_point(&edge.consumer_node),
+                unrecorded_release: false,
+                reads_before: edge.reads_before.clone(),
+                producer_sends: edge.producer_sends,
+            })
+            .collect::<Vec<_>>();
+        let slot_steps = vec![SlotStep::default(); slots.len()];
+        Self {
+            node_id: node.node_id.clone(),
+            throttle_ns: node.throttle_ns,
+            prior_fires: 0,
+            last_fire_ns: 0,
+            resumed,
+            first_clock_ns: None,
+            slots,
+            slot_steps,
+        }
+    }
+
+    /// Each slot's answer at the last step folded in ([`Self::step`]), in the
+    /// order of the node's [`BlockHoldEdges`].
+    pub(crate) fn slot_steps(&self) -> &[SlotStep] {
+        &self.slot_steps
+    }
+
+    /// Whether the throttle and a hold can have deferred the node at `step`,
+    /// whose gating clock is `clock_ns` (and the next step's
+    /// `next_clock_ns`, `None` on the pass's last), from the step's `fires`
+    /// (every fire of the rank, `(node, fire instant)`) and `reads`; then the
+    /// step is folded in.
+    pub(crate) fn step(
+        &mut self,
+        step: u64,
+        clock_ns: u64,
+        next_clock_ns: Option<u64>,
+        fires: &[(&str, u64)],
+        reads: &[RecordedRead],
+        trust: RoleTrust,
+    ) -> StepDeferral {
+        let first_clock_ns = *self.first_clock_ns.get_or_insert(clock_ns);
+        let own: Vec<u64> = fires
+            .iter()
+            .filter(|(id, _)| *id == self.node_id)
+            .map(|&(_, at)| at)
+            .collect();
+        let own_count = u64::try_from(own.len()).unwrap_or(u64::MAX);
+        let throttle = self.throttle_ns.is_some_and(|throttle_ns| {
+            let before_anchor = self.resumed
+                && self.prior_fires == 0
+                && throttle_defers(1, clock_ns, first_clock_ns, throttle_ns);
+            before_anchor
+                || throttle_defers(self.prior_fires, clock_ns, self.last_fire_ns, throttle_ns)
+                || own.last().is_some_and(|&last| {
+                    throttle_defers(
+                        self.prior_fires.saturating_add(own_count),
+                        clock_ns,
+                        last,
+                        throttle_ns,
+                    )
+                })
+        });
+        self.prior_fires = self.prior_fires.saturating_add(own_count);
+        if let Some(&last) = own.last() {
+            self.last_fire_ns = last;
+        }
+        let mut hold = false;
+        let fired = !own.is_empty();
+        for (slot, answer) in self.slots.iter_mut().zip(self.slot_steps.iter_mut()) {
+            *answer = slot.step(step, clock_ns, next_clock_ns, fired, fires, reads, trust);
+            hold |= answer.hold;
+        }
+        StepDeferral {
+            throttle_defers: throttle,
+            hold_possible: hold,
+        }
+    }
+}
+
+/// The gating clock of the step after `steps[at]`, `None` after the last:
+/// what [`PreFireDeferral`] needs to place a frame several steps' clocks
+/// share.
+fn next_clock_ns(steps: &[RecordedStep], at: usize) -> Option<u64> {
+    steps.get(at + 1).map(|s| s.clock_ns)
+}
+
+/// Every fire of `step`, as `(node, fire instant)`: what [`PreFireDeferral`]
+/// folds.
+fn step_fire_instants(step: &RecordedStep) -> Vec<(&str, u64)> {
+    step.fires
+        .iter()
+        .map(|f| (f.node_id.as_str(), f.fire_time_ns))
+        .collect()
+}
+
+/// One step of a FIFO `Data` node's carry rule ([`FifoCarry::step`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FifoStep {
+    /// The frames, or signals, the step had to fire on ([`fifo_supply`]).
+    pub supply: u32,
+    /// Could a `block` slot have held the node at the step?
+    pub hold_possible: bool,
+    /// What the step carries out, or the mismatch no carry explains.
+    pub outcome: Result<u32, FifoCarryMismatch>,
+    /// An earlier step's excuse that this step voids: every slot whose hold
+    /// excused it showed a release by here ([`SlotBound::step`]), with no read
+    /// by its consumer since.
+    pub voided: Option<VoidedExcuse>,
+}
+
+/// A step a hold excused, voided by a later step by which every slot that
+/// held there showed a release ([`FifoStep::voided`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VoidedExcuse {
+    /// The excused step.
+    pub step: u64,
+    /// The frames, or signals, it had to fire on.
+    pub supply: u32,
+    /// The step at which the last of those slots showed its release.
+    pub release_step: u64,
+}
+
+/// A step only a hold excused, with the slots that held there, until one of
+/// their consumers reads, which shows its slot armed at the step, or every one
+/// of them shows a release first, which voids it. Two excuses whose slots are
+/// the same settle together, so only the earlier is kept ([`Self::settle`]).
+/// The FIFO, `period_ms` and Sync rules each keep their own list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingExcuse {
+    step: u64,
+    supply: u32,
+    slots: Vec<usize>,
+}
+
+impl PendingExcuse {
+    /// `step`, which only a hold excused, with the `supply` it had to fire
+    /// on, waiting on the slots whose answer at the step held (`slots`,
+    /// [`PreFireDeferral::slot_steps`]).
+    fn held(step: u64, supply: u32, slots: &[SlotStep]) -> Self {
+        Self {
+            step,
+            supply,
+            slots: (0..slots.len()).filter(|&i| slots[i].hold).collect(),
+        }
+    }
+
+    /// The earliest of the `pending` excuses that the last step's slot answers
+    /// (`slots`, at `step`) void: every slot that vouches for it shows a
+    /// release with no record there. It changes nothing: [`Self::settle`] voids
+    /// the same excuse, then confirms and drops the rest. A slot that holds at
+    /// a step shows no release there ([`SlotBound::step`]), so the step's own
+    /// excuse is never voided at that step, and a rule can ask this before it
+    /// judges the step.
+    fn voided(pending: &[Self], slots: &[SlotStep], step: u64) -> Option<VoidedExcuse> {
+        pending
+            .iter()
+            .find(|e| e.slots.iter().all(|&i| slots[i].unrecorded_release))
+            .map(|e| VoidedExcuse {
+                step: e.step,
+                supply: e.supply,
+                release_step: step,
+            })
+    }
+
+    /// Settle the `pending` excuses on the last step's slot answers (`slots`,
+    /// at `step`): a slot that showed a release stops vouching for each, and
+    /// the earliest one no slot vouches for any more is voided; then a
+    /// consumer's read confirms every excuse its slot gave, since its slot was
+    /// armed at each of those checks.
+    ///
+    /// Excuses with the same slots meet the same releases and the same reads,
+    /// and only the earliest of them can be voided, so only the earliest is
+    /// kept: the pending list holds at most one excuse per set of slots, and a
+    /// hold of any length costs the same per step.
+    fn settle(pending: &mut Vec<Self>, slots: &[SlotStep], step: u64) -> Option<VoidedExcuse> {
+        for excuse in pending.iter_mut() {
+            excuse.slots.retain(|&i| !slots[i].unrecorded_release);
+        }
+        let mut at = 0;
+        while at < pending.len() {
+            if pending[..at].iter().any(|e| e.slots == pending[at].slots) {
+                pending.remove(at);
+            } else {
+                at += 1;
+            }
+        }
+        let voided = pending
+            .iter()
+            .find(|e| e.slots.is_empty())
+            .map(|e| VoidedExcuse {
+                step: e.step,
+                supply: e.supply,
+                release_step: step,
+            });
+        pending.retain(|e| !e.slots.is_empty() && !e.slots.iter().any(|&i| slots[i].read));
+        voided
+    }
+}
+
+/// PURE state: one FIFO `Data` node's carry rule across the steps of a pass,
+/// the ONE walk [`verify_fifo`] and the replay's trailing-refill plan share.
+#[derive(Debug, Clone)]
+pub(crate) struct FifoCarry {
+    drain: FifoDrain,
+    throttle_declared: bool,
+    deferral: PreFireDeferral,
+    carried: u32,
+    first: bool,
+    resumed: bool,
+    pending: Vec<PendingExcuse>,
+}
+
+impl FifoCarry {
+    /// The rule for `node` read through `drain`, at the start of a pass, with
+    /// the stops of the pass's nodes.
+    pub(crate) fn new(node: &NodeDecl, drain: FifoDrain, resumed: bool, stops: &PassStops) -> Self {
+        Self {
+            drain,
+            throttle_declared: node.throttle_ns.is_some(),
+            deferral: PreFireDeferral::new(node, resumed, stops),
+            carried: 0,
+            first: true,
+            resumed,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Judge `step`: the node `popped` frames at its trigger inputs and
+    /// `fired` times; `fires` and `reads` are the whole step's, and
+    /// `next_clock_ns` the next step's gating clock. A mismatch leaves
+    /// nothing carried.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn step(
+        &mut self,
+        popped: u32,
+        fired: u32,
+        step: u64,
+        clock_ns: u64,
+        next_clock_ns: Option<u64>,
+        fires: &[(&str, u64)],
+        reads: &[RecordedRead],
+        trust: RoleTrust,
+    ) -> FifoStep {
+        let StepDeferral {
+            throttle_defers: throttle_now,
+            hold_possible: hold_now,
+        } = self
+            .deferral
+            .step(step, clock_ns, next_clock_ns, fires, reads, trust);
+        if fifo_resume_seed(self.resumed && self.first, popped, fired) {
+            self.carried = self.carried.max(1);
+        }
+        self.first = false;
+        let supply = fifo_supply(self.drain, self.carried, popped);
+        let deferrable =
+            fifo_carry_deferrable(self.drain, self.throttle_declared, throttle_now, hold_now);
+        let outcome = fifo_carry_out(self.drain, self.carried, popped, fired, deferrable);
+        // A step only the hold excused waits on the slots that held there.
+        let without_hold =
+            fifo_carry_deferrable(self.drain, self.throttle_declared, throttle_now, false);
+        if outcome.is_ok()
+            && fifo_carry_out(self.drain, self.carried, popped, fired, without_hold).is_err()
+        {
+            self.pending.push(PendingExcuse::held(
+                step,
+                supply,
+                self.deferral.slot_steps(),
+            ));
+        }
+        self.carried = *outcome.as_ref().unwrap_or(&0);
+        let voided = PendingExcuse::settle(&mut self.pending, self.deferral.slot_steps(), step);
+        FifoStep {
+            supply,
+            hold_possible: hold_now,
+            outcome,
+            voided,
+        }
+    }
+
+    /// Fold in `step`, which the rule cannot judge from its reads, and give
+    /// the earlier held step its slot answers void, if any
+    /// ([`PendingExcuse::voided`]). The rule stops at that step either way, so
+    /// nothing else is carried.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn voided_at(
+        &mut self,
+        step: u64,
+        clock_ns: u64,
+        next_clock_ns: Option<u64>,
+        fires: &[(&str, u64)],
+        reads: &[RecordedRead],
+        trust: RoleTrust,
+    ) -> Option<VoidedExcuse> {
+        self.deferral
+            .step(step, clock_ns, next_clock_ns, fires, reads, trust);
+        PendingExcuse::voided(&self.pending, self.deferral.slot_steps(), step)
+    }
+
+    /// Fold in a step the rule does not judge, so the bounds keep moving.
+    pub(crate) fn skip(
+        &mut self,
+        step: u64,
+        clock_ns: u64,
+        next_clock_ns: Option<u64>,
+        fires: &[(&str, u64)],
+        reads: &[RecordedRead],
+        trust: RoleTrust,
+    ) {
+        self.deferral
+            .step(step, clock_ns, next_clock_ns, fires, reads, trust);
+        self.first = false;
+        self.carried = 0;
+        self.pending.clear();
     }
 }
 
@@ -3608,7 +5282,7 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// ([`StandDownReason::LatestDrainUnrecorded`]).
 ///
 /// A node that produces a topic a `block` input in its own rank reads
-/// ([`NodeDecl::feeds_local_block_edge`]) can have a fire held by that edge's
+/// ([`NodeDecl::may_be_held_by`]) can have a fire held by that edge's
 /// pre-fire check after its drain popped, with no record. The first step that
 /// would owe it a fire it did not record, on either drain, stands the owing
 /// rule down by name ([`StandDownReason::LatestBlockHeld`]); until then both
@@ -3730,7 +5404,7 @@ fn verify_latest(
         let pop_owes_fire = popped > 0
             && node.throttle_ns.is_none()
             && drain == LatestDrain::Unified
-            && !node.feeds_local_block_edge
+            && !node.may_be_held_by.any()
             && !at_stop;
         // A node the pass never ran can be one stopped before the anchor,
         // which owes no fire for a pop.
@@ -3747,6 +5421,7 @@ fn verify_latest(
                 expected: StepFires::count(expected),
                 recorded,
                 unread: None,
+                caveat: None,
             });
             return;
         }
@@ -3765,7 +5440,7 @@ fn verify_latest(
             unrecorded_noted = true;
         }
         if drain == LatestDrain::Unified
-            && node.feeds_local_block_edge
+            && node.may_be_held_by.any()
             && popped > 0
             && recorded.count == 0
             && node.throttle_ns.is_none()
@@ -3814,7 +5489,7 @@ fn verify_latest(
                         named: named.count(),
                     },
                     depth,
-                    node.feeds_local_block_edge,
+                    node.may_be_held_by.any(),
                 ) {
                     LatestUnreadVerdict::Explained => {}
                     // The rule judged the step on the allowance: a judged
@@ -3850,6 +5525,7 @@ fn verify_latest(
                                 expected: StepFires::count(1),
                                 recorded,
                                 unread: Some(frames),
+                                caveat: None,
                             });
                             return;
                         }
@@ -4232,7 +5908,7 @@ impl LatestUnread {
     /// the node at this step; `writers` holds `TriggerDecl::DataLatest`'s
     /// cap and the writers the read log names, and `depth` is
     /// `TriggerDecl::DataLatest`'s; `block_held` is
-    /// [`NodeDecl::feeds_local_block_edge`].
+    /// [`BlockHoldEdges::any`] of [`NodeDecl::may_be_held_by`].
     ///
     /// A count is checked against the reads first. Past them it needs the
     /// writer count: with no cap the frames in delivery have no bound, and the
@@ -4392,7 +6068,8 @@ fn credit_basis(nodes: &[NodeDecl], edge: &BlockEdgeObservation) -> CreditBasis 
         return CreditBasis::Undecidable;
     };
     match &node.trigger {
-        TriggerDecl::Data { trigger_inputs } | TriggerDecl::DataLatest { trigger_inputs, .. }
+        TriggerDecl::Data { trigger_inputs, .. }
+        | TriggerDecl::DataLatest { trigger_inputs, .. }
             if trigger_inputs.contains(&edge.consumer_input) =>
         {
             CreditBasis::BodyOnly
@@ -4672,7 +6349,7 @@ mod tests {
             // mean what they always meant.
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
-            feeds_local_block_edge: false,
+            may_be_held_by: BlockHoldEdges::none(),
         }
     }
 
@@ -5053,10 +6730,11 @@ mod tests {
         stopped_at_fire(node_id, step, 1)
     }
 
-    /// `node_id` stopped by the `fires`-th fire of its burst at `step`.
+    /// `node_id` stopped by a fatal error at the `fires`-th fire of its burst
+    /// at `step`.
     fn stopped_at_fire(node_id: &str, step: u64, fires: u32) -> PassStops {
         let mut stops = PassStops::none();
-        stops.note(node_id, step, fires);
+        stops.note(node_id, step, fires, NodeStopCause::FatalError);
         stops
     }
 
@@ -5266,11 +6944,15 @@ mod tests {
     #[test]
     fn pass_stops_keeps_the_first_stop_of_a_node() {
         let mut stops = PassStops::none();
-        stops.note("a", 4, 2);
-        stops.note("a", 9, 1);
+        stops.note("a", 4, 2, NodeStopCause::FatalError);
+        stops.note("a", 9, 1, NodeStopCause::FatalError);
         assert_eq!(
             stops.stop_point("a"),
-            Some(StopPoint::InPass { step: 4, fires: 2 })
+            Some(StopPoint::InPass {
+                step: 4,
+                fires: 2,
+                cause: NodeStopCause::FatalError,
+            })
         );
         assert!(stops.contains("a"));
         assert!(!stops.contains("b"));
@@ -5279,24 +6961,42 @@ mod tests {
     }
 
     /// Both stop kinds against a hand table: a stop at the checkpoint comes
-    /// before every judged step and has no stopping step; an in-pass stop is
-    /// after its own step only, and carries its burst at that step alone.
+    /// before every judged step, has no stopping step and released the node's
+    /// slots before it; an in-pass stop is after its own step only, carries
+    /// its burst at that step alone, and releases the slots after it unless
+    /// the consecutive-panic breaker made it.
     #[test]
     fn a_stop_point_answers_its_hand_table() {
         let at_anchor = StopPoint::AtAnchor { anchor_step: 3 };
-        let in_pass = StopPoint::InPass { step: 5, fires: 2 };
-        let rows: &[(StopPoint, u64, bool, Option<u32>)] = &[
-            (at_anchor, 2, false, None),
-            (at_anchor, 3, false, None),
-            (at_anchor, 4, true, None),
-            (at_anchor, 9, true, None),
-            (in_pass, 4, false, None),
-            (in_pass, 5, false, Some(2)),
-            (in_pass, 6, true, None),
+        let in_pass = StopPoint::InPass {
+            step: 5,
+            fires: 2,
+            cause: NodeStopCause::FatalError,
+        };
+        let breaker = StopPoint::InPass {
+            step: 5,
+            fires: 3,
+            cause: NodeStopCause::DisabledAfterPanics,
+        };
+        let rows: &[(StopPoint, u64, bool, Option<u32>, bool)] = &[
+            (at_anchor, 2, false, None, false),
+            (at_anchor, 3, false, None, false),
+            (at_anchor, 4, true, None, true),
+            (at_anchor, 9, true, None, true),
+            (in_pass, 4, false, None, false),
+            (in_pass, 5, false, Some(2), false),
+            (in_pass, 6, true, None, true),
+            (breaker, 5, false, Some(3), false),
+            (breaker, 6, true, None, false),
         ];
-        for (stop, step, after, burst) in rows {
+        for (stop, step, after, burst, released) in rows {
             assert_eq!(stop.is_after(*step), *after, "{stop:?} at step {step}");
             assert_eq!(stop.burst_at(*step), *burst, "{stop:?} at step {step}");
+            assert_eq!(
+                stop.slots_released_after(*step),
+                *released,
+                "{stop:?} at step {step}"
+            );
         }
     }
 
@@ -5306,16 +7006,246 @@ mod tests {
     #[test]
     fn pass_stops_seeded_at_the_anchor_are_not_renoted() {
         let mut stops = PassStops::at_anchor(3, ["sink", "relay"]);
-        stops.note("sink", 4, 0);
-        stops.note("other", 6, 1);
+        stops.note("sink", 4, 0, NodeStopCause::FatalError);
+        stops.note("other", 6, 1, NodeStopCause::FatalError);
         let at_anchor = Some(StopPoint::AtAnchor { anchor_step: 3 });
         assert_eq!(stops.stop_point("sink"), at_anchor);
         assert_eq!(stops.stop_point("relay"), at_anchor);
         assert_eq!(
             stops.stop_point("other"),
-            Some(StopPoint::InPass { step: 6, fires: 1 })
+            Some(StopPoint::InPass {
+                step: 6,
+                fires: 1,
+                cause: NodeStopCause::FatalError,
+            })
         );
         assert_eq!(PassStops::at_anchor(3, []), PassStops::none());
+    }
+
+    /// A fire position from 1.
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("a fire position counts from 1")
+    }
+
+    /// A recorded stop against the same hand table: a stop that ends the
+    /// node's fires is judged as an in-pass stop is, and a poisoned entry's
+    /// stop, after which the node keeps firing, owes nothing and cuts no burst
+    /// but releases the slots after it, as a fatal stop does.
+    #[test]
+    fn a_recorded_stop_point_answers_its_hand_table() {
+        let fatal = StopPoint::Recorded {
+            step: 5,
+            fires: nz(2),
+            cause: NodeStopCause::FatalError,
+        };
+        let breaker = StopPoint::Recorded {
+            step: 5,
+            fires: nz(3),
+            cause: NodeStopCause::DisabledAfterPanics,
+        };
+        let poisoned = StopPoint::Recorded {
+            step: 5,
+            fires: nz(1),
+            cause: NodeStopCause::EntryPoisoned,
+        };
+        let rows: &[(StopPoint, u64, bool, Option<u32>, bool)] = &[
+            (fatal, 4, false, None, false),
+            (fatal, 5, false, Some(2), false),
+            (fatal, 6, true, None, true),
+            (breaker, 5, false, Some(3), false),
+            (breaker, 9, true, None, false),
+            (poisoned, 4, false, None, false),
+            (poisoned, 5, false, None, false),
+            (poisoned, 6, false, None, true),
+        ];
+        for (stop, step, after, burst, released) in rows {
+            assert_eq!(stop.is_after(*step), *after, "{stop:?} at step {step}");
+            assert_eq!(stop.burst_at(*step), *burst, "{stop:?} at step {step}");
+            assert_eq!(
+                stop.slots_released_after(*step),
+                *released,
+                "{stop:?} at step {step}"
+            );
+        }
+    }
+
+    /// A recorded stop is noted like any other: the first stop of a node wins,
+    /// so a node the checkpoint states keeps that stop and a later note of the
+    /// same node moves nothing.
+    #[test]
+    fn a_recorded_stop_is_noted_first_wins() {
+        let stop = |node: &str, fires: u32, cause: NodeStopCause| StepStop {
+            node_id: node.to_string(),
+            rank: 0,
+            fires: nz(fires),
+            cause,
+        };
+        let mut stops = PassStops::at_anchor(3, ["sink"]);
+        stops.note_recorded(5, &stop("sink", 1, NodeStopCause::FatalError));
+        stops.note_recorded(6, &stop("relay", 2, NodeStopCause::EntryPoisoned));
+        stops.note("relay", 6, 1, NodeStopCause::FatalError);
+        stops.note_recorded(8, &stop("relay", 1, NodeStopCause::FatalError));
+        assert_eq!(
+            stops.stop_point("sink"),
+            Some(StopPoint::AtAnchor { anchor_step: 3 })
+        );
+        assert_eq!(
+            stops.stop_point("relay"),
+            Some(StopPoint::Recorded {
+                step: 6,
+                fires: nz(2),
+                cause: NodeStopCause::EntryPoisoned,
+            })
+        );
+        assert!(stops.contains("relay"));
+    }
+
+    /// The stop comparison at one step, against a hand table: agreement, each
+    /// of the three ways to differ, and the order the first difference is
+    /// taken in (recorded stops first, in trace order, then the re-executed
+    /// stops the recording does not hold).
+    #[test]
+    fn the_first_stop_disagreement_answers_its_hand_table() {
+        use NodeStopCause::{DisabledAfterPanics, EntryPoisoned, FatalError};
+        let stop = |node: &str, fires: u32, cause: NodeStopCause| StepStop {
+            node_id: node.to_string(),
+            rank: 0,
+            fires: nz(fires),
+            cause,
+        };
+        let a1 = stop("a", 1, FatalError);
+        let b2 = stop("b", 2, EntryPoisoned);
+        // Agreement, in any order, and an empty step.
+        assert_eq!(first_stop_disagreement(&[], &[]), None);
+        assert_eq!(
+            first_stop_disagreement(&[a1.clone(), b2.clone()], &[b2.clone(), a1.clone()]),
+            None
+        );
+        // A recorded stop the re-execution did not make.
+        assert_eq!(
+            first_stop_disagreement(std::slice::from_ref(&a1), &[]),
+            Some(StopDisagreement::NotReExecuted {
+                node_id: "a".to_string(),
+                rank: 0,
+                recorded: (nz(1), FatalError),
+            })
+        );
+        // A re-executed stop the recording does not hold.
+        assert_eq!(
+            first_stop_disagreement(&[], std::slice::from_ref(&b2)),
+            Some(StopDisagreement::NotRecorded {
+                node_id: "b".to_string(),
+                rank: 0,
+                replayed: (nz(2), EntryPoisoned),
+            })
+        );
+        // Another fire, and another cause.
+        assert_eq!(
+            first_stop_disagreement(std::slice::from_ref(&a1), &[stop("a", 2, FatalError)]),
+            Some(StopDisagreement::Differs {
+                node_id: "a".to_string(),
+                rank: 0,
+                recorded: (nz(1), FatalError),
+                replayed: (nz(2), FatalError),
+            })
+        );
+        assert_eq!(
+            first_stop_disagreement(
+                std::slice::from_ref(&a1),
+                &[stop("a", 1, DisabledAfterPanics)]
+            ),
+            Some(StopDisagreement::Differs {
+                node_id: "a".to_string(),
+                rank: 0,
+                recorded: (nz(1), FatalError),
+                replayed: (nz(1), DisabledAfterPanics),
+            })
+        );
+        // Order: the recorded stops are asked first, so a missing recorded stop
+        // of "b" is named before an unrecorded stop of "c" that precedes it in
+        // the re-execution.
+        assert_eq!(
+            first_stop_disagreement(
+                &[a1.clone(), b2.clone()],
+                &[stop("c", 1, FatalError), a1.clone()]
+            ),
+            Some(StopDisagreement::NotReExecuted {
+                node_id: "b".to_string(),
+                rank: 0,
+                recorded: (nz(2), EntryPoisoned),
+            })
+        );
+        // Each disagreement carries the rank of the stop it names: the
+        // recorded stop's, or the re-executed node's when the recording
+        // holds none.
+        let on_rank = |stop: StepStop, rank: u32| StepStop { rank, ..stop };
+        assert_eq!(
+            first_stop_disagreement(&[on_rank(a1.clone(), 3)], &[]).map(|d| d.rank()),
+            Some(3)
+        );
+        assert_eq!(
+            first_stop_disagreement(&[on_rank(a1.clone(), 3)], &[stop("a", 2, FatalError)])
+                .map(|d| d.rank()),
+            Some(3)
+        );
+        assert_eq!(
+            first_stop_disagreement(&[], &[on_rank(b2.clone(), 2)]).map(|d| d.rank()),
+            Some(2)
+        );
+        // …and among the unrecorded stops, the re-execution's order.
+        assert_eq!(
+            first_stop_disagreement(
+                std::slice::from_ref(&a1),
+                &[
+                    stop("d", 1, FatalError),
+                    a1.clone(),
+                    stop("c", 1, FatalError)
+                ]
+            ),
+            Some(StopDisagreement::NotRecorded {
+                node_id: "d".to_string(),
+                rank: 0,
+                replayed: (nz(1), FatalError),
+            })
+        );
+    }
+
+    /// Each disagreement renders the node, both stops' positions and their
+    /// causes in the node-death vocabulary.
+    #[test]
+    fn a_stop_disagreement_renders_each_side() {
+        use NodeStopCause::{EntryPoisoned, FatalError};
+        assert_eq!(
+            StopDisagreement::NotReExecuted {
+                node_id: "sink".to_string(),
+                rank: 0,
+                recorded: (nz(1), FatalError),
+            }
+            .to_string(),
+            "the recording stops node 'sink' at its fire 1 of the step (returned_fatal_error), \
+             and this re-execution does not stop it there"
+        );
+        assert_eq!(
+            StopDisagreement::NotRecorded {
+                node_id: "sink".to_string(),
+                rank: 0,
+                replayed: (nz(2), EntryPoisoned),
+            }
+            .to_string(),
+            "this re-execution stops node 'sink' at its fire 2 of the step \
+             (entry_poisoned_after_panic), and the recording holds no stop of it there"
+        );
+        assert_eq!(
+            StopDisagreement::Differs {
+                node_id: "sink".to_string(),
+                rank: 0,
+                recorded: (nz(2), FatalError),
+                replayed: (nz(1), EntryPoisoned),
+            }
+            .to_string(),
+            "the recording stops node 'sink' at its fire 2 of the step (returned_fatal_error), \
+             and this re-execution stops it at its fire 1 (entry_poisoned_after_panic)"
+        );
     }
 
     /// The checkpoint step of the resumed rule tests below: each slice
@@ -5729,6 +7659,7 @@ mod tests {
                 "fifo",
                 TriggerDecl::Data {
                     trigger_inputs: inputs(&["inp"]),
+                    drain: FifoDrain::Unified,
                 },
             ),
             node(
@@ -5786,7 +7717,7 @@ mod tests {
             .collect();
         let mut from_start_stops = PassStops::none();
         for stopped in ["fifo", "latest", "ticker"] {
-            from_start_stops.note(stopped, 2, 1);
+            from_start_stops.note(stopped, 2, 1, NodeStopCause::FatalError);
         }
         let from_start = verify(
             &nodes,
@@ -5831,6 +7762,7 @@ mod tests {
             "relay",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         relay.throttle_ns = Some(20 * MS);
@@ -5908,6 +7840,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp", "aux"]),
+                drain: FifoDrain::Unified,
             },
         )]
     }
@@ -6374,6 +8307,7 @@ mod tests {
                 "fifo",
                 TriggerDecl::Data {
                     trigger_inputs: inputs(&["inp"]),
+                    drain: FifoDrain::Unified,
                 },
             ),
             node(
@@ -6511,6 +8445,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         )]
     }
@@ -6884,6 +8819,7 @@ mod tests {
             "relay",
             TriggerDecl::Data {
                 trigger_inputs: vec![],
+                drain: FifoDrain::Unified,
             },
         );
         n.throttle_ns = Some(5 * MS);
@@ -7685,6 +9621,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         )];
         let steps = vec![RecordedStep {
@@ -7788,6 +9725,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         )];
         let step = |n: u64, fires: usize, pops: usize| RecordedStep {
@@ -7819,6 +9757,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         )];
         let steps = vec![
@@ -7846,6 +9785,3598 @@ mod tests {
         assert!(resumed.is_clean(), "unexpected: {:?}", resumed.findings);
         let from_start = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert_eq!(from_start.findings.len(), 1, "{:?}", from_start.findings);
+    }
+
+    // -- a FIFO node a `block` input in its rank holds, and a `block` consumer -
+
+    /// One hand-built hold edge: its label, the `(step, relay pops, relay
+    /// fires, sink body pops)` rows, and the step a relay nothing holds is
+    /// convicted at.
+    type HoldEdgeCase = (&'static str, Vec<(u64, u32, u32, u32)>, u64, PassStops);
+    /// One hand-built step no hold explains: its label, the rows, and the
+    /// finding's step, supply and recorded fires.
+    type HeldFindingCase = (&'static str, Vec<(u64, u32, u32, u32)>, u64, u32, u32);
+
+    /// A bag whose read-site roles are believed, as every bag this build
+    /// records is.
+    const STAMPED: RoleTrust = RoleTrust::Believed {
+        consults_recorded: true,
+    };
+
+    /// What a step's pre-fire check can have done.
+    fn defers(throttle_defers: bool, hold_possible: bool) -> StepDeferral {
+        StepDeferral {
+            throttle_defers,
+            hold_possible,
+        }
+    }
+
+    /// The slot record of a topic whose every frame is one fire of one of
+    /// `producers` in `steps`, stamped with its step's clock, as a node built
+    /// with `#[cerulion_node]` that writes its one output on every fire
+    /// records it, drained one frame per body read.
+    fn sent_by(steps: &[RecordedStep], producers: &[&str]) -> SlotRecord {
+        SlotRecord::Counted {
+            frame_stamps: steps
+                .iter()
+                .flat_map(|step| {
+                    step.fires
+                        .iter()
+                        .filter(|f| producers.contains(&f.node_id.as_str()))
+                        .map(move |_| step.clock_ns)
+                })
+                .collect(),
+            drain: BodyDrain::PerFrame,
+        }
+    }
+
+    /// The slot record of a topic whose frames are stamped at `clocks_us`,
+    /// microseconds after [`EPOCH`], drained one frame per body read.
+    fn stamped_at(clocks_us: &[u64]) -> SlotRecord {
+        SlotRecord::Counted {
+            frame_stamps: clocks_us.iter().map(|us| EPOCH + us * 1_000).collect(),
+            drain: BodyDrain::PerFrame,
+        }
+    }
+
+    /// One `block` input, `consumer.inp` at `depth`, with `record`, on a
+    /// consumer whose tick replay cannot know, from a producer that sends at
+    /// most one frame per fire ([`SendsPerFire::AtMostOne`]), as a
+    /// `#[cerulion_node]` node does.
+    fn slot(consumer: &str, depth: u64, record: SlotRecord) -> BlockHoldEdge {
+        BlockHoldEdge {
+            consumer_node: consumer.to_string(),
+            consumer_input: "inp".to_string(),
+            depth,
+            record,
+            reads_before: ReadsBefore::Unknown,
+            producer_sends: SendsPerFire::AtMostOne,
+        }
+    }
+
+    /// The one `block` edge `relay` produces into, `sink.inp` at `depth`,
+    /// filled by the relay's fires in `steps`.
+    fn sink_holds(depth: u64, steps: &[RecordedStep]) -> BlockHoldEdges {
+        BlockHoldEdges::new(vec![slot("sink", depth, sent_by(steps, &["relay"]))])
+    }
+
+    /// A `block` edge in a node's rank, read by a node the case does not
+    /// judge: the `consume = latest` rule asks only that one exists.
+    fn held_in_rank() -> BlockHoldEdges {
+        BlockHoldEdges::new(vec![slot("downstream", 1, SlotRecord::Unaccounted)])
+    }
+
+    /// One step at `clock_us` microseconds after [`EPOCH`]: per node `(id,
+    /// trigger-drain pops, fires, body pops)`, each pop a role-stamped record
+    /// (a `DrainedBatch` at the drain site, a `Served` at the body site).
+    fn fifo_step(n: u64, clock_us: u64, nodes: &[(&str, u32, u32, u32)]) -> RecordedStep {
+        let at = EPOCH + clock_us * 1_000;
+        let drain = |id: &str| {
+            read_with_role(
+                id,
+                "inp",
+                ReadOutcomeKind::DrainedBatch,
+                1,
+                None,
+                ReadSiteRole::Drain,
+            )
+        };
+        let body = |id: &str| {
+            read_with_role(
+                id,
+                "inp",
+                ReadOutcomeKind::Served,
+                1,
+                None,
+                ReadSiteRole::Body,
+            )
+        };
+        RecordedStep {
+            step: n,
+            clock_ns: at,
+            fires: nodes
+                .iter()
+                .flat_map(|&(id, _, fires, _)| (0..fires).map(move |_| fire(id, at)))
+                .collect(),
+            reads: nodes
+                .iter()
+                .flat_map(|&(id, pops, _, body_pops)| {
+                    (0..pops)
+                        .map(move |_| drain(id))
+                        .chain((0..body_pops).map(move |_| body(id)))
+                })
+                .collect(),
+        }
+    }
+
+    /// `(step, relay pops, relay fires, sink body pops)` rows on a 5 ms step.
+    fn relay_steps(rows: &[(u64, u32, u32, u32)]) -> Vec<RecordedStep> {
+        rows.iter()
+            .map(|&(n, pops, fires, drained)| {
+                fifo_step(
+                    n,
+                    n * 5_000,
+                    &[("relay", pops, fires, 0), ("sink", 0, 0, drained)],
+                )
+            })
+            .collect()
+    }
+
+    /// `steps` with `read` added to step `n`'s reads.
+    fn with_read(mut steps: Vec<RecordedStep>, n: u64, read: RecordedRead) -> Vec<RecordedStep> {
+        steps
+            .iter_mut()
+            .find(|s| s.step == n)
+            .expect("the step the case names")
+            .reads
+            .push(read);
+        steps
+    }
+
+    fn fifo_decl(
+        id: &str,
+        drain: FifoDrain,
+        holds: BlockHoldEdges,
+        throttle_ns: Option<u64>,
+    ) -> NodeDecl {
+        let mut decl = node(
+            id,
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+                drain,
+            },
+        );
+        decl.may_be_held_by = holds;
+        decl.throttle_ns = throttle_ns;
+        decl
+    }
+
+    fn relay(holds: BlockHoldEdges) -> Vec<NodeDecl> {
+        vec![fifo_decl("relay", FifoDrain::Unified, holds, None)]
+    }
+
+    /// `(node, step, expected, recorded)` of every finding.
+    fn findings_of(report: &RederivationReport) -> Vec<(String, u64, StepFires, StepFires)> {
+        report
+            .findings
+            .iter()
+            .map(|f| {
+                (
+                    f.node_id.clone(),
+                    f.step,
+                    f.expected.clone(),
+                    f.recorded.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn finding(
+        node: &str,
+        step: u64,
+        expected: u32,
+        recorded: u32,
+    ) -> (String, u64, StepFires, StepFires) {
+        (
+            node.to_string(),
+            step,
+            StepFires::count(expected),
+            StepFires::count(recorded),
+        )
+    }
+
+    /// The relay (one subscriber) and the sink (a `block` trigger input, so
+    /// two subscribers; `throttle_ms = 50`) of one real recording of `src`
+    /// (5 ms) -> `relay` -> `sink` (depth 2), all in one rank.
+    fn ws1_nodes(relay_holds: BlockHoldEdges, sink_drain: FifoDrain) -> Vec<NodeDecl> {
+        vec![
+            fifo_decl("relay", FifoDrain::Unified, relay_holds, None),
+            fifo_decl("sink", sink_drain, BlockHoldEdges::none(), Some(50 * MS)),
+        ]
+    }
+
+    /// Rows `(step, clock in us, relay pops, relay fires, sink pops, sink
+    /// fires, sink body pops)` as steps.
+    fn chain_steps(rows: &[(u64, u64, u32, u32, u32, u32, u32)]) -> Vec<RecordedStep> {
+        rows.iter()
+            .map(|&(n, us, rp, rf, sp, sf, sb)| {
+                fifo_step(n, us, &[("relay", rp, rf, 0), ("sink", sp, sf, sb)])
+            })
+            .collect()
+    }
+
+    /// That recording's active steps, hand-counted from its fire and read
+    /// records as `(step, clock in us, relay pops, relay fires, sink pops, sink
+    /// fires, sink body pops)`:
+    ///
+    /// * steps 1 to 3: the relay pops and fires one frame each; the sink fires
+    ///   the first and its body read takes it, then counts the next two with
+    ///   its throttle closed;
+    /// * step 4: three frames sent, one taken, so the sink's slot is at its
+    ///   depth, 2: the relay pops sequence 3 and is held;
+    /// * step 11: the sink fires and its body takes one frame;
+    /// * step 12: the slot has room for one, so the relay fires its held frame,
+    ///   its refill pops sequence 4 and the slot holds it again; the sink
+    ///   counts the relay's new frame;
+    /// * steps 23 and 24, 35 and 36: the same pair again.
+    fn ws1_steps() -> Vec<RecordedStep> {
+        chain_steps(&[
+            (1, 4_580, 1, 1, 1, 1, 1),
+            (2, 9_610, 1, 1, 1, 0, 0),
+            (3, 14_600, 1, 1, 1, 0, 0),
+            (4, 19_620, 1, 0, 0, 0, 0),
+            (11, 54_600, 0, 0, 0, 1, 1),
+            (12, 55_770, 1, 1, 1, 0, 0),
+            (23, 105_710, 0, 0, 0, 1, 1),
+            (24, 106_840, 1, 1, 1, 0, 0),
+            (35, 155_750, 0, 0, 0, 1, 1),
+            (36, 156_860, 1, 1, 1, 0, 0),
+        ])
+    }
+
+    /// The same chain recorded across two worker ranks by the auto partition,
+    /// rank 1 holding `relay` and `sink`, hand-counted the same way: the
+    /// relay fires steps 1, 3 and 4 and the sink takes the first, so the hold
+    /// engages at step 5; each relay fire after a sink fire (14, 26, 38)
+    /// serves the held frame.
+    fn ws2_auto_steps() -> Vec<RecordedStep> {
+        chain_steps(&[
+            (1, 5_204, 1, 1, 1, 1, 1),
+            (3, 9_952, 1, 1, 1, 0, 0),
+            (4, 14_937, 1, 1, 1, 0, 0),
+            (5, 19_918, 1, 0, 0, 0, 0),
+            (13, 55_992, 0, 0, 0, 1, 1),
+            (14, 57_139, 1, 1, 1, 0, 0),
+            (25, 106_003, 0, 0, 0, 1, 1),
+            (26, 107_136, 1, 1, 1, 0, 0),
+            (37, 156_014, 0, 0, 0, 1, 1),
+            (38, 157_141, 1, 1, 1, 0, 0),
+        ])
+    }
+
+    /// The recording reads clean, the held relay on its one-frame carry and
+    /// the sink on its count. Judged with nothing holding the relay, the relay
+    /// is convicted at step 4 (one pop, no fire); judged as one subscriber, the
+    /// sink is convicted at step 3 (a counted frame carried in, one more
+    /// counted, none fired). The auto partition's recording reads the same:
+    /// clean held, and convicted at step 5 with nothing holding the relay.
+    #[test]
+    fn a_held_relay_and_its_throttled_block_consumer_read_clean() {
+        let steps = ws1_steps();
+        let held = || ws1_nodes(sink_holds(2, &steps), FifoDrain::Separate);
+        let clean = verify_unrestored(&held(), &steps, &[], STAMPED);
+        assert!(clean.is_clean(), "unexpected: {:?}", clean.findings);
+        assert!(clean.stand_downs.is_empty(), "{:?}", clean.stand_downs);
+        assert_eq!(
+            clean,
+            verify_unrestored(&held(), &steps, &[], STAMPED),
+            "two runs over one recording are one report"
+        );
+
+        let unheld = verify_unrestored(
+            &ws1_nodes(BlockHoldEdges::none(), FifoDrain::Separate),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&unheld), vec![finding("relay", 4, 1, 0)]);
+        assert_eq!(
+            unheld.findings[0].caveat, None,
+            "the bag states the relay's drain"
+        );
+
+        let one_subscriber = verify_unrestored(
+            &ws1_nodes(sink_holds(2, &steps), FifoDrain::Unified),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&one_subscriber), vec![finding("sink", 3, 2, 0)]);
+
+        let unaccounted = verify_unrestored(
+            &ws1_nodes(
+                BlockHoldEdges::new(vec![slot("sink", 2, SlotRecord::Unaccounted)]),
+                FifoDrain::Separate,
+            ),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(
+            findings_of(&unaccounted),
+            vec![finding("relay", 4, 1, 0)],
+            "a slot the bag cannot account for explains no step"
+        );
+
+        let auto = ws2_auto_steps();
+        let auto_held = verify_unrestored(
+            &ws1_nodes(sink_holds(2, &auto), FifoDrain::Separate),
+            &auto,
+            &[],
+            STAMPED,
+        );
+        assert!(auto_held.is_clean(), "unexpected: {:?}", auto_held.findings);
+        let auto_unheld = verify_unrestored(
+            &ws1_nodes(BlockHoldEdges::none(), FifoDrain::Separate),
+            &auto,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&auto_unheld), vec![finding("relay", 5, 1, 0)]);
+    }
+
+    /// Each rule's answer over the first steps of the recording, hand-counted:
+    /// the sink's throttle covers every step from its fire at step 1 (after
+    /// that fire, then 5.03 ms, 10.02 ms and 15.04 ms into its 50 ms window;
+    /// at step 11, 50.02 ms on, the window has passed at the decide gate and
+    /// the step's own fire covers the rest). The relay's bound reaches the
+    /// slot's depth at step 3 (three frames sent, one taken), which is what
+    /// excuses its step 4 pop. On a bag whose roles cannot be believed the
+    /// sink's trigger-drain reads are `DrainedBatch` records, which either
+    /// site mints, so nothing bounds the slot and no step is excused.
+    #[test]
+    fn a_step_is_excused_only_when_its_throttle_or_slot_bound_allows_it() {
+        let steps = ws1_steps();
+        let none = PassStops::none();
+        let mut sink = PreFireDeferral::new(
+            &fifo_decl(
+                "sink",
+                FifoDrain::Separate,
+                BlockHoldEdges::none(),
+                Some(50 * MS),
+            ),
+            false,
+            &none,
+        );
+        let relay_decl = fifo_decl("relay", FifoDrain::Unified, sink_holds(2, &steps), None);
+        let mut relay = PreFireDeferral::new(&relay_decl, false, &none);
+        let mut declined = PreFireDeferral::new(&relay_decl, false, &none);
+        let mut seen = Vec::new();
+        for (i, step) in steps.iter().enumerate() {
+            let next = steps.get(i + 1).map(|s| s.clock_ns);
+            let fires: Vec<(&str, u64)> = step
+                .fires
+                .iter()
+                .map(|f| (f.node_id.as_str(), f.fire_time_ns))
+                .collect();
+            let (n, at, reads) = (step.step, step.clock_ns, &step.reads);
+            seen.push((
+                n,
+                {
+                    let d = sink.step(n, at, next, &fires, reads, STAMPED);
+                    (d.throttle_defers, d.hold_possible)
+                },
+                relay
+                    .step(n, at, next, &fires, reads, STAMPED)
+                    .hold_possible,
+                declined
+                    .step(n, at, next, &fires, reads, RoleTrust::Declined)
+                    .hold_possible,
+            ));
+        }
+        assert_eq!(
+            seen[..5],
+            [
+                (1, (true, false), false, false),
+                (2, (true, false), false, false),
+                (3, (true, false), true, false),
+                (4, (true, false), true, false),
+                (11, (true, false), true, false),
+            ]
+        );
+    }
+
+    /// The throttle's line, judged by the live predicate: a gap of exactly the
+    /// throttle fires, one nanosecond less defers; a node that has never fired
+    /// passes. A resumed pass's node may have fired at or before its first
+    /// step, so before its first fire in the pass it defers only while the
+    /// current step's clock is within one throttle of the first step's.
+    #[test]
+    fn the_throttle_defers_exactly_where_the_live_check_does() {
+        let none = PassStops::none();
+        let throttled = fifo_decl(
+            "sink",
+            FifoDrain::Separate,
+            BlockHoldEdges::none(),
+            Some(50 * MS),
+        );
+        let mut d = PreFireDeferral::new(&throttled, false, &none);
+        assert_eq!(
+            d.step(0, EPOCH, None, &[], &[], STAMPED),
+            defers(false, false),
+            "never fired"
+        );
+        // The step's own fire: the check before a further fire reads it.
+        assert!(
+            d.step(1, EPOCH + MS, None, &[("sink", EPOCH + MS)], &[], STAMPED)
+                .throttle_defers
+        );
+        assert!(
+            d.step(2, EPOCH + 51 * MS - 1, None, &[], &[], STAMPED)
+                .throttle_defers,
+            "1 ns inside the window"
+        );
+        assert!(
+            !d.step(3, EPOCH + 51 * MS, None, &[], &[], STAMPED)
+                .throttle_defers,
+            "exactly the throttle"
+        );
+        let mut resumed = PreFireDeferral::new(&throttled, true, &none);
+        assert!(
+            resumed
+                .step(5, EPOCH, None, &[], &[], STAMPED)
+                .throttle_defers,
+            "a fire before the anchor"
+        );
+        assert!(
+            resumed
+                .step(6, EPOCH + 50 * MS - 1, None, &[], &[], STAMPED)
+                .throttle_defers
+        );
+        assert!(
+            !resumed
+                .step(7, EPOCH + 50 * MS, None, &[], &[], STAMPED)
+                .throttle_defers,
+            "the window has passed"
+        );
+        let unthrottled = fifo_decl("sink", FifoDrain::Separate, BlockHoldEdges::none(), None);
+        let mut d = PreFireDeferral::new(&unthrottled, true, &none);
+        assert_eq!(
+            d.step(0, EPOCH, None, &[("sink", EPOCH)], &[], STAMPED),
+            defers(false, false)
+        );
+    }
+
+    /// A slot's first step and a resumed pass. On a pass from the start, a
+    /// frame stamped before its first step is not its send: with one frame
+    /// stamped 1 ms before step 0 and one at step 1 the slot counts one, below
+    /// a depth of 2. On a resumed pass the slot's count is unknown, so nothing
+    /// is excused whatever it is sent, until the consumer reads its queue
+    /// empty: from that read on it counts the step's own sends, two by step 8.
+    #[test]
+    fn a_slot_counts_from_its_first_step_and_a_resumed_one_from_an_empty_read() {
+        let none = PassStops::none();
+        let edge = |stamps: Vec<u64>| {
+            fifo_decl(
+                "relay",
+                FifoDrain::Unified,
+                BlockHoldEdges::new(vec![slot(
+                    "sink",
+                    2,
+                    SlotRecord::Counted {
+                        frame_stamps: stamps,
+                        drain: BodyDrain::PerFrame,
+                    },
+                )]),
+                None,
+            )
+        };
+        let mut fresh = PreFireDeferral::new(&edge(vec![EPOCH - MS, EPOCH + MS]), false, &none);
+        assert_eq!(
+            fresh.step(0, EPOCH, None, &[], &[], STAMPED),
+            defers(false, false)
+        );
+        assert_eq!(
+            fresh.step(1, EPOCH + MS, None, &[], &[], STAMPED),
+            defers(false, false)
+        );
+
+        let stamps = vec![EPOCH, EPOCH + 2 * MS, EPOCH + 3 * MS];
+        let taken = [read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::Served,
+            1,
+            None,
+            ReadSiteRole::Body,
+        )];
+        let empty = [read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Body,
+        )];
+        let mut resumed = PreFireDeferral::new(&edge(stamps), true, &none);
+        assert_eq!(
+            resumed.step(5, EPOCH, None, &[], &taken, STAMPED),
+            defers(false, false)
+        );
+        assert_eq!(
+            resumed.step(6, EPOCH + MS, None, &[], &empty, STAMPED),
+            defers(false, false)
+        );
+        assert_eq!(
+            resumed.step(7, EPOCH + 2 * MS, None, &[], &[], STAMPED),
+            defers(false, false)
+        );
+        assert_eq!(
+            resumed.step(8, EPOCH + 3 * MS, None, &[], &[], STAMPED),
+            defers(false, true)
+        );
+    }
+
+    /// The carry rules on hand-built steps. One subscriber (the relay): a step
+    /// a pre-fire check can defer leaves one popped frame unfired below the
+    /// cap, never two. Two subscribers (the sink): every unspent signal
+    /// carries, up to the scheduler's clamp of 64.
+    #[test]
+    fn the_fifo_carry_rules_carry_what_a_deferred_burst_leaves() {
+        let clamp = u32::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap();
+        assert_eq!(clamp, 64, "the scheduler's clamp and burst cap");
+        // The relay: one pop one fire; the onset; a held frame re-offered; a
+        // held frame fired and the next frozen; a release that fires the held
+        // frame and five refills.
+        assert_eq!(fifo_step_carry(false, 1, 1, true), Ok(false));
+        assert_eq!(fifo_step_carry(false, 1, 0, true), Ok(true));
+        assert_eq!(fifo_step_carry(true, 0, 0, true), Ok(true));
+        assert_eq!(fifo_step_carry(true, 1, 1, true), Ok(true));
+        assert_eq!(fifo_step_carry(true, 5, 6, true), Ok(false));
+        assert_eq!(
+            fifo_step_carry(false, 2, 0, true),
+            Err(FifoCarryMismatch {
+                supply: 2,
+                fires: 0
+            })
+        );
+        assert_eq!(
+            fifo_step_carry(false, 1, 2, true),
+            Err(FifoCarryMismatch {
+                supply: 1,
+                fires: 2
+            })
+        );
+        assert_eq!(
+            fifo_step_carry(false, 1, 0, false),
+            Err(FifoCarryMismatch {
+                supply: 1,
+                fires: 0
+            })
+        );
+        // The sink: its counts; every signal fired; the clamp.
+        assert_eq!(fifo_step_backlog(0, 1, 1, true), Ok(0));
+        assert_eq!(fifo_step_backlog(1, 2, 3, false), Ok(0));
+        assert_eq!(fifo_step_backlog(0, 1, 0, true), Ok(1));
+        assert_eq!(fifo_step_backlog(1, 1, 0, true), Ok(2));
+        assert_eq!(fifo_step_backlog(2, 0, 1, true), Ok(1));
+        assert_eq!(fifo_step_backlog(60, 10, 0, true), Ok(clamp));
+        assert_eq!(fifo_step_backlog(0, clamp + 1, clamp, false), Ok(0));
+        // Nothing deferrable, at and below the cap: the clamped supply is the
+        // mismatch's.
+        assert_eq!(
+            fifo_step_backlog(0, 64, 63, false),
+            Err(FifoCarryMismatch {
+                supply: 64,
+                fires: 63
+            })
+        );
+        assert_eq!(
+            fifo_step_backlog(1, 64, 63, false),
+            Err(FifoCarryMismatch {
+                supply: 64,
+                fires: 63
+            })
+        );
+        assert_eq!(
+            fifo_step_backlog(0, 63, 62, false),
+            Err(FifoCarryMismatch {
+                supply: 63,
+                fires: 62
+            })
+        );
+        assert_eq!(
+            fifo_step_backlog(0, 1, 2, true),
+            Err(FifoCarryMismatch {
+                supply: 1,
+                fires: 2
+            })
+        );
+        // The dispatcher, the supply and the deferral, per drain.
+        assert_eq!(fifo_carry_out(FifoDrain::Unified, 1, 1, 1, true), Ok(1));
+        assert_eq!(fifo_carry_out(FifoDrain::Separate, 1, 1, 0, true), Ok(2));
+        assert_eq!(
+            fifo_carry_out(FifoDrain::Unrecorded, 0, clamp + 1, clamp, false),
+            Ok(1)
+        );
+        assert_eq!(
+            fifo_carry_out(FifoDrain::Unrecorded, 1, 1, 0, true),
+            Err(FifoCarryMismatch {
+                supply: 2,
+                fires: 0
+            })
+        );
+        assert_eq!(fifo_supply(FifoDrain::Separate, 60, 10), clamp);
+        assert_eq!(fifo_supply(FifoDrain::Unified, 1, 70), 71);
+        assert_eq!(fifo_supply(FifoDrain::Unrecorded, 1, 70), 71);
+        for drain in [FifoDrain::Unified, FifoDrain::Separate] {
+            assert!(fifo_carry_deferrable(drain, false, true, false));
+            assert!(fifo_carry_deferrable(drain, false, false, true));
+            assert!(
+                !fifo_carry_deferrable(drain, true, false, false),
+                "a declared throttle outside its window"
+            );
+        }
+        assert!(fifo_carry_deferrable(
+            FifoDrain::Unrecorded,
+            true,
+            false,
+            false
+        ));
+        assert!(!fifo_carry_deferrable(
+            FifoDrain::Unrecorded,
+            false,
+            true,
+            true
+        ));
+    }
+
+    /// The bound counts the frames the bag records on the topic, never the
+    /// producers' fires. Hand-built on depth 2 as `(step, relay pops, relay
+    /// fires, sink body pops)`: a relay whose step 1 fire published nothing
+    /// (a filter tick) has one frame in the slot at step 2, so its step 2 pop
+    /// left unfired is a finding; a relay whose one step 0 fire published two
+    /// frames fills the slot, so its second pop left unfired is the hold; a
+    /// second producer's frame at step 0 counts the same.
+    #[test]
+    fn the_slot_bound_counts_the_recorded_frames_of_the_topic() {
+        let edge = |record| BlockHoldEdges::new(vec![slot("sink", 2, record)]);
+        let filtered = relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0)]);
+        let one_frame = verify_unrestored(&relay(edge(stamped_at(&[0]))), &filtered, &[], STAMPED);
+        assert_eq!(findings_of(&one_frame), vec![finding("relay", 2, 1, 0)]);
+        let both = verify_unrestored(
+            &relay(edge(stamped_at(&[0, 5_000]))),
+            &filtered,
+            &[],
+            STAMPED,
+        );
+        assert!(both.is_clean(), "{:?}", both.findings);
+
+        let one_fire_two_pops = relay_steps(&[(0, 2, 1, 0)]);
+        let two_frames = verify_unrestored(
+            &relay(edge(stamped_at(&[0, 0]))),
+            &one_fire_two_pops,
+            &[],
+            STAMPED,
+        );
+        assert!(two_frames.is_clean(), "{:?}", two_frames.findings);
+        let one = verify_unrestored(
+            &relay(edge(stamped_at(&[0]))),
+            &one_fire_two_pops,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&one), vec![finding("relay", 0, 2, 1)]);
+
+        let shared = vec![fifo_step(0, 0, &[("relay", 2, 1, 0), ("other", 0, 1, 0)])];
+        let counted = verify_unrestored(
+            &relay(edge(sent_by(&shared, &["relay", "other"]))),
+            &shared,
+            &[],
+            STAMPED,
+        );
+        assert!(counted.is_clean(), "{:?}", counted.findings);
+        let alone = verify_unrestored(
+            &relay(edge(sent_by(&shared, &["relay"]))),
+            &shared,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&alone), vec![finding("relay", 0, 2, 1)]);
+    }
+
+    /// A node any of whose edges the bag shows full can be held, and only then:
+    /// rows `(0: one pop, one fire)` and `(1: one pop, no fire)` with no
+    /// drain read clean on edges at depths 1 and 4, and at depths 1 and 1, and
+    /// are a finding at step 1 at depths 3 and 4.
+    #[test]
+    fn a_node_is_held_where_any_of_its_edges_can_be_full() {
+        let steps = relay_steps(&[(0, 1, 1, 0), (1, 1, 0, 0)]);
+        let edges = |a: u64, b: u64| {
+            BlockHoldEdges::new(vec![
+                slot("sink", a, sent_by(&steps, &["relay"])),
+                slot("other", b, sent_by(&steps, &["relay"])),
+            ])
+        };
+        for (a, b) in [(1, 4), (1, 1)] {
+            let report = verify_unrestored(&relay(edges(a, b)), &steps, &[], STAMPED);
+            assert!(
+                report.is_clean(),
+                "depths {a} and {b}: {:?}",
+                report.findings
+            );
+        }
+        let neither = verify_unrestored(&relay(edges(3, 4)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&neither), vec![finding("relay", 1, 1, 0)]);
+    }
+
+    /// What the consumer's reads and its stop do to the bound, hand-built on
+    /// depth 2, each a relay that leaves a pop unfired where the slot no
+    /// longer holds it. The rows are `(step, relay pops, relay fires, sink body
+    /// pops)`, and [`fifo_step`] node entries in the case whose sink fires with
+    /// no read:
+    ///
+    /// * the sink stops at step 1, which releases its slot for good, so the
+    ///   relay's step 2 pop is a finding;
+    /// * after the relay's step 3 hold the sink takes a frame at each of steps
+    ///   3 and 4 through a read that records nothing and pays the slot nothing
+    ///   (`CerulionSubscriber::try_receive_one`), so the slot counts two frames
+    ///   its queue no longer holds; at step 5 its body reads the queue empty,
+    ///   which resyncs the slot, so the frame the relay carries unfired at step
+    ///   6 is a finding. Without that read the slot still counts two, and so it
+    ///   does with the empty read at the drain site, which says nothing of the
+    ///   body's queue. A bag whose roles cannot be believed shows no empty read
+    ///   as the body's, so the rule counts two there as well, where the run
+    ///   these rows narrate resynced the word; no such bag counts a slot, since
+    ///   roles are believed from a trace format older than the one that holds
+    ///   node stops, so that half pins the rule alone;
+    /// * a truncated read stream of the sink's input loses its drains, so from
+    ///   its marker at step 2 nothing bounds the slot and the step 3 frame
+    ///   carried unfired is a finding; without the marker it is the hold;
+    /// * one body read that drains two frames takes both off, so step 2's
+    ///   second pop left unfired is a finding.
+    #[test]
+    fn the_bound_follows_the_consumer_reads_and_stop() {
+        let stopped = relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0)]);
+        let mut stops = PassStops::none();
+        stops.note("sink", 1, 1, NodeStopCause::FatalError);
+        let held = verify(
+            &relay(sink_holds(2, &stopped)),
+            &stopped,
+            &[],
+            STAMPED,
+            &PassRestore::none(),
+            &PassStops::none(),
+        );
+        assert!(held.is_clean(), "{:?}", held.findings);
+        let released = verify(
+            &relay(sink_holds(2, &stopped)),
+            &stopped,
+            &[],
+            STAMPED,
+            &PassRestore::none(),
+            &stops,
+        );
+        assert_eq!(findings_of(&released), vec![finding("relay", 2, 1, 0)]);
+
+        let empty = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Body,
+        );
+        let taken = || {
+            vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 1, 0, 0), ("sink", 0, 1, 0)]),
+                fifo_step(4, 20_000, &[("sink", 0, 1, 0)]),
+                fifo_step(5, 25_000, &[("sink", 0, 1, 0)]),
+                fifo_step(6, 30_000, &[]),
+            ]
+        };
+        let emptied = with_read(taken(), 5, empty);
+        let reset = verify_unrestored(&relay(sink_holds(2, &emptied)), &emptied, &[], STAMPED);
+        assert_eq!(findings_of(&reset), vec![finding("relay", 6, 1, 0)]);
+        let kept = taken();
+        let not_reset = verify_unrestored(&relay(sink_holds(2, &kept)), &kept, &[], STAMPED);
+        assert!(not_reset.is_clean(), "{:?}", not_reset.findings);
+        // An empty read that is not the body's says nothing of the slot's
+        // queue, and the rule takes none whose role it cannot believe as the
+        // body's.
+        let drain_site = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        );
+        let trigger_empty = with_read(taken(), 5, drain_site);
+        let kept_by_site = verify_unrestored(
+            &relay(sink_holds(2, &trigger_empty)),
+            &trigger_empty,
+            &[],
+            STAMPED,
+        );
+        assert!(kept_by_site.is_clean(), "{:?}", kept_by_site.findings);
+        let kept_by_trust = verify_unrestored(
+            &relay(sink_holds(2, &emptied)),
+            &emptied,
+            &[],
+            RoleTrust::Declined,
+        );
+        assert!(kept_by_trust.is_clean(), "{:?}", kept_by_trust.findings);
+
+        let marker = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::Truncated,
+            0,
+            None,
+            ReadSiteRole::Body,
+        );
+        let truncated_rows = [(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0), (3, 0, 0, 0)];
+        let truncated = with_read(relay_steps(&truncated_rows), 2, marker);
+        let lost = verify_unrestored(&relay(sink_holds(2, &truncated)), &truncated, &[], STAMPED);
+        assert_eq!(findings_of(&lost), vec![finding("relay", 3, 1, 0)]);
+        let whole = relay_steps(&truncated_rows);
+        let bounded = verify_unrestored(&relay(sink_holds(2, &whole)), &whole, &[], STAMPED);
+        assert!(bounded.is_clean(), "{:?}", bounded.findings);
+
+        let batch = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::DrainedBatch,
+            2,
+            None,
+            ReadSiteRole::Body,
+        );
+        let batched = with_read(
+            relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 2, 1, 0)]),
+            1,
+            batch,
+        );
+        let drained = verify_unrestored(&relay(sink_holds(2, &batched)), &batched, &[], STAMPED);
+        assert_eq!(findings_of(&drained), vec![finding("relay", 2, 2, 1)]);
+    }
+
+    /// On a bag whose read-site roles cannot be believed, a `Served` read
+    /// still drains the slot (it is minted only at a body site), and a
+    /// `DrainedBatch` read, which either site mints, leaves the slot unbounded
+    /// from then on. Hand-built on depth 2: the sink takes the step 1 frame,
+    /// so the relay's step 2 pop left unfired is a finding under either
+    /// trust; the same take as a body `DrainedBatch` keeps the slot bounded
+    /// where roles are believed (step 3 is the hold) and unbounded where they
+    /// are not (step 3 is a finding).
+    #[test]
+    fn a_bag_whose_roles_are_not_believed_counts_only_body_minted_drains() {
+        let served = relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 1), (2, 1, 0, 0)]);
+        for trust in [STAMPED, RoleTrust::Declined] {
+            let report = verify_unrestored(&relay(sink_holds(2, &served)), &served, &[], trust);
+            assert_eq!(
+                findings_of(&report),
+                vec![finding("relay", 2, 1, 0)],
+                "{trust:?}"
+            );
+        }
+        let batch = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            None,
+            ReadSiteRole::Body,
+        );
+        let batched = with_read(
+            relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 1, 0), (3, 1, 0, 0)]),
+            1,
+            batch,
+        );
+        let believed = verify_unrestored(&relay(sink_holds(2, &batched)), &batched, &[], STAMPED);
+        assert!(believed.is_clean(), "{:?}", believed.findings);
+        let declined = verify_unrestored(
+            &relay(sink_holds(2, &batched)),
+            &batched,
+            &[],
+            RoleTrust::Declined,
+        );
+        assert_eq!(findings_of(&declined), vec![finding("relay", 3, 1, 0)]);
+    }
+
+    /// A resumed pass does not know what the slot held at its anchor: a relay
+    /// held at depth 2 whose first resumed step pops a frame and fires none is
+    /// a finding, as it is judged from a pass's start, until the consumer
+    /// reads its queue empty. After such a read at step 1 and two frames
+    /// sent, a pop left unfired at step 4 is the hold. A throttled
+    /// consumer that never fires on a resumed pass is convicted once the
+    /// window from the pass's first step has passed: the sink counts a frame
+    /// a step on a 5 ms step and owes them all at step 10.
+    #[test]
+    fn a_resumed_pass_bounds_the_slot_and_the_throttle_from_its_first_step() {
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+        let first = relay_steps(&[(0, 1, 0, 0)]);
+        let holds = |steps: &[RecordedStep]| sink_holds(2, steps);
+        let unknown = verify(
+            &relay(holds(&first)),
+            &first,
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        );
+        assert_eq!(findings_of(&unknown), vec![finding("relay", 0, 1, 0)]);
+        let from_start = verify_unrestored(&relay(holds(&first)), &first, &[], STAMPED);
+        assert_eq!(findings_of(&from_start), vec![finding("relay", 0, 1, 0)]);
+
+        let empty = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Body,
+        );
+        let after_empty = with_read(
+            relay_steps(&[
+                (0, 1, 1, 0),
+                (1, 0, 0, 0),
+                (2, 1, 1, 0),
+                (3, 1, 1, 0),
+                (4, 1, 0, 0),
+            ]),
+            1,
+            empty,
+        );
+        let known = verify(
+            &relay(holds(&after_empty)),
+            &after_empty,
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        );
+        assert!(known.is_clean(), "{:?}", known.findings);
+
+        let sink = [fifo_decl(
+            "sink",
+            FifoDrain::Separate,
+            BlockHoldEdges::none(),
+            Some(50 * MS),
+        )];
+        let counting: Vec<RecordedStep> = (0..=10)
+            .map(|n| fifo_step(n, n * 5_000, &[("sink", 1, 0, 0)]))
+            .collect();
+        let report = verify(&sink, &counting, &[], STAMPED, &resumed, &PassStops::none());
+        assert_eq!(findings_of(&report), vec![finding("sink", 10, 11, 0)]);
+        let inside = verify(
+            &sink,
+            &counting[..10],
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        );
+        assert!(inside.is_clean(), "{:?}", inside.findings);
+    }
+
+    /// What the bag's record and the consumer's reads add to the bound,
+    /// hand-built on depth 2 (depth 1 for the tie) as `(step, relay pops,
+    /// relay fires, sink body pops)`:
+    ///
+    /// * two steps that share a clock: the relay pops a frame at the first and
+    ///   fires at the second, whose frame carries the shared stamp, so the
+    ///   frame is the second step's send and the first step's pop is a
+    ///   finding;
+    /// * a consumer whose input drains to its newest frame: after the relay's
+    ///   hold through steps 2 to 4 its body read at step 4, a `Served` or a
+    ///   body `DrainedBatch` read, empties the queue, so with the relay's
+    ///   step 5 frame the slot counts one and the relay's step 6 pop is a
+    ///   finding, where one frame per read leaves two counted;
+    /// * a consumer that fires with no read of the input recorded: from the
+    ///   step after it nothing bounds the slot, so the frame carried into step
+    ///   3 is a finding.
+    #[test]
+    fn the_bound_follows_the_bags_clocks_and_the_consumer_reads() {
+        let tied = vec![
+            fifo_step(0, 0, &[("relay", 1, 0, 0)]),
+            fifo_step(1, 0, &[("relay", 0, 1, 0)]),
+        ];
+        let tie = verify_unrestored(&relay(sink_holds(1, &tied)), &tied, &[], STAMPED);
+        assert_eq!(findings_of(&tie), vec![finding("relay", 0, 1, 0)]);
+
+        let rows = [
+            (0, 1, 1, 0),
+            (1, 1, 1, 0),
+            (2, 1, 0, 0),
+            (3, 0, 0, 0),
+            (4, 0, 0, 1),
+            (5, 0, 1, 0),
+            (6, 1, 0, 0),
+        ];
+        let steps = relay_steps(&rows);
+        let to_empty = {
+            let SlotRecord::Counted { frame_stamps, .. } = sent_by(&steps, &["relay"]) else {
+                unreachable!("sent_by counts")
+            };
+            BlockHoldEdges::new(vec![slot(
+                "sink",
+                2,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain: BodyDrain::ToEmpty,
+                },
+            )])
+        };
+        let latest = verify_unrestored(&relay(to_empty), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&latest), vec![finding("relay", 6, 1, 0)]);
+        let per_frame = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
+        assert!(per_frame.is_clean(), "{:?}", per_frame.findings);
+        // The same take as a body `DrainedBatch` read (an `accumulate` input's
+        // drain) empties the queue too, and only on an input that drains to
+        // its newest frame.
+        let batch_rows = [
+            (0, 1, 1, 0),
+            (1, 1, 1, 0),
+            (2, 1, 0, 0),
+            (3, 0, 0, 0),
+            (4, 0, 0, 0),
+            (5, 0, 1, 0),
+            (6, 1, 0, 0),
+        ];
+        let batch = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            None,
+            ReadSiteRole::Body,
+        );
+        let batched = with_read(relay_steps(&batch_rows), 4, batch);
+        let drained_to = |drain| {
+            let SlotRecord::Counted { frame_stamps, .. } = sent_by(&batched, &["relay"]) else {
+                unreachable!("sent_by counts")
+            };
+            BlockHoldEdges::new(vec![slot(
+                "sink",
+                2,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain,
+                },
+            )])
+        };
+        let batch_empties = verify_unrestored(
+            &relay(drained_to(BodyDrain::ToEmpty)),
+            &batched,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&batch_empties), vec![finding("relay", 6, 1, 0)]);
+        let batch_takes_one = verify_unrestored(
+            &relay(drained_to(BodyDrain::PerFrame)),
+            &batched,
+            &[],
+            STAMPED,
+        );
+        assert!(batch_takes_one.is_clean(), "{:?}", batch_takes_one.findings);
+
+        let unread_rows = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 0, 0), ("sink", 0, 1, 0)]),
+            fifo_step(3, 15_000, &[("relay", 0, 0, 0)]),
+        ];
+        let unread = verify_unrestored(
+            &relay(sink_holds(2, &unread_rows)),
+            &unread_rows,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&unread), vec![finding("relay", 3, 1, 0)]);
+        let quiet: Vec<RecordedStep> = unread_rows
+            .iter()
+            .cloned()
+            .map(|mut s| {
+                s.fires.retain(|f| f.node_id != "sink");
+                s
+            })
+            .collect();
+        let bounded = verify_unrestored(&relay(sink_holds(2, &quiet)), &quiet, &[], STAMPED);
+        assert!(bounded.is_clean(), "{:?}", bounded.findings);
+    }
+
+    /// The hold's edges on a relay read through one subscriber, each
+    /// hand-built as `(step, relay pops, relay fires, sink body pops)` on a
+    /// depth-1 `block` input, every one a shape the scheduler can record: an
+    /// onset at the second step (the first frame sent and not yet taken), a
+    /// hold that releases in full and engages again, and a consumer that
+    /// stops at step 2 and releases its slot for good, after which the relay
+    /// fires everything it holds. Each reads clean for a held relay and
+    /// convicts the first held step of a relay nothing holds. The stop is what
+    /// the last one is judged on: after it, a step that leaves one frame
+    /// unfired is a finding. With no stop known, the relay fires at step 3
+    /// while the slot already counts its depth, with no read since step 0,
+    /// which a slot that holds never allows, so it was released with no
+    /// record: the holds at steps 1 and 2 are voided, and step 1 is the
+    /// finding.
+    #[test]
+    fn a_held_fifo_relay_is_judged_at_every_edge_of_its_hold() {
+        let stopped_at_2 = || {
+            let mut stops = PassStops::none();
+            stops.note("sink", 2, 1, NodeStopCause::FatalError);
+            stops
+        };
+        let cases: Vec<HoldEdgeCase> = vec![
+            (
+                "onset at step 1",
+                vec![(0, 1, 1, 0), (1, 1, 0, 0), (2, 0, 0, 0)],
+                1,
+                PassStops::none(),
+            ),
+            (
+                "release and re-engage",
+                vec![
+                    (0, 1, 1, 0),
+                    (1, 1, 0, 1),
+                    (2, 0, 1, 1),
+                    (3, 1, 1, 0),
+                    (4, 1, 0, 1),
+                    (5, 0, 1, 0),
+                ],
+                1,
+                PassStops::none(),
+            ),
+            (
+                "consumer stops",
+                vec![(0, 1, 1, 0), (1, 1, 0, 0), (2, 0, 0, 0), (3, 5, 6, 0)],
+                1,
+                stopped_at_2(),
+            ),
+        ];
+        let judged = |holds, steps: &[RecordedStep], stops: &PassStops| {
+            verify(
+                &relay(holds),
+                steps,
+                &[],
+                STAMPED,
+                &PassRestore::none(),
+                stops,
+            )
+        };
+        for (label, rows, onset, stops) in &cases {
+            let steps = relay_steps(rows);
+            let held = judged(sink_holds(1, &steps), &steps, stops);
+            assert!(held.is_clean(), "{label}: {:?}", held.findings);
+            let unheld = verify_unrestored(&relay(BlockHoldEdges::none()), &steps, &[], STAMPED);
+            assert_eq!(unheld.findings.len(), 1, "{label}: {:?}", unheld.findings);
+            assert_eq!(unheld.findings[0].step, *onset, "{label}");
+        }
+        let one_left = relay_steps(&[(0, 1, 1, 0), (1, 1, 0, 0), (2, 0, 0, 0), (3, 5, 5, 0)]);
+        let after_stop = judged(sink_holds(1, &one_left), &one_left, &stopped_at_2());
+        assert_eq!(findings_of(&after_stop), vec![finding("relay", 3, 6, 5)]);
+        let no_stop = judged(sink_holds(1, &one_left), &one_left, &PassStops::none());
+        assert_eq!(findings_of(&no_stop), vec![finding("relay", 1, 1, 0)]);
+        assert_eq!(
+            no_stop.findings[0].caveat,
+            Some(FindingCaveat::UnrecordedRelease { release_step: 3 })
+        );
+    }
+
+    /// A held relay is convicted wherever no hold explains its step: a hold at
+    /// step 0, before anything was sent; a relay that freezes for good while
+    /// its consumer drains (the slot has room again at step 3); two popped
+    /// frames unfired; more fires than frames; a second frame unfired while
+    /// one is held (the boundary re-offers a held frame, it never pops
+    /// another). Depth 2 throughout.
+    #[test]
+    fn a_held_fifo_relay_is_still_convicted_where_no_hold_explains_it() {
+        let cases: &[HeldFindingCase] = &[
+            ("a hold before any frame", vec![(0, 1, 0, 0)], 0, 1, 0),
+            (
+                "a freeze while the consumer drains",
+                vec![(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 1), (3, 0, 0, 1)],
+                3,
+                1,
+                0,
+            ),
+            (
+                "two unfired",
+                vec![(0, 1, 1, 0), (1, 1, 1, 0), (2, 2, 0, 0)],
+                2,
+                2,
+                0,
+            ),
+            (
+                "more fires than frames",
+                vec![(0, 1, 1, 0), (1, 1, 2, 0)],
+                1,
+                1,
+                2,
+            ),
+            (
+                "a second frame unfired while one is held",
+                vec![(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0), (3, 1, 0, 0)],
+                3,
+                2,
+                0,
+            ),
+        ];
+        for (label, rows, step, supply, fires) in cases {
+            let steps = relay_steps(rows);
+            let report = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
+            assert_eq!(
+                findings_of(&report),
+                vec![finding("relay", *step, *supply, *fires)],
+                "{label}"
+            );
+            assert_eq!(
+                report.findings[0].caveat, None,
+                "{label}: the bag states the drain"
+            );
+        }
+    }
+
+    /// A throttled consumer read through two subscribers with nothing
+    /// downstream: it fires at step 0 and counts one frame per step after.
+    /// Every step inside its 50 ms window carries the count, and the first
+    /// step past it (step 10, 50 ms after the fire) owes every counted frame.
+    #[test]
+    fn a_throttled_two_subscriber_consumer_owes_its_count_once_the_window_passes() {
+        let sink = [fifo_decl(
+            "sink",
+            FifoDrain::Separate,
+            BlockHoldEdges::none(),
+            Some(50 * MS),
+        )];
+        let mut steps = vec![fifo_step(0, 0, &[("sink", 1, 1, 1)])];
+        steps.extend((1..=10).map(|n| fifo_step(n, n * 5_000, &[("sink", 1, 0, 0)])));
+        let report = verify_unrestored(&sink, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("sink", 10, 10, 0)]);
+        let inside = verify_unrestored(&sink, &steps[..10], &[], STAMPED);
+        assert!(inside.is_clean(), "{:?}", inside.findings);
+    }
+
+    /// The middle node of a `block` chain: its own trigger input is `block`,
+    /// so it reads through two subscribers, and the `block` input after it
+    /// (depth 2) holds it. Hand-built as `(step, its pops, its fires, the
+    /// consumer's body pops)`: it fires steps 0 to 2, the consumer taking the
+    /// first; at steps 3 to 6 it counts four frames held; each release (steps
+    /// 11 and 21, after the consumer's body takes a frame at steps 10 and 20)
+    /// fires one while one more frame arrives. Read clean on its count, a
+    /// finding at step 4 as one subscriber and at step 3 with nothing holding
+    /// it.
+    #[test]
+    fn a_held_fifo_node_read_through_two_subscribers_carries_its_count() {
+        let rows = [
+            (0, 1, 1, 1),
+            (1, 1, 1, 0),
+            (2, 1, 1, 0),
+            (3, 1, 0, 0),
+            (4, 1, 0, 0),
+            (5, 1, 0, 0),
+            (6, 1, 0, 0),
+            (10, 0, 0, 1),
+            (11, 0, 1, 0),
+            (12, 1, 0, 0),
+            (20, 0, 0, 1),
+            (21, 0, 1, 0),
+            (22, 1, 0, 0),
+        ];
+        let steps = relay_steps(&rows);
+        let mid = |drain, holds| [fifo_decl("relay", drain, holds, None)];
+        let separate = verify_unrestored(
+            &mid(FifoDrain::Separate, sink_holds(2, &steps)),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(separate.is_clean(), "unexpected: {:?}", separate.findings);
+        let unified = verify_unrestored(
+            &mid(FifoDrain::Unified, sink_holds(2, &steps)),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&unified), vec![finding("relay", 4, 2, 0)]);
+        let unheld = verify_unrestored(
+            &mid(FifoDrain::Separate, BlockHoldEdges::none()),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&unheld), vec![finding("relay", 3, 1, 0)]);
+    }
+
+    /// The same recording on a bag that does not record how the relay's
+    /// `drop_oldest` trigger input was read: the relay is judged without the
+    /// hold, convicted at step 4 (one pop, no fire), and its finding carries
+    /// the caveat, since the slot was full there by the bag's own record. The sink's
+    /// `block` trigger input settles its drain by declaration, so it is still
+    /// read clean on its count.
+    #[test]
+    fn a_held_relay_whose_drain_the_bag_does_not_record_is_judged_without_the_hold() {
+        let steps = ws1_steps();
+        let nodes = vec![
+            fifo_decl("relay", FifoDrain::Unrecorded, sink_holds(2, &steps), None),
+            fifo_decl(
+                "sink",
+                FifoDrain::Separate,
+                BlockHoldEdges::none(),
+                Some(50 * MS),
+            ),
+        ];
+        let report = verify_unrestored(&nodes, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 4, 1, 0)]);
+        assert_eq!(
+            report.findings[0].caveat,
+            Some(FindingCaveat::DrainUnrecordedHold)
+        );
+        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        assert_eq!(
+            report.findings[0].to_string(),
+            "fire-schedule divergence: node 'relay' step 4 FIFO pop count \u{2014} re-derived 1 \
+             fire(s), recorded 0 fire(s); the bag does not record whether this node's trigger \
+             input was read through one subscriber or two, so a hold by a `block` input in its \
+             rank is not allowed for and can read as this divergence; a bag that records how a \
+             FIFO input was read is judged with the hold"
+        );
+    }
+
+    /// The caveat rides only a short step of a held node whose drain the bag
+    /// does not settle, at a step where the slot was full by the bag's own record: an
+    /// unthrottled node short by one, a throttled one short by two (short by
+    /// one, its throttle already excuses it). Not an over-fire, not a step
+    /// whose slot the bag does not show full, not a stopping step, not a node whose
+    /// drain the bag states, not one nothing holds.
+    #[test]
+    fn the_unrecorded_drain_caveat_rides_only_a_short_step_a_hold_can_explain() {
+        let short_one = relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0)]);
+        let short_two = relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 2, 0, 0)]);
+        let over_fire = relay_steps(&[(0, 1, 1, 0), (1, 1, 2, 0)]);
+        let before_any = relay_steps(&[(0, 1, 0, 0)]);
+        let decl = |drain, holds, throttle| fifo_decl("relay", drain, holds, throttle);
+        let cases: Vec<(&str, NodeDecl, &[RecordedStep], Option<FindingCaveat>)> = vec![
+            (
+                "held, unthrottled, short by one",
+                decl(FifoDrain::Unrecorded, sink_holds(2, &short_one), None),
+                &short_one,
+                Some(FindingCaveat::DrainUnrecordedHold),
+            ),
+            (
+                "held, throttled, short by two",
+                decl(FifoDrain::Unrecorded, sink_holds(2, &short_two), Some(MS)),
+                &short_two,
+                Some(FindingCaveat::DrainUnrecordedHold),
+            ),
+            (
+                "an over-fire",
+                decl(FifoDrain::Unrecorded, sink_holds(2, &over_fire), None),
+                &over_fire,
+                None,
+            ),
+            (
+                "a slot the bag does not show full",
+                decl(FifoDrain::Unrecorded, sink_holds(2, &before_any), None),
+                &before_any,
+                None,
+            ),
+            (
+                "a bag that records the drain",
+                decl(FifoDrain::Unified, sink_holds(2, &short_two), None),
+                &short_two,
+                None,
+            ),
+            (
+                "nothing holds it",
+                decl(FifoDrain::Unrecorded, BlockHoldEdges::none(), None),
+                &short_one,
+                None,
+            ),
+        ];
+        for (label, decl, steps, caveat) in &cases {
+            let report = verify_unrestored(std::slice::from_ref(decl), steps, &[], STAMPED);
+            assert_eq!(report.findings.len(), 1, "{label}: {:?}", report.findings);
+            assert_eq!(report.findings[0].caveat, *caveat, "{label}");
+        }
+        let throttled_one = verify_unrestored(
+            &[decl(
+                FifoDrain::Unrecorded,
+                sink_holds(2, &short_one),
+                Some(MS),
+            )],
+            &short_one,
+            &[],
+            STAMPED,
+        );
+        assert!(throttled_one.is_clean(), "{:?}", throttled_one.findings);
+        // The stopping step: the relay stops on step 1's first fire, which
+        // recorded none.
+        let stop_step = relay_steps(&[(0, 1, 1, 0), (1, 2, 0, 0)]);
+        let mut stops = PassStops::none();
+        stops.note("relay", 1, 1, NodeStopCause::FatalError);
+        let stopped = verify(
+            &[decl(FifoDrain::Unrecorded, sink_holds(1, &stop_step), None)],
+            &stop_step,
+            &[],
+            STAMPED,
+            &PassRestore::none(),
+            &stops,
+        );
+        assert_eq!(stopped.findings.len(), 1, "{:?}", stopped.findings);
+        assert_eq!(stopped.findings[0].caveat, None);
+    }
+
+    /// Two steps that share a clock place a frame stamped at that clock at the
+    /// last of them, so a drain at the first takes a frame the bound has not
+    /// counted yet: it is owed against that frame, never lost. Depth 1: the
+    /// relay fires at step 0 and the sink takes the frame in the same step;
+    /// step 1 shares the clock and is empty; the relay's step 2 pop left
+    /// unfired is a finding, since the slot holds nothing.
+    #[test]
+    fn a_drain_inside_a_shared_clock_is_owed_against_its_frames() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 0, 1)]),
+            fifo_step(1, 0, &[]),
+            fifo_step(2, 5_000, &[("relay", 1, 0, 0)]),
+        ];
+        let report = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 1, 0)]);
+    }
+
+    /// An empty read inside steps that share a clock: the frames stamped at
+    /// that clock cannot be placed before or after it, so none of them is
+    /// counted, and the bound stays at or below the slot's count. Depth 1: the
+    /// relay fires at steps 0 and 2, the sink takes the first frame at step 0
+    /// and reads its queue empty at step 1, all three at one clock; the
+    /// relay's step 3 pop left unfired is a finding. The next clock's frames
+    /// count again: a step 3 that pops two and fires one fills the slot with
+    /// its own frame, and the pop it left unfired is the hold.
+    #[test]
+    fn an_empty_read_inside_a_shared_clock_counts_none_of_its_frames() {
+        let empty = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Body,
+        );
+        let shared = |last: (&'static str, u32, u32, u32)| {
+            with_read(
+                vec![
+                    fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 0, 1)]),
+                    fifo_step(1, 0, &[]),
+                    fifo_step(2, 0, &[("relay", 1, 1, 0)]),
+                    fifo_step(3, 5_000, &[last]),
+                ],
+                1,
+                empty.clone(),
+            )
+        };
+        let steps = shared(("relay", 1, 0, 0));
+        let report = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        let refilled = shared(("relay", 2, 1, 0));
+        let report = verify_unrestored(&relay(sink_holds(1, &refilled)), &refilled, &[], STAMPED);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// The relay's frames as the slot `sink.inp` at `depth` counts them,
+    /// drained the way `drain` says.
+    fn sink_slot(depth: u64, steps: &[RecordedStep], drain: BodyDrain) -> BlockHoldEdges {
+        let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+            unreachable!("sent_by counts")
+        };
+        BlockHoldEdges::new(vec![slot(
+            "sink",
+            depth,
+            SlotRecord::Counted {
+                frame_stamps,
+                drain,
+            },
+        )])
+    }
+
+    /// A latest-value consumer fire with no read recorded can hide a drain,
+    /// which follows the relay's checks of that step: the step keeps its
+    /// count and the slot is unknown from the next. Depth 2: the relay fires
+    /// one frame at each of steps 0 and 1, the sink's step 0 read draining the
+    /// first, and at step 2 the relay pops two and fires one, which fills the
+    /// slot, so the pop left unfired is the hold, while the sink fires with no
+    /// read. At step 3 the relay pops two and fires two, the first fire taking
+    /// the frame it held, and holds the second: the slot is unknown, so the
+    /// step is the finding. With the step 2 read present and believed empty,
+    /// the slot is empty after step 2, the relay's two step 3 frames fill it,
+    /// and the step reads clean.
+    #[test]
+    fn a_latest_value_consumer_fire_with_no_read_leaves_the_slot_unknown() {
+        let unread = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 2, 1, 0), ("sink", 0, 1, 0)]),
+            fifo_step(3, 15_000, &[("relay", 2, 2, 0)]),
+        ];
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &unread, BodyDrain::ToEmpty)),
+            &unread,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 3, 2)]);
+
+        let read_empty = with_read(
+            unread.clone(),
+            2,
+            read_with_role(
+                "sink",
+                "inp",
+                ReadOutcomeKind::NoFrame,
+                0,
+                None,
+                ReadSiteRole::Body,
+            ),
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &read_empty, BodyDrain::ToEmpty)),
+            &read_empty,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// The slot a consumer fire with no read left unknown is known again from
+    /// the step after the consumer's next read, which empties a latest-value
+    /// input. Depth 2: the sink reads at steps 0 and 2 and fires with no read
+    /// at step 3, while the relay fires one frame a step. A step 4 that pops
+    /// two and fires one, before any read, is the finding; with the sink
+    /// reading at step 4 instead, the step 5 frame and the first of step 6
+    /// fill the slot, and step 6's second pop left unfired is the hold.
+    #[test]
+    fn a_slot_left_unknown_by_an_unread_fire_is_known_at_the_next_read() {
+        let lead = |rest: Vec<RecordedStep>| {
+            let mut steps = vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(3, 15_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
+            ];
+            steps.extend(rest);
+            steps
+        };
+        let judge = |steps: &[RecordedStep]| {
+            verify_unrestored(
+                &relay(sink_slot(2, steps, BodyDrain::ToEmpty)),
+                steps,
+                &[],
+                STAMPED,
+            )
+        };
+        let unknown = lead(vec![fifo_step(4, 20_000, &[("relay", 2, 1, 0)])]);
+        assert_eq!(
+            findings_of(&judge(&unknown)),
+            vec![finding("relay", 4, 2, 1)]
+        );
+        let known = lead(vec![
+            fifo_step(4, 20_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(5, 25_000, &[("relay", 1, 1, 0)]),
+            fifo_step(6, 30_000, &[("relay", 2, 1, 0)]),
+        ]);
+        let report = judge(&known);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// A FIFO input drains only at the reads its consumer's body makes, so a
+    /// consumer fire that reads it not at all drains nothing and the slot
+    /// keeps its count. Depth 2: the sink takes the step 0 frame, the relay's
+    /// steps 1 and 2 frames fill the slot, the sink fires with no read at step
+    /// 2, and the relay's step 3 pop left unfired is the hold: the steps read
+    /// clean.
+    #[test]
+    fn a_fifo_input_its_consumer_fires_without_reading_keeps_its_count() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
+            fifo_step(3, 15_000, &[("relay", 1, 0, 0)]),
+        ];
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &steps, BodyDrain::PerFrame)),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// The relay's frames as the slot `sink.inp` at `depth` counts them,
+    /// drained to empty, on a consumer whose tick reads `before` ahead of
+    /// `inp`.
+    fn sink_slot_reading(depth: u64, steps: &[RecordedStep], before: &[&str]) -> BlockHoldEdges {
+        let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+            unreachable!("sent_by counts")
+        };
+        let counted = SlotRecord::Counted {
+            frame_stamps,
+            drain: BodyDrain::ToEmpty,
+        };
+        BlockHoldEdges::new(vec![BlockHoldEdge {
+            reads_before: ReadsBefore::Known(
+                before
+                    .iter()
+                    .map(|name| ViewedInput::Context((*name).to_string()))
+                    .collect(),
+            ),
+            ..slot("sink", depth, counted)
+        }])
+    }
+
+    /// The rows of the healthy-collapse vectors: depth 2, the relay firing
+    /// one frame at each of steps 0 and 1, the sink's step 0 read draining the
+    /// first, then the sink firing `fires` times at step 1 with `reads` and no
+    /// read of `inp`, and at step 2 the relay popping two and firing one
+    /// before the sink reads `inp`.
+    fn collapse_rows(fires: u32, reads: Vec<RecordedRead>) -> Vec<RecordedStep> {
+        let mut steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0), ("sink", 0, fires, 0)]),
+            fifo_step(2, 10_000, &[("relay", 2, 1, 0), ("sink", 0, 1, 1)]),
+        ];
+        steps[1].reads.extend(reads);
+        steps
+    }
+
+    /// A read of the sink's input `input`: `kind`, popping `popped`, at
+    /// `role`.
+    fn sink_read(
+        input: &str,
+        kind: ReadOutcomeKind,
+        popped: u32,
+        role: ReadSiteRole,
+    ) -> RecordedRead {
+        read_with_role("sink", input, kind, popped, None, role)
+    }
+
+    /// The generated tick reads each input it views once per fire, in
+    /// declaration order, and ends at the first that serves nothing, so a
+    /// fire whose earlier input records a believed body `NoFrame` never
+    /// reached the `block` input and drained nothing. On the collapse rows
+    /// with the sink reading `a` ahead of `inp`, the step 1 fire ends at `a`,
+    /// so the slot keeps the relay's step 1 frame; the relay's step 2 frame
+    /// fills it, and the pop left unfired is the hold. A `NoFrame`
+    /// whose role is not believed says nothing of where the tick ended, and a
+    /// consumer whose tick replay cannot know reads nothing off it: both
+    /// leave the slot unknown at step 2, and the step is the finding.
+    #[test]
+    fn a_fire_that_ends_before_a_latest_value_input_keeps_its_count() {
+        let ended = collapse_rows(
+            1,
+            vec![sink_read(
+                "a",
+                ReadOutcomeKind::NoFrame,
+                0,
+                ReadSiteRole::Body,
+            )],
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot_reading(2, &ended, &["a"])),
+            &ended,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unbelieved = collapse_rows(
+            1,
+            vec![sink_read(
+                "a",
+                ReadOutcomeKind::NoFrame,
+                0,
+                ReadSiteRole::Unstamped,
+            )],
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot_reading(2, &unbelieved, &["a"])),
+            &unbelieved,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &ended, BodyDrain::ToEmpty)),
+            &ended,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+    }
+
+    /// Each believed body `NoFrame` of an earlier `block` input stands for one
+    /// fire that ended there, so a step whose fires outnumber them can hide a
+    /// drain. The collapse rows with the sink firing twice at step 1: one tick
+    /// ends at `a`, the other reads `a` and records no read of `inp`, so the
+    /// slot is unknown at step 2 and the pop left unfired is the finding.
+    #[test]
+    fn fires_past_the_ones_that_ended_early_leave_the_slot_unknown() {
+        let steps = collapse_rows(
+            2,
+            vec![
+                sink_read("a", ReadOutcomeKind::NoFrame, 0, ReadSiteRole::Body),
+                sink_read("a", ReadOutcomeKind::Served, 1, ReadSiteRole::Body),
+            ],
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot_reading(2, &steps, &["a"])),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+    }
+
+    /// Only an input the tick reads before the `block` input can end it
+    /// there: an input read after it records its `NoFrame` on a fire that
+    /// read the `block` input first, and the trigger drain's empty consult of
+    /// an earlier input is not the tick's read. On the collapse rows with the
+    /// step 1 `NoFrame` on `b`, which the sink reads after `inp`, or on `a` at
+    /// the drain site, the slot is unknown at step 2 and the pop left unfired
+    /// is the finding.
+    #[test]
+    fn a_no_frame_after_the_input_or_at_the_drain_ends_no_fire_before_it() {
+        for (label, read) in [
+            (
+                "read after the input",
+                sink_read("b", ReadOutcomeKind::NoFrame, 0, ReadSiteRole::Body),
+            ),
+            (
+                "the trigger drain's consult",
+                sink_read("a", ReadOutcomeKind::NoFrame, 0, ReadSiteRole::Drain),
+            ),
+        ] {
+            let steps = collapse_rows(1, vec![read]);
+            let report = verify_unrestored(
+                &relay(sink_slot_reading(2, &steps, &["a"])),
+                &steps,
+                &[],
+                STAMPED,
+            );
+            assert_eq!(
+                findings_of(&report),
+                vec![finding("relay", 2, 2, 1)],
+                "{label}"
+            );
+        }
+    }
+
+    /// The relay's frames as the slot `sink.inp` at `depth` counts them,
+    /// drained the way `drain` says, on a consumer whose tick views the
+    /// trigger inputs `triggers` and the other inputs `contexts` before `inp`.
+    fn sink_slot_viewing(
+        depth: u64,
+        steps: &[RecordedStep],
+        drain: BodyDrain,
+        triggers: &[&str],
+        contexts: &[&str],
+    ) -> BlockHoldEdges {
+        let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+            unreachable!("sent_by counts")
+        };
+        let viewed = triggers
+            .iter()
+            .map(|name| ViewedInput::Trigger((*name).to_string()))
+            .chain(
+                contexts
+                    .iter()
+                    .map(|name| ViewedInput::Context((*name).to_string())),
+            )
+            .collect();
+        BlockHoldEdges::new(vec![BlockHoldEdge {
+            reads_before: ReadsBefore::Known(viewed),
+            ..slot(
+                "sink",
+                depth,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain,
+                },
+            )
+        }])
+    }
+
+    /// One step on a 5 ms step of the startup vectors: the relay's `(pops,
+    /// fires)`, the sink's fires and body pops of `inp`, and the sink's other
+    /// reads.
+    fn startup_step(
+        n: u64,
+        relay: (u32, u32),
+        sink: (u32, u32),
+        reads: Vec<RecordedRead>,
+    ) -> RecordedStep {
+        let mut step = fifo_step(
+            n,
+            n * 5_000,
+            &[("relay", relay.0, relay.1, 0), ("sink", 0, sink.0, sink.1)],
+        );
+        step.reads.extend(reads);
+        step
+    }
+
+    /// The tick of a consumer whose context input has had no delivery yet
+    /// ends at that input, which a step-boundary snapshot records as one body
+    /// `NoFrame` served to every fire of the step, so a first fire that ends
+    /// there leaves the slot counted. Depth 1, the sink's tick viewing its
+    /// trigger `s` and its context `cfg` before `inp`: the relay fires one
+    /// frame at step 0 and is held from step 1, the sink fires at every step,
+    /// and its tick ends at `cfg` at steps 0 to 2 (`NoFrame`, one record a
+    /// step, two fires at step 1). At step 3 `cfg` serves and the sink takes
+    /// the frame, and at step 4 the relay fires the frame it held and holds
+    /// the next. Every pop left unfired is the hold and the pass reads clean.
+    /// A relay that pops at step 4 and fires nothing, with the slot empty,
+    /// is the finding; so is the step after a first fire whose `cfg` read
+    /// served and whose `inp` read is not recorded, a read log that never
+    /// records the input; and so is a step after two fires that read the
+    /// slot's input past a `block` input that was empty for one of them.
+    #[test]
+    fn a_first_fire_that_ends_at_a_context_input_before_its_first_delivery_keeps_the_slot() {
+        let cfg = |kind, popped| sink_read("cfg", kind, popped, ReadSiteRole::Body);
+        let rows = |cfg0: RecordedRead, last_relay: (u32, u32)| {
+            vec![
+                startup_step(0, (1, 1), (1, 0), vec![cfg0]),
+                startup_step(1, (1, 0), (2, 0), vec![cfg(ReadOutcomeKind::NoFrame, 0)]),
+                startup_step(2, (0, 0), (1, 0), vec![cfg(ReadOutcomeKind::NoFrame, 0)]),
+                startup_step(3, (0, 0), (1, 1), vec![cfg(ReadOutcomeKind::Served, 1)]),
+                startup_step(4, last_relay, (1, 1), vec![cfg(ReadOutcomeKind::Held, 0)]),
+            ]
+        };
+        let judge = |steps: &[RecordedStep], contexts: &[&str]| {
+            verify_unrestored(
+                &relay(sink_slot_viewing(
+                    1,
+                    steps,
+                    BodyDrain::ToEmpty,
+                    &["s"],
+                    contexts,
+                )),
+                steps,
+                &[],
+                STAMPED,
+            )
+        };
+        let healthy = rows(cfg(ReadOutcomeKind::NoFrame, 0), (1, 1));
+        let report = judge(&healthy, &["cfg"]);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let dropped = rows(cfg(ReadOutcomeKind::NoFrame, 0), (1, 0));
+        assert_eq!(
+            findings_of(&judge(&dropped, &["cfg"])),
+            vec![finding("relay", 4, 2, 0)]
+        );
+        let unrecorded = rows(cfg(ReadOutcomeKind::Served, 1), (1, 1));
+        assert_eq!(
+            findings_of(&judge(&unrecorded, &["cfg"])),
+            vec![finding("relay", 1, 1, 0)]
+        );
+
+        let a = |kind, popped| sink_read("a", kind, popped, ReadSiteRole::Body);
+        let past_a = vec![
+            startup_step(0, (1, 1), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(
+                1,
+                (1, 0),
+                (2, 0),
+                vec![
+                    a(ReadOutcomeKind::NoFrame, 0),
+                    a(ReadOutcomeKind::Served, 1),
+                ],
+            ),
+            startup_step(2, (0, 0), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+        ];
+        assert_eq!(
+            findings_of(&judge(&past_a, &["a"])),
+            vec![finding("relay", 2, 1, 0)]
+        );
+    }
+
+    /// An earlier `block` input whose producer starts late ends the first
+    /// fire with a live `NoFrame`, its only record at the step, so the slot
+    /// stays counted. Depth 1, the sink viewing `t` and the `block` input `a`
+    /// before `inp`: `a` is empty at the even steps and serves at the odd
+    /// ones, where the sink takes the slot's frame; the relay fires at steps 0
+    /// and 2 and is held at steps 1 and 3, and the pass reads clean.
+    #[test]
+    fn a_first_fire_that_ends_at_a_block_input_whose_producer_starts_late_keeps_the_slot() {
+        let a = |kind, popped| sink_read("a", kind, popped, ReadSiteRole::Body);
+        let steps = vec![
+            startup_step(0, (1, 1), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(1, (1, 0), (1, 1), vec![a(ReadOutcomeKind::Served, 1)]),
+            startup_step(2, (0, 1), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(3, (1, 0), (1, 1), vec![a(ReadOutcomeKind::Served, 1)]),
+        ];
+        let report = verify_unrestored(
+            &relay(sink_slot_viewing(
+                1,
+                &steps,
+                BodyDrain::ToEmpty,
+                &["t"],
+                &["a"],
+            )),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// On a resumed pass the slot is unknown until the consumer first reads
+    /// its queue empty, and a first fire that ends at an earlier input does
+    /// not lose it for the pass. Depth 2, the sink viewing `s` and `cfg`
+    /// before `inp`: at step 0 its tick ends at `cfg`, at step 1 it reads the
+    /// slot empty, the relay's frames at steps 2 and 3 fill it, and the step 3
+    /// pop left unfired is the hold.
+    #[test]
+    fn a_resumed_pass_whose_first_fire_ends_before_the_input_is_known_at_its_first_read() {
+        let cfg = |kind, popped| sink_read("cfg", kind, popped, ReadSiteRole::Body);
+        let steps = vec![
+            startup_step(0, (1, 1), (1, 0), vec![cfg(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(1, (1, 1), (1, 1), vec![cfg(ReadOutcomeKind::Served, 1)]),
+            startup_step(2, (1, 1), (0, 0), vec![]),
+            startup_step(3, (2, 1), (0, 0), vec![]),
+        ];
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+        let report = verify(
+            &relay(sink_slot_viewing(
+                2,
+                &steps,
+                BodyDrain::ToEmpty,
+                &["s"],
+                &["cfg"],
+            )),
+            &steps,
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// A `sample(N)` trigger input read before the `block` input ends the
+    /// fire whose frame its gate drops: the live read records `Decimated` and
+    /// serves nothing. On the collapse rows with the sink viewing the trigger
+    /// `s` ahead of `inp`, a `Decimated` read of `s` at step 1 keeps the
+    /// count, and the relay's step 2 pop left unfired is the hold. A context
+    /// input frozen at the step's boundary still serves the frame it held
+    /// after a decimated snapshot, so a `Decimated` read of one ends nothing:
+    /// the slot is unknown at step 2 and the pop left unfired is the finding.
+    #[test]
+    fn a_fire_whose_sample_gate_drops_the_trigger_frame_keeps_the_count() {
+        let decimated = |input| sink_read(input, ReadOutcomeKind::Decimated, 1, ReadSiteRole::Body);
+        let gated = collapse_rows(1, vec![decimated("s")]);
+        let report = verify_unrestored(
+            &relay(sink_slot_viewing(
+                2,
+                &gated,
+                BodyDrain::ToEmpty,
+                &["s"],
+                &[],
+            )),
+            &gated,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let held = collapse_rows(1, vec![decimated("c")]);
+        let report = verify_unrestored(
+            &relay(sink_slot_viewing(2, &held, BodyDrain::ToEmpty, &[], &["c"])),
+            &held,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+    }
+
+    /// A slot that counts past its depth from a producer that sends at most one
+    /// frame per fire holds nothing from that step on: while it holds, the
+    /// check stops the producer at the depth. Depth 4, a
+    /// latest-value input on a consumer throttled to one fire per 50 ms, on a
+    /// 20 ms step: the sink fires at steps 0, 3, 6 and so on through 30, taking
+    /// every frame, so the slot never reaches 4. It stops at its step 30 fire
+    /// (a `NodeError::Fatal`, which releases its slot), the relay fires one
+    /// frame a step to step 39, pops a frame at step 40 and fires nothing
+    /// although nothing could hold it, and fires the frame it kept and the
+    /// next at step 41. With no stop known the slot counts five frames at
+    /// step 35, past its depth, so it holds nothing from there and step 40 is
+    /// the finding; with the stop known it is released after step 30, and step
+    /// 40 is the same finding.
+    #[test]
+    fn a_slot_that_counts_past_its_depth_holds_nothing_from_there() {
+        let steps: Vec<RecordedStep> = (0..=41)
+            .map(|n| {
+                let relay = match n {
+                    40 => ("relay", 1, 0, 0),
+                    41 => ("relay", 1, 2, 0),
+                    _ => ("relay", 1, 1, 0),
+                };
+                if n <= 30 && n % 3 == 0 {
+                    fifo_step(n, n * 20_000, &[relay, ("sink", 0, 1, 1)])
+                } else {
+                    fifo_step(n, n * 20_000, &[relay])
+                }
+            })
+            .collect();
+        let decls = relay(sink_slot(4, &steps, BodyDrain::ToEmpty));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 40, 1, 0)]);
+        assert_eq!(report.findings[0].caveat, None);
+
+        let mut stops = PassStops::none();
+        stops.note("sink", 30, 1, NodeStopCause::FatalError);
+        let report = verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops);
+        assert_eq!(findings_of(&report), vec![finding("relay", 40, 1, 0)]);
+    }
+
+    /// A consumer's recorded stop releases its slot from the next step when it
+    /// releases the slot live: a fatal error or a poisoned entry, though a
+    /// poisoned node keeps firing; the consecutive-panic breaker releases
+    /// none. Depth 2 on a FIFO input: the sink takes the step 0 frame, the
+    /// relay fills the slot, the sink takes a frame at step 3 and stops
+    /// there, and the relay fires one frame at step 4 and pops one at step 5
+    /// that it does not fire. A poisoned sink also fires at step 4 with no
+    /// read (its tick skipped); a fatal or breaker stop ends the sink's
+    /// fires. Released after step 3, nothing holds the relay at step 5, so it
+    /// is the finding; armed, the slot counts two there and the step is the
+    /// hold.
+    #[test]
+    fn a_consumer_stop_releases_its_slot_where_it_does_live() {
+        let judged = |cause, sink_fires_at_4| {
+            let steps = vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("sink", 0, 1, 1)]),
+                fifo_step(
+                    4,
+                    20_000,
+                    &[("relay", 1, 1, 0), ("sink", 0, sink_fires_at_4, 0)],
+                ),
+                fifo_step(5, 25_000, &[("relay", 1, 0, 0)]),
+            ];
+            let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+            let mut stops = PassStops::none();
+            stops.note_recorded(
+                3,
+                &StepStop {
+                    node_id: "sink".to_string(),
+                    rank: 0,
+                    fires: NonZeroU32::MIN,
+                    cause,
+                },
+            );
+            verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops)
+        };
+        for (cause, sink_fires_at_4) in [
+            (NodeStopCause::EntryPoisoned, 1),
+            (NodeStopCause::FatalError, 0),
+        ] {
+            assert_eq!(
+                findings_of(&judged(cause, sink_fires_at_4)),
+                vec![finding("relay", 5, 1, 0)],
+                "{cause:?}"
+            );
+        }
+        let breaker = judged(NodeStopCause::DisabledAfterPanics, 0);
+        assert!(breaker.is_clean(), "{:?}", breaker.findings);
+    }
+
+    /// Depth 2 on a FIFO input: the sink reads one frame at step 0, the relay
+    /// fills the slot at steps 1 and 2, pops a frame at step 3 and fires
+    /// nothing, which the full slot excuses, and at step 4 fires the frame it
+    /// kept and the next: the slot then counts four with no read of it by the
+    /// sink since step 0. `sink_at_3` is one more `(node, pops, fires, body
+    /// pops)` entry at step 3, as [`fifo_step`] takes it.
+    fn voided_hold_steps(sink_at_3: (&'static str, u32, u32, u32)) -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 1_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 2_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 3_000, &[("relay", 1, 0, 0), sink_at_3]),
+            fifo_step(4, 4_000, &[("relay", 1, 2, 0)]),
+        ]
+    }
+
+    /// A hold the slot later counts past its depth for, with no read of it by
+    /// its consumer in between, is voided: from a producer that sends at most
+    /// one frame per fire, a slot that holds never passes its depth, so it was
+    /// released before then with no record, and the step it excused is the
+    /// finding, saying why.
+    #[test]
+    fn a_hold_its_slot_later_counts_past_the_depth_for_is_the_finding() {
+        let steps = voided_hold_steps(("relay", 0, 0, 0));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        assert_eq!(
+            report.findings[0].caveat,
+            Some(FindingCaveat::UnrecordedRelease { release_step: 4 })
+        );
+        assert_eq!(
+            report.findings[0].to_string(),
+            "fire-schedule divergence: node 'relay' step 3 FIFO pop count \u{2014} re-derived 1 \
+             fire(s), recorded 0 fire(s); the recording shows every `block` slot that excused \
+             this step released, the last of them at step 4, with no read by their consumers \
+             in between: its producer fired while it counted its depth, or a producer that \
+             sends at most one frame per fire took it past its depth; a slot that holds allows \
+             neither, so each was released with no record and the hold is not allowed for"
+        );
+    }
+
+    /// The step that shows the release voids the hold whatever the step's own
+    /// reads give its pop count: a truncated read of the relay's input at step
+    /// 4, which stands the rule down from there, comes after the void.
+    #[test]
+    fn a_hold_a_later_release_voids_is_the_finding_before_that_steps_stand_down() {
+        let mut steps = voided_hold_steps(("relay", 0, 0, 0));
+        steps[4].reads.push(read_with_role(
+            "relay",
+            "inp",
+            ReadOutcomeKind::Truncated,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        ));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        assert_eq!(
+            report.findings[0].caveat,
+            Some(FindingCaveat::UnrecordedRelease { release_step: 4 })
+        );
+        assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+    }
+
+    /// A read of the slot by its consumer after the hold shows the slot armed
+    /// at it, so a later count past the depth leaves the hold standing: the
+    /// same steps with the sink reading its frame at step 3 read clean.
+    #[test]
+    fn a_consumer_read_after_the_hold_keeps_it() {
+        let steps = voided_hold_steps(("sink", 0, 1, 1));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// A consumer read confirms every hold its slot gave since the consumer
+    /// last read it. Depth 2 on a FIFO input: the sink takes the step 0 frame,
+    /// the relay fills the slot and pops a frame at step 3 that it keeps
+    /// unfired through step 5, the sink reads a frame at step 5, and at step 6
+    /// the relay fires the frame it kept and two more, so the slot counts four
+    /// with no read since step 5. The step 5 read shows the slot armed at the
+    /// checks of steps 3, 4 and 5, so those holds stand and the steps read
+    /// clean.
+    #[test]
+    fn a_consumer_read_confirms_every_hold_its_slot_gave_before_it() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 1_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 2_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 3_000, &[("relay", 1, 0, 0)]),
+            fifo_step(4, 4_000, &[]),
+            fifo_step(5, 5_000, &[("sink", 0, 1, 1)]),
+            fifo_step(6, 6_000, &[("relay", 2, 3, 0)]),
+        ];
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// A hold that lasts with no read of its slot keeps one pending excuse, its
+    /// first step's, so each held step costs the same however long the hold
+    /// runs. Depth 2 on a FIFO input: the sink takes the step 0 frame, the
+    /// relay fills the slot and pops a frame at step 3 that it keeps unfired
+    /// through step 10002, the sink never reads again, and at step 10003 the
+    /// relay fires the frame it kept and two more, so the slot counts five:
+    /// step 3, the first step the hold excused, is the finding, voided at step
+    /// 10003.
+    #[test]
+    fn a_hold_of_ten_thousand_steps_with_no_read_voids_its_first_step() {
+        const LAST: u64 = 10_003;
+        let mut steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 1_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 2_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 3_000, &[("relay", 1, 0, 0)]),
+        ];
+        steps.extend((4..LAST).map(|n| fifo_step(n, n * 1_000, &[])));
+        steps.push(fifo_step(LAST, LAST * 1_000, &[("relay", 2, 3, 0)]));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        assert_eq!(
+            report.findings[0].caveat,
+            Some(FindingCaveat::UnrecordedRelease { release_step: LAST })
+        );
+    }
+
+    /// A hold that lasts with no read of its slot keeps one pending excuse,
+    /// whatever its length: excuses with the same slots settle together, so
+    /// only the first held step's stays. Depth 2 on a FIFO input, as `(step,
+    /// relay pops, relay fires)`: the sink takes the step 0 frame, the relay
+    /// fills the slot at steps 1 and 2, pops a frame at step 3 that it keeps
+    /// unfired through step 1002, and the sink never reads again. After each
+    /// of steps 0 to 2 nothing is pending; after each step from 3 on, step 3's
+    /// excuse alone is.
+    #[test]
+    fn a_hold_with_no_read_keeps_one_pending_excuse_however_long_it_lasts() {
+        const LAST: u64 = 1_002;
+        let mut rows: Vec<(u64, u32, u32)> = vec![(0, 1, 1), (1, 1, 1), (2, 1, 1), (3, 1, 0)];
+        rows.extend((4..=LAST).map(|n| (n, 0, 0)));
+        let steps: Vec<RecordedStep> = rows
+            .iter()
+            .map(|&(n, pops, fires)| {
+                if n == 0 {
+                    fifo_step(n, 0, &[("relay", pops, fires, 0), ("sink", 0, 1, 1)])
+                } else {
+                    fifo_step(n, n * 1_000, &[("relay", pops, fires, 0)])
+                }
+            })
+            .collect();
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let mut carry = FifoCarry::new(&decls[0], FifoDrain::Unified, false, &PassStops::none());
+        for (at, (step, &(n, pops, fires))) in steps.iter().zip(&rows).enumerate() {
+            let next_clock_ns = steps.get(at + 1).map(|s| s.clock_ns);
+            let fired: Vec<(&str, u64)> = step
+                .fires
+                .iter()
+                .map(|f| (f.node_id.as_str(), f.fire_time_ns))
+                .collect();
+            let judged = carry.step(
+                pops,
+                fires,
+                n,
+                step.clock_ns,
+                next_clock_ns,
+                &fired,
+                &step.reads,
+                STAMPED,
+            );
+            assert!(judged.outcome.is_ok(), "step {n}: {:?}", judged.outcome);
+            assert_eq!(judged.voided, None, "step {n}");
+            let pending: Vec<u64> = carry.pending.iter().map(|e| e.step).collect();
+            let expected: &[u64] = if n >= 3 { &[3] } else { &[] };
+            assert_eq!(pending, expected, "pending after step {n}");
+        }
+    }
+
+    /// `edges` with every producer able to send several frames in one fire
+    /// ([`SendsPerFire::Unbounded`]), as a raw FFI node can.
+    fn sending_any(edges: BlockHoldEdges) -> BlockHoldEdges {
+        BlockHoldEdges::new(
+            edges
+                .edges()
+                .iter()
+                .cloned()
+                .map(|e| BlockHoldEdge {
+                    producer_sends: SendsPerFire::Unbounded,
+                    ..e
+                })
+                .collect(),
+        )
+    }
+
+    /// Depth 1 on a FIFO input: at step 0 the relay pops two frames and fires
+    /// twice, sending nothing from its first fire and two frames from its
+    /// second, and the sink reads one; at step 1 the relay pops a frame and
+    /// fires nothing. Each step 0 check found the slot empty, and at step 1
+    /// the slot counts one, its depth, at the relay's check.
+    fn two_frame_fire_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 2, 2, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+        ]
+    }
+
+    /// A producer that can send several frames in one fire counts past its
+    /// slot's depth with nothing released: on the two-frame-fire rows the slot
+    /// counts two at step 0 and one at step 1, so the step 1 pop left unfired
+    /// is the hold, and the steps read clean.
+    #[test]
+    fn a_slot_a_several_frame_fire_counts_past_its_depth_still_holds() {
+        let steps = two_frame_fire_steps();
+        let decls = relay(sending_any(sink_holds(1, &steps)));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// A producer that sends at most one frame per fire stops at its slot's
+    /// depth, so a count past it is a release with no record: the same
+    /// two-frame-fire rows from a one-frame producer hold nothing after step 0,
+    /// and the step 1 pop left unfired is the finding.
+    #[test]
+    fn a_slot_a_one_frame_producer_counts_past_its_depth_holds_nothing() {
+        let steps = two_frame_fire_steps();
+        let report = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 1, 1, 0)]);
+        assert_eq!(report.findings[0].caveat, None);
+    }
+
+    /// Depth 1 on a FIFO input: at step 0 the relay pops three frames and
+    /// fires twice, sending nothing and then two frames, so its check before
+    /// a third fire finds the slot full; at step 1 it fires nothing and the
+    /// sink reads one frame.
+    fn filled_by_one_fire_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 3, 2, 0)]),
+            fifo_step(1, 5_000, &[("sink", 0, 1, 1)]),
+        ]
+    }
+
+    /// A fire that sends several frames fills its slot at its own step, and
+    /// the hold that follows stands: from a producer that can send several
+    /// frames in one fire the step 0 frame left unfired is the hold, and the
+    /// steps read clean; from a one-frame producer the slot counts past its
+    /// depth at step 0, so nothing holds there and step 0 is the finding.
+    #[test]
+    fn a_several_frame_fire_that_fills_its_slot_excuses_its_steps_unfired_frame() {
+        let steps = filled_by_one_fire_steps();
+        let any = verify_unrestored(
+            &relay(sending_any(sink_holds(1, &steps))),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(any.is_clean(), "{:?}", any.findings);
+        let one = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&one), vec![finding("relay", 0, 3, 2)]);
+    }
+
+    /// Depth 1 on a FIFO input: the relay fires one frame at step 0 and the
+    /// sink never reads; the relay pops a frame at step 1 that it keeps
+    /// unfired, which the full slot excuses, and fires it at step 2; the
+    /// slot's record says what that fire sent.
+    fn fire_at_full_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+            fifo_step(2, 10_000, &[("relay", 0, 1, 0)]),
+        ]
+    }
+
+    /// A producer that fires while its slot already counts its depth was
+    /// released with no record, whatever the fire sends: its check holds it
+    /// there. On the fire-at-full rows, from a producer that can send several
+    /// frames in one fire, the step 2 fire comes at a count of one, the depth,
+    /// so the step 1 hold is voided with the caveat, whether the fire sends a
+    /// frame or none; the same holds where the step 0 fires sent two frames
+    /// and the count before step 2 is two.
+    #[test]
+    fn a_producer_that_fires_at_a_full_slot_was_released_whatever_it_sends() {
+        let steps = fire_at_full_steps();
+        let voided = |report: &RederivationReport| {
+            assert_eq!(findings_of(report), vec![finding("relay", 1, 1, 0)]);
+            assert_eq!(
+                report.findings[0].caveat,
+                Some(FindingCaveat::UnrecordedRelease { release_step: 2 })
+            );
+        };
+        let nothing_sent = BlockHoldEdges::new(vec![BlockHoldEdge {
+            producer_sends: SendsPerFire::Unbounded,
+            ..slot("sink", 1, stamped_at(&[0]))
+        }]);
+        voided(&verify_unrestored(
+            &relay(nothing_sent),
+            &steps,
+            &[],
+            STAMPED,
+        ));
+        let one_sent = relay(sending_any(sink_holds(1, &steps)));
+        voided(&verify_unrestored(&one_sent, &steps, &[], STAMPED));
+        let mut above = steps.clone();
+        above[0] = fifo_step(0, 0, &[("relay", 2, 2, 0)]);
+        let above_decls = relay(sending_any(sink_holds(1, &above)));
+        voided(&verify_unrestored(&above_decls, &above, &[], STAMPED));
+    }
+
+    /// Depth 1 on a latest-value input: the relay fires once at step 0 and
+    /// sends two frames, pops a frame at step 1 that it keeps unfired through
+    /// step 2, at which the sink reads the queue empty, and fires the kept
+    /// frame at step 3, sending two more. The relay's check found the slot
+    /// empty at each fire, and at its depth at steps 1 and 2.
+    fn one_fire_two_frames_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+            fifo_step(2, 10_000, &[("sink", 0, 1, 1)]),
+            fifo_step(3, 15_000, &[("relay", 0, 1, 0)]),
+        ]
+    }
+
+    /// The one-fire-two-frames rows' slot, at depth 1 on a latest-value input,
+    /// its frames stamped at steps 0 and 3, from a producer that sends as
+    /// `producer_sends` says.
+    fn one_fire_two_frames_slot(producer_sends: SendsPerFire) -> BlockHoldEdges {
+        BlockHoldEdges::new(vec![BlockHoldEdge {
+            producer_sends,
+            ..slot(
+                "sink",
+                1,
+                SlotRecord::Counted {
+                    frame_stamps: [0, 0, 15_000, 15_000]
+                        .iter()
+                        .map(|us| EPOCH + us * 1_000)
+                        .collect(),
+                    drain: BodyDrain::ToEmpty,
+                },
+            )
+        }])
+    }
+
+    /// One fire that sends two frames takes its slot past the depth with
+    /// nothing released when its producer can send several frames in one
+    /// fire: the one-fire-two-frames rows then hold at steps 1 and 2 and read
+    /// clean. From a producer that sends at most one frame per fire the same
+    /// count shows a release at step 0, so nothing holds at step 1 and it is
+    /// the finding.
+    #[test]
+    fn a_fire_that_sends_two_frames_holds_its_slot_by_what_its_producer_can_send() {
+        let steps = one_fire_two_frames_steps();
+        let edge = one_fire_two_frames_slot;
+        let any = verify_unrestored(&relay(edge(SendsPerFire::Unbounded)), &steps, &[], STAMPED);
+        assert!(any.is_clean(), "{:?}", any.findings);
+        let one = verify_unrestored(&relay(edge(SendsPerFire::AtMostOne)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&one), vec![finding("relay", 1, 1, 0)]);
+    }
+
+    /// The several-frame, fire-at-full and one-fire-two-frames rows judged
+    /// twice give one report each time, field for field and in its rendering.
+    #[test]
+    fn the_several_frame_and_fire_at_full_rows_judge_the_same_twice() {
+        let two = two_frame_fire_steps();
+        let filled = filled_by_one_fire_steps();
+        let full = fire_at_full_steps();
+        let one_fire = one_fire_two_frames_steps();
+        let cases = [
+            (relay(sending_any(sink_holds(1, &two))), two.clone()),
+            (relay(sink_holds(1, &two)), two),
+            (relay(sending_any(sink_holds(1, &filled))), filled.clone()),
+            (relay(sink_holds(1, &filled)), filled),
+            (relay(sending_any(sink_holds(1, &full))), full),
+            (
+                relay(one_fire_two_frames_slot(SendsPerFire::Unbounded)),
+                one_fire.clone(),
+            ),
+            (
+                relay(one_fire_two_frames_slot(SendsPerFire::AtMostOne)),
+                one_fire,
+            ),
+        ];
+        for (decls, steps) in &cases {
+            let first = verify_unrestored(decls, steps, &[], STAMPED);
+            let second = verify_unrestored(decls, steps, &[], STAMPED);
+            assert_eq!(first, second);
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        }
+    }
+
+    /// A slot its consumer's stop has released counts past its depth after the
+    /// stop with nothing wrong: the same steps with the sink stopped by a
+    /// fatal error at its step 3 fire, which returned before it read the input
+    /// (a tick replay cannot see into, so the fire drains nothing), keep the
+    /// step 3 hold.
+    #[test]
+    fn a_slot_released_by_its_consumers_stop_is_not_held_to_its_depth() {
+        let steps = voided_hold_steps(("sink", 0, 1, 0));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let mut stops = PassStops::none();
+        stops.note("sink", 3, 1, NodeStopCause::FatalError);
+        let report = verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops);
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// An empty read leaves the slot empty. Depth 2: the sink takes the step 0
+    /// frame and the relay fills the slot. After the relay's step 3 hold the
+    /// sink takes a frame through a read that records nothing and pays the
+    /// slot nothing (`CerulionSubscriber::try_receive_one`), so the slot
+    /// counts one frame its queue no longer holds; it reads the other at step
+    /// 4, and at step 5 reads the frame the relay fires there and then reads
+    /// its queue empty, which leaves the slot empty. The relay's step 6 pop of
+    /// two and fire of one then leaves a frame unfired with one frame in the
+    /// slot, which is a finding; without the empty read the slot counts two
+    /// there and the step is the hold.
+    #[test]
+    fn an_empty_read_leaves_the_slot_empty() {
+        let empty = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Body,
+        );
+        let rows = || {
+            vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 1, 0, 0), ("sink", 0, 1, 0)]),
+                fifo_step(4, 20_000, &[("sink", 0, 1, 1)]),
+                fifo_step(5, 25_000, &[("relay", 0, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(6, 30_000, &[("relay", 2, 1, 0)]),
+            ]
+        };
+        let kept = rows();
+        let report = verify_unrestored(&relay(sink_holds(2, &kept)), &kept, &[], STAMPED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+        let steps = with_read(rows(), 5, empty);
+        let report = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 6, 2, 1)]);
+    }
+
+    /// A read of a latest-value input empties the slot, the frame its own step
+    /// sent included, since a producer sends before its consumer reads; on a
+    /// resumed pass that read is the one that makes the slot known. Depth 1:
+    /// the relay fires at step 0 and the sink fires and its latest-value read
+    /// takes the frame, so the relay's step 1 pop left unfired is a finding.
+    /// With the slot known from that read, a step 1 fire fills it, and the
+    /// relay's step 2 pop left unfired is the hold: that pass reads clean,
+    /// where a slot still unknown would convict it.
+    #[test]
+    fn a_latest_value_read_on_a_resumed_pass_empties_the_slot_of_its_steps_own_frame() {
+        let judge = |steps: &[RecordedStep]| {
+            let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+                unreachable!("sent_by counts")
+            };
+            let holds = BlockHoldEdges::new(vec![slot(
+                "sink",
+                1,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain: BodyDrain::ToEmpty,
+                },
+            )]);
+            let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+                .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+            verify(
+                &relay(holds),
+                steps,
+                &[],
+                STAMPED,
+                &resumed,
+                &PassStops::none(),
+            )
+        };
+        let read = fifo_step(0, 0, &[("relay", 0, 1, 0), ("sink", 1, 1, 1)]);
+        let emptied = vec![read.clone(), fifo_step(1, 5_000, &[("relay", 1, 0, 0)])];
+        assert_eq!(
+            findings_of(&judge(&emptied)),
+            vec![finding("relay", 1, 1, 0)]
+        );
+        let known = vec![
+            read,
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 0, 0)]),
+        ];
+        let report = judge(&known);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// A frame whose stamp no step's clock carries counts at the next step,
+    /// with that step's own: at depth 3 the relay's frame at 0 ms, one stamped
+    /// at 2 ms and one at the 5 ms step fill the slot there, so the relay's
+    /// step 1 pop left unfired is the hold. Without the 5 ms frame it is a
+    /// finding. A bag the replay accepts holds no such frame (the recording
+    /// consistency check refuses one, exit 2); this pins the count's
+    /// arithmetic, not a recording a run can make.
+    #[test]
+    fn a_frame_stamped_between_two_steps_counts_at_the_next_with_its_own() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+        ];
+        let holds = |frame_stamps: Vec<u64>| {
+            BlockHoldEdges::new(vec![slot(
+                "sink",
+                3,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain: BodyDrain::PerFrame,
+                },
+            )])
+        };
+        let held = verify_unrestored(
+            &relay(holds(vec![EPOCH, EPOCH + 2 * MS, EPOCH + 5 * MS])),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        let short = verify_unrestored(
+            &relay(holds(vec![EPOCH, EPOCH + 2 * MS])),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&short), vec![finding("relay", 1, 1, 0)]);
+    }
+
+    /// A resumed pass knows nothing of the slot before its consumer reads it
+    /// empty, so frames sent in the pass do not prove a hold: at depth 1 a
+    /// fire at step 0 then a pop left unfired at step 1 is a finding, and at
+    /// depth 2 two fires then a pop left unfired at step 2. From the pass's
+    /// start each of those slots is full and reads clean.
+    #[test]
+    fn a_resumed_slot_is_unknown_until_its_consumer_reads_it_empty() {
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+        for (depth, rows, step) in [
+            (1, vec![(0, 1, 1, 0), (1, 1, 0, 0)], 1),
+            (2, vec![(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0)], 2),
+        ] {
+            let steps = relay_steps(&rows);
+            let unknown = verify(
+                &relay(sink_holds(depth, &steps)),
+                &steps,
+                &[],
+                STAMPED,
+                &resumed,
+                &PassStops::none(),
+            );
+            assert_eq!(
+                findings_of(&unknown),
+                vec![finding("relay", step, 1, 0)],
+                "depth {depth}"
+            );
+            let from_start =
+                verify_unrestored(&relay(sink_holds(depth, &steps)), &steps, &[], STAMPED);
+            assert!(
+                from_start.is_clean(),
+                "depth {depth}: {:?}",
+                from_start.findings
+            );
+        }
+    }
+
+    /// Only a read the bound counts as the consumer's body read shows its
+    /// reads are recorded: a consumer that fires with only a trigger-drain
+    /// record of the input leaves the slot unbounded from that step, so the
+    /// frame carried into step 3 is a finding.
+    #[test]
+    fn only_a_body_read_shows_the_consumers_reads_are_recorded() {
+        let drain_only = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            None,
+            ReadSiteRole::Drain,
+        );
+        let steps = with_read(
+            vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 0, 0), ("sink", 0, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 0, 0, 0)]),
+            ],
+            2,
+            drain_only,
+        );
+        let report = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+    }
+
+    // -- a Period or Sync node a `block` input in its rank holds -------------
+
+    /// One recorded step: its clock and fires, as nanoseconds after
+    /// [`EPOCH`], plus per FIFO node `(id, trigger pops, fires, body pops)`.
+    fn timed_step(
+        n: u64,
+        clock: u64,
+        fires_at: &[(&str, u64)],
+        fifo: &[(&str, u32, u32, u32)],
+    ) -> RecordedStep {
+        let mut built = fifo_step(n, 0, fifo);
+        built.clock_ns = EPOCH + clock;
+        for f in &mut built.fires {
+            f.fire_time_ns = EPOCH + clock;
+        }
+        built
+            .fires
+            .extend(fires_at.iter().map(|&(id, at)| fire(id, EPOCH + at)));
+        built
+    }
+
+    /// The `block` edge `src` sends into, `sink.inp` at `depth`, filled by
+    /// `src`'s fires in `steps`: a fire's frame carries its step's clock, not
+    /// its deadline.
+    fn src_holds(depth: u64, steps: &[RecordedStep]) -> BlockHoldEdges {
+        BlockHoldEdges::new(vec![slot("sink", depth, sent_by(steps, &["src"]))])
+    }
+
+    /// The note of `node` judged by `rule` with a hold allowed for.
+    fn held_note(node: &str, rule: HeldRule) -> HoldAllowedForNote {
+        HoldAllowedForNote {
+            node_id: node.to_string(),
+            rule,
+        }
+    }
+
+    fn held_period(interval_ns: u64, max_catchup: Option<u32>, holds: BlockHoldEdges) -> NodeDecl {
+        let mut decl = node("src", period(interval_ns, max_catchup));
+        decl.may_be_held_by = holds;
+        decl
+    }
+
+    /// One real recording of `src` (5 ms period) -> `sink` (`block`, depth 2,
+    /// `throttle_ms = 50`) in one rank, hand-counted from its first seven
+    /// steps, the clocks and fire instants in ns:
+    ///
+    /// * steps 1 to 3: `src` fires its 5 ms schedule (4.8285, 9.8285, 14.8285
+    ///   ms); the sink fires the first frame, its body takes it, and it counts
+    ///   the next two;
+    /// * step 4 (54.89 ms): three frames sent and one taken, so the slot is at
+    ///   its depth: `src` is held at the decide gate and fires none of the
+    ///   four catch-up fires it owes (`max_catchup` 4: 19.8285 to 34.8285 ms);
+    ///   the sink fires one and takes it;
+    /// * step 5: `src` fires the first owed instant (19.8285 ms) into the
+    ///   place that freed, and the re-check holds the rest; the sink counts it;
+    /// * steps 6 and 7: the same, from 24.8285 ms.
+    fn ws3_steps() -> Vec<RecordedStep> {
+        vec![
+            timed_step(1, 4_844_917, &[("src", 4_828_500)], &[("sink", 1, 1, 1)]),
+            timed_step(2, 9_868_084, &[("src", 9_828_500)], &[("sink", 1, 0, 0)]),
+            timed_step(3, 14_862_167, &[("src", 14_828_500)], &[("sink", 1, 0, 0)]),
+            timed_step(4, 54_891_167, &[], &[("sink", 0, 1, 1)]),
+            timed_step(5, 56_149_584, &[("src", 19_828_500)], &[("sink", 1, 0, 0)]),
+            timed_step(6, 104_936_834, &[], &[("sink", 0, 1, 1)]),
+            timed_step(7, 106_126_542, &[("src", 24_828_500)], &[("sink", 1, 0, 0)]),
+        ]
+    }
+
+    fn ws3_nodes(src_holds: BlockHoldEdges) -> Vec<NodeDecl> {
+        vec![
+            held_period(5 * MS, Some(4), src_holds),
+            fifo_decl(
+                "sink",
+                FifoDrain::Separate,
+                BlockHoldEdges::none(),
+                Some(50 * MS),
+            ),
+        ]
+    }
+
+    /// The recording reads clean with the held source judged on every step:
+    /// the hold is noted once, at step 4, as a judged note and not a
+    /// stand-down, and its next deadline is the first owed instant it did not
+    /// fire. Judged with
+    /// nothing holding it, step 4 is a `period_ms` schedule finding: four
+    /// owed fires re-derived at their instants, none recorded.
+    #[test]
+    fn a_held_period_producer_is_judged_on_the_prefix_of_its_owed_fires() {
+        let steps = ws3_steps();
+        let held = verify_unrestored(&ws3_nodes(src_holds(2, &steps)), &steps, &[], STAMPED);
+        assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        assert!(held.stand_downs.is_empty(), "{:?}", held.stand_downs);
+        assert_eq!(
+            held.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
+        );
+        assert_eq!(held.holds_allowed_for[0].rule.code(), "period_block_held");
+        assert_eq!(
+            held.holds_allowed_for[0].to_string(),
+            "node 'src' period_ms schedule: judged with a hold allowed for, since a block input \
+             in its own rank reads a topic the node produces and its pre-fire check can hold the \
+             period fires a step owed with no record in the bag; at a step where the bag shows \
+             the slot full the node is judged on the first fires it owed, unless every slot that \
+             held it there shows a release with no record before its consumer next reads it, and \
+             the rest of its schedule is still judged (report-only; the allowance can only drop a \
+             finding, never invent one)"
+        );
+        assert_eq!(
+            held,
+            verify_unrestored(&ws3_nodes(src_holds(2, &steps)), &steps, &[], STAMPED)
+        );
+
+        let unheld = verify_unrestored(&ws3_nodes(BlockHoldEdges::none()), &steps, &[], STAMPED);
+        assert_eq!(unheld.findings.len(), 1, "{:?}", unheld.findings);
+        let finding = &unheld.findings[0];
+        assert_eq!((finding.node_id.as_str(), finding.step), ("src", 4));
+        assert_eq!(
+            finding.expected,
+            StepFires::at(vec![
+                EPOCH + 19_828_500,
+                EPOCH + 24_828_500,
+                EPOCH + 29_828_500,
+                EPOCH + 34_828_500
+            ])
+        );
+        assert_eq!(finding.recorded, StepFires::at(vec![]));
+    }
+
+    /// The slot is counted over the steps before the node's first fire too. A
+    /// sink fire at step 0, before `src` first fires at step 1, with no read
+    /// of its input recorded, says the bag does not hold the sink's reads, so
+    /// nothing bounds the slot: step 4, which fires none of the four fires it
+    /// owes, is the finding. With a body read at that fire that finds the
+    /// queue empty, the slot is counted as before and step 4 is the hold.
+    #[test]
+    fn a_consumer_fire_before_the_anchor_with_no_read_of_its_input_allows_no_hold() {
+        let unread = |reads: Vec<RecordedRead>| {
+            let mut steps = vec![RecordedStep {
+                step: 0,
+                clock_ns: EPOCH + MS,
+                fires: vec![fire("sink", EPOCH + MS)],
+                reads,
+            }];
+            steps.extend(ws3_steps());
+            steps
+        };
+        let steps = unread(vec![]);
+        let judged = verify_unrestored(
+            &[held_period(5 * MS, Some(4), src_holds(2, &steps))],
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(judged.findings.len(), 1, "{:?}", judged.findings);
+        let finding = &judged.findings[0];
+        assert_eq!((finding.node_id.as_str(), finding.step), ("src", 4));
+        assert_eq!(finding.recorded, StepFires::at(vec![]));
+        assert!(judged.stand_downs.is_empty(), "{:?}", judged.stand_downs);
+        assert!(
+            judged.holds_allowed_for.is_empty(),
+            "{:?}",
+            judged.holds_allowed_for
+        );
+
+        let read = unread(vec![read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Body,
+        )]);
+        let held = verify_unrestored(
+            &[held_period(5 * MS, Some(4), src_holds(2, &read))],
+            &read,
+            &[],
+            STAMPED,
+        );
+        assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        assert!(held.stand_downs.is_empty(), "{:?}", held.stand_downs);
+        assert_eq!(
+            held.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
+        );
+    }
+
+    /// The held rule keeps judging after the hold engages, so what a
+    /// whole-node stand-down would let through is still caught: a fire off
+    /// the owed instants, a fire past what the step owed, a held step of a
+    /// node whose `period_ms` changed, and a capped burst judged under a
+    /// raised `max_catchup`. A depth-1 hold (one fire, then held until each
+    /// release) reads clean. A step at which the bag does not show the slot
+    /// full is a finding: a shortened step before the slot reaches its depth,
+    /// and one after the consumer drained it.
+    #[test]
+    fn a_held_period_producer_is_still_convicted_off_its_schedule() {
+        let src = |at: u64| [("src", at)];
+        let drained = [("sink", 1, 1, 1)];
+        // Depth 1: fires at 5 and 10 ms, held at 15 ms, then one owed fire per
+        // release (the deadline moves 5 ms each time); the sink takes a frame
+        // in the step before each release.
+        let depth_one = vec![
+            timed_step(1, 5 * MS, &src(5 * MS), &drained),
+            timed_step(2, 10 * MS, &src(10 * MS), &[]),
+            timed_step(3, 15 * MS, &[], &drained),
+            timed_step(4, 60 * MS, &src(15 * MS), &drained),
+            timed_step(5, 110 * MS, &src(20 * MS), &[]),
+        ];
+        let held = |steps: &[RecordedStep]| [held_period(5 * MS, None, src_holds(1, steps))];
+        assert!(verify_unrestored(&held(&depth_one), &depth_one, &[], STAMPED).is_clean());
+        let unheld = verify_unrestored(
+            &[held_period(5 * MS, None, BlockHoldEdges::none())],
+            &depth_one,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(unheld.findings[0].step, 3);
+
+        // Resumed at step 2: the slot is unknown until the sink reads its
+        // queue empty, which a frame-by-frame read never does, so the step 3
+        // hold is not allowed for. From the start, the same steps read clean.
+        let later = &depth_one[1..];
+        assert!(verify_unrestored(&held(later), later, &[], STAMPED).is_clean());
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+            .with_stops_stated(BTreeSet::from(["src".to_string(), "sink".to_string()]));
+        let found = verify(
+            &held(later),
+            later,
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        )
+        .findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 3);
+
+        // Off the owed instants: step 4 fires at 16 ms where 15 was owed.
+        let mut off = depth_one.clone();
+        off[3] = timed_step(4, 60 * MS, &src(16 * MS), &drained);
+        let found = verify_unrestored(&held(&off), &off, &[], STAMPED).findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 4);
+
+        // Before the slot is full: at depth 2, two frames sent by step 2 and
+        // one taken do not fill it at step 3.
+        let early = [held_period(5 * MS, None, src_holds(2, &depth_one))];
+        let found = verify_unrestored(&early, &depth_one[..3], &[], STAMPED).findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 3);
+
+        // After the consumer drained it: at depth 1, the sink takes the step 2
+        // frame at step 3, so a step 4 that fires none of what it owes is not
+        // a hold.
+        let freed = vec![
+            timed_step(1, 5 * MS, &src(5 * MS), &drained),
+            timed_step(2, 10 * MS, &src(10 * MS), &[]),
+            timed_step(3, 15 * MS, &[], &drained),
+            timed_step(4, 20 * MS, &[], &[]),
+        ];
+        let found = verify_unrestored(&held(&freed), &freed, &[], STAMPED).findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 4);
+
+        // Past what the step owed: three fires where max_catchup 2 owed two.
+        // Depth 3, and the sink takes step 1's frame, so the slot counts 0
+        // before step 2's sends and 3 after them: full at the step, with no
+        // release. The three fires sit on the owed grid, so only the bound
+        // that a held burst fires fewer than it owed convicts the step.
+        let extra = vec![
+            timed_step(1, 5 * MS, &src(5 * MS), &drained),
+            timed_step(
+                2,
+                40 * MS,
+                &[("src", 10 * MS), ("src", 15 * MS), ("src", 20 * MS)],
+                &[],
+            ),
+        ];
+        let capped = [held_period(5 * MS, Some(2), src_holds(3, &extra))];
+        let found = verify_unrestored(&capped, &extra, &[], STAMPED).findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            (found[0].step, &found[0].expected, &found[0].recorded),
+            (
+                2,
+                &StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 15 * MS]),
+                &StepFires::at(vec![EPOCH + 10 * MS, EPOCH + 15 * MS, EPOCH + 20 * MS])
+            )
+        );
+
+        // A `period_ms` change after the onset: the recording ran 5 ms (fires
+        // 5, held at 40 while the sink takes that frame, fires the owed 10 at
+        // 41 into the room it freed); a 10 ms declaration owes 15 first, so
+        // step 3 is off its schedule.
+        let changed = vec![
+            timed_step(1, 5 * MS, &src(5 * MS), &[]),
+            timed_step(2, 40 * MS, &[], &drained),
+            timed_step(3, 41 * MS, &src(10 * MS), &[]),
+        ];
+        assert!(verify_unrestored(
+            &[held_period(5 * MS, Some(4), src_holds(1, &changed))],
+            &changed,
+            &[],
+            STAMPED
+        )
+        .is_clean());
+        let found = verify_unrestored(
+            &[held_period(10 * MS, Some(4), src_holds(1, &changed))],
+            &changed,
+            &[],
+            STAMPED,
+        )
+        .findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 3);
+
+        // A raised `max_catchup`, on a depth-5 slot the sink takes a frame
+        // from at step 2: the recording's cap of 4 fired 10..25 ms at 60 ms,
+        // filling the slot, and skipped to 65, fired into the place the sink
+        // freed; a cap of 8 reads those four as a held prefix of eight and owes
+        // 30 ms next, so the 65 ms fire is off it.
+        let burst = vec![
+            timed_step(1, 5 * MS, &src(5 * MS), &[]),
+            timed_step(
+                2,
+                60 * MS,
+                &[
+                    ("src", 10 * MS),
+                    ("src", 15 * MS),
+                    ("src", 20 * MS),
+                    ("src", 25 * MS),
+                ],
+                &drained,
+            ),
+            timed_step(3, 65 * MS, &src(65 * MS), &[]),
+        ];
+        assert!(verify_unrestored(
+            &[held_period(5 * MS, Some(4), src_holds(5, &burst))],
+            &burst,
+            &[],
+            STAMPED
+        )
+        .is_clean());
+        let found = verify_unrestored(
+            &[held_period(5 * MS, Some(8), src_holds(5, &burst))],
+            &burst,
+            &[],
+            STAMPED,
+        )
+        .findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 3);
+    }
+
+    /// The prefix predicate on hand-built bursts: fewer fires at the owed
+    /// instants, an empty prefix included; never the whole burst, an instant
+    /// off the grid, or more fires than owed. A burst past the render cap is
+    /// judged fire by fire.
+    #[test]
+    fn a_held_period_burst_is_a_strict_prefix_of_the_owed_fires() {
+        let owed = PeriodStep {
+            fire_count: 4,
+            first_fire_ns: 100,
+            next_fire_ns: 140,
+        };
+        assert!(is_block_held_period_burst(&owed, 10, &[]));
+        assert!(is_block_held_period_burst(&owed, 10, &[100]));
+        assert!(is_block_held_period_burst(&owed, 10, &[100, 110, 120]));
+        assert!(!is_block_held_period_burst(
+            &owed,
+            10,
+            &[100, 110, 120, 130]
+        ));
+        assert!(!is_block_held_period_burst(
+            &owed,
+            10,
+            &[100, 110, 120, 130, 140]
+        ));
+        assert!(!is_block_held_period_burst(&owed, 10, &[101]));
+        assert!(!is_block_held_period_burst(&owed, 10, &[110]));
+        let none = PeriodStep {
+            fire_count: 0,
+            first_fire_ns: 0,
+            next_fire_ns: 100,
+        };
+        assert!(!is_block_held_period_burst(&none, 10, &[]));
+        let big = PERIOD_BURST_RENDER_CAP + 5;
+        let past_cap = PeriodStep {
+            fire_count: big,
+            first_fire_ns: 0,
+            next_fire_ns: u64::from(big) * 10,
+        };
+        let at: Vec<u64> = (0..u64::from(PERIOD_BURST_RENDER_CAP) + 1)
+            .map(|j| j * 10)
+            .collect();
+        assert!(is_block_held_period_burst(&past_cap, 10, &at));
+        let mut off = at;
+        off[PERIOD_BURST_RENDER_CAP as usize] += 1;
+        assert!(!is_block_held_period_burst(&past_cap, 10, &off));
+    }
+
+    /// A held `period_ms` step waits on the slot that held there, as a FIFO
+    /// node's does. Hand-built, depth 1, `max_catchup` 4: `src` fires 5 ms at
+    /// step 1, which fills the slot; step 2 (10 ms) fires none of the one fire
+    /// it owes while the slot counts its depth, the hold; step 3 (15 ms)
+    /// fires both owed instants, 10 and 15 ms. A slot that holds stops `src`
+    /// at its depth, so a fire at step 3 with no read by the sink since shows
+    /// the slot released with no record: step 2 is the finding, and says so.
+    /// With the sink's body taking the frame at step 2, after `src`'s checks,
+    /// the hold is confirmed there and the steps read clean. Judged with
+    /// nothing holding it, step 2 is a finding with no caveat.
+    #[test]
+    fn a_held_period_step_a_later_release_with_no_record_voids_is_the_finding() {
+        let unread = vec![
+            timed_step(1, 5 * MS, &[("src", 5 * MS)], &[]),
+            timed_step(2, 10 * MS, &[], &[]),
+            timed_step(3, 15 * MS, &[("src", 10 * MS), ("src", 15 * MS)], &[]),
+        ];
+        let held = |steps: &[RecordedStep]| [held_period(5 * MS, Some(4), src_holds(1, steps))];
+        let voided = verify_unrestored(&held(&unread), &unread, &[], STAMPED);
+        assert_eq!(
+            voided.findings,
+            vec![ScheduleFinding {
+                node_id: "src".to_string(),
+                step: 2,
+                decider: Decider::Period,
+                expected: StepFires::at(vec![EPOCH + 10 * MS]),
+                recorded: StepFires::at(vec![]),
+                unread: None,
+                caveat: Some(FindingCaveat::UnrecordedRelease { release_step: 3 }),
+            }]
+        );
+        assert!(voided.stand_downs.is_empty(), "{:?}", voided.stand_downs);
+        assert_eq!(
+            voided.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
+        );
+        assert_eq!(
+            voided,
+            verify_unrestored(&held(&unread), &unread, &[], STAMPED)
+        );
+
+        let mut read = unread.clone();
+        read[1] = timed_step(2, 10 * MS, &[], &[("sink", 1, 1, 1)]);
+        let confirmed = verify_unrestored(&held(&read), &read, &[], STAMPED);
+        assert!(confirmed.is_clean(), "unexpected: {:?}", confirmed.findings);
+        assert!(
+            confirmed.stand_downs.is_empty(),
+            "{:?}",
+            confirmed.stand_downs
+        );
+        assert_eq!(
+            confirmed.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
+        );
+
+        let unheld = verify_unrestored(
+            &[held_period(5 * MS, Some(4), BlockHoldEdges::none())],
+            &unread,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(unheld.findings.len(), 1, "{:?}", unheld.findings);
+        assert_eq!(
+            (unheld.findings[0].step, unheld.findings[0].caveat),
+            (2, None)
+        );
+    }
+
+    /// A Sync node whose output a depth-1 `block` input reads: an aligned set
+    /// it left unfired while the bag shows its slot full is not convicted, the
+    /// node is noted once with the hold allowed for, and it is still judged,
+    /// so a later fire while misaligned is a finding. Hand-built: it fires at step 0, so the slot
+    /// holds that frame at step 1, where the set is left unfired and the
+    /// consumer fires and its body takes the frame; the held set fires at step
+    /// 2, which fills the slot again, and step 3's aligned set is left unfired
+    /// too. Two held steps, one note. Not held, or held before it has sent a
+    /// frame, or after its consumer took the frame (a step later, or in the
+    /// step that sent it), the aligned unfired step is the finding, and so is
+    /// one at the step after a held step whose read emptied the slot. Each of
+    /// the rule's stand-downs at a later step withdraws the note.
+    #[test]
+    fn a_held_sync_node_is_noted_once_and_still_judged() {
+        let unheld_node = node(
+            "fusion",
+            TriggerDecl::Sync {
+                window_ns: Some(50 * MS),
+                trigger_inputs: inputs(&["a", "b"]),
+            },
+        );
+        // The node, held by `ctl.inp` at depth 1, which each of its fires in
+        // `steps` fills.
+        let held_over = |steps: &[RecordedStep]| {
+            let mut n = unheld_node.clone();
+            n.may_be_held_by =
+                BlockHoldEdges::new(vec![slot("ctl", 1, sent_by(steps, &["fusion"]))]);
+            [n]
+        };
+        let head = |input: &str, at: u64| {
+            read_with_role(
+                "fusion",
+                input,
+                ReadOutcomeKind::DrainedBatch,
+                1,
+                Some(at),
+                ReadSiteRole::Drain,
+            )
+        };
+        let aligned = |step: u64, at: u64, fired: bool| RecordedStep {
+            step,
+            clock_ns: at,
+            fires: if fired {
+                vec![fire("fusion", at)]
+            } else {
+                vec![]
+            },
+            reads: vec![head("a", at), head("b", at)],
+        };
+        let ctl_takes_one = read_with_role(
+            "ctl",
+            "inp",
+            ReadOutcomeKind::Served,
+            1,
+            None,
+            ReadSiteRole::Body,
+        );
+        let mut first_held = aligned(1, EPOCH + 10 * MS, false);
+        first_held.reads.push(ctl_takes_one.clone());
+        first_held.fires.push(fire("ctl", EPOCH + 10 * MS));
+        let quiet = vec![
+            aligned(0, EPOCH, true),
+            first_held,
+            RecordedStep {
+                step: 2,
+                clock_ns: EPOCH + 100 * MS,
+                fires: vec![fire("fusion", EPOCH + 100 * MS)],
+                reads: vec![],
+            },
+            aligned(3, EPOCH + 110 * MS, false),
+        ];
+        let held = verify_unrestored(&held_over(&quiet), &quiet, &[], STAMPED);
+        assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        // Resumed at step 0, the slot is unknown until the consumer reads its
+        // queue empty, which a frame-by-frame read never does: the step 1 set
+        // left unfired is the finding.
+        let resumed = verify(
+            &held_over(&quiet),
+            &quiet,
+            &[],
+            STAMPED,
+            &PassRestore::from_sync_heads(BTreeMap::new())
+                .with_stops_stated(BTreeSet::from(["fusion".to_string(), "ctl".to_string()])),
+            &PassStops::none(),
+        );
+        assert_eq!(resumed.findings.len(), 1, "{:?}", resumed.findings);
+        assert_eq!(resumed.findings[0].step, 1);
+        assert!(held.stand_downs.is_empty(), "{:?}", held.stand_downs);
+        assert_eq!(
+            held.holds_allowed_for,
+            vec![held_note("fusion", HeldRule::Sync)]
+        );
+        assert_eq!(held.holds_allowed_for[0].rule.code(), "sync_block_held");
+        assert_eq!(
+            held.holds_allowed_for[0].to_string(),
+            "node 'fusion' sync alignment: judged with a hold allowed for, since a block input in \
+             its own rank reads a topic the node produces and its pre-fire check can hold an \
+             aligned set's fire with no record in the bag; at a step where the bag shows the slot \
+             full an aligned set left unfired is not convicted, unless every slot that held it \
+             there shows a release with no record before its consumer next reads it, and every \
+             other step and every set the node fired is still judged (report-only; the allowance \
+             can only drop a finding, never invent one)"
+        );
+
+        // After the first held step, step 3 fires on two heads 400 ms apart,
+        // outside the 50 ms window (the held set of step 3 above would carry
+        // an aligned pair it could fire on).
+        let mut loud = quiet[..3].to_vec();
+        loud[2].reads.push(ctl_takes_one.clone());
+        loud[2].fires.push(fire("ctl", EPOCH + 100 * MS));
+        loud.push(RecordedStep {
+            step: 3,
+            clock_ns: EPOCH + 200 * MS,
+            fires: vec![fire("fusion", EPOCH + 200 * MS)],
+            reads: vec![head("a", EPOCH + 200 * MS), head("b", EPOCH + 600 * MS)],
+        });
+        let bad = verify_unrestored(&held_over(&loud), &loud, &[], STAMPED);
+        assert_eq!(bad.findings.len(), 1, "{:?}", bad.findings);
+        assert_eq!(bad.findings[0].step, 3);
+
+        // Held before it has sent a frame: step 0 left unfired.
+        let first = vec![aligned(0, EPOCH, false)];
+        let early = verify_unrestored(&held_over(&first), &first, &[], STAMPED);
+        assert_eq!(early.findings.len(), 1, "{:?}", early.findings);
+        assert_eq!(early.findings[0].step, 0);
+
+        // After its consumer took the frame at step 1: step 2 left unfired.
+        // Sent and taken in one step: the consumer's body takes step 0's frame
+        // in step 0, so the slot is empty at step 1, and the aligned set left
+        // unfired there is the finding.
+        let mut sent_and_taken = aligned(0, EPOCH, true);
+        sent_and_taken.reads.push(ctl_takes_one.clone());
+        sent_and_taken.fires.push(fire("ctl", EPOCH));
+        let same_step = vec![sent_and_taken, aligned(1, EPOCH + 10 * MS, false)];
+        let taken = verify_unrestored(&held_over(&same_step), &same_step, &[], STAMPED);
+        assert_eq!(taken.findings.len(), 1, "{:?}", taken.findings);
+        assert_eq!(taken.findings[0].step, 1);
+        assert!(taken.stand_downs.is_empty(), "{:?}", taken.stand_downs);
+        assert!(
+            taken.holds_allowed_for.is_empty(),
+            "{:?}",
+            taken.holds_allowed_for
+        );
+
+        let freed = vec![
+            aligned(0, EPOCH, true),
+            RecordedStep {
+                step: 1,
+                clock_ns: EPOCH + 10 * MS,
+                fires: vec![fire("ctl", EPOCH + 10 * MS)],
+                reads: vec![ctl_takes_one],
+            },
+            aligned(2, EPOCH + 20 * MS, false),
+        ];
+        let drained = verify_unrestored(&held_over(&freed), &freed, &[], STAMPED);
+        assert_eq!(drained.findings.len(), 1, "{:?}", drained.findings);
+        assert_eq!(drained.findings[0].step, 2);
+
+        // Held at step 1, then not: `ctl`'s read there empties the slot, so
+        // the aligned set step 2 leaves unfired owes its fire. That step is the
+        // finding, with no caveat, beside the one note of the held step.
+        let then_unheld = vec![
+            aligned(0, EPOCH, true),
+            quiet[1].clone(),
+            aligned(2, EPOCH + 20 * MS, false),
+        ];
+        let owed = verify_unrestored(&held_over(&then_unheld), &then_unheld, &[], STAMPED);
+        assert_eq!(
+            owed.findings,
+            vec![ScheduleFinding {
+                node_id: "fusion".to_string(),
+                step: 2,
+                decider: Decider::Sync,
+                expected: StepFires::count(1),
+                recorded: StepFires::count(0),
+                unread: None,
+                caveat: None,
+            }]
+        );
+        assert!(owed.stand_downs.is_empty(), "{:?}", owed.stand_downs);
+        assert_eq!(owed.holds_allowed_for, held.holds_allowed_for);
+
+        // A stand-down after the held step stops the rule for the node, so the
+        // note that the rule judged the node is withdrawn: step 2's head on `a`
+        // is stamped before step 1's.
+        let mut regressed = quiet[..2].to_vec();
+        regressed.push(RecordedStep {
+            step: 2,
+            clock_ns: EPOCH + 20 * MS,
+            fires: vec![],
+            reads: vec![head("a", EPOCH), head("b", EPOCH + 20 * MS)],
+        });
+        let stood = verify_unrestored(&held_over(&regressed), &regressed, &[], STAMPED);
+        assert!(stood.is_clean(), "unexpected: {:?}", stood.findings);
+        assert_eq!(
+            stood.stand_downs,
+            vec![StandDown {
+                node_id: "fusion".to_string(),
+                decider: Decider::Sync,
+                reason: StandDownReason::SyncHeadStampRegressed,
+            }]
+        );
+        assert!(
+            stood.holds_allowed_for.is_empty(),
+            "{:?}",
+            stood.holds_allowed_for
+        );
+        // The same from each of the rule's two other stand-downs at a step:
+        // a truncated read of `a` at step 2, and a drain-site read of it with
+        // no wire stamp.
+        let cuts = [
+            (
+                "truncated",
+                read_with_role(
+                    "fusion",
+                    "a",
+                    ReadOutcomeKind::Truncated,
+                    0,
+                    None,
+                    ReadSiteRole::Drain,
+                ),
+                StandDownReason::TruncatedReadLog,
+            ),
+            (
+                "unstamped",
+                read_with_role(
+                    "fusion",
+                    "a",
+                    ReadOutcomeKind::DrainedBatch,
+                    1,
+                    None,
+                    ReadSiteRole::Drain,
+                ),
+                StandDownReason::MissingWireStamp,
+            ),
+        ];
+        let judged: Vec<_> = cuts
+            .iter()
+            .map(|(shape, cut_read, _)| {
+                let mut cut = quiet[..2].to_vec();
+                cut.push(RecordedStep {
+                    step: 2,
+                    clock_ns: EPOCH + 20 * MS,
+                    fires: vec![],
+                    reads: vec![cut_read.clone()],
+                });
+                let stood = verify_unrestored(&held_over(&cut), &cut, &[], STAMPED);
+                (
+                    *shape,
+                    stood.findings,
+                    stood.stand_downs,
+                    stood.holds_allowed_for,
+                )
+            })
+            .collect();
+        let expected: Vec<_> = cuts
+            .iter()
+            .map(|(shape, _, reason)| {
+                (
+                    *shape,
+                    Vec::new(),
+                    vec![StandDown {
+                        node_id: "fusion".to_string(),
+                        decider: Decider::Sync,
+                        reason: reason.clone(),
+                    }],
+                    Vec::new(),
+                )
+            })
+            .collect();
+        assert_eq!(judged, expected);
+
+        let unheld = verify_unrestored(&[unheld_node], &quiet, &[], STAMPED);
+        assert_eq!(unheld.findings.len(), 1, "{:?}", unheld.findings);
+        assert_eq!(unheld.findings[0].step, 1);
+        assert!(unheld.stand_downs.is_empty(), "{:?}", unheld.stand_downs);
+        assert!(
+            unheld.holds_allowed_for.is_empty(),
+            "{:?}",
+            unheld.holds_allowed_for
+        );
+    }
+
+    /// A held Sync step waits on the slot that held there, as a FIFO node's
+    /// does. Hand-built, depth 1: the node fires at step 0, which fills the
+    /// slot, and leaves step 1's aligned set unfired while the slot counts its
+    /// depth, the hold; it fires at step 2 on the set it carried. A slot that
+    /// holds stops the node at its depth, so that fire with no read by `ctl`
+    /// since shows the slot released with no record: step 1 is the finding,
+    /// and says so. With `ctl`'s body taking the frame at step 1, after the
+    /// node's checks, the hold is confirmed there and the steps read clean.
+    #[test]
+    fn a_held_sync_step_a_later_release_with_no_record_voids_is_the_finding() {
+        let head = |input: &str, at: u64| {
+            read_with_role(
+                "fusion",
+                input,
+                ReadOutcomeKind::DrainedBatch,
+                1,
+                Some(at),
+                ReadSiteRole::Drain,
+            )
+        };
+        let aligned = |step: u64, at: u64, fired: bool| RecordedStep {
+            step,
+            clock_ns: at,
+            fires: if fired {
+                vec![fire("fusion", at)]
+            } else {
+                vec![]
+            },
+            reads: vec![head("a", at), head("b", at)],
+        };
+        let held_over = |steps: &[RecordedStep]| {
+            let mut n = node(
+                "fusion",
+                TriggerDecl::Sync {
+                    window_ns: Some(50 * MS),
+                    trigger_inputs: inputs(&["a", "b"]),
+                },
+            );
+            n.may_be_held_by =
+                BlockHoldEdges::new(vec![slot("ctl", 1, sent_by(steps, &["fusion"]))]);
+            [n]
+        };
+        let unread = vec![
+            aligned(0, EPOCH, true),
+            aligned(1, EPOCH + 10 * MS, false),
+            RecordedStep {
+                step: 2,
+                clock_ns: EPOCH + 100 * MS,
+                fires: vec![fire("fusion", EPOCH + 100 * MS)],
+                reads: vec![],
+            },
+        ];
+        let voided = verify_unrestored(&held_over(&unread), &unread, &[], STAMPED);
+        assert_eq!(
+            voided.findings,
+            vec![ScheduleFinding {
+                node_id: "fusion".to_string(),
+                step: 1,
+                decider: Decider::Sync,
+                expected: StepFires::count(1),
+                recorded: StepFires::count(0),
+                unread: None,
+                caveat: Some(FindingCaveat::UnrecordedRelease { release_step: 2 }),
+            }]
+        );
+        assert!(voided.stand_downs.is_empty(), "{:?}", voided.stand_downs);
+        assert_eq!(
+            voided.holds_allowed_for,
+            vec![held_note("fusion", HeldRule::Sync)]
+        );
+        assert_eq!(
+            voided,
+            verify_unrestored(&held_over(&unread), &unread, &[], STAMPED)
+        );
+
+        // The step that shows the release voids the held step whatever else
+        // its reads or fires give: a stand-down of the rule from its own reads
+        // (a head stamped before step 1's, a truncated read, a drain-site read
+        // with no wire stamp), or a set-supply ceiling its two fires on one
+        // carried set would break, comes after the void.
+        let mut regressed = unread.clone();
+        regressed[2].reads = vec![head("a", EPOCH)];
+        let mut truncated = unread.clone();
+        truncated[2].reads = vec![read_with_role(
+            "fusion",
+            "a",
+            ReadOutcomeKind::Truncated,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        )];
+        let mut unstamped = unread.clone();
+        unstamped[2].reads = vec![read_with_role(
+            "fusion",
+            "a",
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            None,
+            ReadSiteRole::Drain,
+        )];
+        let mut twice = unread.clone();
+        twice[2].fires.push(fire("fusion", EPOCH + 100 * MS));
+        let shapes = [
+            ("regressed", regressed),
+            ("truncated", truncated),
+            ("unstamped", unstamped),
+            ("fired twice", twice),
+        ];
+        let judged: Vec<_> = shapes
+            .iter()
+            .map(|(shape, steps)| {
+                let report = verify_unrestored(&held_over(steps), steps, &[], STAMPED);
+                (
+                    *shape,
+                    report.findings,
+                    report.stand_downs,
+                    report.holds_allowed_for,
+                )
+            })
+            .collect();
+        let expected: Vec<_> = shapes
+            .iter()
+            .map(|(shape, _)| {
+                (
+                    *shape,
+                    voided.findings.clone(),
+                    Vec::new(),
+                    vec![held_note("fusion", HeldRule::Sync)],
+                )
+            })
+            .collect();
+        assert_eq!(judged, expected);
+
+        let mut read = unread.clone();
+        read[1].reads.push(read_with_role(
+            "ctl",
+            "inp",
+            ReadOutcomeKind::Served,
+            1,
+            None,
+            ReadSiteRole::Body,
+        ));
+        read[1].fires.push(fire("ctl", EPOCH + 10 * MS));
+        let confirmed = verify_unrestored(&held_over(&read), &read, &[], STAMPED);
+        assert!(confirmed.is_clean(), "unexpected: {:?}", confirmed.findings);
+        assert!(
+            confirmed.stand_downs.is_empty(),
+            "{:?}",
+            confirmed.stand_downs
+        );
+        assert_eq!(
+            confirmed.holds_allowed_for,
+            vec![held_note("fusion", HeldRule::Sync)]
+        );
     }
 
     // -- consume = latest ---------------------------------------------------
@@ -8036,6 +13567,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         )];
         let as_fifo = verify_unrestored(&fifo, &steps, &[], RoleTrust::Declined);
@@ -8154,6 +13686,7 @@ mod tests {
                     in_delivery: 2,
                     unlogged: 2,
                 }),
+                caveat: None,
             }]
         );
         let rendered = report.findings[0].to_string();
@@ -8321,6 +13854,7 @@ mod tests {
                     in_delivery: 2,
                     unlogged: 0,
                 }),
+                caveat: None,
             }]
         );
         let archived = verify_unrestored(&separate, &stalled, &[], RoleTrust::Declined);
@@ -8497,7 +14031,7 @@ mod tests {
     /// its own rank reads.
     fn block_producing_latest_node(drain: LatestDrain) -> Vec<NodeDecl> {
         let mut nodes = latest_node_on(drain, Some(1));
-        nodes[0].feeds_local_block_edge = true;
+        nodes[0].may_be_held_by = held_in_rank();
         nodes
     }
 
@@ -8847,7 +14381,7 @@ mod tests {
         );
 
         let mut block_producing = deep.clone();
-        block_producing[0].feeds_local_block_edge = true;
+        block_producing[0].may_be_held_by = held_in_rank();
         let held = verify_unrestored(&block_producing, &past_one_queue, &[], BELIEVED);
         assert!(held.is_clean(), "{:?}", held.findings);
         assert_eq!(
@@ -9603,6 +15137,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         )];
         let steps = vec![RecordedStep {
@@ -10420,6 +15955,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let corrupt_stream = vec![RecordedStep {
@@ -10546,6 +16082,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let batch = |role: ReadSiteRole| {
@@ -10753,6 +16290,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let steps = vec![RecordedStep {
@@ -10904,6 +16442,7 @@ mod tests {
             "n",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let gating = vec![BlockEdgeObservation {
@@ -11018,6 +16557,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["trig"]),
+                drain: FifoDrain::Unified,
             },
         );
         let run = |reads: Vec<RecordedRead>, trust: RoleTrust| {
@@ -11266,6 +16806,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let separate_shape = vec![r(K::DrainedBatch, 6, R::Drain), r(K::Served, 4, R::Body)];
@@ -11358,6 +16899,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["other"]),
+                drain: FifoDrain::Unified,
             },
         );
         assert_eq!(
@@ -11442,6 +16984,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let steps = vec![RecordedStep {
@@ -12429,7 +17972,7 @@ mod tests {
                 trigger_inputs: inputs(&["cam", "lidar"]),
             },
             throttle_ns: None,
-            feeds_local_block_edge: false,
+            may_be_held_by: BlockHoldEdges::none(),
             has_non_trigger_inputs: true,
             trigger_input_capacities: [("cam".to_string(), DEPTH)].into_iter().collect(),
         };
@@ -13900,6 +19443,7 @@ mod tests {
             "sink",
             TriggerDecl::Data {
                 trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
             },
         );
         let batch = |popped: u32, role: ReadSiteRole| {

@@ -141,6 +141,7 @@ fn test_different_periods_interleave() {
             global_level: 0,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         }
     );
     assert_eq!(
@@ -152,6 +153,7 @@ fn test_different_periods_interleave() {
             global_level: 0,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         }
     );
     assert_eq!(
@@ -163,6 +165,7 @@ fn test_different_periods_interleave() {
             global_level: 0,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         }
     );
 }
@@ -3085,6 +3088,7 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
         global_level: 0,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
 
     // Same id + fire_time, WILDLY different duration → EQUAL (excluded).
@@ -3095,6 +3099,7 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
         global_level: 0,
         duration_ns: 999_999,
         discarded: false,
+        stop: None,
     };
     assert_eq!(base, differ_duration);
 
@@ -3113,6 +3118,7 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
         global_level: 0,
         duration_ns: 5,
         discarded: true,
+        stop: None,
     };
     assert_eq!(base, differ_discarded);
 
@@ -3124,6 +3130,7 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
         global_level: 0,
         duration_ns: 999_999,
         discarded: true,
+        stop: None,
     };
     assert_eq!(base, differ_both_annotations);
 
@@ -3135,6 +3142,7 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
         global_level: 0,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
     assert_ne!(base, differ_fire_time);
 
@@ -3146,8 +3154,45 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
         global_level: 0,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
     assert_ne!(base, differ_node_id);
+}
+
+/// `stop` is replay-deterministic (a fire's own outcome), so it is INCLUDED in
+/// `PartialEq`: two entries that differ only in their stop are different fires.
+#[test]
+fn test_trace_entry_partial_eq_includes_stop() {
+    let base = TraceEntry {
+        node_id: Arc::from("a"),
+        step: 2,
+        fire_time_ns: 30,
+        global_level: 0,
+        duration_ns: 5,
+        discarded: false,
+        stop: None,
+    };
+    for stop in [
+        cerulion_core::scheduler::NodeStopCause::FatalError,
+        cerulion_core::scheduler::NodeStopCause::EntryPoisoned,
+        cerulion_core::scheduler::NodeStopCause::DisabledAfterPanics,
+    ] {
+        let stopped = TraceEntry {
+            stop: Some(stop),
+            ..base.clone()
+        };
+        assert_ne!(base, stopped, "{stop:?}");
+        assert_eq!(stopped, stopped.clone());
+    }
+    let fatal = TraceEntry {
+        stop: Some(cerulion_core::scheduler::NodeStopCause::FatalError),
+        ..base.clone()
+    };
+    let poisoned = TraceEntry {
+        stop: Some(cerulion_core::scheduler::NodeStopCause::EntryPoisoned),
+        ..base.clone()
+    };
+    assert_ne!(fatal, poisoned, "two causes are two fires");
 }
 
 /// The HAND-WRITTEN `PartialEq` INCLUDES `global_level`
@@ -3164,6 +3209,7 @@ fn test_trace_entry_partial_eq_includes_global_level() {
         global_level: 0,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
 
     // Same id + fire_time, DIFFERENT global_level → NOT equal (INCLUDED).
@@ -3174,6 +3220,7 @@ fn test_trace_entry_partial_eq_includes_global_level() {
         global_level: 3,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
     assert_ne!(
         base, differ_global_level,
@@ -3189,6 +3236,7 @@ fn test_trace_entry_partial_eq_includes_global_level() {
         global_level: 0,
         duration_ns: 999_999,
         discarded: false,
+        stop: None,
     };
     assert_eq!(
         base, differ_duration_only,
@@ -3210,6 +3258,7 @@ fn test_trace_entry_partial_eq_includes_step() {
         global_level: 0,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
 
     // Same id + fire_time + global_level, DIFFERENT step → NOT equal (INCLUDED).
@@ -3220,6 +3269,7 @@ fn test_trace_entry_partial_eq_includes_step() {
         global_level: 0,
         duration_ns: 5,
         discarded: false,
+        stop: None,
     };
     assert_ne!(
         base, differ_step,
@@ -3235,6 +3285,7 @@ fn test_trace_entry_partial_eq_includes_step() {
         global_level: 0,
         duration_ns: 999_999,
         discarded: false,
+        stop: None,
     };
     assert_eq!(
         base, differ_duration_only,
