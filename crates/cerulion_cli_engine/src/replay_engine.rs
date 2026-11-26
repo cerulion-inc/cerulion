@@ -18211,7 +18211,7 @@ fn run_rank_pass(
         // word in this runtime, so it has no entry here; the re-derived check
         // after the pass judges it or stands it down by name. Where the rank's
         // verifier declines the whole rank, nothing judges the edge's
-        // conservation and no note names it: the decline note names the
+        // conservation, and no note says so: the decline note names the
         // rank's deciders only.
         for credit in runtime.block_credits() {
             if credit.conservation_broken() {
