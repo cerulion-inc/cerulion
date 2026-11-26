@@ -1627,3 +1627,283 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
          intra-step pause exists to prevent"
     );
 }
+
+#[test]
+fn raw_ffi_node_second_commit_on_depth_one_block_edge_errors_without_overwriting() {
+    use cerulion_core::error::TransportError;
+    use cerulion_core::graph::node::{DylibNodeEntry, NodeContext};
+    use cerulion_core::graph::node_host_abi::{
+        register_context, remove_context, with_context, HostContext, HostPortSpec, HOST_API,
+    };
+    use cerulion_core::graph::node_plugin_abi::{HostClient, NodeContext as PluginContext};
+    use cerulion_core::node_abi::ContextHandle;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+    use std::collections::HashMap;
+
+    struct RawFfiBlockProducer {
+        context: Option<ContextHandle>,
+        client: Option<HostClient>,
+        plugin: Option<PluginContext>,
+        fire: u32,
+        second_commit_errors: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RawFfiBlockProducer {
+        fn parsed_info() -> cerulion_core::error::TransportResult<NodeInfo> {
+            DylibNodeEntry::parse_info_json_labeled(
+                &format!(
+                    r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":{},"max_slice_len_default":64}}],"policy":{{"period_ms":10}}}}"#,
+                    Vector3::SCHEMA_HASH
+                ),
+                "raw_ffi_block_producer",
+            )
+            .map_err(|reason| TransportError::NodeError {
+                node_id: "producer".into(),
+                reason,
+            })
+        }
+    }
+
+    impl NodeEntry for RawFfiBlockProducer {
+        fn info(&self) -> cerulion_core::error::TransportResult<NodeInfo> {
+            Self::parsed_info()
+        }
+
+        fn init(&mut self, ctx: NodeContext) -> cerulion_core::error::TransportResult<()> {
+            let env = Arc::new(HashMap::new());
+            let specs = vec![HostPortSpec {
+                name: "out".into(),
+                direction: LeaseDirection::Write,
+                layout: PluginWireLayout {
+                    schema_hash: Vector3::SCHEMA_HASH,
+                    fixed_size: 24,
+                    variable_fields: 0,
+                    alignment: 8,
+                },
+                read_mode: 0,
+                accumulate_cap: None,
+            }];
+            let host =
+                HostContext::new(ctx, specs, env, 2).map_err(|e| TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("HostContext::new failed: {e:?}"),
+                })?;
+            let handle = register_context(host).map_err(|e| TransportError::NodeError {
+                node_id: "producer".into(),
+                reason: format!("register_context failed: {e:?}"),
+            })?;
+            let context = ContextHandle { value: handle };
+            // SAFETY (U05): process HOST_API and registered context outlive client and plugin.
+            let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.map_err(|s| {
+                TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("HostClient::connect failed: {s:?}"),
+                }
+            })?;
+            let info = Self::parsed_info()?;
+            with_context(context.value, HostContext::begin_node_call).map_err(|e| {
+                TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("begin_node_call failed: {e:?}"),
+                }
+            })?;
+            let plugin = PluginContext::new(HostClient::share(&client), &info)?;
+            with_context(context.value, HostContext::end_node_call).map_err(|e| {
+                TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("end_node_call failed: {e:?}"),
+                }
+            })?;
+            self.context = Some(context);
+            self.client = Some(client);
+            self.plugin = Some(plugin);
+            Ok(())
+        }
+
+        fn tick(&mut self) -> cerulion_core::error::TransportResult<()> {
+            let context = self.context.expect("initialized context");
+            let node = self.plugin.as_mut().expect("initialized plugin");
+            self.fire += 1;
+            let fire_val = f64::from(self.fire);
+            with_context(context.value, HostContext::begin_node_call).map_err(|e| {
+                TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("begin_node_call failed: {e:?}"),
+                }
+            })?;
+            let tick_res = with_context(context.value, HostContext::begin_fire)
+                .map_err(|e| TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("begin_fire failed: {e:?}"),
+                })
+                .and_then(|()| {
+                    // First commit in this fire succeeds.
+                    let write_header = |bytes: &mut [u8]| {
+                        let mut hdr =
+                            cerulion_core::wire::WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
+                        hdr.total_size = 64;
+                        hdr.offset_table_offset = 64;
+                        hdr.write_to_buf(bytes);
+                    };
+                    let mut first = node
+                        .publisher_mut("out")
+                        .expect("wired out")
+                        .loan_raw_frame(HostClient::request::<Vector3>(), 64)?;
+                    write_header(first.bytes_mut());
+                    first.bytes_mut()[40..48].copy_from_slice(&fire_val.to_le_bytes());
+                    first.bytes_mut()[48..56].copy_from_slice(&2.0f64.to_le_bytes());
+                    first.bytes_mut()[56..64].copy_from_slice(&3.0f64.to_le_bytes());
+                    first.commit()?;
+
+                    // On fire 1, attempt a second commit in the same fire.
+                    if self.fire == 1 {
+                        let mut second = node
+                            .publisher_mut("out")
+                            .expect("wired out")
+                            .loan_raw_frame(HostClient::request::<Vector3>(), 64)?;
+                        write_header(second.bytes_mut());
+                        second.bytes_mut()[40..48].copy_from_slice(&99.0f64.to_le_bytes());
+                        if let Err(err) = second.commit() {
+                            self.second_commit_errors
+                                .lock()
+                                .unwrap()
+                                .push(err.to_string());
+                        }
+                    }
+                    Ok(())
+                });
+            with_context(context.value, HostContext::end_node_call).map_err(|e| {
+                TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("end_node_call failed: {e:?}"),
+                }
+            })?;
+            tick_res
+        }
+
+        fn shutdown(&mut self) -> cerulion_core::error::TransportResult<()> {
+            self.plugin = None;
+            self.client = None;
+            if let Some(context) = self.context.take() {
+                remove_context(context.value).map_err(|e| TransportError::NodeError {
+                    node_id: "producer".into(),
+                    reason: format!("remove_context failed: {e:?}"),
+                })?;
+            }
+            Ok(())
+        }
+    }
+
+    let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+    let received = Arc::new(Mutex::new(Vec::<(u32, f64, f64, f64)>::new()));
+    let received_sink = Arc::clone(&received);
+
+    // Depth-1 block consumer triggered by data (FIFO) so it drains every frame.
+    let mut consumer_input = block_input_meta(1);
+    consumer_input.trigger = true;
+    let consumer_info =
+        NodeInfo::with_meta(vec![consumer_input], vec![]).with_policy(MacroPolicy::DataTrigger {
+            input_name: "inp".to_string(),
+        });
+    let consumer = ClosureNodeEntry::new(consumer_info, move |ctx| {
+        if let Some(sub) = ctx.subscriber_mut("inp") {
+            if let Some(view) = sub.view_raw_expecting(Vector3::SCHEMA_HASH)? {
+                let seq = view.header().sequence;
+                let x = f64::from_le_bytes(view[40..48].try_into().unwrap());
+                let y = f64::from_le_bytes(view[48..56].try_into().unwrap());
+                let z = f64::from_le_bytes(view[56..64].try_into().unwrap());
+                received_sink.lock().unwrap().push((seq, x, y, z));
+            }
+        }
+        Ok(())
+    });
+
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "raw_ffi_block_depth_one".to_string(),
+        prefix: "bp".to_string(),
+        nodes: vec![
+            NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: "producer".to_string(),
+                node_type: "raw_ffi_block_producer".to_string(),
+                inputs: vec![],
+                outputs: vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            },
+            NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: "consumer".to_string(),
+                node_type: "depth_one_block_consumer".to_string(),
+                inputs: vec![InputDef {
+                    name: "inp".to_string(),
+                    source: "producer/out".to_string(),
+                    ..Default::default()
+                }],
+                outputs: vec![],
+            },
+        ],
+    };
+
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "producer".to_string(),
+        Box::new(RawFfiBlockProducer {
+            context: None,
+            client: None,
+            plugin: None,
+            fire: 0,
+            second_commit_errors: Arc::clone(&errors),
+        }),
+    );
+    factories.insert("consumer".to_string(), Box::new(consumer));
+
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime =
+        GraphRuntime::build_for_test(config, factories, clock, 8).expect("build depth-1 graph");
+
+    // Step 1: producer fires (commits frame 1, second commit refused), then
+    // consumer drains frame 1 in the same step (level 1 after producer level 0).
+    runtime.step(Duration::from_millis(10));
+    let recorded_errors = errors.lock().unwrap().clone();
+    assert_eq!(
+        recorded_errors,
+        vec![
+            "node 'producer' output 'out' on topic '/bp/producer/out' already committed a frame in this fire; block consumer 'consumer.inp' allows at most one commit per output per fire".to_string()
+        ]
+    );
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![(0, 1.0, 2.0, 3.0)],
+        "depth-1 block consumer must receive frame 1 intact with zero overwrite"
+    );
+    let credits: Vec<_> = runtime.block_credits().collect();
+    assert_eq!(credits.len(), 1);
+    assert_eq!(
+        credits[0].outstanding, 0,
+        "credit word must conserve exact outstanding count after drain"
+    );
+
+    // Step 2: producer fires again and commits frame 2 cleanly on the next fire.
+    runtime.step(Duration::from_millis(10));
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![(0, 1.0, 2.0, 3.0), (1, 2.0, 2.0, 3.0)]
+    );
+    let credits: Vec<_> = runtime.block_credits().collect();
+    assert_eq!(credits[0].outstanding, 0);
+}
