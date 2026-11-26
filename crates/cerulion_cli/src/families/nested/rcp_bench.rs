@@ -87,9 +87,9 @@ impl NestedVerbs for RcpBench {
         None
     }
 
-    /// The same rule as every `rcp` form: the free Cerulion account.
+    /// Local benchmark / verification reaches no Cerulion service or robot.
     fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-        true
+        false
     }
 
     fn run(&self, matches: &ArgMatches) -> ExitCode {

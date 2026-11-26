@@ -382,10 +382,13 @@ fn ensure_login_gate_at_a_terminal_auto_triggers_device_flow() {
         Duration::from_secs(15),
     )
     .expect("the gate auto-triggered the device flow + printed a user_code");
-    // The refusal message names the fix (`cerulion login`).
+    // The prompt names the Cerulion account service and the explicit login verb.
+    let prompt = buf.snapshot();
     assert!(
-        buf.snapshot().contains("cerulion login"),
-        "the refusal must name the fix"
+        prompt.contains("Cerulion account service")
+            && prompt.contains(&format!("http://127.0.0.1:{port}"))
+            && prompt.contains("cerulion login"),
+        "the prompt must name the account service and `cerulion login`; got: {prompt}"
     );
 
     authorize_via_magic_link(port, &email, &code);
@@ -2705,7 +2708,12 @@ fn logout_revokes_the_session_and_the_gate_then_refuses() {
 
     let err = login_cmd::ensure_login_gate_with(&mut Vec::new(), false)
         .expect_err("a signed-out machine is refused");
-    assert!(err.to_string().contains("signed out"), "{err}");
+    assert!(
+        err.to_string().contains("Cerulion account service")
+            && err.to_string().contains(&base)
+            && err.to_string().contains("signed out"),
+        "{err}"
+    );
 
     assert_eq!(
         login_cmd::run_logout().expect("a second logout is a no-op"),

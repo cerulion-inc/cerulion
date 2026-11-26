@@ -934,6 +934,135 @@ async fn a_poisoned_receipt_sink_refuses_the_session_fail_closed() {
     );
 }
 
+#[test]
+fn queued_session_refuses_fail_closed_when_receipt_sink_poisons_before_worker_starts() {
+    // Regression: if the receipt sink mutex is healthy when `serve_session`
+    // submits its blocking worker, then poisons while the worker is queued
+    // behind a full blocking pool, the worker must still refuse fail-closed
+    // before `serve_connection` sends a handshake Ack and must close the QUIC
+    // connection with `ops receipt sink poisoned`. Test both paired (OpsAdmit)
+    // and unpaired bootstrap (OpsBootstrapOnly) sessions.
+    for (case_name, paired, robot_seed, client_seed) in [
+        ("paired", true, 211u8, 72u8),
+        ("bootstrap", false, 212u8, 73u8),
+    ] {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build 1-blocking-thread runtime");
+
+        rt.block_on(async move {
+            let dir = tempfile::tempdir().unwrap();
+            let robot = disabled_endpoint([robot_seed; 32]).await;
+            let client = disabled_endpoint([client_seed; 32]).await;
+            let client_key = *client.id().as_bytes();
+            let robot_key = *robot.id().as_bytes();
+            let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+
+            let bindings: Vec<([u8; 32], AccountId)> =
+                if paired { vec![(client_key, OWNER)] } else { Vec::new() };
+            let mut r = build_robot(dir.path(), robot_key, /*claim_owner=*/ true, &bindings);
+
+            let (queued_tx, mut queued_rx) = tokio::sync::mpsc::unbounded_channel();
+            r.ops = Arc::new(
+                OpsServing::new(
+                    r.shared.clone(),
+                    r.lease.clone(),
+                    r.sessions.clone(),
+                    r.clock.clone(),
+                    &r.receipt_path,
+                    r.dir.clone(),
+                    "cerulion-remoted-test",
+                )
+                .expect("ops serving builds")
+                .with_on_blocking_queued_for_test(move || {
+                    let _ = queued_tx.send(());
+                }),
+            );
+
+            // Occupy the runtime's sole blocking worker thread so the ops
+            // session's `spawn_blocking` call queues behind it.
+            let (pool_busy_tx, pool_busy_rx) = tokio::sync::oneshot::channel();
+            let (pool_release_tx, pool_release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = pool_busy_tx.send(());
+                let _ = pool_release_rx.recv();
+            });
+            bounded("blocking pool occupied", pool_busy_rx)
+                .await
+                .expect("blocker entered pool");
+
+            let (handshake, close_reason) = with_serving(&r, &robot, async {
+                let conn = bounded("dial", dial(&client, robot_addr, alpn::OPS))
+                    .await
+                    .expect("dial ok");
+                let (send, recv) = bounded("open_bi", open_frame_stream(&conn))
+                    .await
+                    .expect("open_bi ok");
+                let ops = QuicOpsStream::new(send, recv);
+
+                // Run the client handshake on an OS thread so it never competes
+                // for the runtime's single blocking-pool thread.
+                let (hs_tx, hs_rx) = tokio::sync::oneshot::channel();
+                let client_thread = std::thread::spawn(move || {
+                    let _ = hs_tx.send(OpsClient::connect_current(ops).map(|_| ()));
+                });
+
+                // Wait until the server has passed its pre-spawn check and
+                // queued its blocking worker behind `blocker`.
+                bounded("worker queued behind full pool", queued_rx.recv())
+                    .await
+                    .expect("server queued blocking worker");
+
+                // Poison the receipt sink while the worker is still queued,
+                // then release the blocking pool so the queued worker runs.
+                r.ops.poison_receipt_sink_for_test();
+                let _ = pool_release_tx.send(());
+                bounded("blocker exit", blocker)
+                    .await
+                    .expect("blocker did not panic");
+
+                let handshake = bounded("client handshake", hs_rx)
+                    .await
+                    .expect("client thread replied");
+                let _ = client_thread.join();
+
+                let close_reason = match tokio::time::timeout(Duration::from_secs(3), conn.closed())
+                    .await
+                {
+                    Ok(cerulion_link::ConnectionError::ApplicationClosed(close)) => {
+                        Some(close.reason.to_vec())
+                    }
+                    Ok(_) | Err(_) => None,
+                };
+                drop(conn);
+                (handshake, close_reason)
+            })
+            .await;
+
+            assert!(
+                handshake.is_err(),
+                "{case_name}: queued session must not acknowledge handshake after sink poisons, got {handshake:?}"
+            );
+            assert_eq!(
+                close_reason.as_deref(),
+                Some(b"ops receipt sink poisoned".as_slice()),
+                "{case_name}: queued session must close with ops receipt sink poisoned"
+            );
+            let rx = receipts(&r.receipt_path);
+            assert!(
+                rx.is_empty(),
+                "{case_name}: refused queued session must not write receipts, got {rx:?}"
+            );
+
+            bounded("robot close", robot.close()).await;
+            bounded("client close", client.close()).await;
+        });
+    }
+}
+
 // ── scenario 7: double-framing pin (cerud BE-u32, NOT link LE) ────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -130,9 +130,14 @@ impl NestedVerbs for TopicMessage {
         network_switch::robot_refusal(robot.as_deref(), verb, env)
     }
 
-    /// The same rule as every `topic` verb.
-    fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-        true
+    /// Only `--robot` authenticates to a remote robot; local `topic pub` and
+    /// `topic snapshot` need no account sign-in.
+    fn needs_identity(&self, matches: &ArgMatches) -> bool {
+        matches!(
+            TopicMessageAction::from_arg_matches(matches),
+            Ok(TopicMessageAction::Pub { robot: Some(_), .. }
+                | TopicMessageAction::Snapshot { robot: Some(_), .. })
+        )
     }
 
     fn run(&self, matches: &ArgMatches) -> ExitCode {

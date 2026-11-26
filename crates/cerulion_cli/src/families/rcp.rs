@@ -51,8 +51,8 @@ enum RcpCmd {
     /// HTTP at `--http ADDR` (path `/mcp`). The first run installs the
     /// simulator and the benchmark scenes once, with its progress on STDERR.
     /// `cerulion rcp bench` reruns a benchmark task with and without the
-    /// harness against your own model. Both run under the free Cerulion
-    /// account, as `cerulion rcp <robot>` does; neither reaches a robot.
+    /// harness against your own model. Neither `--sim` nor `bench` reaches a
+    /// robot or requires a Cerulion account sign-in.
     #[command(args_conflicts_with_subcommands = true)]
     Rcp(RcpCliArgs),
 }
@@ -142,10 +142,10 @@ impl VerbFamily for Rcp {
         .map(|refusal| NetworkRefusal::error(refusal, rcp_cmd::EXIT_NETWORK_REFUSED))
     }
 
-    /// The same rule as `connect`, `--sim` included: every form runs under
-    /// the free Cerulion account.
-    fn needs_identity(&self, _matches: &ArgMatches) -> bool {
-        true
+    /// `cerulion rcp <robot>` authenticates to a remote robot; `--sim` runs a
+    /// local simulated robot without requiring an account sign-in.
+    fn needs_identity(&self, matches: &ArgMatches) -> bool {
+        !matches.get_flag("sim")
     }
 
     /// Spawns `cerulion-connectd rcp` with inherited stdio (the MCP stream)

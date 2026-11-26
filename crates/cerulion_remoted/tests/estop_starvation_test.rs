@@ -2,12 +2,16 @@
 //! — the un-starvable e-stop channel, over REAL iroh endpoints.
 //!
 //! The safety requirement: a legitimate remote `engage-estop` must reach the lease
-//! within a SMALL bounded latency regardless of how many other sessions (hostile
-//! or not) are in flight. Ops sessions SERIALIZED behind one permit would let a
-//! stalled/reconnect-loop attacker delay a legitimate e-stop up to the
-//! session deadline. The daemon serves sessions CONCURRENTLY over a shared
-//! `Arc<OpsServer>` whose receipt sink is a brief-append `Mutex`, so the safety
-//! verb never waits on an attacker's session.
+//! within a SMALL bounded latency without waiting behind other sessions. Ops
+//! sessions SERIALIZED behind one permit would let a stalled/reconnect-loop
+//! attacker delay a legitimate e-stop up to the session deadline. The daemon
+//! serves sessions CONCURRENTLY over a shared `Arc<OpsServer>` whose receipt
+//! sink is a brief-append `Mutex`, caps unpaired `OpsBootstrapOnly`, refused,
+//! and skeleton connections at 64 permits with a 5 s opening-frame deadline so
+//! throwaway peers cannot saturate the runtime's 512-thread blocking pool, and
+//! keeps paired `OpsAdmit` sessions exempt from that 64-permit cap (paired
+//! sessions still share the runtime's 512-thread blocking pool with one
+//! another).
 //!
 //! Every await is bounded so CI can never hang; every oracle is hand-built (real
 //! crypto, deterministic fixed-seed keys — Principle #13); the lease + receipt
@@ -32,10 +36,11 @@ const ESTOP_CEILING: Duration = Duration::from_secs(3);
 /// serialized model would make the e-stop wait this long, but under the harness
 /// bound so the test never hangs).
 const STALL_SECS: u64 = 6;
-/// Number of concurrent stalled sessions (proves "regardless of HOW MANY").
+/// Number of concurrent stalled sessions for the concurrency-vs-serialization
+/// pin (the 600-session saturation test below pins the blocking-pool cap).
 const STALLERS: usize = 3;
 
-// ── doc pin ───────────────────────────────────────────────────────────────────
+// ── doc pins ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn ops_session_deadline_is_the_120s_value_the_docs_cite() {
@@ -49,6 +54,15 @@ fn ops_session_deadline_is_the_120s_value_the_docs_cite() {
         cerulion_remoted::ops::OPS_SESSION_DEADLINE,
         Duration::from_secs(120),
         "docs/remote_plane.md cites a 120 s per-session deadline; update the doc if you re-tune it"
+    );
+}
+
+#[test]
+fn bootstrap_first_frame_deadline_is_the_5s_value_the_docs_cite() {
+    assert_eq!(
+        cerulion_remoted::ops::OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE,
+        Duration::from_secs(5),
+        "docs/remote_plane.md cites a 5 s bootstrap first-frame deadline; update the doc if you re-tune it"
     );
 }
 
@@ -484,4 +498,662 @@ async fn shared_endpoint_outbound_saturation_does_not_delay_estop_delivery() {
     .unwrap();
     common::bounded("shared endpoint close", robot.close()).await;
     common::bounded("e-stop client close", estop_client.close()).await;
+}
+
+/// Run an ops client closure on an OS thread (not tokio's blocking pool) so the
+/// client never contends for the robot's blocking pool in starvation tests.
+async fn run_client_off_blocking_pool<F, R>(
+    client: &cerulion_link::Endpoint,
+    robot_addr: cerulion_link::EndpointAddr,
+    f: F,
+) -> R
+where
+    F: FnOnce(&mut cerud::client::OpsClient<cerulion_link::QuicOpsStream>) -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let conn = common::bounded(
+        "dial",
+        cerulion_link::dial(client, robot_addr, cerulion_link::alpn::OPS),
+    )
+    .await
+    .expect("dial ok");
+    let (send, recv) = common::bounded("open_bi", cerulion_link::open_frame_stream(&conn))
+        .await
+        .expect("open_bi ok");
+    let ops = cerulion_link::QuicOpsStream::new(send, recv);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let thread = std::thread::spawn(move || {
+        let mut client = cerud::client::OpsClient::connect_current(ops).expect("cerud handshake");
+        let _ = tx.send(f(&mut client));
+    });
+    let out = common::bounded("off-pool client task", rx)
+        .await
+        .expect("off-pool client returned a value");
+    let _ = thread.join();
+    drop(conn);
+    out
+}
+
+/// Wait for `conn` to close within `budget` and return its QUIC application
+/// close reason bytes if it closed with `ApplicationClosed`.
+async fn wait_app_close_reason(
+    conn: &cerulion_link::Connection,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    match tokio::time::timeout(budget, conn.closed()).await {
+        Ok(cerulion_link::ConnectionError::ApplicationClosed(close)) => Some(close.reason.to_vec()),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_session_completes_normally_within_first_frame_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([235; 32]).await;
+    let peer = disabled_endpoint([75; 32]).await;
+    let peer_key = *peer.id().as_bytes();
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+
+    let r = build_robot(dir.path(), *robot.id().as_bytes(), true, &[]);
+    let viewer_account = cerulion_pairing::format::AccountId([21; 32]);
+    let pres_hex = common::viewer_presentation_hex(viewer_account, peer_key);
+
+    let paired = with_serving(&r, &robot, async {
+        run_client(&peer, robot_addr.clone(), move |c| {
+            c.call(
+                "pair",
+                serde_json::json!({ "presentation_postcard": pres_hex }),
+            )
+        })
+        .await
+    })
+    .await
+    .expect("unpaired bootstrap pair verb completes promptly within first-frame deadline");
+
+    assert_eq!(paired["paired"], true);
+    assert_eq!(
+        r.classify
+            .classify_accept(cerulion_link::alpn::OPS, &peer_key),
+        cerulion_remoted::AcceptDecision::OpsAdmit
+    );
+
+    let rx = read_all(&r.receipt_path).expect("read receipts");
+    assert_eq!(
+        rx.len(),
+        2,
+        "mutating pair writes intent + outcome receipts"
+    );
+    verify_chain(&rx).expect("receipt chain intact");
+
+    common::bounded("robot close", robot.close()).await;
+    common::bounded("peer close", peer.close()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn estop_is_served_under_600_stalled_bootstrap_sessions_within_bound() {
+    use std::sync::Arc;
+
+    const STALLED_CONNECTIONS: usize = 600;
+    const UNPAIRED_CAP: usize = 64;
+    const EXCESS_CONNECTIONS: usize = STALLED_CONNECTIONS - UNPAIRED_CAP;
+    const MIN_ACTIVE_STALLERS: usize = UNPAIRED_CAP;
+    const CLIENT_ENDPOINTS: usize = 6;
+    const MAX_CONCURRENT_DIALS: usize = 12;
+
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([240; 32]).await;
+    let estop_client = disabled_endpoint([74; 32]).await;
+    let estop_key = *estop_client.id().as_bytes();
+    let robot_key = *robot.id().as_bytes();
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+
+    let r = build_robot(dir.path(), robot_key, true, &[(estop_key, OWNER)]);
+
+    // Multiplex 600 real QUIC connections across 6 unpaired endpoints so macOS's
+    // 256-FD soft limit is respected while establishing 600 distinct connections.
+    let mut endpoints = Vec::with_capacity(CLIENT_ENDPOINTS);
+    for i in 0..CLIENT_ENDPOINTS {
+        endpoints.push(Arc::new(disabled_endpoint([100 + i as u8; 32]).await));
+    }
+
+    let (cap_refused, held_open_before, held_open_after, elapsed, estop_res) =
+        with_serving(&r, &robot, async {
+            let dial_gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS));
+
+            // 1. Fill all 64 unpaired permits with stalled bootstrap sessions
+            //    that complete the cerud Hello handshake and then park inside
+            //    `serve_connection` on the blocking pool (120 s session
+            //    deadline). Reading Ack proves synchronously that every permit
+            //    is held and guarantees these 64 stalled peers stay alive
+            //    through the excess flood and the `engage-estop` measurement.
+            let hello = serde_json::to_vec(&cerud::protocol::Hello::current()).unwrap();
+            let hello_len = (hello.len() as u32).to_be_bytes();
+            let mut active_tasks = tokio::task::JoinSet::new();
+            for idx in 0..UNPAIRED_CAP {
+                let ep = Arc::clone(&endpoints[idx % CLIENT_ENDPOINTS]);
+                let addr = robot_addr.clone();
+                let gate = Arc::clone(&dial_gate);
+                let hello = hello.clone();
+                active_tasks.spawn(async move {
+                    let _permit = gate.acquire_owned().await.unwrap();
+                    let conn = cerulion_link::dial(&ep, addr, cerulion_link::alpn::OPS)
+                        .await
+                        .expect("active bootstrap staller dial completes TLS");
+                    let (mut send, mut recv) = cerulion_link::open_frame_stream(&conn)
+                        .await
+                        .expect("active bootstrap staller open_bi");
+                    send.write_all(&hello_len)
+                        .await
+                        .expect("write bootstrap hello len");
+                    send.write_all(&hello).await.expect("write bootstrap hello");
+                    let mut ack_len_buf = [0u8; 4];
+                    recv.read_exact(&mut ack_len_buf)
+                        .await
+                        .expect("read bootstrap ack len");
+                    let ack_len = u32::from_be_bytes(ack_len_buf) as usize;
+                    let mut ack_buf = vec![0u8; ack_len];
+                    recv.read_exact(&mut ack_buf)
+                        .await
+                        .expect("read bootstrap ack");
+                    let reply: cerud::protocol::HandshakeReply =
+                        serde_json::from_slice(&ack_buf).expect("decode bootstrap ack");
+                    assert!(
+                        matches!(reply, cerud::protocol::HandshakeReply::Ack { .. }),
+                        "expected Ack for stalled bootstrap peer, got {reply:?}"
+                    );
+                    (conn, send, recv)
+                });
+            }
+            let mut held = Vec::with_capacity(UNPAIRED_CAP);
+            while let Some(res) = active_tasks.join_next().await {
+                held.push(res.expect("active staller task did not panic"));
+            }
+
+            // 2. Flood the remaining 536 unpaired bootstrap connections (600
+            //    total) with 1-byte stallers and confirm each hits the
+            //    64-permit cap.
+            let mut excess_tasks = tokio::task::JoinSet::new();
+            for idx in UNPAIRED_CAP..STALLED_CONNECTIONS {
+                let ep = Arc::clone(&endpoints[idx % CLIENT_ENDPOINTS]);
+                let addr = robot_addr.clone();
+                let gate = Arc::clone(&dial_gate);
+                excess_tasks.spawn(async move {
+                    let _permit = gate.acquire_owned().await.unwrap();
+                    let conn = cerulion_link::dial(&ep, addr, cerulion_link::alpn::OPS)
+                        .await
+                        .expect("excess unpaired dial completes TLS");
+                    if let Ok((mut send, _recv)) = cerulion_link::open_frame_stream(&conn).await {
+                        let _ = send.write_all(&[0x00]).await;
+                    }
+                    wait_app_close_reason(&conn, Duration::from_secs(5)).await
+                });
+            }
+            let mut cap_refused = 0usize;
+            while let Some(res) = excess_tasks.join_next().await {
+                if res.expect("excess dial task did not panic").as_deref()
+                    == Some(b"unpaired session cap".as_slice())
+                {
+                    cap_refused += 1;
+                }
+            }
+
+            let held_open_before = held
+                .iter()
+                .filter(|(conn, _, _)| conn.close_reason().is_none())
+                .count();
+
+            let start = Instant::now();
+            let res = tokio::time::timeout(
+                ESTOP_CEILING + Duration::from_secs(2),
+                run_client_off_blocking_pool(&estop_client, robot_addr.clone(), |c| {
+                    c.call("engage-estop", serde_json::json!({}))
+                }),
+            )
+            .await;
+            let elapsed = start.elapsed();
+
+            let held_open_after = held
+                .iter()
+                .filter(|(conn, _, _)| conn.close_reason().is_none())
+                .count();
+
+            drop(held);
+            (cap_refused, held_open_before, held_open_after, elapsed, res)
+        })
+        .await;
+
+    let engaged = estop_res
+        .expect("engage-estop did not time out behind 600 stalled bootstrap sessions")
+        .expect("engage-estop succeeded");
+    assert_eq!(engaged["engaged"], true);
+    assert_eq!(engaged["by"], hex::encode(estop_key));
+    assert!(
+        elapsed < ESTOP_CEILING,
+        "engage-estop took {elapsed:?}, exceeding {ESTOP_CEILING:?} under 600 stalled bootstrap sessions"
+    );
+    assert_eq!(
+        held_open_before, UNPAIRED_CAP,
+        "all {UNPAIRED_CAP} stalled bootstrap peers must be open before engage-estop, got {held_open_before}"
+    );
+    assert!(
+        (MIN_ACTIVE_STALLERS..=UNPAIRED_CAP).contains(&held_open_after),
+        "at least {MIN_ACTIVE_STALLERS} (and at most {UNPAIRED_CAP}) stalled bootstrap peers must \
+         still hold their connections after engage-estop completes, got {held_open_after}"
+    );
+    assert_eq!(
+        cap_refused, EXCESS_CONNECTIONS,
+        "all {EXCESS_CONNECTIONS} excess unpaired connections must hit the unpaired session cap, \
+         got {cap_refused}"
+    );
+
+    {
+        let lease = r.lease.lock().unwrap();
+        assert_eq!(
+            lease.estop(),
+            &EstopState::Engaged {
+                by: hex::encode(estop_key)
+            }
+        );
+    }
+    let rx = read_all(&r.receipt_path).expect("read receipts");
+    assert_eq!(rx.len(), 1);
+    assert_eq!(rx[0].verb, "engage-estop");
+    assert_eq!(rx[0].outcome, ReceiptOutcome::Ok);
+    verify_chain(&rx).expect("receipt chain intact");
+
+    common::bounded("robot endpoint close", robot.close()).await;
+    common::bounded("estop client close", estop_client.close()).await;
+    for ep in endpoints {
+        common::bounded("staller endpoint close", ep.close()).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_refused_and_skeleton_connections_share_the_unpaired_cap() {
+    use std::sync::Arc;
+
+    const UNPAIRED_CAP: usize = 64;
+    const CLIENT_ENDPOINTS: usize = 4;
+    const MAX_CONCURRENT_DIALS: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([241; 32]).await;
+    let estop_client = disabled_endpoint([76; 32]).await;
+    let estop_key = *estop_client.id().as_bytes();
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+
+    let r = build_robot(
+        dir.path(),
+        *robot.id().as_bytes(),
+        true,
+        &[(estop_key, OWNER)],
+    );
+
+    let mut endpoints = Vec::with_capacity(CLIENT_ENDPOINTS);
+    for i in 0..CLIENT_ENDPOINTS {
+        endpoints.push(Arc::new(disabled_endpoint([110 + i as u8; 32]).await));
+    }
+    let extra_unpaired = disabled_endpoint([119; 32]).await;
+
+    let (refused_65th_wire, refused_65th_ops, held_open_after, elapsed, estop_res) =
+        with_serving(&r, &robot, async {
+            // Saturate all 64 permits with stalled refused wire connections
+            // (unpaired peer on cerulion/wire/2 -> Refuse -> skeleton report
+            // bounded by 10 s HANDSHAKE_DEADLINE).
+            let dial_gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS));
+            let mut dial_tasks = tokio::task::JoinSet::new();
+            for idx in 0..UNPAIRED_CAP {
+                let ep = Arc::clone(&endpoints[idx % CLIENT_ENDPOINTS]);
+                let addr = robot_addr.clone();
+                let gate = Arc::clone(&dial_gate);
+                dial_tasks.spawn(async move {
+                    let _permit = gate.acquire_owned().await.unwrap();
+                    let conn = cerulion_link::dial(&ep, addr, cerulion_link::alpn::WIRE)
+                        .await
+                        .expect("refused wire dial completes TLS");
+                    let (send, recv) = cerulion_link::open_frame_stream(&conn)
+                        .await
+                        .expect("open_bi on refused wire connection");
+                    (conn, send, recv)
+                });
+            }
+            let mut held = Vec::with_capacity(UNPAIRED_CAP);
+            while let Some(res) = dial_tasks.join_next().await {
+                held.push(res.expect("dial task did not panic"));
+            }
+
+            // Let all 64 handlers classify and acquire their permits.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            // The 65th refused wire connection AND a 65th unpaired ops
+            // bootstrap connection must both be closed immediately with
+            // `unpaired session cap`.
+            let extra_wire = common::bounded(
+                "dial 65th wire",
+                cerulion_link::dial(
+                    &extra_unpaired,
+                    robot_addr.clone(),
+                    cerulion_link::alpn::WIRE,
+                ),
+            )
+            .await
+            .expect("65th wire TLS completes");
+            let refused_65th_wire =
+                wait_app_close_reason(&extra_wire, Duration::from_secs(2)).await;
+
+            let extra_ops = common::bounded(
+                "dial 65th ops",
+                cerulion_link::dial(
+                    &extra_unpaired,
+                    robot_addr.clone(),
+                    cerulion_link::alpn::OPS,
+                ),
+            )
+            .await
+            .expect("65th ops TLS completes");
+            let refused_65th_ops = wait_app_close_reason(&extra_ops, Duration::from_secs(2)).await;
+
+            // Paired engage-estop is exempt from the shared 64-permit cap.
+            let start = Instant::now();
+            let res = run_client_off_blocking_pool(&estop_client, robot_addr.clone(), |c| {
+                c.call("engage-estop", serde_json::json!({}))
+            })
+            .await;
+            let elapsed = start.elapsed();
+
+            let held_open_after = held
+                .iter()
+                .filter(|(conn, _, _)| conn.close_reason().is_none())
+                .count();
+
+            drop(held);
+            (
+                refused_65th_wire,
+                refused_65th_ops,
+                held_open_after,
+                elapsed,
+                res,
+            )
+        })
+        .await;
+
+    assert_eq!(
+        held_open_after, UNPAIRED_CAP,
+        "all {UNPAIRED_CAP} stalled refused wire connections must remain open through engage-estop, got {held_open_after}"
+    );
+
+    assert_eq!(
+        refused_65th_wire.as_deref(),
+        Some(b"unpaired session cap".as_slice()),
+        "65th refused wire connection must be closed at the unpaired cap"
+    );
+    assert_eq!(
+        refused_65th_ops.as_deref(),
+        Some(b"unpaired session cap".as_slice()),
+        "ops bootstrap must share the same 64-permit cap with refused/skeleton connections"
+    );
+    let engaged = estop_res.expect("paired engage-estop is exempt from the unpaired cap");
+    assert_eq!(engaged["engaged"], true);
+    assert_eq!(engaged["by"], hex::encode(estop_key));
+    assert!(
+        elapsed < ESTOP_CEILING,
+        "engage-estop took {elapsed:?}, exceeding {ESTOP_CEILING:?}"
+    );
+
+    common::bounded("robot close", robot.close()).await;
+    common::bounded("estop client close", estop_client.close()).await;
+    common::bounded("extra client close", extra_unpaired.close()).await;
+    for ep in endpoints {
+        common::bounded("staller endpoint close", ep.close()).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_first_frame_deadline_closes_one_byte_staller_and_frees_permit() {
+    use std::sync::Arc;
+
+    const UNPAIRED_CAP: usize = 64;
+    const CLIENT_ENDPOINTS: usize = 4;
+    const MAX_CONCURRENT_DIALS: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([242; 32]).await;
+    let staller = disabled_endpoint([77; 32]).await;
+    let next_peer = disabled_endpoint([78; 32]).await;
+    let next_peer_key = *next_peer.id().as_bytes();
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+
+    let mut r = build_robot(dir.path(), *robot.id().as_bytes(), true, &[]);
+    // Leave OPS_SESSION_DEADLINE at 120 s; shorten ONLY the bootstrap
+    // first-frame deadline so 0-byte, 1-byte, and mid-payload stallers are
+    // closed in ~300 ms rather than 120 s.
+    r.ops = Arc::new(
+        cerulion_remoted::OpsServing::new(
+            r.shared.clone(),
+            r.lease.clone(),
+            r.sessions.clone(),
+            r.clock.clone(),
+            &r.receipt_path,
+            r.dir.clone(),
+            "cerulion-remoted-test",
+        )
+        .expect("ops serving builds")
+        .with_bootstrap_first_frame_deadline_for_test(Duration::from_millis(300)),
+    );
+
+    let mut pool = Vec::with_capacity(CLIENT_ENDPOINTS);
+    for i in 0..CLIENT_ENDPOINTS {
+        pool.push(Arc::new(disabled_endpoint([120 + i as u8; 32]).await));
+    }
+
+    let viewer_account = cerulion_pairing::format::AccountId([22; 32]);
+    let pres_hex = common::viewer_presentation_hex(viewer_account, next_peer_key);
+
+    let (zero_byte_reason, one_byte_reason, mid_payload_reason, next_peer_res) =
+        with_serving(&r, &robot, async {
+            // 1. 0-byte staller (never opens a bidi stream).
+            let c0 = common::bounded(
+                "dial 0-byte",
+                cerulion_link::dial(&staller, robot_addr.clone(), cerulion_link::alpn::OPS),
+            )
+            .await
+            .expect("dial 0-byte");
+            let r0 = wait_app_close_reason(&c0, Duration::from_secs(3)).await;
+
+            // 2. 1-byte staller (opens bidi stream, sends 1 byte of prefix).
+            let c1 = common::bounded(
+                "dial 1-byte",
+                cerulion_link::dial(&staller, robot_addr.clone(), cerulion_link::alpn::OPS),
+            )
+            .await
+            .expect("dial 1-byte");
+            let (mut s1, _r1_stream) =
+                common::bounded("open_bi 1-byte", cerulion_link::open_frame_stream(&c1))
+                    .await
+                    .expect("open_bi 1-byte");
+            s1.write_all(&[0x00]).await.expect("write 1 byte");
+            let r1 = wait_app_close_reason(&c1, Duration::from_secs(3)).await;
+
+            // 3. Mid-payload staller (sends 4-byte length = 64 + 4 bytes of payload).
+            let c2 = common::bounded(
+                "dial mid-payload",
+                cerulion_link::dial(&staller, robot_addr.clone(), cerulion_link::alpn::OPS),
+            )
+            .await
+            .expect("dial mid-payload");
+            let (mut s2, _r2_stream) =
+                common::bounded("open_bi mid-payload", cerulion_link::open_frame_stream(&c2))
+                    .await
+                    .expect("open_bi mid-payload");
+            s2.write_all(&[0, 0, 0, 64, b'{', b'"', b'x', b'"'])
+                .await
+                .expect("write partial payload");
+            let r2 = wait_app_close_reason(&c2, Duration::from_secs(3)).await;
+
+            // 4. Fill all 64 permits with 1-byte stallers, wait for the 300 ms
+            //    first-frame deadline to close them and free all permits, then
+            //    verify a subsequent unpaired peer completes `pair`.
+            let dial_gate = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DIALS));
+            let mut tasks = tokio::task::JoinSet::new();
+            for idx in 0..UNPAIRED_CAP {
+                let ep = Arc::clone(&pool[idx % CLIENT_ENDPOINTS]);
+                let addr = robot_addr.clone();
+                let gate = Arc::clone(&dial_gate);
+                tasks.spawn(async move {
+                    let _permit = gate.acquire_owned().await.unwrap();
+                    let conn = cerulion_link::dial(&ep, addr, cerulion_link::alpn::OPS)
+                        .await
+                        .expect("dial staller wave");
+                    if let Ok((mut send, recv)) = cerulion_link::open_frame_stream(&conn).await {
+                        let _ = send.write_all(&[0x00]).await;
+                        (conn, Some((send, recv)))
+                    } else {
+                        (conn, None)
+                    }
+                });
+            }
+            let mut wave = Vec::with_capacity(UNPAIRED_CAP);
+            while let Some(res) = tasks.join_next().await {
+                wave.push(res.expect("wave task"));
+            }
+            for (conn, _) in &wave {
+                let reason = wait_app_close_reason(conn, Duration::from_secs(3)).await;
+                assert_eq!(
+                    reason.as_deref(),
+                    Some(b"ops bootstrap first-frame deadline".as_slice()),
+                    "every 1-byte staller must close on the short first-frame deadline"
+                );
+            }
+            drop(wave);
+
+            let next_peer_res = run_client(&next_peer, robot_addr.clone(), move |c| {
+                c.call(
+                    "pair",
+                    serde_json::json!({ "presentation_postcard": pres_hex }),
+                )
+            })
+            .await;
+
+            (r0, r1, r2, next_peer_res)
+        })
+        .await;
+
+    assert_eq!(
+        zero_byte_reason.as_deref(),
+        Some(b"ops bootstrap first-frame deadline".as_slice())
+    );
+    assert_eq!(
+        one_byte_reason.as_deref(),
+        Some(b"ops bootstrap first-frame deadline".as_slice())
+    );
+    assert_eq!(
+        mid_payload_reason.as_deref(),
+        Some(b"ops bootstrap first-frame deadline".as_slice())
+    );
+    let paired = next_peer_res.expect("subsequent bootstrap peer succeeds after permits are freed");
+    assert_eq!(paired["paired"], true);
+
+    common::bounded("robot close", robot.close()).await;
+    common::bounded("staller close", staller.close()).await;
+    common::bounded("next peer close", next_peer.close()).await;
+    for ep in pool {
+        common::bounded("pool close", ep.close()).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_first_frame_error_arms() {
+    let dir = tempfile::tempdir().unwrap();
+    let robot = disabled_endpoint([243; 32]).await;
+    let peer = disabled_endpoint([79; 32]).await;
+    let robot_addr = loopback_addr(robot.id(), &robot.bound_sockets());
+
+    let r = build_robot(dir.path(), *robot.id().as_bytes(), true, &[]);
+
+    let (eof_reason, huge_closed, poisoned_reason) = with_serving(&r, &robot, async {
+        // 1. Clean EOF mid-prefix -> closed promptly with incomplete first frame.
+        let c_eof = common::bounded(
+            "dial eof",
+            cerulion_link::dial(&peer, robot_addr.clone(), cerulion_link::alpn::OPS),
+        )
+        .await
+        .expect("dial eof");
+        let (mut s_eof, _r_eof) =
+            common::bounded("open_bi eof", cerulion_link::open_frame_stream(&c_eof))
+                .await
+                .expect("open_bi eof");
+        s_eof.write_all(&[0x00]).await.expect("write 1 byte");
+        s_eof.finish().expect("finish mid-prefix");
+        let eof_reason = wait_app_close_reason(&c_eof, Duration::from_secs(3)).await;
+
+        // 2. Declared length > MAX_FRAME_BYTES -> preloads only 4 bytes and
+        //    cerud::protocol::read_frame rejects with FrameTooLarge without
+        //    allocating len bytes or waiting for payload bytes.
+        let c_huge = common::bounded(
+            "dial huge",
+            cerulion_link::dial(&peer, robot_addr.clone(), cerulion_link::alpn::OPS),
+        )
+        .await
+        .expect("dial huge");
+        let (mut s_huge, mut r_huge) =
+            common::bounded("open_bi huge", cerulion_link::open_frame_stream(&c_huge))
+                .await
+                .expect("open_bi huge");
+        let huge_len = (cerud::protocol::MAX_FRAME_BYTES as u32) + 1;
+        s_huge
+            .write_all(&huge_len.to_be_bytes())
+            .await
+            .expect("write oversized length prefix");
+        // The server closes the stream without sending any Ack bytes after
+        // cerud rejects FrameTooLarge, without waiting for 16 MiB of payload.
+        let mut buf = [0u8; 64];
+        let huge_closed = matches!(
+            tokio::time::timeout(Duration::from_secs(3), r_huge.read(&mut buf)).await,
+            Ok(Ok(None)) | Ok(Err(_))
+        );
+
+        // 3. ReceiptSinkPoisoned on a bootstrap connection still closes with
+        //    `ops receipt sink poisoned` after preloading a valid Hello frame.
+        r.ops.poison_receipt_sink_for_test();
+        let c_poison = common::bounded(
+            "dial poisoned",
+            cerulion_link::dial(&peer, robot_addr.clone(), cerulion_link::alpn::OPS),
+        )
+        .await
+        .expect("dial poisoned");
+        let (mut s_poison, _r_poison) = common::bounded(
+            "open_bi poisoned",
+            cerulion_link::open_frame_stream(&c_poison),
+        )
+        .await
+        .expect("open_bi poisoned");
+        let hello = serde_json::to_vec(&cerud::protocol::Hello::current()).unwrap();
+        let hello_len = (hello.len() as u32).to_be_bytes();
+        s_poison.write_all(&hello_len).await.expect("write len");
+        s_poison.write_all(&hello).await.expect("write hello");
+        let poisoned_reason = wait_app_close_reason(&c_poison, Duration::from_secs(3)).await;
+
+        (eof_reason, huge_closed, poisoned_reason)
+    })
+    .await;
+
+    assert_eq!(
+        eof_reason.as_deref(),
+        Some(b"ops bootstrap incomplete first frame".as_slice())
+    );
+    assert!(
+        huge_closed,
+        "oversized length prefix must be rejected promptly without waiting for payload"
+    );
+    assert_eq!(
+        poisoned_reason.as_deref(),
+        Some(b"ops receipt sink poisoned".as_slice())
+    );
+    assert!(
+        read_all(&r.receipt_path).expect("read receipts").is_empty(),
+        "no receipt was written by any rejected bootstrap error arm"
+    );
+
+    common::bounded("robot close", robot.close()).await;
+    common::bounded("peer close", peer.close()).await;
 }

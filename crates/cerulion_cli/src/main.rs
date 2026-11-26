@@ -275,59 +275,25 @@ fn dispatch(cli: Cli, switch: &network_switch::SwitchEnv) -> ExitCode {
     // because both bridges have the same destination semantics.
     let _ = cerulion_core::iceoryx_logger::install_iceoryx2_tracing_bridge();
 
-    // The first-need runtime login gate. Every
-    // identity-needing command runs under a logged-in-ever account — the gate
-    // reads LOCAL state (microseconds; zero network on the proceed path) and, on
-    // a machine that has never signed in, either runs the device-code flow
-    // inline (at a terminal) or refuses at once (anywhere else). The gate is on
+    // The first-need runtime login gate. Every command that calls the Cerulion
+    // account service or authenticates to a remote robot runs under a
+    // logged-in-ever account (`command_needs_identity` / `VerbFamily::needs_identity`).
+    // Local and offline verbs do not enter this gate. The gate reads LOCAL state
+    // (microseconds; zero network on the proceed path) and, on a machine that has
+    // never signed in, either runs the device-code flow inline (at a terminal) or
+    // refuses at once naming the account service (anywhere else). The gate is on
     // in every build, released or built from source; the one escape is this
     // repository's own runs, which set `CERULION_LOGIN_GATE=off` (see
-    // `login_cmd` and `docs/internals/cli.md`). Internal
-    // subprocess verbs (bagd, already dispatched above; `graph
-    // run-worker`/`run-gateway`, spawned by a gated parent) and `login` itself
-    // are exempt (`command_needs_identity`). The prompt/refusal rides stderr so
-    // it never pollutes a command's stdout.
+    // `login_cmd` and `docs/internals/cli.md`). The prompt/refusal rides stderr
+    // so it never pollutes a command's stdout.
     //
-    // A REMOVED verb needs no intercept here. `cerulion replay` must not be
-    // blocked on a device-code prompt before the user learns it is gone, and
-    // with no variant declared for it that refusal
-    // comes EARLIER (clap rejects it while parsing) and on every
-    // platform, so the property holds without any code here.
+    // A REMOVED verb needs no intercept here. `cerulion replay` is rejected by
+    // clap while parsing before dispatch.
     //
-    // A malformed resim invocation is answered
-    // here, ABOVE the login gate, for the same reason the removed `replay` verb
-    // is — you do not have to prove who you are to be told your command line is
-    // wrong. `bag play` is identity-gated (`command_needs_identity` exempts only
-    // `login`, `completions`, `clean` and the two internal `graph run-worker` /
-    // `run-gateway` subprocess verbs), and on a never-signed-in machine
-    // `ensure_login_gate` runs the DEVICE-CODE FLOW inline, so `cerulion bag
-    // play b.mcap --verify` would open a browser prompt and exit 7 (auth)
-    // instead of exit 2 (usage), never reaching the refusal that would have
-    // named `--resim`.
-    //
-    // Only the VALIDATION is hoisted, never the run: `resolve_play_mode` is a
-    // pure function of the parsed flags (no I/O, no transport, no bag read), so
-    // it is safe above the gate. A WELL-FORMED resim still falls through to the
-    // gate and authenticates before a single node executes — re-execution is a
-    // runtime verb and stays gated.
-    //
-    // The cost is that `resolve_play_mode` runs twice on the happy path. It is
-    // pure and total, so the second call is the same answer for free; the
-    // alternative (threading the resolved mode down) would put the gate INSIDE
-    // the resim path and make the ordering an implementation detail rather than
-    // a visible property of `main`.
-    //
-    // The refusal is hoisted for EVERY `bag play`, not
-    // only the resim family. `--duration` is legal on BOTH halves, so a
-    // malformed one (`--duration -1`) on the playback half fell through to the
-    // generic dispatch and exited 1 — while the identical mistake on
-    // `--start-offset` exited 2, because that flag puts the invocation in the
-    // family. A malformed VALUE is a usage error on both halves, and on this
-    // surface 1 means "your code diverged": a CI job cannot be left to tell a
-    // typo from a regression by reading stderr. `resolve_play_mode` is pure and
-    // total and answers `Ok(Playback)` for every well-formed playback
-    // invocation, so widening the gate refuses nothing it did not refuse
-    // before — it only changes which CODE the refusal spends.
+    // A malformed `bag play` / resim invocation is answered here, before
+    // dispatch, so usage errors always exit 2 (distinct from exit 1 for data
+    // divergence) across both playback and re-execution forms. `resolve_play_mode`
+    // is a pure function of the parsed flags (no I/O, no transport, no bag read).
     if let Commands::Bag { action } = &cli.command {
         if let Some(refusal) = resim_usage_refusal(action) {
             eprintln!("Error: {refusal}");
@@ -446,6 +412,7 @@ fn cli_error_exit_code(err: &cerulion_cli_engine::error::CliError) -> u8 {
     use cerulion_cli_engine::error::{CliError, EXIT_NODE_FATAL};
     match err {
         CliError::AmbiguousTopic(_) => 2,
+        CliError::AuthRequired(_) => cerulion_cli_engine::login_cmd::EXIT_AUTH_REQUIRED,
         CliError::NodeFatal { .. }
         | CliError::WorkerNodeFatal { .. }
         | CliError::WorkerNodeFatalAnnounced => EXIT_NODE_FATAL,
@@ -3198,7 +3165,9 @@ fn map_levels_partition_result(partition_error: Option<String>) -> CliResult<()>
 /// removed; the state-file half stays a bounded read; and the report closes
 /// by saying nothing was removed.
 fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
-    let (result, converged) = clean_dead_nodes(mode);
+    let (result, default_converged) = clean_dead_nodes(mode);
+    let resim_converged = clean_resim_slots(mode);
+    let converged = default_converged && resim_converged;
     // The reclamation is DOWNGRADED to a report when the sweep above
     // left dead nodes registered. A `.shm_state` file is the only mapping from
     // an iceoryx2 resource name to the object behind it, so removing one that a
@@ -3223,6 +3192,78 @@ fn clean_iceoryx2_state(mode: SweepMode) -> CliResult<()> {
         println!("{NOTHING_WAS_REMOVED}");
     }
     result
+}
+
+/// Sweep every lockable resim private namespace slot and print its summary.
+/// Returns whether every lockable slot's node registry converged.
+fn clean_resim_slots(mode: SweepMode) -> bool {
+    let report = cerulion_cli_engine::ipc_cleanup::sweep_resim_slots_global(mode, None);
+    for line in render_resim_slot_sweep(&report, mode) {
+        println!("{line}");
+    }
+    report.nodes_converged()
+}
+
+/// Render the resim-slot section for `cerulion clean` and `clean --report-only`.
+/// Empty when lockable resim slots have nothing to report and no errors.
+fn render_resim_slot_sweep(
+    report: &cerulion_cli_engine::ipc_cleanup::ResimSweepReport,
+    mode: SweepMode,
+) -> Vec<String> {
+    let has_activity = match mode {
+        SweepMode::ReportOnly => {
+            report.dead_nodes > 0 || report.leftover_segments > 0 || !report.errors.is_empty()
+        }
+        SweepMode::Remove => {
+            report.cleaned_nodes > 0
+                || report.failed_node_cleanups > 0
+                || report.segments_removed > 0
+                || report.segments_failed > 0
+                || !report.errors.is_empty()
+        }
+    };
+    if !has_activity {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    match mode {
+        SweepMode::ReportOnly => {
+            if report.dead_nodes > 0 || report.leftover_segments > 0 {
+                lines.push(format!(
+                    "Resim namespace slots `cerulion clean` would sweep: {} dead iceoryx2 node(s) \
+                     and {} leftover shared-memory segment(s) across {} lockable slot(s) \
+                     (report only; none was removed)",
+                    report.dead_nodes, report.leftover_segments, report.slots_checked
+                ));
+            }
+        }
+        SweepMode::Remove => {
+            if report.cleaned_nodes > 0
+                || report.failed_node_cleanups > 0
+                || report.segments_removed > 0
+                || report.segments_failed > 0
+            {
+                lines.push(format!(
+                    "Resim namespace slots: cleaned {} dead iceoryx2 node(s) ({} failed); \
+                     removed {} leftover shared-memory segment(s) ({} failed).",
+                    report.cleaned_nodes,
+                    report.failed_node_cleanups,
+                    report.segments_removed,
+                    report.segments_failed
+                ));
+            }
+        }
+    }
+    if !report.errors.is_empty() {
+        lines.push("Resim namespace slot errors:".to_string());
+        for err in report.errors.iter().take(NODES_SHOWN) {
+            lines.push(format!("  {err}"));
+        }
+        if report.errors.len() > NODES_SHOWN {
+            lines.push(format!("  and {} more", report.errors.len() - NODES_SHOWN));
+        }
+    }
+    lines
 }
 
 /// The closing line of every `--report-only` run: the whole verb's promise,
@@ -3865,64 +3906,62 @@ fn prompt_yes_no(preview: &str, question: &str) -> CliResult<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
-/// Whether a command must run under a logged-in-ever identity (the
-/// runtime login gate — "every command requires a logged-in-ever
-/// identity"). Everything a user invokes gates, `account` and its sub-verbs
-/// included: those talk to the account service and need a session anyway, so
-/// exempting them would only move the failure later and word it worse.
+/// Whether `command` calls the Cerulion account service or authenticates to a
+/// remote robot, and therefore enters the runtime login gate before dispatch.
 ///
-/// Two more things answer above this gate and therefore need no exemption here:
-/// clap's own `--help` and `--version`, which exit inside the clap parse
-/// (`Cli::command().get_matches()`) before the dispatch runs, and the usage
-/// refusals `main` performs before the gate call (a moved verb, the hidden
-/// `pair` stub, a malformed resim invocation). You do not have to
-/// prove who you are to be told a command line is wrong.
-///
-/// The exemptions are:
-///
-/// - **`login`** itself — it IS the login (gating it would auto-trigger a device
-///   flow BEFORE the real login runs — a doubled/confusing login).
-/// - **`graph run-worker` / `graph run-gateway`** — the internal subprocess
-///   verbs the multi-process supervisor / monolith parent spawns. **Why exempt
-///   is safe:** the PARENT already passed this gate, and it spawns these children
-///   with the parent's env (the cached auth is visible); gating them would make
-///   each spawned worker re-hit the gate and — on a child env without a visible
-///   auth cache — auto-trigger an interactive device-code login MID-SPAWN,
-///   wedging the whole run. (`bagd` is also internal but is dispatched away in
-///   `main` BEFORE this hook, so it never reaches here.)
-/// - **`clean`** — it sweeps the iceoryx2 bookkeeping that provably dead
-///   processes left behind on THIS machine: it reads no account, sends nothing
-///   anywhere and reaches no network. The desks that need it most have never
-///   signed in — a CI runner, a fresh install a `kill -9` left wedged — and a
-///   machine must be able to clear its own state. Gating it would also make the
-///   remedy for a wedged desk depend on a device-code flow that the wedge is
-///   perfectly capable of outliving.
-///
-/// The enforcement boundary: `run-worker` and `run-gateway` are hidden from
-/// help but still reachable as standalone `cerulion graph run-worker`
-/// invocations, so a machine that has never signed in can run them ungated.
-/// The local gate is a convenience check on a user's own machine; access to
-/// an account and its robots is enforced by the account service.
+/// The match is exhaustive over `Commands`, `GraphAction`, and `TopicAction` so
+/// every new verb requires a compile-time decision. Local and offline verbs
+/// return `false` and run without an account session; access to an account and
+/// its robots is still enforced by the account service and the robot.
 fn command_needs_identity(command: &Commands) -> bool {
-    !matches!(
-        command,
-        Commands::Login
-            // Consent must be changeable without an account: opting out
-            // may not require signing in first.
-            | Commands::Telemetry { .. }
-            // Signing out must work on a machine whose session is gone or
-            // expired, and must never start a sign-in.
-            | Commands::Logout
-            // Emitting a completion script is a pure local text
-            // render — gating it behind the login flow would make `cerulion
-            // completions zsh` in a shell rc file block startup on a device
-            // -code prompt nobody is watching.
-            | Commands::Completions { .. }
-            | Commands::Clean { .. }
-            | Commands::Graph {
-                action: GraphAction::RunWorker { .. } | GraphAction::RunGateway { .. },
-            }
-    )
+    match command {
+        Commands::Account { .. } | Commands::Connect { .. } => true,
+        Commands::Viz { robot, .. } => robot.is_some(),
+        Commands::Graph { action } => match action {
+            GraphAction::Live { .. } | GraphAction::Fires { .. } => true,
+            GraphAction::Create { .. }
+            | GraphAction::Run { .. }
+            | GraphAction::Validate { .. }
+            | GraphAction::List
+            | GraphAction::Levels { .. }
+            | GraphAction::Plan { .. }
+            | GraphAction::Profile { .. }
+            | GraphAction::Partition { .. }
+            | GraphAction::Pause { .. }
+            | GraphAction::Resume { .. }
+            | GraphAction::RunWorker { .. }
+            | GraphAction::RunGateway { .. } => false,
+        },
+        Commands::Topic { action } => match action {
+            TopicAction::Echo { robot, .. }
+            | TopicAction::Hz { robot, .. }
+            | TopicAction::Info { robot, .. } => robot.is_some(),
+            TopicAction::List { .. } => false,
+        },
+        #[cfg(unix)]
+        Commands::BootstrapRobot { .. } | Commands::RobotSyncEpoch { .. } => false,
+        Commands::Workspace { .. }
+        | Commands::Node { .. }
+        | Commands::Ros { .. }
+        | Commands::Ros2 { .. }
+        | Commands::Pair { .. }
+        | Commands::Login
+        | Commands::Logout
+        | Commands::Telemetry { .. }
+        | Commands::Tui
+        | Commands::Trace { .. }
+        | Commands::Bag { .. }
+        | Commands::Completions { .. }
+        | Commands::Clean { .. } => false,
+        #[cfg(unix)]
+        Commands::Flashback { .. } => false,
+        #[cfg(not(unix))]
+        Commands::Flashback => false,
+        #[cfg(unix)]
+        Commands::Bagd(..) => false,
+        #[cfg(not(unix))]
+        Commands::Bagd => false,
+    }
 }
 
 /// The network kill-switch refusal of a `Commands` verb under `switch`, which
@@ -4289,9 +4328,10 @@ mod login_gate_exemption_tests {
 
     #[test]
     fn the_android_viz_refusal_fires_before_the_identity_gate() {
-        // A never-signed-in Android device must see the platform refusal, not
-        // a sign-in prompt: `viz_refusal` is what `dispatch` checks above the
-        // gate, and `viz` stays gated underneath it (it is NOT exempted).
+        // Local `viz` does not enter the identity gate, while `viz --robot`
+        // does; on Android or when `--robot` omits TOPIC, `viz_refusal` answers
+        // above the gate so a never-signed-in machine never sees a sign-in
+        // prompt instead of the platform or usage refusal.
         let viz = Commands::Viz {
             topics: vec!["/t".to_string()],
             robot: None,
@@ -4299,7 +4339,7 @@ mod login_gate_exemption_tests {
             listen: Vec::new(),
             detach: false,
         };
-        assert!(command_needs_identity(&viz));
+        assert!(!command_needs_identity(&viz));
         assert_eq!(
             viz_refusal(&viz, true),
             cerulion_cli_engine::viz_client::unsupported_viz_message(true)
@@ -4308,7 +4348,7 @@ mod login_gate_exemption_tests {
         assert!(viz_refusal(&viz, false).is_none());
         assert!(viz_refusal(&Commands::Login, true).is_none());
         // `--robot` with no TOPIC is refused above the gate too, after the
-        // platform refusal; with a TOPIC it is not.
+        // platform refusal; with a TOPIC it enters the identity gate.
         let robot_only = Commands::Viz {
             topics: Vec::new(),
             robot: Some("go2".to_string()),
@@ -4316,6 +4356,7 @@ mod login_gate_exemption_tests {
             listen: Vec::new(),
             detach: false,
         };
+        assert!(command_needs_identity(&robot_only));
         assert!(viz_refusal(&robot_only, false)
             .is_some_and(|r| r.starts_with("cerulion viz --robot needs at least one TOPIC")));
         assert_eq!(
@@ -4329,31 +4370,110 @@ mod login_gate_exemption_tests {
             listen: Vec::new(),
             detach: false,
         };
+        assert!(command_needs_identity(&robot_topic));
         assert!(viz_refusal(&robot_topic, false).is_none());
     }
 
     #[test]
-    fn ordinary_verbs_are_gated() {
-        // A representative spread of user-facing verbs must gate. Without this
-        // arm every assertion above would still hold for a build that exempted
-        // everything. `topic list` is the twin of the behavioural control in
-        // `tests/login_gate_e2e_test.rs`.
-        assert!(command_needs_identity(&Commands::Topic {
-            action: TopicAction::List {
-                all: false,
-                no_network: true,
-                connect: Vec::new(),
-                listen: Vec::new(),
-                scan: false,
-                show_types: false,
-            },
-        }));
-        assert!(command_needs_identity(&Commands::Graph {
-            action: GraphAction::List,
-        }));
-        assert!(command_needs_identity(&Commands::Node {
-            action: NodeAction::List,
-        }));
+    fn identity_partition_gates_only_account_and_remote_robot_verbs() {
+        let needs = |argv: &[&str]| {
+            let matches = families::cli_command()
+                .try_get_matches_from(std::iter::once("cerulion").chain(argv.iter().copied()))
+                .unwrap_or_else(|e| panic!("{argv:?} failed to parse: {e}"));
+            families::needs_identity(&matches)
+        };
+
+        let gated: &[&[&str]] = &[
+            &["account", "devices", "list"],
+            &["account", "devices", "revoke", "dev-1"],
+            &["connect", "bench-arm"],
+            &["rcp", "bench-arm"],
+            &["viz", "/camera", "--robot", "bench-arm"],
+            &["graph", "live"],
+            &["graph", "live", "--robot", "bench-arm"],
+            &["graph", "fires"],
+            &["graph", "fires", "--robot", "bench-arm"],
+            &["topic", "echo", "/camera", "--robot", "bench-arm"],
+            &["topic", "hz", "/camera", "--robot", "bench-arm"],
+            &["topic", "info", "/camera", "--robot", "bench-arm"],
+            &[
+                "topic",
+                "pub",
+                "/cmd_vel",
+                "std_msgs/String",
+                "{data: hi}",
+                "--robot",
+                "bench-arm",
+            ],
+            &["topic", "snapshot", "/camera", "--robot", "bench-arm"],
+            &[
+                "service",
+                "call",
+                "/reset",
+                "std_srvs/srv/Trigger",
+                "--robot",
+                "bench-arm",
+            ],
+        ];
+        for argv in gated {
+            let first = needs(argv);
+            assert!(first, "{argv:?} must require identity");
+            assert_eq!(needs(argv), first, "{argv:?} must be deterministic");
+        }
+
+        let local: &[&[&str]] = &[
+            &["workspace", "create", "demo"],
+            &["workspace", "init"],
+            &["node", "list"],
+            &["node", "run", "Demo"],
+            &["graph", "validate", "demo"],
+            &["graph", "run", "demo"],
+            &["graph", "list"],
+            &["graph", "levels", "demo"],
+            &["graph", "plan", "demo"],
+            &["graph", "profile", "demo"],
+            &["graph", "partition", "demo"],
+            &["graph", "pause", "run-1"],
+            &["graph", "resume", "run-1"],
+            &["topic", "list"],
+            &["topic", "echo", "/camera"],
+            &["topic", "hz", "/camera"],
+            &["topic", "info", "/camera"],
+            &["topic", "type", "/camera"],
+            &["topic", "find", "std_msgs/String"],
+            &["topic", "bw", "/camera"],
+            &["topic", "pub", "/cmd_vel", "std_msgs/String", "{data: hi}"],
+            &["topic", "snapshot", "/camera"],
+            &["service", "call", "/reset", "std_srvs/srv/Trigger"],
+            &["schema", "list"],
+            &["schema", "info", "std_msgs/String"],
+            &["schema", "create", "Demo"],
+            &["schema", "delete", "Demo"],
+            &["bag", "info", "run.mcap"],
+            &["bag", "play", "run.mcap"],
+            &["bag", "record", "/camera"],
+            &["bag", "migrate", "run.mcap"],
+            &["trace", "inspect", "traces"],
+            &["flashback"],
+            &["tui"],
+            &["viz", "/camera"],
+            &["rcp", "--sim"],
+            &["rcp", "bench", "--model", "m"],
+            &["rcp", "bench", "--verify"],
+            &["ros2", "migrate", "--workspace", "ws"],
+            &["ros2", "attach", "--iface", "127.0.0.1"],
+            &["doctor", "--local"],
+            &["login"],
+            &["logout"],
+            &["telemetry", "status"],
+            &["completions", "zsh"],
+            &["clean", "--report-only"],
+        ];
+        for argv in local {
+            let first = needs(argv);
+            assert!(!first, "{argv:?} must not require identity");
+            assert_eq!(needs(argv), first, "{argv:?} must be deterministic");
+        }
     }
 }
 

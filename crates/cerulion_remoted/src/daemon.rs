@@ -68,6 +68,98 @@ const UNPAIRED_PENDING: usize = 24;
 const PER_SOURCE_PENDING: usize = 4;
 const PER_UNPAIRED_RELAY_PENDING: usize = 8;
 
+/// Maximum concurrent unpaired bootstrap, refused, and skeleton connections
+/// after TLS completes. Paired sessions routed to their live plane are exempt
+/// so unpaired peers cannot fill the blocking pool ahead of `engage-estop`.
+const MAX_UNPAIRED_SESSIONS: usize = 64;
+
+const _: () = assert!(MAX_UNPAIRED_SESSIONS >= 2);
+
+/// Whether an accepted connection must take a permit from the unpaired session
+/// cap before running its plane or skeleton handler.
+///
+/// Paired sessions routed to their live plane (`OpsAdmit` with ops wired,
+/// `WireAdmit` with wire wired, `RcpAdmit` with rcp wired) are exempt.
+/// `OpsBootstrapOnly`, `Refuse`, `UnknownAlpn`, and any no-plane fallback that
+/// enters the skeleton report share the cap.
+fn needs_unpaired_session_permit(
+    decision: &AcceptDecision,
+    ops_wired: bool,
+    wire_wired: bool,
+    rcp_wired: bool,
+) -> bool {
+    match decision {
+        AcceptDecision::OpsAdmit => !ops_wired,
+        AcceptDecision::WireAdmit => !wire_wired,
+        AcceptDecision::RcpAdmit => !rcp_wired,
+        AcceptDecision::OpsBootstrapOnly
+        | AcceptDecision::Refuse { .. }
+        | AcceptDecision::UnknownAlpn { .. } => true,
+    }
+}
+
+/// Bounded permit pool and flood-suppression latch for unpaired bootstrap,
+/// refused, and skeleton connections.
+struct UnpairedSessionCap {
+    permits: Arc<tokio::sync::Semaphore>,
+    cap: usize,
+    failures: std::sync::Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
+}
+
+enum UnpairedPermit {
+    Admitted {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+        recovered_suppressed: Option<u64>,
+    },
+    Exhausted {
+        decision: cerulion_core::transport::failure_regime_latch::RegimeDecision,
+        total_failures: u64,
+    },
+}
+
+impl UnpairedSessionCap {
+    fn new(cap: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(cap)),
+            cap,
+            failures: std::sync::Mutex::new(
+                cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default(),
+            ),
+        }
+    }
+
+    fn try_acquire(&self) -> UnpairedPermit {
+        match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(permit) => {
+                // Close the refusal regime only once at least half the pool
+                // remains free, so arrivals under sustained saturation cannot
+                // re-arm the loud warning on every released slot.
+                let recovered_suppressed = if self.permits.available_permits() >= self.cap / 2 {
+                    self.failures
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_success()
+                } else {
+                    None
+                };
+                UnpairedPermit::Admitted {
+                    _permit: permit,
+                    recovered_suppressed,
+                }
+            }
+            Err(_) => {
+                let mut latch = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+                let decision = latch.on_failure();
+                let total_failures = latch.total_failures();
+                UnpairedPermit::Exhausted {
+                    decision,
+                    total_failures,
+                }
+            }
+        }
+    }
+}
+
 /// The admission cap that refused an arrival. Each cap has its own failure
 /// regime ([`AdmissionLatches`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -690,6 +782,7 @@ pub async fn serve_planes(
         cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
     let mut sources = indexmap::IndexMap::<SourceKey, u8>::new();
     let mut task_sources = indexmap::IndexMap::<tokio::task::Id, SourceKey>::new();
+    let unpaired_cap = Arc::new(UnpairedSessionCap::new(MAX_UNPAIRED_SESSIONS));
     let closed_on_its_own = loop {
         tokio::select! {
             biased;
@@ -758,9 +851,18 @@ pub async fn serve_planes(
                         let ops = ops.clone();
                         let wire = wire.clone();
                         let rcp = rcp.clone();
+                        let unpaired_cap = unpaired_cap.clone();
                         tokio::spawn(async move {
                             let _hold = hold;
-                            handle_accepted_planes(a, classify, ops, wire, rcp).await;
+                            handle_accepted_planes_inner(
+                                a,
+                                classify,
+                                ops,
+                                wire,
+                                rcp,
+                                Some(unpaired_cap),
+                            )
+                            .await;
                         });
                     }
                     // A SINGLE inbound connection failed its handshake (a scanner
@@ -926,8 +1028,71 @@ pub async fn handle_accepted_planes(
     wire: Option<Arc<WirePlane>>,
     rcp: Option<Arc<RcpPlane>>,
 ) {
+    handle_accepted_planes_inner(accepted, classify, ops, wire, rcp, None).await
+}
+
+async fn handle_accepted_planes_inner(
+    accepted: Accepted,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    rcp: Option<Arc<RcpPlane>>,
+    unpaired_cap: Option<Arc<UnpairedSessionCap>>,
+) {
     let (decision, unpaired) = classify
         .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
+    let _unpaired_permit = if let Some(cap) = unpaired_cap.as_ref().filter(|_| {
+        needs_unpaired_session_permit(&decision, ops.is_some(), wire.is_some(), rcp.is_some())
+    }) {
+        match cap.try_acquire() {
+            UnpairedPermit::Admitted {
+                _permit,
+                recovered_suppressed,
+            } => {
+                if let Some(suppressed) = recovered_suppressed {
+                    tracing::info!(
+                        suppressed,
+                        cap = "unpaired_sessions",
+                        "remote unpaired session admission recovered"
+                    );
+                }
+                Some(_permit)
+            }
+            UnpairedPermit::Exhausted {
+                decision: regime,
+                total_failures,
+            } => {
+                use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                let alpn = String::from_utf8_lossy(&accepted.alpn);
+                match regime {
+                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => {
+                        tracing::warn!(
+                            remote_id = %accepted.remote_id,
+                            alpn = %alpn,
+                            cap = "unpaired_sessions",
+                            total_failures,
+                            "remote unpaired session refused at its admission cap"
+                        );
+                    }
+                    RegimeDecision::Suppressed { .. } => {
+                        tracing::debug!(
+                            remote_id = %accepted.remote_id,
+                            alpn = %alpn,
+                            cap = "unpaired_sessions",
+                            total_failures,
+                            "remote unpaired session refused at its admission cap"
+                        );
+                    }
+                }
+                accepted
+                    .connection
+                    .close(0u32.into(), b"unpaired session cap");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     tracing::info!(
         remote_id = %accepted.remote_id,
         alpn = %String::from_utf8_lossy(&accepted.alpn),
@@ -936,18 +1101,20 @@ pub async fn handle_accepted_planes(
     );
 
     // ── The ops-ALPN dispatch arm ───────────────────────────
-    // Ops plane → the real cerud ops server (per-verb authz is the enforcement).
-    if matches!(
-        decision,
-        AcceptDecision::OpsAdmit | AcceptDecision::OpsBootstrapOnly
-    ) {
-        if let Some(ops) = ops {
+    // Ops plane -> the real cerud ops server (per-verb authz is the enforcement).
+    // Paired OpsAdmit runs under the normal session deadline with no unpaired
+    // permit; unpaired OpsBootstrapOnly runs under the held unpaired permit and
+    // the shorter opening-frame deadline.
+    match (&decision, ops) {
+        (AcceptDecision::OpsAdmit, Some(ops)) => {
             ops.serve_session(accepted).await;
             return;
         }
-        // No ops-serving context wired (accept-classification test harness) → fall
-        // through to the skeleton decision frame so the classification stays
-        // observable.
+        (AcceptDecision::OpsBootstrapOnly, Some(ops)) => {
+            ops.serve_bootstrap_session(accepted).await;
+            return;
+        }
+        _ => {}
     }
 
     // ── The wire-ALPN dispatch arm ──────────────────────────
@@ -1815,5 +1982,220 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert_eq!(load_mac_key(&link, true).unwrap(), b"linked-mac-key");
         assert_eq!(mode_of(&target), 0o644, "the link's target keeps its mode");
+    }
+
+    #[test]
+    fn unpaired_session_permit_predicate_exempts_paired_planes_and_caps_bootstrap_refused_and_skeleton(
+    ) {
+        let refuse = AcceptDecision::Refuse {
+            reason: "unpaired".into(),
+        };
+        let unknown = AcceptDecision::UnknownAlpn {
+            alpn: b"cerulion/bogus/1".to_vec(),
+        };
+        // Hand-written oracle table: (decision, ops_wired, wire_wired, rcp_wired, needs_permit).
+        let rows: &[(&AcceptDecision, bool, bool, bool, bool)] = &[
+            // OpsAdmit is exempt iff ops is wired; other plane flags do not matter.
+            (&AcceptDecision::OpsAdmit, true, false, false, false),
+            (&AcceptDecision::OpsAdmit, true, true, true, false),
+            (&AcceptDecision::OpsAdmit, false, false, false, true),
+            (&AcceptDecision::OpsAdmit, false, true, true, true),
+            // WireAdmit is exempt iff wire is wired.
+            (&AcceptDecision::WireAdmit, false, true, false, false),
+            (&AcceptDecision::WireAdmit, true, true, true, false),
+            (&AcceptDecision::WireAdmit, false, false, false, true),
+            (&AcceptDecision::WireAdmit, true, false, true, true),
+            // RcpAdmit is exempt iff rcp is wired.
+            (&AcceptDecision::RcpAdmit, false, false, true, false),
+            (&AcceptDecision::RcpAdmit, true, true, true, false),
+            (&AcceptDecision::RcpAdmit, false, false, false, true),
+            (&AcceptDecision::RcpAdmit, true, true, false, true),
+            // OpsBootstrapOnly is always capped regardless of wired planes.
+            (&AcceptDecision::OpsBootstrapOnly, false, false, false, true),
+            (&AcceptDecision::OpsBootstrapOnly, true, false, false, true),
+            (&AcceptDecision::OpsBootstrapOnly, true, true, true, true),
+            // Refuse is always capped regardless of wired planes.
+            (&refuse, false, false, false, true),
+            (&refuse, true, false, false, true),
+            (&refuse, true, true, true, true),
+            // UnknownAlpn is always capped regardless of wired planes.
+            (&unknown, false, false, false, true),
+            (&unknown, true, true, true, true),
+        ];
+        for &(decision, ops_wired, wire_wired, rcp_wired, expected) in rows {
+            assert_eq!(
+                needs_unpaired_session_permit(decision, ops_wired, wire_wired, rcp_wired),
+                expected,
+                "decision={decision:?} ops={ops_wired} wire={wire_wired} rcp={rcp_wired}"
+            );
+        }
+    }
+
+    #[test]
+    fn unpaired_session_cap_enforces_64_permits_and_recovers_at_half_capacity() {
+        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+
+        // Doc pin: docs/remote_plane.md and docs/internals/remote-access.md
+        // document a 64-session cap for unpaired bootstrap, refused, and
+        // skeleton connections.
+        assert_eq!(MAX_UNPAIRED_SESSIONS, 64);
+
+        let cap = UnpairedSessionCap::new(MAX_UNPAIRED_SESSIONS);
+        let mut held = Vec::with_capacity(MAX_UNPAIRED_SESSIONS);
+        for i in 0..MAX_UNPAIRED_SESSIONS {
+            match cap.try_acquire() {
+                UnpairedPermit::Admitted {
+                    _permit,
+                    recovered_suppressed,
+                } => {
+                    assert_eq!(recovered_suppressed, None, "slot {i} had no open regime");
+                    held.push(_permit);
+                }
+                UnpairedPermit::Exhausted { .. } => {
+                    panic!("slot {i} should be admitted under cap {MAX_UNPAIRED_SESSIONS}");
+                }
+            }
+        }
+
+        // 65th arrival triggers the loud refusal; 66th is suppressed.
+        match cap.try_acquire() {
+            UnpairedPermit::Exhausted {
+                decision,
+                total_failures,
+            } => {
+                assert_eq!(decision, RegimeDecision::Loud);
+                assert_eq!(total_failures, 1);
+            }
+            UnpairedPermit::Admitted { .. } => panic!("65th arrival must be refused"),
+        }
+        match cap.try_acquire() {
+            UnpairedPermit::Exhausted {
+                decision,
+                total_failures,
+            } => {
+                assert_eq!(decision, RegimeDecision::Suppressed { suppressed: 1 });
+                assert_eq!(total_failures, 2);
+            }
+            UnpairedPermit::Admitted { .. } => panic!("66th arrival must be refused"),
+        }
+
+        // Releasing 32 permits leaves 32 held; acquiring 1 leaves 31 available
+        // (< 32), so the refusal regime stays open.
+        held.truncate(32);
+        match cap.try_acquire() {
+            UnpairedPermit::Admitted {
+                _permit,
+                recovered_suppressed,
+            } => {
+                assert_eq!(
+                    recovered_suppressed, None,
+                    "regime must stay open when fewer than half the permits remain free"
+                );
+                held.push(_permit);
+            }
+            UnpairedPermit::Exhausted { .. } => panic!("slot should be admitted"),
+        }
+
+        // Releasing down to 31 held leaves 33 available; acquiring 1 leaves 32
+        // available (>= half capacity), closing the refusal regime with 1
+        // suppressed refusal reported.
+        held.truncate(31);
+        match cap.try_acquire() {
+            UnpairedPermit::Admitted {
+                _permit,
+                recovered_suppressed,
+            } => {
+                assert_eq!(recovered_suppressed, Some(1));
+                held.push(_permit);
+            }
+            UnpairedPermit::Exhausted { .. } => panic!("slot should be admitted"),
+        }
+
+        // A subsequent admission sees no open regime.
+        held.truncate(30);
+        match cap.try_acquire() {
+            UnpairedPermit::Admitted {
+                recovered_suppressed,
+                ..
+            } => assert_eq!(recovered_suppressed, None),
+            UnpairedPermit::Exhausted { .. } => panic!("slot should be admitted"),
+        }
+    }
+
+    #[test]
+    fn unpaired_session_cap_decisions_and_latch_are_bit_identical_across_two_runs() {
+        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum Event {
+            Admitted(Option<u64>),
+            Exhausted(RegimeDecision, u64),
+        }
+
+        enum Op {
+            Arrive,
+            Release(usize),
+        }
+
+        let script = [
+            Op::Arrive,
+            Op::Arrive,
+            Op::Arrive,
+            Op::Arrive,
+            Op::Arrive, // loud refusal (total 1)
+            Op::Arrive, // suppressed (suppressed 1, total 2)
+            Op::Release(1),
+            Op::Arrive, // admitted, 0 available (< 2): regime stays open
+            Op::Arrive, // suppressed (suppressed 2, total 3)
+            Op::Release(3),
+            Op::Arrive, // admitted, 2 available (>= 2): recovers with 2 suppressed
+            Op::Arrive, // admitted, no open regime
+        ];
+
+        let run = || {
+            let cap = UnpairedSessionCap::new(4);
+            let mut held = Vec::new();
+            let mut log = Vec::new();
+            for op in &script {
+                match *op {
+                    Op::Arrive => match cap.try_acquire() {
+                        UnpairedPermit::Admitted {
+                            _permit,
+                            recovered_suppressed,
+                        } => {
+                            held.push(_permit);
+                            log.push(Event::Admitted(recovered_suppressed));
+                        }
+                        UnpairedPermit::Exhausted {
+                            decision,
+                            total_failures,
+                        } => log.push(Event::Exhausted(decision, total_failures)),
+                    },
+                    Op::Release(n) => {
+                        let keep = held.len().saturating_sub(n);
+                        held.truncate(keep);
+                    }
+                }
+            }
+            log
+        };
+
+        let expected = vec![
+            Event::Admitted(None),
+            Event::Admitted(None),
+            Event::Admitted(None),
+            Event::Admitted(None),
+            Event::Exhausted(RegimeDecision::Loud, 1),
+            Event::Exhausted(RegimeDecision::Suppressed { suppressed: 1 }, 2),
+            Event::Admitted(None),
+            Event::Exhausted(RegimeDecision::Suppressed { suppressed: 2 }, 3),
+            Event::Admitted(Some(2)),
+            Event::Admitted(None),
+        ];
+
+        let first = run();
+        let second = run();
+        assert_eq!(first, expected);
+        assert_eq!(first, second);
     }
 }
