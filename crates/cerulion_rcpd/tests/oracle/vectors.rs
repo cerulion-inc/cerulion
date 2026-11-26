@@ -84,7 +84,8 @@ pub fn each_call_is_published_once_answered_by_its_call_id_and_receipted() -> Ve
 /// docs/rcp.md, Tools, step 1: "A name the manifest does not declare is
 /// refused (`not_in_manifest`) and receipted `denied`"; step 2: "The arguments
 /// are checked against `input_schema` (`invalid_args`, receipted
-/// `error:invalid_args`); the error message names the argument that failed".
+/// `error:invalid_args`); the error message names the argument that failed,
+/// in double quotes".
 /// The manifest: `minItems` holds the array length,
 /// and `additionalProperties` is `false` by default. The page's opening:
 /// "refused calls are in the receipt log only". Safety classes: "Every result

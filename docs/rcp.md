@@ -155,7 +155,7 @@ order:
    `<invalid-tool-name>`.
 2. The arguments are checked against `input_schema` (`invalid_args`,
    receipted `error:invalid_args`); the error message names the argument
-   that failed.
+   that failed, in double quotes.
 3. A call whose frame would exceed 63 KiB is refused (`args_too_large`).
 4. While the e-stop is engaged a `reversible` or `irreversible` tool is
    refused (`estopped`) and receipted `denied`; the message says how the
