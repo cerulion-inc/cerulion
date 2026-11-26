@@ -78,7 +78,7 @@ impl Guarded {
     }
 }
 
-const PATTERN_SHAPE: u64 = 0xD1EC_0000_0000_1064;
+const PATTERN_SHAPE: u64 = 0xD1EC_0000_0000_0001;
 
 #[derive(Clone, Copy)]
 enum Encode {
@@ -170,7 +170,7 @@ impl NodeEntry for Pattern {
 }
 
 const RING_RECORDS: u32 = 4096;
-const RUN_ID: u64 = 0xC0FF_EE10_1064;
+const RUN_ID: u64 = 0xC0FF_EE00_D1EC;
 
 fn unique(tag: &str) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
