@@ -923,16 +923,21 @@ fn schema_hash_capture_rclpy_publishers_to_native_subscribers() {
         subs.push(sub);
     }
 
-    // The first frame on each topic gives that type's wire hash.
-    let mut measured: Vec<Option<u64>> = vec![None; CAPTURE_TYPES.len()];
+    // The first frame on each topic gives that type's wire hash. A receive
+    // error ends that topic's polling and is reported with the rest, so every
+    // other type still gets its MEASURED line.
+    let mut measured: Vec<Result<Option<u64>, String>> = vec![Ok(None); CAPTURE_TYPES.len()];
     let collect_deadline = Instant::now() + Duration::from_secs(30);
-    while measured.iter().any(Option::is_none) && Instant::now() < collect_deadline {
+    while measured.iter().any(|m| matches!(m, Ok(None))) && Instant::now() < collect_deadline {
         for (sub, slot) in subs.iter().zip(measured.iter_mut()) {
-            if slot.is_none() {
-                sub.try_receive(|msg| {
-                    slot.get_or_insert(msg.header().schema_hash);
-                })
-                .expect("native try_receive on a capture topic");
+            if let Ok(None) = slot {
+                let mut first = None;
+                match sub.try_receive(|msg| {
+                    first.get_or_insert(msg.header().schema_hash);
+                }) {
+                    Ok(_) => *slot = Ok(first),
+                    Err(e) => *slot = Err(e.to_string()),
+                }
             }
         }
         thread::sleep(Duration::from_millis(3));
@@ -940,21 +945,23 @@ fn schema_hash_capture_rclpy_publishers_to_native_subscribers() {
 
     for ((package, name, _), hash) in CAPTURE_TYPES.iter().zip(&measured) {
         match hash {
-            Some(h) => println!("MEASURED {package}/{name} 0x{h:016x}"),
-            None => println!("NOT MEASURED {package}/{name}: no frame within the deadline"),
+            Ok(Some(h)) => println!("MEASURED {package}/{name} 0x{h:016x}"),
+            Ok(None) => println!("NOT MEASURED {package}/{name}: no frame within the deadline"),
+            Err(e) => println!("NOT MEASURED {package}/{name}: receive failed: {e}"),
         }
     }
 
     let mut problems: Vec<String> = Vec::new();
     for ((package, name, generated), hash) in CAPTURE_TYPES.iter().zip(&measured) {
         match hash {
-            None => problems.push(format!(
+            Ok(None) => problems.push(format!(
                 "  {package}/{name}: no frame reached the native subscriber"
             )),
-            Some(h) if h != generated => problems.push(format!(
+            Err(e) => problems.push(format!("  {package}/{name}: receive failed: {e}")),
+            Ok(Some(h)) if h != generated => problems.push(format!(
                 "  {package}/{name}: wire 0x{h:016x}, generated SCHEMA_HASH 0x{generated:016x}"
             )),
-            Some(_) => {}
+            Ok(Some(_)) => {}
         }
     }
     if !problems.is_empty() {
