@@ -2362,10 +2362,10 @@ pub struct ReadPlanEdge<'a> {
 /// fourth state (both set) nothing would choose between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateBlocker {
-    /// A per-set `Sync` trigger input. Its pops leave the two gated drain
-    /// bodies: `sync_peek_next_stamp` and `sync_discard_head` remove frames
-    /// from the queue through the matcher's ops, so a gate installed here
-    /// would be bypassed rather than enforced.
+    /// An unfed per-set `Sync` trigger input. A fed stage gates the matcher's
+    /// ops (`sync_next_arrived`, `sync_peek_next_stamp`, `sync_discard_head`)
+    /// through its private feed and clears this blocker; an unfed replay keeps
+    /// the blocker so its best-effort path is unchanged.
     PerSetSyncEdge,
     /// A `multi_publisher_topics` edge. The wire sequence is a PER-PUBLISHER
     /// counter, so the due frame is not necessarily the head and a served seq

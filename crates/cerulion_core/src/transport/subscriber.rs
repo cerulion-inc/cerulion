@@ -5402,10 +5402,9 @@ impl CerulionSubscriber {
                 // consult rule (`consult_capture_armed`) AND under the pass's
                 // SITE: a BOUNDARY align pass runs on both sides, so its empty
                 // pop has a replayed twin, while a post-fire REFILL align pass
-                // runs only on the recording side (a planned Sync fire goes to
-                // `Scheduler::tick_replay_burst`, and
-                // `Scheduler::set_trigger_refill` refuses any non-`Data`
-                // policy, so no align pass follows it). The split is applied to
+                // stages no `NoFrame` on an empty queue (a fed replay withholds
+                // silently under `empty_recorded = false`, and an unfed replay
+                // runs no post-fire align pass). The split is applied to
                 // the empty-consult record only, the one trace format 7
                 // introduced; the `Decimated` record above predates it and this
                 // site gate does not reach it.
@@ -5559,13 +5558,11 @@ impl CerulionSubscriber {
                 // split `drain_for_trigger` applies: a BOUNDARY align pass runs
                 // on both sides (`GraphRuntime::drain_level` runs it
                 // unconditionally), so its empty refill has a replayed twin,
-                // while a post-fire REFILL align pass runs only on the
-                // recording side. `Scheduler::set_trigger_refill` refuses any
-                // non-`Data` policy, so a planned Sync fire goes to
-                // `Scheduler::tick_replay_burst` with no align pass behind it
-                // and makes no consult here at all; a record staged at the
-                // refill site would hold a position the replayed log can never
-                // fill.
+                // while a post-fire REFILL align pass stages no `NoFrame` on an
+                // empty queue (a fed replay withholds silently under
+                // `empty_recorded = false`, and an unfed replay runs no
+                // post-fire align pass); a record staged at the refill site
+                // would hold a position an unfed replayed log could never fill.
                 FrozenSlot::Empty => {
                     if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
                         self.stage_read_outcome(
