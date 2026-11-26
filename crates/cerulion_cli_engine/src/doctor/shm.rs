@@ -222,7 +222,8 @@ pub(super) fn decide_stale(r: &StaleReading) -> Outcome {
     }
     if let Some(why) = &r.resim_incomplete {
         incomplete.push(why.clone());
-    } else if r.resim_errors > 0 {
+    }
+    if r.resim_errors > 0 {
         incomplete.push(format!(
             "resim namespace slots could not be read in full ({})",
             plural(len(r.resim_errors), "error", "errors")

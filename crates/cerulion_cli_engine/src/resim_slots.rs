@@ -269,8 +269,10 @@ enum ExistingLockAttempt {
     HeldByLiveResim,
 }
 
-/// Open an existing slot lock file read-only with `O_NOFOLLOW`, verify it is a
-/// regular file owned by `expected_euid`, and try a non-blocking exclusive `flock`.
+/// Open an existing slot lock file read-only with `O_NOFOLLOW | O_NONBLOCK`,
+/// verify it is a regular file owned by `expected_euid`, and try a non-blocking
+/// exclusive `flock`. `O_NONBLOCK` prevents an attacker-planted FIFO from
+/// blocking `open(2)` before `fstat` can reject it.
 #[cfg(unix)]
 fn try_lock_existing_slot(path: &Path, expected_euid: u32) -> Result<ExistingLockAttempt, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -278,7 +280,7 @@ fn try_lock_existing_slot(path: &Path, expected_euid: u32) -> Result<ExistingLoc
         .read(true)
         .write(false)
         .create(false)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -385,7 +387,7 @@ pub(crate) fn claim_resim_slot(
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
             .map_err(|e| format!("{}: {e}", path.display()))
             .and_then(|lock| {
@@ -677,11 +679,18 @@ fn process_segment_batch(
     let batch_slots: BTreeSet<u32> = batch.iter().map(|(slot, _)| *slot).collect();
     match std::fs::read_dir(dir) {
         Ok(entries) => {
-            for entry in entries.flatten() {
+            for entry in entries {
                 if budget.is_some_and(|b| started.elapsed() >= b) {
                     report.truncated = true;
                     break;
                 }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        report.errors.push(format!("{}: {error}", dir.display()));
+                        continue;
+                    }
+                };
                 let Some(slot) = entry.file_name().to_str().and_then(resim_namespace_slot) else {
                     continue;
                 };
@@ -953,5 +962,50 @@ mod tests {
             report.errors
         );
         assert_eq!(std::fs::read(&target).expect("victim intact"), b"keep");
+    }
+
+    #[test]
+    fn fifo_lock_file_is_refused_without_blocking_in_claim_and_sweep() {
+        let root = IsolatedRoot::mint("rslotfifo");
+        let locks = tempfile::tempdir().expect("lock dir");
+        let segments = tempfile::tempdir().expect("segment dir");
+        let fifo = locks.path().join("cer_resim_00000000.lock");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo");
+        assert!(status.success(), "mkfifo failed for {}", fifo.display());
+
+        // Both sweep and claim must return immediately and refuse the FIFO.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cfg = root.config();
+        let locks_path = locks.path().to_path_buf();
+        let segs_path = segments.path().to_path_buf();
+        std::thread::spawn(move || {
+            let sweep = sweep_resim_slots(
+                &cfg,
+                &locks_path,
+                Some(&segs_path),
+                SweepMode::ReportOnly,
+                None,
+            );
+            let claimed = claim_resim_slot(&locks_path, 2, |_| Ok(())).map(|s| s.slot);
+            let _ = tx.send((sweep, claimed));
+        });
+        let (sweep, claimed) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("FIFO lock file must not block sweep or claim");
+        assert_eq!(sweep.slots_checked, 0);
+        assert_eq!(sweep.errors.len(), 1, "{sweep:?}");
+        assert!(
+            sweep.errors[0].contains("not a regular file"),
+            "{:?}",
+            sweep.errors
+        );
+        assert_eq!(
+            claimed,
+            Ok(1),
+            "claim must pass over the FIFO at slot 0 and take slot 1"
+        );
     }
 }

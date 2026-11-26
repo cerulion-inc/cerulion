@@ -2607,27 +2607,21 @@ fn two_resims_of_one_bag_write_byte_identical_reports() {
         "the second resim leaves one node on slot {second_slot}: {second_nodes:?}"
     );
 
-    // Reports differ only in the `record_out` path we passed; compare every other
-    // field plus confirm neither report carries any namespace/slot data.
-    let mut first_json: serde_json::Value =
+    // Reports differ only in the `record_out` path we passed; normalize that
+    // path and assert byte-identical report output plus parsed field equality.
+    let first_norm = String::from_utf8_lossy(&first_report)
+        .replace(&first_bag.display().to_string(), "<RECORD_OUT>");
+    let second_norm = String::from_utf8_lossy(&second_report)
+        .replace(&second_bag.display().to_string(), "<RECORD_OUT>");
+    assert_eq!(
+        first_norm, second_norm,
+        "two resims on different slots must report byte for byte alike apart from --record-out path"
+    );
+    let first_json: serde_json::Value =
         serde_json::from_slice(&first_report).expect("first report is JSON");
-    let mut second_json: serde_json::Value =
-        serde_json::from_slice(&second_report).expect("second report is JSON");
     assert_eq!(first_json["passed"], true, "{first_json}");
     assert_eq!(first_json["topics_checked"], 1, "{first_json}");
     assert_eq!(first_json["topics_passed"], 1, "{first_json}");
-    first_json
-        .as_object_mut()
-        .expect("report object")
-        .remove("record_out");
-    second_json
-        .as_object_mut()
-        .expect("report object")
-        .remove("record_out");
-    assert_eq!(
-        first_json, second_json,
-        "two resims on different slots must report identically"
-    );
 
     // Compare `--record-out` channels and frame bytes across the two slots.
     let first_recorded = read_record_out(&first_bag);
