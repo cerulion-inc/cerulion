@@ -12,9 +12,11 @@
 //! only if `CerulionState::INLINE_SAFE` (the const saying its capture runs only
 //! framework-generated code over data that cannot block it) and it stays inline
 //! only while its encode FITS. Everything else joins a fork set, and the process calls
-//! `fork(2)` **once**, so the MMU-frozen child can encode at leisure.
+//! `fork(2)` **once**, so the MMU-frozen child can encode at leisure. A runtime armed
+//! without fork, an executor unit that shares its process with other units, streams the
+//! set on its own thread through [`direct`] instead.
 //!
-//! Both carriers call the same generated encoder and emit identical bytes, so which
+//! Every carrier calls the same generated encoder and emit identical bytes, so which
 //! nodes went inline and which forked is invisible in the bag. What varies with state
 //! size is anchor SPACING and the first post-fork tick's page-fault cost — never
 //! anchor EXISTENCE.
@@ -31,6 +33,7 @@
 //! | [`child`] | the child's own code, and the ONLY file the source-walk gate polices |
 //! | [`reaper`] | the targeted `waitpid`, the outcome vocabulary, and the stale-claim sweep's `kill(pid,0)` |
 //! | [`fork`] | the `fork(2)` call site, the child's encode path, and the reaper THREAD |
+//! | [`direct`] | the no-fork stream of the deferred set on the unit thread, budgeted and never waiting |
 //!
 //! # The measured basis (2026-08-08, Jetson / L4T 5.15.148-tegra)
 //!

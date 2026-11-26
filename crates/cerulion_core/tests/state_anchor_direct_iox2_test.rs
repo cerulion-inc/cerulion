@@ -411,7 +411,7 @@ fn a_lock_carrying_node_and_a_node_over_the_arena_are_captured_on_the_unit_threa
 
     let split = runtime.last_anchor_carriers().expect("an anchor at step 4");
     assert_eq!(
-        (split.inline_nodes, split.forked_nodes, split.gated_nodes),
+        (split.inline_nodes, split.deferred_nodes, split.gated_nodes),
         (1, 2, 1)
     );
     let records = |len: usize| len.div_ceil(472) as u64;

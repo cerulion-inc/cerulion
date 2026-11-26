@@ -4737,7 +4737,8 @@ pub struct GraphRuntime {
     /// runtime carries no arena at all.
     capture_arena: Vec<u8>,
     /// The nodes the inline walk deferred, refilled every
-    /// anchor and reused across them (`walk_inline` CLEARS it).
+    /// anchor and reused across them (`walk_inline` CLEARS it). The set goes to the
+    /// fork carrier, or to the direct stream when `direct_carrier` is `Some`.
     capture_fork_set: Vec<(u32, CarrierForkReason)>,
     /// The fork carrier — the breadcrumb, the child setup and the
     /// reaper thread — or `None` (the default) while no recorder has armed this run.
@@ -12514,7 +12515,7 @@ impl GraphRuntime {
         tracing::debug!(
             step,
             inline_nodes = stats.inline_nodes,
-            forked_nodes = stats.forked_nodes,
+            deferred_nodes = stats.deferred_nodes,
             gated_nodes = stats.gated_nodes,
             unwound_nodes = stats.unwound_nodes,
             bytes_used = stats.bytes_used,
