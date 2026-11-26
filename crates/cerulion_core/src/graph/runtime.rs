@@ -6386,6 +6386,11 @@ impl GraphRuntime {
             for warning in paced {
                 warning.log(config.identity());
             }
+            for warning in
+                super::validation::check_sync_window_periods(&config, &topology, &entry_infos)
+            {
+                warning.log();
+            }
         }
 
         // CHAIN FUSION, resolved once and logged once. The decision is the
