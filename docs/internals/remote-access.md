@@ -569,14 +569,18 @@ snapshot (`topic-snapshot`).
 - **E-stop is not serialized behind other sessions at the transport layer**: ops sessions are served
   CONCURRENTLY over one `Arc<cerud::OpsServer>` whose receipt sink is a
   brief-append mutex; a stalled/hostile session parks on a blocking read holding
-  no lock. Unpaired `OpsBootstrapOnly`, refused, and skeleton connections share a
-  64-permit concurrency cap (`MAX_UNPAIRED_SESSIONS` in `daemon.rs`), and
-  unpaired bootstrap sessions must deliver their opening `cerud` frame
-  asynchronously within `OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE` (5 s, `ops.rs`)
-  before entering `spawn_blocking`. Paired `OpsAdmit` sessions are exempt from
-  the 64-permit cap so throwaway peers cannot saturate the runtime's 512-thread
-  blocking pool ahead of a paired `engage-estop`; paired sessions still share
-  that 512-thread blocking pool with one another. Once admitted to the ops
+  no lock. Unpaired `OpsBootstrapOnly`, refused, unknown-ALPN, and no-plane
+  skeleton connections share a 64-permit concurrency cap
+  (`MAX_UNPAIRED_SESSIONS` / `needs_unpaired_session_permit` in `daemon.rs`),
+  closing excess arrivals immediately with `unpaired session cap` (flood-suppressed
+  via `FailureRegimeLatch`), and unpaired bootstrap sessions must deliver their
+  opening `cerud` frame asynchronously within
+  `OPS_BOOTSTRAP_FIRST_FRAME_DEADLINE` (5 s, `ops.rs`) before entering
+  `spawn_blocking`. Paired `OpsAdmit`, `WireAdmit`, and `RcpAdmit` sessions on
+  their wired planes are exempt from the 64-permit cap so throwaway peers cannot
+  saturate the runtime's 512-thread blocking pool ahead of a paired
+  `engage-estop`; paired sessions still share that 512-thread blocking pool with
+  one another. Once admitted to the ops
   server, a paired `engage-estop` runs its safety EFFECT BEFORE its audit
   receipt (e-stop is non-mutating, so no intent receipt precedes it; see
   `crates/cerud/src/server.rs`). Each session is bounded by
