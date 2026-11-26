@@ -116,6 +116,9 @@ struct TopicIndex {
     unattributed: usize,
     /// The distinct writers the labels name.
     writers: BTreeSet<u64>,
+    /// Lowest wire sequence seen for each writer key (`writer` when labeled,
+    /// `0` when unlabeled), across every attributed headered frame in the bag.
+    first_seq_by_writer: HashMap<u64, u32>,
     /// Every headered frame in file order, for the timestamp-feed mutant.
     #[cfg(feature = "oracle-mutants")]
     ordered: Vec<(u64, FrameSpan)>,
@@ -489,6 +492,10 @@ impl<'l> FrameIndexBuilder<'l> {
         } else {
             0
         };
+        idx.first_seq_by_writer
+            .entry(writer)
+            .and_modify(|first| *first = (*first).min(seq))
+            .or_insert(seq);
         #[cfg(feature = "oracle-mutants")]
         if let Some(ts) = frame.timestamp_ns {
             idx.ordered.push((ts, frame.span));
@@ -631,7 +638,11 @@ pub enum FeedRefusalReason {
         cause: AbsentWriter,
     },
     /// The bag holds no frame of this writer at this sequence on the topic.
-    FrameMissing,
+    FrameMissing {
+        /// The earliest wire sequence held in the bag for this writer on this
+        /// topic, or `None` when the bag holds no frame attributed to it.
+        first_held: Option<u32>,
+    },
     /// Several recorded frames carry this writer and this sequence, so which
     /// one the read served cannot be told apart. A gateway that republishes
     /// several remote writers' frames under its own one port is the shape that
@@ -694,7 +705,7 @@ impl FeedRefusalReason {
     pub fn code(&self) -> &'static str {
         match self {
             Self::IdentityAbsent { .. } => "read_identity_absent",
-            Self::FrameMissing => "read_identity_frame_missing",
+            Self::FrameMissing { .. } => "read_identity_frame_missing",
             Self::WritersIndistinguishable { .. } => "read_identity_writers_indistinguishable",
             Self::BatchUnattributed { .. } => "read_identity_batch_unattributed",
             Self::BatchMiscounted { .. } => "read_identity_batch_miscounted",
@@ -762,10 +773,18 @@ impl fmt::Display for FeedRefusal {
                     ),
                 }
             }
-            FeedRefusalReason::FrameMissing => write!(
-                f,
-                "the bag holds no frame of that writer at that sequence (the recorder lost it)"
-            ),
+            FeedRefusalReason::FrameMissing { first_held } => match (*first_held, self.sequence) {
+                (Some(first), Some(seq)) if seq < first => write!(
+                    f,
+                    "the bag's frames of that writer begin at sequence {first}, after sequence \
+                     {seq} (the recorder's taps attached after it, or the window dropped earlier \
+                     frames)"
+                ),
+                _ => write!(
+                    f,
+                    "the bag holds no frame of that writer at that sequence (the recorder lost it)"
+                ),
+            },
             FeedRefusalReason::WritersIndistinguishable { frames } => write!(
                 f,
                 "{frames} recorded frames carry that writer and that sequence, so the frame the \
@@ -1208,7 +1227,9 @@ pub fn plan_feeds(
                                 step.step,
                                 Some(frame_writer),
                                 Some(seq),
-                                FeedRefusalReason::FrameMissing,
+                                FeedRefusalReason::FrameMissing {
+                                    first_held: topic.first_seq_by_writer.get(&lookup.0).copied(),
+                                },
                             ));
                         }
                     }
@@ -1632,7 +1653,12 @@ mod tests {
         let (need, planned) = overflow_batch_through_a_budgeted_index();
         assert_eq!(need.entries(), 3, "the mutant names 18, 19 and 20");
         let refusal = planned.expect_err("frame 1 is outside the mutant's index");
-        assert_eq!(refusal.reason, FeedRefusalReason::FrameMissing);
+        assert_eq!(
+            refusal.reason,
+            FeedRefusalReason::FrameMissing {
+                first_held: Some(1)
+            }
+        );
         assert_eq!(refusal.sequence, Some(1));
         let caught = std::panic::catch_unwind(
             a_budgeted_index_feeds_an_overflowed_batch_exactly_its_recorded_frames,
@@ -1920,8 +1946,113 @@ mod tests {
         let mut adm = admission(&[(3, 7, Some(9), 2, ReadKind::Served)]);
         adm.per_step[0].identity[0].batch = frames_of(&[(Some(9), 6)]);
         let r = plan(&adm, &idx).unwrap_err();
-        assert_eq!(r.reason, FeedRefusalReason::FrameMissing);
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::FrameMissing {
+                first_held: Some(5)
+            }
+        );
         assert_eq!(r.sequence, Some(6));
+    }
+
+    #[test]
+    fn a_missing_frame_before_a_writers_first_held_sequence_says_frames_begin_late() {
+        let adm = admission(&[(1, 1, Some(7), 1, ReadKind::Served)]);
+        // Unbudgeted index: writer holds [3, 4], read asks for 1.
+        let unbudgeted = index(vec![frame(10, 3), frame(20, 4)], vec![]);
+        // Budgeted index: need only names 1, while bag frames pushed are [3, 4].
+        let need = need_of(&adm, None);
+        let mut b = FrameIndexBuilder::new(["/t".to_string()], &NO_LABELS, Some(need));
+        b.push("/t", frame(10, 3));
+        b.push("/t", frame(20, 4));
+        let budgeted = b.finish();
+
+        for (label, idx) in [("unbudgeted", &unbudgeted), ("budgeted", &budgeted)] {
+            let r = plan(&adm, idx).unwrap_err();
+            assert_eq!(
+                r.reason,
+                FeedRefusalReason::FrameMissing {
+                    first_held: Some(3)
+                },
+                "{label}"
+            );
+            assert_eq!(r.reason.code(), "read_identity_frame_missing", "{label}");
+            let text = r.to_string();
+            assert!(
+                text.contains("begin at sequence 3, after sequence 1"),
+                "{label}: {text}"
+            );
+            assert!(
+                !text.contains("(the recorder lost it)"),
+                "{label}: must not blame recorder loss: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_frame_between_held_sequences_keeps_recorder_lost_message() {
+        let idx = index(vec![frame(10, 3), frame(20, 5)], vec![]);
+        let adm = admission(&[(2, 4, Some(7), 1, ReadKind::Served)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::FrameMissing {
+                first_held: Some(3)
+            }
+        );
+        assert_eq!(r.reason.code(), "read_identity_frame_missing");
+        let text = r.to_string();
+        assert!(text.contains("(the recorder lost it)"), "{text}");
+        assert!(!text.contains("begin at sequence"), "{text}");
+
+        // Boundary: sequence == first_held is not "before first_held" and keeps
+        // the lost-frame wording.
+        let equal_boundary = FeedRefusal {
+            node: "sink".to_string(),
+            input: "inp".to_string(),
+            topic: "/t".to_string(),
+            step: 2,
+            writer: Some(7),
+            sequence: Some(3),
+            reason: FeedRefusalReason::FrameMissing {
+                first_held: Some(3),
+            },
+        };
+        let eq_text = equal_boundary.to_string();
+        assert!(eq_text.contains("(the recorder lost it)"), "{eq_text}");
+        assert!(!eq_text.contains("begin at sequence"), "{eq_text}");
+    }
+
+    #[test]
+    fn a_missing_frame_on_a_labeled_writer_with_no_held_frames_keeps_lost_message() {
+        let labels: TopicLabels = vec![
+            (ProducerAttribution::FrameLabel { frame_index: 0 }, 11),
+            (ProducerAttribution::FrameLabel { frame_index: 1 }, 11),
+        ];
+        let idx = index(vec![frame(10, 3), frame(20, 4)], labels);
+        let adm = admission(&[(1, 1, Some(writer_token(22)), 1, ReadKind::Served)]);
+        let r = plan(&adm, &idx).unwrap_err();
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::FrameMissing { first_held: None }
+        );
+        assert_eq!(r.reason.code(), "read_identity_frame_missing");
+        let text = r.to_string();
+        assert!(text.contains("(the recorder lost it)"), "{text}");
+        assert!(!text.contains("begin at sequence"), "{text}");
+    }
+
+    #[test]
+    fn late_frame_feed_refusal_is_deterministic() {
+        let idx = index(vec![frame(10, 3), frame(20, 4)], vec![]);
+        let adm = admission(&[(1, 1, Some(7), 1, ReadKind::Served)]);
+        let a = plan(&adm, &idx).unwrap_err();
+        let b = plan(&adm, &idx).unwrap_err();
+        assert_eq!(a, b);
+        assert_eq!(a.to_string(), b.to_string());
+        assert!(a
+            .to_string()
+            .contains("begin at sequence 3, after sequence 1"));
     }
 
     #[test]
@@ -2085,13 +2216,13 @@ mod tests {
         let named_by_first = admission(&[(1, 5, Some(writer_token(4)), 1, ReadKind::Served)]);
         assert_eq!(
             plan(&named_by_first, &idx).unwrap_err().reason,
-            FeedRefusalReason::FrameMissing,
+            FeedRefusalReason::FrameMissing { first_held: None },
             "frame 0 is contradicted"
         );
         let named_by_second = admission(&[(1, 6, Some(writer_token(5)), 1, ReadKind::Served)]);
         assert_eq!(
             plan(&named_by_second, &idx).unwrap_err().reason,
-            FeedRefusalReason::FrameMissing,
+            FeedRefusalReason::FrameMissing { first_held: None },
             "frame 1 is not attributed by the contested prefix"
         );
     }
@@ -2157,7 +2288,12 @@ mod tests {
         let mut adm = admission(&[(7, 30, Some(a), 2, ReadKind::DrainedBatch)]);
         adm.per_step[0].identity[0].batch = frames_of(&[(Some(b), 12)]);
         let r = plan(&adm, &idx).unwrap_err();
-        assert_eq!(r.reason, FeedRefusalReason::FrameMissing);
+        assert_eq!(
+            r.reason,
+            FeedRefusalReason::FrameMissing {
+                first_held: Some(13)
+            }
+        );
         assert_eq!((r.step, r.writer, r.sequence), (7, Some(b), Some(12)));
         assert!(
             r.to_string()

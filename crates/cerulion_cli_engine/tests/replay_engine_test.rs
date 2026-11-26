@@ -18078,6 +18078,98 @@ fn late_start_resume_refusal_is_deterministic_across_two_runs() {
     assert_eq!(a.to_string(), b.to_string());
 }
 
+#[test]
+#[serial]
+fn a_free_run_verify_reading_pre_anchor_seq_before_first_held_frame_names_late_start() {
+    // Free-run --verify mid-run capture resuming at step 1 (step-0 anchor).
+    // Step 0 has no external input; before step 1 (target 10 ms), external
+    // frame seq 0 arrives at 5 ms so `relay` reads seq 0 at step 1 and emits
+    // its output at 10 ms. With tap attach at step 1's target (10 ms),
+    // `/xr/relay/out` holds its frame at 10 ms (`at_anchor = [0]`), so resume
+    // passes, while `/xr/ext/cam` begins at sequence 1 (seq 0 absent).
+    // `plan_feeds` then refuses with `read_identity_frame_missing` naming the
+    // late start rather than blaming recorder loss.
+    let ext_topic = "/xr/ext/cam";
+    let externals = vec![ExternalDrive {
+        topic: ext_topic.to_string(),
+        per_step: vec![
+            vec![],
+            vec![10.0],
+            vec![20.0],
+            vec![30.0],
+            vec![40.0],
+            vec![50.0],
+        ],
+    }];
+    let rec =
+        record_uniform_with_read_log_at(ext_graph_yaml(), ext_relay_factories, &externals, 6, &[0]);
+    let target_1 = rec
+        .trace
+        .iter()
+        .find(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == 1)
+        .expect("step 1 boundary")
+        .fire_time_ns;
+    let mid = make_mid_run_with_tap_attach(&rec, 1, target_1);
+    let kept_ext: Vec<u32> = mid.messages[ext_topic]
+        .iter()
+        .map(|f| frame_seq(f))
+        .collect();
+    assert_eq!(
+        kept_ext,
+        vec![1, 2, 3, 4],
+        "hand oracle: external frames begin at sequence 1 (seq 0 absent)"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("free_run_pre_anchor_read.mcap");
+    let mut manifest_keys = serde_json::Map::new();
+    manifest_keys.insert("read_log_capacity".to_string(), serde_json::json!(0));
+    manifest_keys.insert("read_log_capacities".to_string(), rec.stage_rows.clone());
+    manifest_keys.insert("publishers".to_string(), ri_publishers(&rec));
+    write_checkpoint_bag_with_manifest_keys(
+        &mid,
+        &bag,
+        &state_records(CHECKPOINT_RUN, 0, CHECKPOINT_NODE_IDX, &relay_anchor_blob()),
+        Some(&coverage_naming(
+            "relay",
+            cerulion_bagd::STATE_COVERAGE_VERSION,
+            1,
+            Some(CHECKPOINT_NODE_IDX),
+        )),
+        None,
+        None,
+        Some(ri_free_run_recorder_json()),
+        manifest_keys,
+    );
+
+    let (res, _) = ri_replay(
+        &bag,
+        ext_relay_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = res.expect_err("reading missing pre-anchor seq 0 must refuse under --verify");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    match &err {
+        ReplayError::ReadLogNotEnforceable {
+            edge,
+            cause,
+            detail,
+        } => {
+            assert_eq!(edge.as_deref(), Some("relay.inp"), "{err:?}");
+            assert_eq!(cause, "read_identity_frame_missing", "{err:?}");
+            assert!(
+                detail.contains("begin at sequence 1, after sequence 0"),
+                "expected late-start wording in: {detail}"
+            );
+            assert!(
+                !detail.contains("(the recorder lost it)"),
+                "must not blame recorder loss when frames begin later: {detail}"
+            );
+        }
+        other => panic!("expected ReadLogNotEnforceable, got {other:?}"),
+    }
+}
+
 // ===========================================================================
 // The FRAMEWORK SECTION of the anchor blob, end to end
 // ===========================================================================
