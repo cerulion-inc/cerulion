@@ -1218,8 +1218,10 @@ fn the_staged_wire_discriminants_are_pinned() {
             ReadOutcomeKind::Decimated.wire(),
             ReadOutcomeKind::Truncated.wire(),
             ReadOutcomeKind::Producer.wire(),
+            ReadOutcomeKind::BatchFrame.wire(),
+            ReadOutcomeKind::Taken.wire(),
         ],
-        [1, 2, 3, 4, 5, 6, 7],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
         "abi_layout: a `ReadOutcomeKind` wire value moved. These discriminants ARE the \
          kind-6 record's low-16 half; renumbering one silently re-labels every read in every bag \
          recorded before the change."

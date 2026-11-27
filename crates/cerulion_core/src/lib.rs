@@ -859,8 +859,9 @@ pub mod wire;
 /// owned twin) on a graph-wired input is a recorded read (`trace_format` 13):
 /// it consults the replay read gate, stages its read record and pays the
 /// `block` credit word. `ReadOutcomeStage` gains `records_single_takes`, the
-/// rule a replay adopts from the bag's trace format, and
-/// `OwnedInboundSample` gains `origin`, the writer stream key of a fed take.
+/// rule a replay adopts from the bag's trace format,
+/// `OwnedInboundSample` gains `origin`, the writer stream key of a fed take,
+/// and `ReadOutcomeKind` gains `Taken` (9), the record a take stages.
 /// The take paths run inside a node library, so a library built against an
 /// earlier core reads the stage at stale offsets and takes without recording.
 ///

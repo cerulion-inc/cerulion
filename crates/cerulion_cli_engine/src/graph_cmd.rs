@@ -17967,9 +17967,10 @@ pub fn render_recorder_json(
         // in which every complete checkpoint part of a stopped node carries
         // the stopped flag, v11 one in which every read site names its
         // writer again at every checkpoint window head and the boundary there
-        // carries the reopen flag, and v12 one in which every fire that
-        // stopped its node is followed by a NODE-STOP record, all five also
-        // every bag this binary writes.
+        // carries the reopen flag, v12 one in which every fire that
+        // stopped its node is followed by a NODE-STOP record, and v13 one in
+        // which every single-frame take is a read record, all six also every
+        // bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17979,7 +17980,7 @@ pub fn render_recorder_json(
             // THIS binary's claims, with whether THIS run folds identical runs
             // read from the one switch. The node stops, window heads, stops,
             // identity and consult terms are tested first, so every bag this
-            // binary writes stamps 12 with folding on or off.
+            // binary writes stamps 13 with folding on or off.
             crate::replay_engine::RecorderClaims::of_this_recorder(
                 cerulion_core::read_outcome::fold_enabled(),
             ),

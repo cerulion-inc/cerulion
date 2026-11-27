@@ -306,7 +306,11 @@ impl ReadKind {
     #[must_use]
     pub fn from_outcome(kind: ReadOutcomeKind) -> Option<Self> {
         match kind {
-            ReadOutcomeKind::Served => Some(Self::Served),
+            // A take names the one frame it consumed, exactly as a `Served`
+            // read does, so the planner admits and feeds it the same way;
+            // what the two leave queued behind them is the block hold
+            // verifier's question (`replay_rederive`), not the planner's.
+            ReadOutcomeKind::Served | ReadOutcomeKind::Taken => Some(Self::Served),
             ReadOutcomeKind::Held => Some(Self::Held),
             ReadOutcomeKind::NoFrame => Some(Self::NoFrame),
             ReadOutcomeKind::DrainedBatch => Some(Self::DrainedBatch),

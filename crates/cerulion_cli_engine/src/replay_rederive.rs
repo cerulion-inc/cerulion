@@ -1027,6 +1027,8 @@ pub enum SlotRecord {
 }
 
 /// How one body read of a `block` consumer's input drains the input's queue.
+/// A single-frame take ([`ReadOutcomeKind::Taken`]) takes one frame on either
+/// drain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyDrain {
     /// One frame per read: a FIFO trigger input, which takes the frame the
@@ -3252,7 +3254,7 @@ fn believed_role(read: &RecordedRead, trust: RoleTrust) -> bool {
 /// on an annotated edge, the `Producer` token paired with that same read. Every
 /// other kind is unproducible under it, and each for its own reason:
 ///
-/// * `Served` / `Held` / `NoFrame` — body-only kinds, as above;
+/// * `Served` / `Held` / `Taken` / `NoFrame`: body-only kinds, as above;
 /// * `Decimated` — the peek's OWN decimated arm deliberately keeps `Drain`
 ///   (a decimated pop parks nothing, so there is no head to distinguish it
 ///   from), and no other site mints `Peek` at all;
@@ -3279,7 +3281,7 @@ fn unproducible_read_shape(read: &RecordedRead, trust: RoleTrust) -> bool {
     }
     match read.role {
         ReadSiteRole::Drain => match read.kind {
-            ReadOutcomeKind::Served | ReadOutcomeKind::Held => true,
+            ReadOutcomeKind::Served | ReadOutcomeKind::Held | ReadOutcomeKind::Taken => true,
             // The empty drain's own record from format 7 on, a body kind
             // below it.
             ReadOutcomeKind::NoFrame => !trust.consults_recorded(),
@@ -4644,6 +4646,15 @@ impl SlotBound {
                     emptied |= drain == BodyDrain::ToEmpty;
                     body_read = true;
                 }
+                // A single-frame take (trace format 13) removes the frames it
+                // popped and leaves the rest queued on every input, so the
+                // word pays those and nothing more
+                // (`CerulionSubscriber::try_receive_one`): it never empties
+                // the slot, whatever the input's drain.
+                ReadOutcomeKind::Taken => {
+                    removed = removed.saturating_add(u64::from(read.popped));
+                    body_read = true;
+                }
                 // Minted at both sites: a body drain only where the role says
                 // so, and one whose site the bag cannot say leaves the slot
                 // unbounded.
@@ -5620,14 +5631,14 @@ fn node_ran_in_pass(node_id: &str, steps: &[RecordedStep], trust: RoleTrust) -> 
 }
 
 /// Was this record minted by a read the node's body made, on any input?
-/// `Served` and `Held` are minted only there; a `NoFrame` is too, except one
+/// `Served`, `Held` and `Taken` are minted only there; a `NoFrame` is too, except one
 /// whose believed role is [`ReadSiteRole::Drain`], an empty consult of the
 /// boundary drain; a `DrainedBatch` or `Decimated` read is one only when its
 /// believed role is [`ReadSiteRole::Body`], since the drain sites mint both
 /// kinds. Annotations and the overflow marker read nothing.
 fn is_body_read(read: &RecordedRead, trust: RoleTrust) -> bool {
     match read.kind {
-        ReadOutcomeKind::Served | ReadOutcomeKind::Held => true,
+        ReadOutcomeKind::Served | ReadOutcomeKind::Held | ReadOutcomeKind::Taken => true,
         ReadOutcomeKind::NoFrame => {
             !(believed_role(read, trust) && read.role == ReadSiteRole::Drain)
         }
@@ -5651,7 +5662,7 @@ struct LatestStepPops {
     /// on a step the node fired, such a `DrainedBatch` can be the tick's own
     /// `try_receive`.
     unsited: u32,
-    /// Frames the node body's reads took: `Served`, `Held` and `NoFrame`,
+    /// Frames the node body's reads took: `Served`, `Held`, `Taken` and `NoFrame`,
     /// which only a body read mints, and a `DrainedBatch` whose believed role
     /// is `Body`.
     read: u32,
@@ -5681,6 +5692,7 @@ impl LatestStepPops {
             ReadOutcomeKind::DrainedBatch
             | ReadOutcomeKind::Served
             | ReadOutcomeKind::Held
+            | ReadOutcomeKind::Taken
             | ReadOutcomeKind::NoFrame => {
                 self.read = self.read.saturating_add(read.popped);
             }
@@ -5793,6 +5805,7 @@ impl LatestWriters {
             }
             ReadOutcomeKind::Served
             | ReadOutcomeKind::Held
+            | ReadOutcomeKind::Taken
             | ReadOutcomeKind::NoFrame
             | ReadOutcomeKind::DrainedBatch
             | ReadOutcomeKind::Decimated
@@ -6196,6 +6209,7 @@ fn verify_conservation(
                     ReadOutcomeKind::BatchFrame => {}
                     ReadOutcomeKind::Served
                     | ReadOutcomeKind::Held
+                    | ReadOutcomeKind::Taken
                     | ReadOutcomeKind::NoFrame
                     | ReadOutcomeKind::DrainedBatch
                     | ReadOutcomeKind::Decimated => {
@@ -12319,6 +12333,47 @@ mod tests {
         let steps = with_read(rows(), 5, empty);
         let report = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
         assert_eq!(findings_of(&report), vec![finding("relay", 6, 2, 1)]);
+    }
+
+    /// A take takes one frame off the slot and leaves the rest counted, on a
+    /// latest-value input as on a FIFO one: unlike a `Served` read of a
+    /// latest-value input, which drains its queue to the newest frame, a
+    /// `Taken` read empties nothing.
+    ///
+    /// Hand oracle, depth 2: the relay sends one frame at each of steps 0 to
+    /// 3, and the sink takes one at steps 0 and 2. The slot counts 0, 1, 1, 2
+    /// after steps 0 to 3, so at step 4 it is full and the relay's pop left
+    /// unfired is the hold: clean on both drains. The same steps with the
+    /// takes recorded as `Served` reads of a latest-value input empty the slot
+    /// at step 2, so it counts 1 at step 4 and the pop is a finding; on a FIFO
+    /// input a `Served` read takes one frame too, and the steps read clean.
+    #[test]
+    fn a_take_leaves_the_frames_behind_it_counted_on_every_drain() {
+        let rows = |kind: ReadOutcomeKind| {
+            let take = || read_with_role("sink", "inp", kind, 1, None, ReadSiteRole::Body);
+            let steps = vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 1, 1, 0)]),
+                fifo_step(4, 20_000, &[("relay", 1, 0, 0)]),
+            ];
+            with_read(with_read(steps, 0, take()), 2, take())
+        };
+        let judge = |kind: ReadOutcomeKind, drain: BodyDrain| {
+            let steps = rows(kind);
+            verify_unrestored(&relay(sink_slot(2, &steps, drain)), &steps, &[], STAMPED)
+        };
+        for drain in [BodyDrain::ToEmpty, BodyDrain::PerFrame] {
+            let report = judge(ReadOutcomeKind::Taken, drain);
+            assert!(report.is_clean(), "{drain:?}: {:?}", report.findings);
+        }
+        assert_eq!(
+            findings_of(&judge(ReadOutcomeKind::Served, BodyDrain::ToEmpty)),
+            vec![finding("relay", 4, 1, 0)]
+        );
+        let report = judge(ReadOutcomeKind::Served, BodyDrain::PerFrame);
+        assert!(report.is_clean(), "{:?}", report.findings);
     }
 
     /// A read of a latest-value input empties the slot, the frame its own step

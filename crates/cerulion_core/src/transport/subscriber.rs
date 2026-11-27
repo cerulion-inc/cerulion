@@ -2154,7 +2154,7 @@ impl CerulionSubscriber {
             Some((seq, origin)) if take.capture => {
                 if take.annotate {
                     self.stage_read_outcome_with_producer(
-                        ReadOutcomeKind::Served,
+                        ReadOutcomeKind::Taken,
                         Some(seq),
                         1,
                         producer_token(origin),
@@ -2162,7 +2162,7 @@ impl CerulionSubscriber {
                     );
                 } else {
                     self.stage_read_outcome(
-                        ReadOutcomeKind::Served,
+                        ReadOutcomeKind::Taken,
                         Some(seq),
                         1,
                         ReadSiteRole::Body,
@@ -3478,10 +3478,13 @@ impl CerulionSubscriber {
     ///
     /// On a graph-wired input the take is a recorded read like the graph's
     /// other read paths (`trace_format` 13): it asks the replay read gate
-    /// first, stages one `Served` record (popped 1, the `Body` role, with the
+    /// first, stages one `Taken` record (popped 1, the `Body` role, with the
     /// producer annotation of its writer run) for the frame it delivers or one
     /// `NoFrame` record for an empty queue, and pays the `block` credit word
-    /// for every frame it removed. A replay of a bag below format 13 takes the
+    /// for every frame it removed. A take leaves the frames behind the one it
+    /// delivered queued on every input, a latest-value one included, so its
+    /// record is `Taken` and not the `Served` of a read that drains the queue
+    /// to its newest frame. A replay of a bag below format 13 takes the
     /// unrecorded path that recorder took: no gate, no record, no credit, and a
     /// replay fed by read identity reports the take as an unrecorded take
     /// (`ReadOutcomeStage::records_single_takes`). On a subscriber the graph
@@ -9363,7 +9366,7 @@ mod tests {
             .collect()
     }
 
-    /// A take is a recorded read: one `Served` record (popped 1, the `Body`
+    /// A take is a recorded read: one `Taken` record (popped 1, the `Body`
     /// role) for each frame it delivers, through both twins, and one `NoFrame`
     /// record (popped 0) for each take that finds the queue empty. A malformed
     /// frame the take skips is not the frame it names.
@@ -9371,7 +9374,7 @@ mod tests {
     /// Hand oracle: frames 0 and 1 are queued, then a 3-byte frame and frame 5.
     /// The takes are callback, owned, callback, callback, owned: they see 0, 1,
     /// 5 (past the malformed one), nothing, nothing, so the records are
-    /// `Served 0`, `Served 1`, `Served 5`, then two `NoFrame` records. Every
+    /// `Taken 0`, `Taken 1`, `Taken 5`, then two `NoFrame` records. Every
     /// record reads `popped` 1 or 0, never the 2 frames the third take removed.
     ///
     /// What breaks it: a take that records nothing (the trace format 12
@@ -9409,9 +9412,9 @@ mod tests {
         assert_eq!(
             take_records(&stage),
             vec![
-                (ReadOutcomeKind::Served, 0, 1, None, body),
-                (ReadOutcomeKind::Served, 1, 1, None, body),
-                (ReadOutcomeKind::Served, 5, 1, None, body),
+                (ReadOutcomeKind::Taken, 0, 1, None, body),
+                (ReadOutcomeKind::Taken, 1, 1, None, body),
+                (ReadOutcomeKind::Taken, 5, 1, None, body),
                 (ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body),
                 (ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body),
             ]
@@ -9422,7 +9425,7 @@ mod tests {
     /// writer's annotation, once per writer run.
     ///
     /// Hand oracle: two frames of one publisher, taken one at a time, stage
-    /// `Producer` (the publisher's token), `Served 3`, `Served 4`: the second
+    /// `Producer` (the publisher's token), `Taken 3`, `Taken 4`: the second
     /// read continues the run the first opened.
     #[test]
     fn a_take_on_an_annotated_edge_names_its_writer_once_per_run() {
@@ -9446,8 +9449,8 @@ mod tests {
         assert_eq!(
             &records[1..],
             &[
-                (ReadOutcomeKind::Served, 3, 1, None, body),
-                (ReadOutcomeKind::Served, 4, 1, None, body),
+                (ReadOutcomeKind::Taken, 3, 1, None, body),
+                (ReadOutcomeKind::Taken, 4, 1, None, body),
             ]
         );
     }
@@ -9554,7 +9557,7 @@ mod tests {
     ///
     /// Hand oracle: admissions A's 10 then B's 100. The callback take sees
     /// `(A, 10)` and the owned take `(B, 100)`, each with the eight zero bytes
-    /// the feed's frame carries; the stage holds `Served 10` then `Served
+    /// the feed's frame carries; the stage holds `Taken 10` then `Taken
     /// 100`; no divergence. A third take, past the plan, is withheld, returns
     /// nothing and is one unplanned consult.
     #[test]
@@ -9590,8 +9593,8 @@ mod tests {
             assert_eq!(
                 &take_records(&stage)[..2],
                 &[
-                    (ReadOutcomeKind::Served, 10, 1, None, body),
-                    (ReadOutcomeKind::Served, 100, 1, None, body),
+                    (ReadOutcomeKind::Taken, 10, 1, None, body),
+                    (ReadOutcomeKind::Taken, 100, 1, None, body),
                 ]
             );
             assert!(take_violations(&plan).is_empty(), "every admission settled");
@@ -9614,9 +9617,9 @@ mod tests {
     /// Hand oracle, three admissions: nothing; A's 7; A's 8, which the feed
     /// does not publish. Frame 3 is queued by hand before the first take.
     /// * take 1 is withheld: `false`, `NoFrame` staged, frame 3 stays queued;
-    /// * take 2 fills 7 behind 3 and pops 3: `Served 3` and
+    /// * take 2 fills 7 behind 3 and pops 3: `Taken 3` and
     ///   `SequenceMismatch { 7, 3 }`;
-    /// * take 3 pops 7 where 8 was due: `Served 7` and `SequenceMismatch { 8,
+    /// * take 3 pops 7 where 8 was due: `Taken 7` and `SequenceMismatch { 8,
     ///   7 }`;
     /// * a fourth gate, fresh, admits A's 9 and its feed publishes nothing:
     ///   the take finds the queue empty, `NoFrame` staged, and the gate mints
@@ -9653,8 +9656,8 @@ mod tests {
             take_records(&stage),
             vec![
                 (ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body),
-                (ReadOutcomeKind::Served, 3, 1, None, body),
-                (ReadOutcomeKind::Served, 7, 1, None, body),
+                (ReadOutcomeKind::Taken, 3, 1, None, body),
+                (ReadOutcomeKind::Taken, 7, 1, None, body),
             ]
         );
         assert_eq!(
@@ -9716,7 +9719,7 @@ mod tests {
     ///
     /// Hand oracle: the subscriber's borrow budget is `n`; the gate admits one
     /// fed frame per take, sequences `0..=n`. Each of the first `n` owned
-    /// takes is held, so each stages `Served i` and settles clean. Take `n + 1`
+    /// takes is held, so each stages `Taken i` and settles clean. Take `n + 1`
     /// fails at iceoryx2's receive (`ExceedsMaxBorrows`): an `Err`, no record,
     /// and the gate mints `PoppedShortfall { 1, 0 }` and `SequenceMismatch {
     /// n, none }` for it.
@@ -9745,7 +9748,7 @@ mod tests {
         assert!(matches!(err, TransportError::Receive { .. }), "{err:?}");
         let body = ReadSiteRole::Body;
         let expected: Vec<_> = (0..budget)
-            .map(|s| (ReadOutcomeKind::Served, u64::from(s), 1, None, body))
+            .map(|s| (ReadOutcomeKind::Taken, u64::from(s), 1, None, body))
             .collect();
         assert_eq!(take_records(&stage), expected);
         assert_eq!(
@@ -9777,8 +9780,8 @@ mod tests {
     /// frame.
     ///
     /// Hand oracle: frames 0 and 1 are queued. The outer take delivers 0 and
-    /// its callback's inner take delivers 1, so the records are `Served 0`
-    /// then `Served 1`.
+    /// its callback's inner take delivers 1, so the records are `Taken 0`
+    /// then `Taken 1`.
     #[test]
     fn a_take_made_inside_a_take_callback_is_recorded_after_it() {
         let (_mgr, mut publisher, sub, stage) = take_fixture("take_nested_order");
@@ -9801,8 +9804,8 @@ mod tests {
         assert_eq!(
             take_records(&stage),
             vec![
-                (ReadOutcomeKind::Served, 0, 1, None, body),
-                (ReadOutcomeKind::Served, 1, 1, None, body),
+                (ReadOutcomeKind::Taken, 0, 1, None, body),
+                (ReadOutcomeKind::Taken, 1, 1, None, body),
             ]
         );
     }
@@ -9812,7 +9815,7 @@ mod tests {
     /// queue, so the record and the word say so whatever the callback did.
     ///
     /// Hand oracle, depth 4: two frames are published and counted (2). The
-    /// take removes frame 0 and its callback panics: the stage holds `Served
+    /// take removes frame 0 and its callback panics: the stage holds `Taken
     /// 0` and the word counts 1, the one frame still queued.
     #[test]
     fn a_take_whose_callback_panics_has_recorded_and_paid_for_its_frame() {
@@ -9837,8 +9840,64 @@ mod tests {
         assert!(unwound.is_err(), "the callback's panic unwinds the take");
         assert_eq!(
             take_records(&stage),
-            vec![(ReadOutcomeKind::Served, 0, 1, None, ReadSiteRole::Body)]
+            vec![(ReadOutcomeKind::Taken, 0, 1, None, ReadSiteRole::Body)]
         );
         assert_eq!(word.outstanding(), 1);
+    }
+
+    /// On a fed replay a take settles its admission before its callback runs:
+    /// a take the callback makes is admitted the next recorded read and fed
+    /// its frame, and a callback that panics leaves its admission settled.
+    ///
+    /// Hand oracle: admissions A's 7 then A's 8. The outer take is fed 7 and
+    /// its callback's inner take is fed 8; the stage holds `Taken 7` then
+    /// `Taken 8` and no divergence. On a second gate admitting A's 9 alone, a
+    /// take whose callback panics holds `Taken 9`, no divergence, and the take
+    /// after it is past the plan: withheld, one unplanned consult.
+    #[test]
+    fn a_fed_take_settles_before_its_callback_runs() {
+        use crate::read_outcome::DueRead;
+        let body = ReadSiteRole::Body;
+        let (_mgr, _feed, sub, plan, stage) = fed_take_fixture(
+            "fed_take_nested",
+            &[DueRead::pops(1, Some(7)), DueRead::pops(1, Some(8))],
+            vec![vec![(FED_WRITER_A, 7)], vec![(FED_WRITER_A, 8)]],
+        );
+        let seen = std::cell::RefCell::new(Vec::new()); // hot-path-alloc-ok: test-only collector.
+        assert!(sub
+            .try_receive_one(|outer| {
+                seen.borrow_mut().push(outer.header().sequence);
+                assert!(sub
+                    .try_receive_one(|inner| seen.borrow_mut().push(inner.header().sequence))
+                    .expect("inner take"));
+            })
+            .expect("outer take"));
+        assert_eq!(seen.into_inner(), vec![7, 8]);
+        assert_eq!(
+            take_records(&stage),
+            vec![
+                (ReadOutcomeKind::Taken, 7, 1, None, body),
+                (ReadOutcomeKind::Taken, 8, 1, None, body),
+            ]
+        );
+        assert!(take_violations(&plan).is_empty(), "every admission settled");
+        assert_eq!(plan.unplanned_consults(), 0);
+
+        let (_mgr, _feed, sub, plan, stage) = fed_take_fixture(
+            "fed_take_panics",
+            &[DueRead::pops(1, Some(9))],
+            vec![vec![(FED_WRITER_A, 9)]],
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sub.try_receive_one(|_| panic!("the callback panics"))
+        }));
+        assert!(unwound.is_err(), "the callback's panic unwinds the take");
+        assert_eq!(
+            take_records(&stage),
+            vec![(ReadOutcomeKind::Taken, 9, 1, None, body)]
+        );
+        assert!(take_violations(&plan).is_empty(), "the admission settled");
+        assert!(!sub.try_receive_one(|_| {}).expect("a take past the plan"));
+        assert_eq!(plan.unplanned_consults(), 1);
     }
 }

@@ -1231,6 +1231,15 @@ pub enum ReadOutcomeKind {
     /// (`ReadOutcomeStage::room`); otherwise none is, and the read names only
     /// its newest frame.
     BatchFrame = 8,
+    /// A single-frame take (`CerulionSubscriber::try_receive_one` and its
+    /// owned twin, `trace_format` 13) delivered one frame: `served_seq` is
+    /// that frame's wire sequence, `popped` is 1, the role is `Body`. It is
+    /// not [`Self::Served`] because a take removes only the frame it names:
+    /// on a latest-value input the queue can still hold frames after it,
+    /// where a `Served` read drained the queue to its newest frame. A take
+    /// that finds the queue empty stages [`Self::NoFrame`], as every other
+    /// empty read does.
+    Taken = 9,
 }
 
 impl ReadOutcomeKind {
@@ -1440,11 +1449,12 @@ fn resolve_seq_slot(inner: &mut StageInner, kind: ReadOutcomeKind, served_seq: O
         ReadOutcomeKind::Served
         | ReadOutcomeKind::Held
         | ReadOutcomeKind::DrainedBatch
-        | ReadOutcomeKind::BatchFrame => served_seq.map(u64::from).unwrap_or(STAGE_NO_FRAME),
+        | ReadOutcomeKind::BatchFrame
+        | ReadOutcomeKind::Taken => served_seq.map(u64::from).unwrap_or(STAGE_NO_FRAME),
     };
     if matches!(
         kind,
-        ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch
+        ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Taken
     ) {
         if let Some(seq) = served_seq {
             inner.last_served_seq = Some(seq);
@@ -1789,7 +1799,7 @@ impl ReadOutcomeStage {
     }
 
     /// Stage one read outcome. `served_seq` is the served frame's wire
-    /// sequence where the kind carries one (`Served` / `Held` /
+    /// sequence where the kind carries one (`Served` / `Held` / `Taken` /
     /// `DrainedBatch`); for `Decimated` it is IGNORED and the stage's
     /// remembered last-served sequence is reported instead; for `NoFrame` it
     /// is ignored (sentinel). `popped` saturates to `u32` for the packed aux
@@ -3549,7 +3559,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             // not be added silently.
             run_count
         }),
-        abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer, ReadOutcomeKind::BatchFrame }),
+        abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer, ReadOutcomeKind::BatchFrame, ReadOutcomeKind::Taken }),
         abi_pin_enum!(ReadSiteRole { ReadSiteRole::Unstamped, ReadSiteRole::Drain, ReadSiteRole::Body, ReadSiteRole::Peek }),
         abi_pin_enum!(ReadStageRole { ReadStageRole::Body, ReadStageRole::Drain }),
         // ABI v27: the ENFORCEMENT side. The subscriber owns a

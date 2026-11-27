@@ -801,6 +801,7 @@ fn name_consumed_frame(
         }
         tr::READ_OUTCOME_BATCH_FRAME => true,
         tr::READ_OUTCOME_SERVED
+        | tr::READ_OUTCOME_TAKEN
         | tr::READ_OUTCOME_HELD
         | tr::READ_OUTCOME_NONE
         | tr::READ_OUTCOME_DRAINED_BATCH => tr::unpack_read_outcome_popped(rec.duration_ns) > 0,

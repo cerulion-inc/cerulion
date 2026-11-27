@@ -2444,7 +2444,7 @@ pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
 
 /// The lowest `trace_format` whose read log records every single-frame take
 /// (`CerulionSubscriber::try_receive_one` and its owned twin) on a graph-wired
-/// input: one `Served` record (popped 1) per frame a take delivered, one
+/// input: one `Taken` record (popped 1) per frame a take delivered, one
 /// `NoFrame` record per take that found its queue empty, both under the
 /// `Body` role with the writer run annotation of every other read, and a
 /// `block` credit word paid for every frame a take removed.
@@ -8523,7 +8523,9 @@ fn earliest_missing_reads_for_topics(
             return Ok(());
         };
         let candidate_seq = match read_outcome_kind_from_wire(kind_wire) {
-            Some(ReadOutcomeKind::Served | ReadOutcomeKind::BatchFrame) => {
+            Some(
+                ReadOutcomeKind::Served | ReadOutcomeKind::Taken | ReadOutcomeKind::BatchFrame,
+            ) => {
                 if rec.fire_time_ns == READ_OUTCOME_NO_FRAME {
                     return Ok(());
                 }
@@ -11538,6 +11540,7 @@ fn read_outcome_kind_from_wire(wire: u16) -> Option<ReadOutcomeKind> {
         READ_OUTCOME_TRUNCATED => ReadOutcomeKind::Truncated,
         READ_OUTCOME_PRODUCER => ReadOutcomeKind::Producer,
         cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME => ReadOutcomeKind::BatchFrame,
+        cerulion_core::trace_ring::READ_OUTCOME_TAKEN => ReadOutcomeKind::Taken,
         _ => return None,
     })
 }
@@ -29468,6 +29471,7 @@ fn read_outcome_kind_label(kind: u16, role: ReadSiteRole) -> String {
         READ_OUTCOME_TRUNCATED => "truncated",
         READ_OUTCOME_PRODUCER => "producer",
         cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME => "batch_frame",
+        cerulion_core::trace_ring::READ_OUTCOME_TAKEN => "taken",
         other => return format!("unknown({other})"),
     };
     if role.is_stamped() {
