@@ -3025,15 +3025,15 @@ impl TransportManager {
             return Ok(Arc::clone(existing));
         }
         // Suppress iceoryx2 "No config file was loaded" warning. Cerulion uses
-        // iceoryx2's defaults intentionally — no custom config file is needed.
+        // iceoryx2's defaults intentionally; no custom config file is needed.
         crate::iceoryx_logger::init_iceoryx_log_level_from_env();
 
         // Every node this manager builds runs on a config with
         // iceoryx2's automatic dead-node cleanup DISABLED (the same-PID cdylib
-        // reap defeat — see disable_auto_dead_node_cleanup). The shared-config
+        // reap defeat, see disable_auto_dead_node_cleanup). The shared-config
         // arm pins the supervisor-minted config (multi-process workers); the
         // default arm is byte-identical to NodeBuilder's own no-config path
-        // (Config::global_config()) — resolve_singleton_node_config disables
+        // (Config::global_config()); resolve_singleton_node_config disables
         // the flags on either.
         let shared_config = ix_config.is_some();
         let ix_config = resolve_singleton_node_config(ix_config);
@@ -3050,7 +3050,7 @@ impl TransportManager {
             })?;
 
         // Restore iceoryx2's crash-recovery reaping at the ONE moment
-        // it is safe — host init, before any cdylib is loaded, where the host
+        // it is safe: host init, before any cdylib is loaded, where the host
         // linkage unit sees its own just-created node Alive via the
         // same-UniqueProcessId fast path (runtime auto-reap stays off).
         startup_dead_node_sweep(&ix_config);
@@ -3059,7 +3059,7 @@ impl TransportManager {
         // RLIMIT_AS, near-exhausted vm.max_map_count) that break our
         // oversize-freely SHM assumption and warn loudly. Linux-only,
         // detect-and-warn only (never mutates a machine setting, never aborts);
-        // no-op off Linux. Cold path — runs once per process at init.
+        // no-op off Linux. Cold path: runs once per process at init.
         shm_guard::check_and_warn_shm_safety();
 
         // Lifecycle bookkeeping (every process that builds a manager would
