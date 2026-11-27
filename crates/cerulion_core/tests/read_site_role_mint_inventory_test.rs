@@ -99,7 +99,16 @@ const WALKED: [&str; 3] = [
 /// `the_sync_matchers_descent_pops_are_drain_site_reads` (which now
 /// asserts the promotion row on BOTH legs) and
 /// `a_non_improving_peek_is_marked_a_peek_not_the_head`.
-const DECLARED_LITERAL_MINTS: usize = 35;
+///
+/// It went 35 -> 39 with recorded single-frame takes (trace format 13): a take
+/// through `try_receive_one` or its owned twin stages `Body`-role records on
+/// four arms, `begin_take`'s `NoFrame` where the read gate withheld the take,
+/// and `finish_take`'s `Served` (plain and producer-annotated) and `NoFrame` at
+/// an empty queue. Their capture arms are `subscriber.rs`'s
+/// `a_take_records_each_frame_it_delivers_and_each_empty_queue`,
+/// `a_take_on_an_annotated_edge_names_its_writer_once_per_run` and
+/// `a_take_is_bound_by_the_gate_answer`.
+const DECLARED_LITERAL_MINTS: usize = 39;
 
 /// Calls that FORWARD a `role` parameter rather than naming one, all eight in
 /// `subscriber.rs`: the two `stage_read_outcome*` helper bodies, the two

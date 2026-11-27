@@ -580,3 +580,34 @@ in prepare_pass_verification
 # it with a test, or list it here with a reason.
 
 (none)
+
+# Scope: the pure decisions a replay and the recorder make about a recorded
+# single-frame take (`trace_format` 13). In src/replay_engine.rs: the trace
+# format stamp's single-take term (`stamp_trace_format`), the claims this
+# build's recorder makes (`RecorderClaims::of_this_recorder`,
+# `recorder_records_single_takes`) and the replay's rule
+# (`replay_records_single_takes`). The take paths themselves run on the live
+# receive path in cerulion_core, which the mutation rule does not cover; they
+# are pinned by the red-first vectors `transport::subscriber::tests::a_take_*`
+# and `a_fed_take_*` in cerulion_core and, in tests/replay_engine_test.rs, by
+# `a_take_is_a_recorded_read_in_a_format_13_recording`,
+# `a_verify_replay_beside_a_skipped_ros2_entry_feeds_every_take_by_identity`,
+# `a_candidate_that_drops_a_recorded_take_is_caught` and
+# `a_format_12_bag_replays_its_takes_unrecorded`.
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the file> \
+#            --re '\bstamp_trace_format\b|RecorderClaims::of_this_recorder|replay_records_single_takes|recorder_records_single_takes' \
+#            --exclude-re 'delete field' --timeout 600 \
+#            -- --lib -- replay_engine:: graph_cmd::
+#          (the unmutated baseline passed)
+# Result:  12 mutants: 11 caught, 1 unviable, 0 missed. The unviable one
+#          replaces `RecorderClaims::of_this_recorder` with a default the type
+#          does not have.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)

@@ -1190,14 +1190,16 @@ read that serves a frame after each checkpoint, with bit 0 of the next step
 boundary's
 `global_level` saying so, is what `trace_format` 11 means, and a NODE-STOP
 record (record kind 7) after every fire that stopped its node is what
-`trace_format` 12 means.
+`trace_format` 12 means, and a read record for every single-frame take is
+what `trace_format` 13 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
 decodes as one occurrence each), since read identity every such bag is
 format 8, since batch frames format 9, since checkpoint stops format 10,
-since window heads format 11, and since node stops format 12. A bag
+since window heads format 11, since node stops format 12, and since
+single-frame takes format 13. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -1369,17 +1371,25 @@ node, the input, the writer and the sequence:
 | `read_identity_labels_unread` | The topic carries no writer label the replay could read and the bag's label stream was not read in full, so the topic may have had several writers |
 | `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |
 | `read_identity_ungateable_stage` | A stage the read gate cannot drive |
-| `read_identity_rmw_node` | The graph has `ros2` nodes, whose takes the read log does not record |
 
-A take on an rmw path inside a replayed node (`try_receive_one`) has no
-recorded identity either; it is reported as an edge-read divergence (exit 6,
-`unrecorded_take`).
+A single-frame take inside a replayed node (`try_receive_one` and
+`try_receive_one_owned`, the read path of an rmw `take`) is fed like any other
+read from format 13 (see "Single-frame takes" below). On a bag recorded below
+format 13 a take has no recorded identity: a `--verify` replay reports it as an
+edge-read divergence (exit 6, `unrecorded_take`), and refuses an input whose
+only reads are takes before the first step, since the bag holds no read to
+feed it (`read_log_no_coverage`, exit 2).
+
+A graph with `ros2` nodes is fed like any other. A resim never re-executes a
+`ros2:` entry: its frames are recorded inputs of the native nodes that read
+them, and those reads are fed by recorded identity. What the ROS 2 process
+itself took is not replayed by `bag play`; `cerulion ros2 run
+--replay-deliveries` replays one ROS 2 process from its own delivery log
+([ROS 2 replay](ros2_replay.md)).
 
 **Graphs `--verify` cannot feed yet.** These shapes are refused rather than
 fed:
 
-- A graph with `ros2` nodes (`read_identity_rmw_node`): an rmw take does not
-  pass through the read log, so its frames have no recorded identity.
 - A `sample(N)` input whose gate dropped frames
   (`read_identity_decimated_unattributed`): the decimated read names the last
   accepted frame, not the frames it popped and dropped.
@@ -1534,6 +1544,26 @@ below 12 does not define record kind 7: its record walk, which runs before its
 version gate, refuses the first stop record as an unknown record kind (exit 2,
 saying to upgrade cerulion), and its version gate refuses a format 12 bag that
 holds no stop record.
+
+### Single-frame takes (`trace_format` 13)
+
+A format 13 recording records every single-frame take on a graph-wired input
+(`CerulionSubscriber::try_receive_one` and `try_receive_one_owned`) as a read:
+a `Served` record (popped 1) for the frame a take delivered, after its writer's
+annotation when the take opens a writer run, and a `NoFrame` record (popped 0)
+for a take that found its queue empty, both under the `Body` role. A take on a
+`block` input pays the credit word for every frame it removed, and a take that
+finds its queue empty clears what the word still counts, as a drain does.
+
+A `--verify` replay feeds each take the frame its recorded read took, by writer
+and sequence, and holds it to that read: a take the re-execution does not make
+is `never_arrived`, a take of another frame is `sequence_mismatch`, and a take
+where the recording took nothing is withheld, so the frame stays in its queue.
+
+Below 13 a take recorded nothing and paid nothing, and a replay of such a bag
+takes the same unrecorded path: it stages no record for a take, asks no read
+gate and pays no credit word, so its read log and its credit words match the
+recording's. A reader below 13 refuses a format 13 bag by its version gate.
 
 ### The kind-6 annotations ride INSIDE the record kind
 
