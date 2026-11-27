@@ -48,10 +48,11 @@
 //! Each raw mapping also owns a [`RawRouteStats`] (listed by
 //! [`PumpStats::raw_routes`], rendered per route): the reader's DDS status
 //! stream is drained beside its samples, so writer matches, QoS refusals and
-//! receive counts are visible per route. Once the DDS side is up, the helper
-//! judges every raw route each [`RAW_ROUTE_HEALTH_PERIOD`] with the pure
-//! [`evaluate_raw_route_health`] and warns about a route that is silent while
-//! other ingress receives. Nothing here rebinds or restarts a reader.
+//! receive counts are visible per route. A closed status stream is logged
+//! once and dropped; its samples keep draining. Once the DDS side is up, the
+//! helper judges every raw route each [`RAW_ROUTE_HEALTH_PERIOD`] with the
+//! pure [`evaluate_raw_route_health`] and warns about a route that is silent
+//! while other ingress receives. Nothing here rebinds or restarts a reader.
 //!
 //! # Lifecycle
 //!
@@ -1224,10 +1225,14 @@ async fn drain_raw_stream(
 /// `statuses` is the reader's DDS status stream, polled FIRST on every turn
 /// so a writer match is counted before the samples it brings. Each event
 /// updates [`RawRouteStats`] and logs through [`classify_reader_status`];
-/// the loop still ends only when the SAMPLE stream ends.
+/// the loop still ends only when the SAMPLE stream ends. The status stream
+/// is fused HERE, not trusted to be: the pinned rustdds reader status stream
+/// returns `None` on every poll once its channel closes and never reports
+/// itself terminated, so an unfused end would win every biased turn and
+/// starve the samples.
 async fn drain_raw_from_stream<E, S, T>(
     mut stream: Pin<&mut S>,
-    mut statuses: Pin<&mut T>,
+    statuses: Pin<&mut T>,
     mut route: RawIngressRoute,
     codec: &CdrCodec,
     now_ns: &dyn Fn() -> u64,
@@ -1236,10 +1241,11 @@ async fn drain_raw_from_stream<E, S, T>(
 ) -> RawIngressRoute
 where
     S: Stream<Item = Result<RawSample, E>> + FusedStream,
-    T: Stream<Item = DataReaderStatus> + FusedStream,
+    T: Stream<Item = DataReaderStatus>,
     E: std::fmt::Debug,
 {
     let dds_topic = route_stats.dds_topic.as_str();
+    let mut statuses = statuses.fuse();
     stats
         .raw_streams_started_total
         .fetch_add(1, Ordering::Relaxed);
@@ -1249,10 +1255,18 @@ where
     loop {
         let next = futures::select_biased! {
             status = statuses.next() => {
-                if let Some(status) = status {
-                    route_stats.record_status(&status);
-                    let class = classify_reader_status(&status, &mut status_latches);
-                    log_reader_status(route_stats, &status, class);
+                match status {
+                    Some(status) => {
+                        route_stats.record_status(&status);
+                        let class = classify_reader_status(&status, &mut status_latches);
+                        log_reader_status(route_stats, &status, class);
+                    }
+                    None => tracing::warn!(
+                        dds_topic = %dds_topic,
+                        topic = %route_stats.cerulion_topic,
+                        "dds_bridge pump: raw route reader status stream closed; its match, \
+                         QoS and loss counters stop here, samples still drain"
+                    ),
                 }
                 continue;
             }
@@ -2520,8 +2534,9 @@ mod tests {
         assert_eq!(frames[1], expected_v3_frame(4.0, 5.0, 6.0, 1, 300));
     }
 
-    /// The production status stream never ends. The drain must still end
-    /// (and count the end) when the SAMPLE stream ends.
+    /// While the status stream stays open (it ends only when its channel
+    /// closes), the drain must still end, and count the end, when the
+    /// SAMPLE stream ends.
     #[test]
     fn the_drain_ends_with_the_sample_stream_while_statuses_stay_open() {
         use cerulion_core::wire::MaxSliceLen;
@@ -2568,6 +2583,100 @@ mod tests {
             1
         );
         assert_eq!(route_stats.last_published_ns.load(Ordering::Relaxed), 7);
+    }
+
+    /// A status stream shaped like the pinned rustdds reader status stream
+    /// after its channel disconnects: `Ready(None)` on EVERY poll, and
+    /// `is_terminated()` always `false` (rustdds builds a fresh inner stream
+    /// for each call, so its end flag never sticks). Counts its polls and
+    /// panics past a bound, so a drain that spins on it fails the test
+    /// instead of hanging it.
+    struct EndedStatusStream {
+        pending: Vec<DataReaderStatus>,
+        polls: Arc<AtomicU64>,
+    }
+
+    impl Stream for EndedStatusStream {
+        type Item = DataReaderStatus;
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<DataReaderStatus>> {
+            let polls = self.polls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert!(
+                polls <= 16,
+                "the drain polled an ended status stream {polls} times: it spins"
+            );
+            std::task::Poll::Ready(self.pending.pop())
+        }
+    }
+
+    impl FusedStream for EndedStatusStream {
+        fn is_terminated(&self) -> bool {
+            false
+        }
+    }
+
+    /// When the reader's status channel closes, the drain stops polling the
+    /// status stream and goes on draining samples: one status event, then
+    /// the end; both samples still cross with their hand-built frames.
+    #[test]
+    fn a_closed_status_stream_is_dropped_and_samples_still_drain() {
+        use cerulion_core::wire::MaxSliceLen;
+        let mgr = raw_test_transport("closed_status");
+        let codec = crate::generic::bridge_codec();
+        let topic = "/pump25/closed_status/v3";
+        let route = RawIngressRoute::open(
+            &RawIngress::native(Arc::clone(&mgr)),
+            &codec,
+            "geometry_msgs/Vector3",
+            topic,
+            MaxSliceLen::const_new(4096),
+        )
+        .expect("raw route");
+        let sub = mgr.create_subscriber(topic).expect("observer");
+        let items: Vec<Result<RawSample, &'static str>> = vec![
+            Ok(raw_v3_sample(1.0, 2.0, 3.0)),
+            Ok(raw_v3_sample(4.0, 5.0, 6.0)),
+        ];
+        let stream = futures::stream::iter(items).fuse();
+        let polls = Arc::new(AtomicU64::new(0));
+        let statuses = EndedStatusStream {
+            pending: vec![matched(1, 1, 1)],
+            polls: Arc::clone(&polls),
+        };
+        futures::pin_mut!(stream, statuses);
+        let stats = PumpStats::default();
+        let route_stats = RawRouteStats::new("/raw_dds", topic, "geometry_msgs/Vector3");
+        let t = std::cell::Cell::new(0u64);
+        let now = || {
+            t.set(t.get() + 100);
+            t.get()
+        };
+        let route = smol::block_on(drain_raw_from_stream(
+            stream,
+            statuses,
+            route,
+            &codec,
+            &now,
+            &stats,
+            &route_stats,
+        ));
+        // Poll 1 yields the match, poll 2 the end; never polled again.
+        assert_eq!(polls.load(Ordering::Relaxed), 2);
+        assert_eq!(route.published_total(), 2);
+        assert_eq!(stats.raw_streams_ended_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            route_stats.render(),
+            "/raw_dds matched_writers=1 matched_writers_total=1 incompatible_qos=0 \
+             sample_lost=0 sample_rejected=0 received=2 published=2 decode_failures=0 \
+             publish_failures=0 stream_errors=0 last_received_ns=200 last_published_ns=200"
+        );
+        let frames = captured_frames(&sub);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], expected_v3_frame(1.0, 2.0, 3.0, 0, 100));
+        assert_eq!(frames[1], expected_v3_frame(4.0, 5.0, 6.0, 1, 200));
     }
 
     /// The NOT-FULLY-CONSUMED refusal must ride the
