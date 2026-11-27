@@ -590,8 +590,9 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   stops being required. No required writer: `Settled` at once, no ring. A gather rings at
   most once per drain pass (`next_pass`): again as soon as a pass stores a part it did not
   hold, with 1 ms between passes, else once every 20 ms; so a snapshot of many sends is
-  paced by the writer's answers, not by 20 ms per send. Static config and frame v1 are fixed for the two service
-  names; a change takes new names. The consumer is `rmw_cerulion`: one writer per process
+  paced by the writer's answers, not by 20 ms per send. Static config and frame v1 are
+  fixed for the two service names; a change takes new names. The consumer is
+  `rmw_cerulion`: one writer per process
   (`Runtime::graph_registry`, none in a replay) and one gather per
   `rmw_get_topic_names_and_types` (`docs/internals/rmw.md`).
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
