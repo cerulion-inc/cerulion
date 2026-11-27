@@ -24,8 +24,10 @@ comment, and enforced: the marker in a string literal, a data column or a
 heading is text the change ships rather than a decision its author recorded, and
 a file type with no comment syntax at all (`.json`) has no waiver.
 
-WHAT IT READS. `git diff <base>...HEAD`, which diffs against the MERGE BASE of
-`<base>` and HEAD. The three dots matter only when the base is NOT an ancestor
+WHAT IT READS. `git diff --histogram <base>...HEAD`, which diffs against the
+MERGE BASE of `<base>` and HEAD. Histogram favors uncommon matching lines as
+anchors, so edits around repeated lines are less likely to count an unchanged
+line as added. The three dots matter only when the base is NOT an ancestor
 of HEAD, which is a base on a target branch somebody rewrote and a base that is
 an ordinary branch tip: two dots there report every line that branch gained
 since this one left it as a line this branch added. Whenever the base IS an
@@ -345,11 +347,11 @@ def resolve_base(given, repo, env=None):
 
 
 def git_diff(base, repo, env=None):
-    """`git diff <base>...HEAD` in `repo`, as text.
+    """`git diff --histogram <base>...HEAD` in `repo`, as text.
 
     `env` as in `git_output`: None for this process's own environment.
     """
-    command = ["git", "diff", "--no-color", "%s...HEAD" % base]
+    command = ["git", "diff", "--histogram", "--no-color", "%s...HEAD" % base]
     try:
         completed = subprocess.run(command, cwd=repo, env=env,
                                    capture_output=True, check=False)
@@ -736,6 +738,24 @@ def self_test():
         got = offending_lines(git_diff("base", scratch, FIXTURE_GIT_ENV))
         arm("the-three-dot-diff-ignores-what-the-base-gained",
             [(p, n) for p, n, _, _ in got] == [("added.md", 2)], "-> %r" % (got,))
+
+        intro = "A retained introduction.\n"
+        repeated = "An old repeated line.\n" * 600
+        retained = "A retained sentence %s with a dash.\n" % EM_DASH
+        ending = "A retained ending.\n"
+        write("long.md", intro + repeated + retained + ending)
+        git("add", "long.md")
+        git("commit", "--quiet", "-m", "long file")
+        before = git("rev-parse", "HEAD").strip()
+        write("long.md", intro + "A replacement line.\n" * 300 + retained + repeated + ending)
+        git("add", "long.md")
+        git("commit", "--quiet", "-m", "edit around the retained line")
+        default_got = offending_lines(git("diff", "--no-color", "%s...HEAD" % before))
+        arm("the-default-diff-reports-the-retained-dash-as-added",
+            [(p, n, line) for p, n, _, line in default_got]
+            == [("long.md", 302, retained.rstrip("\n"))], "-> %r" % (default_got,))
+        got = offending_lines(git_diff(before, scratch, FIXTURE_GIT_ENV))
+        arm("a-long-file-edit-does-not-report-a-retained-dash", not got, "-> %r" % (got,))
 
     # THE BASE ARMS, on a real repository shaped like the checkout a pull request
     # gets. `main` carries a file, a branch adds two lines with a dash, `main`
