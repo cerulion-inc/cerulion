@@ -608,14 +608,7 @@ impl Resolver {
                         }
                     }
                     Binding::Referenced(found) => {
-                        if !under_dynamic {
-                            self.warn_cross_package_bare(
-                                &found,
-                                schema_name,
-                                field_name,
-                                &parent_name,
-                            );
-                        }
+                        self.warn_cross_package_bare(&found, schema_name, field_name, &parent_name);
                         match self.resolved_hash_of(found.idx) {
                             Ok(hash) => *target_hash = Some(hash),
                             Err(reason) => {
@@ -628,14 +621,7 @@ impl Resolver {
                         }
                     }
                     Binding::Cyclic(found) => {
-                        if !under_dynamic {
-                            self.warn_cross_package_bare(
-                                &found,
-                                schema_name,
-                                field_name,
-                                &parent_name,
-                            );
-                        }
+                        self.warn_cross_package_bare(&found, schema_name, field_name, &parent_name);
                         // A self reference (`Node[] children` on `Node`)
                         // loses nothing: the parent's own layout is already
                         // in its own hash.
@@ -687,10 +673,9 @@ impl Resolver {
 
 /// The strongly connected component of every schema in the reference
 /// graph: an edge `S -> T` for each nested reference of `S`, at any array
-/// depth, that binds to `T` through `index`. Iterative Tarjan, so a deep
-/// chain cannot overflow the stack; components are numbered in the order
-/// the walk closes them, which depends only on the input order, and only
-/// equality of two numbers is ever read.
+/// depth, that binds to `T` through `index` (iterative Tarjan). Components
+/// are numbered in the order the walk closes them, which depends on the
+/// input order, so only equality of two numbers is ever read.
 fn reference_components(schemas: &[MessageSchema], index: &NestedIndex) -> Vec<usize> {
     let edges: Vec<Vec<usize>> = schemas
         .iter()
@@ -783,8 +768,8 @@ struct FixednessAcc {
 /// classification — sizes play no part in fixedness) but whose composed
 /// fixed-section arithmetic overflows — the exact set
 /// [`resolve_fixed_nested`] would PANIC materializing as nested targets
-/// (`resolved_fixed_of` sizes each fixed target through the panicking
-/// `wire_fixed_size`). A caller folding UNTRUSTED declarations (a
+/// (the rewrite panics when an inlined target's composed size overflows;
+/// a target that is only referenced is warned instead). A caller folding UNTRUSTED declarations (a
 /// workspace `.msg` store acquired over the wire, hand-edited YAML, a
 /// peer-served schema doc) runs this to a fixpoint BEFORE resolution —
 /// drop the reported definitions, re-probe (a drop can flip a bare
@@ -2282,6 +2267,172 @@ mod tests {
             };
             assert_eq!(types(a), types(b), "{}", a.qualified_name());
             assert_eq!(a.schema_hash(), b.schema_hash(), "{}", a.qualified_name());
+        }
+    }
+
+    #[test]
+    fn a_cross_package_bare_dynamic_array_element_is_stamped_and_warned() {
+        let mut user = MessageSchema::new_in_package("Cloud", "third_msgs");
+        user.add_field(FieldDef::new("points", dynamic(nested("Point", None))));
+        let mut schemas = vec![point_schema("geometry_msgs"), user];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "Cloud.points: unqualified reference 'Point' resolved CROSS-PACKAGE to \
+                 'geometry_msgs/Point'"
+            ),
+            "{warnings:?}"
+        );
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        assert_eq!(
+            schemas[1].fields[0].field_type,
+            dynamic(FieldType::Nested {
+                schema_name: "Point".to_string(),
+                package: None,
+                fixed: None,
+                target_hash: Some(point),
+            })
+        );
+    }
+
+    #[test]
+    fn a_three_cycle_with_a_spur_stamps_only_the_edges_that_leave_the_cycle() {
+        // demo/A -> B -> C -> A, and C -> D (the spur) with D outside the
+        // cycle. Every schema holds a string, so none is inlined.
+        let spec: [(&str, &[&str]); 4] =
+            [("A", &["B"]), ("B", &["C"]), ("C", &["A", "D"]), ("D", &[])];
+        let build = |order: [usize; 4]| -> Vec<MessageSchema> {
+            order
+                .iter()
+                .map(|&i| {
+                    let (name, targets) = spec[i];
+                    let mut s = MessageSchema::new_in_package(name, "demo");
+                    for target in targets {
+                        s.add_field(FieldDef::new(
+                            target.to_lowercase(),
+                            nested(target, Some("demo")),
+                        ));
+                    }
+                    s.add_field(FieldDef::new("s", FieldType::String));
+                    s
+                })
+                .collect()
+        };
+        let d_hash = recipe3_hash("demo/D", 0, &[("s", "string", None)]);
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1]] {
+            let mut schemas = build(order);
+            let warnings = resolve_fixed_nested(&mut schemas);
+            let cycle_warnings = warnings
+                .iter()
+                .filter(|w| w.contains("is in a reference cycle"))
+                .count();
+            assert_eq!(cycle_warnings, 3, "order {order:?}: {warnings:?}");
+            let c = schemas.iter().find(|s| s.name == "C").unwrap();
+            assert_eq!(c.fields[0].field_type, stamped("A", "demo", None));
+            assert_eq!(c.fields[1].field_type, stamped("D", "demo", Some(d_hash)));
+            for name in ["A", "B"] {
+                let schema = schemas.iter().find(|s| s.name == name).unwrap();
+                assert!(
+                    matches!(
+                        schema.fields[0].field_type,
+                        FieldType::Nested {
+                            fixed: None,
+                            target_hash: None,
+                            ..
+                        }
+                    ),
+                    "order {order:?}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn references_under_mixed_array_layers_are_stamped_at_their_depth() {
+        let mut holder = MessageSchema::new_in_package("Holder", "demo");
+        // A fixed array of a variable target: not inlined, stamped.
+        holder.add_field(FieldDef::new(
+            "inners",
+            FieldType::FixedArray {
+                element_type: Box::new(nested("Inner", Some("demo"))),
+                length: 2,
+            },
+        ));
+        // A dynamic array of fixed arrays of a fixed target: never inlined
+        // under the dynamic array, stamped with the fixed target's hash.
+        holder.add_field(FieldDef::new(
+            "triangles",
+            dynamic(FieldType::FixedArray {
+                element_type: Box::new(nested("Point", Some("geometry_msgs"))),
+                length: 3,
+            }),
+        ));
+        let mut schemas = vec![inner(FieldType::U32), point_schema("geometry_msgs"), holder];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        assert_eq!(
+            schemas[2].fields[0].field_type,
+            FieldType::FixedArray {
+                element_type: Box::new(stamped("Inner", "demo", Some(inner_hash("uint32")))),
+                length: 2,
+            }
+        );
+        assert_eq!(
+            schemas[2].fields[1].field_type,
+            dynamic(FieldType::FixedArray {
+                element_type: Box::new(stamped("Point", "geometry_msgs", Some(point))),
+                length: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_definition_stamps_the_later_one() {
+        let mut schemas = vec![inner(FieldType::U32), inner(FieldType::F32), outer()];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("duplicate schema definition for 'demo/Inner'"));
+        assert_eq!(
+            schemas[2].fields[0].field_type,
+            stamped("Inner", "demo", Some(inner_hash("float32")))
+        );
+    }
+
+    #[test]
+    fn two_independent_resolutions_of_a_stamped_set_are_identical() {
+        let build = || {
+            let mut set = pose_family(POSITION_FIRST);
+            set.extend(two_cycle_with_referrer(["B", "T", "A"]));
+            set
+        };
+        let mut first = build();
+        let mut second = build();
+        assert_eq!(
+            resolve_fixed_nested(&mut first),
+            resolve_fixed_nested(&mut second)
+        );
+        for (a, b) in first.iter().zip(&second) {
+            for (fa, fb) in a.fields.iter().zip(&b.fields) {
+                assert_eq!(fa.field_type, fb.field_type, "{}", a.qualified_name());
+            }
         }
     }
 }
