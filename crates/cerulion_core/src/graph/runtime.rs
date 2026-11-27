@@ -7485,9 +7485,10 @@ impl GraphRuntime {
                 precreated_services.push(transport.precreate_topic_services(&flow.topic, cfg)?);
             }
         }
-        // topic → outstanding counters to register on that topic's publisher.
-        let mut pub_block_by_topic: HashMap<String, Vec<crate::credit::CreditWord>> =
-            HashMap::new();
+        // topic -> (outstanding counter, consumer node, consumer input) entries
+        // to register on that topic's publisher.
+        type PubBlockRegistration = (crate::credit::CreditWord, Arc<str>, Arc<str>);
+        let mut pub_block_by_topic: HashMap<String, Vec<PubBlockRegistration>> = HashMap::new();
         // (consumer node, input) → that consumer's outstanding counter.
         // `block`: consumer (node,input) → (outstanding mirror,
         // defer threshold, shared counters) — everything the consumer's
@@ -7721,7 +7722,11 @@ impl GraphRuntime {
                 pub_block_by_topic
                     .entry(flow.topic.clone())
                     .or_default()
-                    .push(outstanding.clone());
+                    .push((
+                        outstanding.clone(),
+                        Arc::from(edge.node_id.as_str()),
+                        Arc::from(edge.input.as_str()),
+                    ));
                 sub_block_by_input.insert(
                     (edge.node_id.clone(), edge.input.clone()),
                     (outstanding.clone(), threshold as u64, Arc::clone(&counters)),
@@ -8003,7 +8008,11 @@ impl GraphRuntime {
                 pub_block_by_topic
                     .entry(binding.topic.clone())
                     .or_default()
-                    .push(word.clone());
+                    .push((
+                        word.clone(),
+                        Arc::from(binding.consumer_node.as_str()),
+                        Arc::from(binding.consumer_input.as_str()),
+                    ));
                 // Each producer of the edge publishes through its own
                 // connection into the consumer's input (at most 16, so the
                 // count fits a `u32`). Only this half publishes, so only this
@@ -8379,8 +8388,12 @@ impl GraphRuntime {
                              history_size = 0."
                         );
                     }
-                    for ctr in counters {
-                        publisher.register_block_outstanding(ctr.clone());
+                    for (ctr, consumer_node, consumer_input) in counters {
+                        publisher.register_block_outstanding(
+                            ctr.clone(),
+                            Arc::clone(consumer_node),
+                            Arc::clone(consumer_input),
+                        );
                     }
                 }
                 // Wire this output's `promise_within_ms`
@@ -8811,14 +8824,14 @@ impl GraphRuntime {
                         role: stage_role,
                     },
                     read_stage.capacity(),
-                    if node_per_set_sync && node_trigger_names.contains(input.name.as_str()) {
-                        // A per-set `Sync` trigger input pops through the
-                        // matcher's own ops, which are NOT the two gated drain
-                        // bodies, so a gate here would be bypassed. Named
-                        // before the multi-publisher fact because it is the
-                        // harder one: a bypass admits a frame the recording did
-                        // not, where an ambiguous sequence only fails to pin
-                        // one.
+                    if node_per_set_sync
+                        && node_trigger_names.contains(input.name.as_str())
+                        && body_feed.is_none()
+                    {
+                        // An UNFED per-set `Sync` trigger input stays blocked
+                        // so unfed replays keep their existing best-effort path;
+                        // a FED stage gates its matcher ops through the private
+                        // feed.
                         Some(crate::read_outcome::GateBlocker::PerSetSyncEdge)
                     } else if annotated_edge && body_feed.is_none() {
                         // A FED stage is fed by (writer, sequence), so a
@@ -19236,12 +19249,39 @@ impl GraphRuntime {
     }
 
     /// Re-read the armed flag off the stages, the ONE writer of
-    /// `replay_read_armed`.
+    /// `replay_read_armed`, and mirror per-set `Sync` trigger arming onto the
+    /// scheduler's `sync_replay_refill` flag.
     fn refresh_replay_read_armed(&mut self) {
         self.replay_read_armed = self
             .replay_read_plans
             .iter()
             .any(|(_node, plan)| plan.is_armed());
+        for binding in &self.sync_input_bindings {
+            if !binding.per_set {
+                continue;
+            }
+            let node_id = binding.node_id.as_ref();
+            let trigger_armed = self
+                .sync_input_bindings
+                .iter()
+                .filter(|b| b.per_set && b.node_id.as_ref() == node_id)
+                .any(|b| {
+                    let Some(input_idx) = self
+                        .read_log_input_names
+                        .get(node_id)
+                        .and_then(|names| names.iter().position(|n| n == b.input_name.as_ref()))
+                    else {
+                        return false;
+                    };
+                    self.replay_read_plans.iter().any(|(_, plan)| {
+                        plan.is_armed()
+                            && plan.key().node == node_id
+                            && usize::from(plan.key().input_idx) == input_idx
+                    })
+                });
+            self.scheduler
+                .set_sync_replay_refill(node_id, trigger_armed);
+        }
     }
 
     /// Is any read gate armed (Principle #3; false on a virgin runtime).

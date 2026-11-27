@@ -1400,7 +1400,7 @@ node, the input, the writer and the sequence:
 | `read_identity_frames_unattributed` | An unlabelled topic's reads name more than one writer |
 | `read_identity_labels_unread` | The topic carries no writer label the replay could read and the bag's label stream was not read in full, so the topic may have had several writers |
 | `read_identity_frame_claimed_twice` | Two reads on one read stage claim the same frame of one writer, which a queue hands to one pop only |
-| `read_identity_ungateable_stage` | A stage the read gate cannot drive (a per-set `Sync` trigger input) |
+| `read_identity_ungateable_stage` | A stage the read gate cannot drive |
 | `read_identity_rmw_node` | The graph has `ros2` nodes, whose takes the read log does not record |
 
 A take on an rmw path inside a replayed node (`try_receive_one`) has no
@@ -1412,9 +1412,6 @@ fed:
 
 - A graph with `ros2` nodes (`read_identity_rmw_node`): an rmw take does not
   pass through the read log, so its frames have no recorded identity.
-- A per-set `Sync` trigger input (`read_identity_ungateable_stage`): its pops
-  run through the matcher's peek and promote operations, which the read gate
-  does not drive, so a feed on that stage is never asked for frames.
 - A `sample(N)` input whose gate dropped frames
   (`read_identity_decimated_unattributed`): the decimated read names the last
   accepted frame, not the frames it popped and dropped.

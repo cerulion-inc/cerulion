@@ -2205,6 +2205,9 @@ pub enum DueShape {
         /// served sequence names the last ACCEPTED sequence and not what this
         /// read popped, so the COUNT is enforced and the identity is not.
         identity_unstated: bool,
+        /// True only for a recorded [`ReadSiteRole::Peek`] read, a per-set
+        /// `Sync` matcher peek that parks a frame in `next_head`.
+        peek: bool,
     },
     /// The recorded read served NOTHING and consumed nothing: a recorded none,
     /// or a held read that took no new frame. It is a POSITION a gated consult
@@ -2247,14 +2250,23 @@ impl DueRead {
     /// a caller folding a record cannot mint a pop of nothing.
     #[must_use]
     pub fn pops(pops: u32, served_seq: Option<u32>) -> Self {
-        Self::pops_with_identity(pops, served_seq, false)
+        Self::pops_with_flags(pops, served_seq, false, false)
+    }
+
+    /// [`Self::pops`] for a recorded [`ReadSiteRole::Peek`] read: a per-set
+    /// `Sync` matcher peek that parks a frame into `next_head`. A `pops` of 0
+    /// normalises to [`Self::nothing`] or [`Self::served_without_pop`] with
+    /// `is_peek() == false`.
+    #[must_use]
+    pub fn peek(pops: u32, served_seq: Option<u32>) -> Self {
+        Self::pops_with_flags(pops, served_seq, false, true)
     }
 
     /// [`Self::pops`] for a recorded [`ReadOutcomeKind::Decimated`] read: the
     /// count is enforced and the identity is not.
     #[must_use]
     pub fn decimated(pops: u32, last_accepted: Option<u32>) -> Self {
-        Self::pops_with_identity(pops, last_accepted, true)
+        Self::pops_with_flags(pops, last_accepted, true, false)
     }
 
     /// A read that served nothing and consumed nothing.
@@ -2287,6 +2299,12 @@ impl DueRead {
         self.served_seq
     }
 
+    /// Is this read a recorded per-set `Sync` matcher peek?
+    #[must_use]
+    pub fn is_peek(&self) -> bool {
+        matches!(self.shape, DueShape::Pops { peek: true, .. })
+    }
+
     /// Frames this read must consume: 0 on both pop-less shapes.
     #[must_use]
     pub fn pop_count(&self) -> u32 {
@@ -2296,7 +2314,12 @@ impl DueRead {
         }
     }
 
-    fn pops_with_identity(pops: u32, served_seq: Option<u32>, identity_unstated: bool) -> Self {
+    fn pops_with_flags(
+        pops: u32,
+        served_seq: Option<u32>,
+        identity_unstated: bool,
+        peek: bool,
+    ) -> Self {
         if pops == 0 {
             // A pop of nothing is one of the two pop-less shapes, decided by
             // what the record SERVED. Normalising here is what keeps
@@ -2310,6 +2333,7 @@ impl DueRead {
             shape: DueShape::Pops {
                 pops,
                 identity_unstated,
+                peek,
             },
             served_seq,
         }
@@ -2338,10 +2362,10 @@ pub struct ReadPlanEdge<'a> {
 /// fourth state (both set) nothing would choose between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateBlocker {
-    /// A per-set `Sync` trigger input. Its pops leave the two gated drain
-    /// bodies: `sync_peek_next_stamp` and `sync_discard_head` remove frames
-    /// from the queue through the matcher's ops, so a gate installed here
-    /// would be bypassed rather than enforced.
+    /// An unfed per-set `Sync` trigger input. A fed stage gates the matcher's
+    /// ops (`sync_next_arrived`, `sync_peek_next_stamp`, `sync_discard_head`)
+    /// through its private feed and clears this blocker; an unfed replay keeps
+    /// the blocker so its best-effort path is unchanged.
     PerSetSyncEdge,
     /// A `multi_publisher_topics` edge. The wire sequence is a PER-PUBLISHER
     /// counter, so the due frame is not necessarily the head and a served seq
@@ -2850,8 +2874,112 @@ impl ReadPlanStage {
     /// Beside an `Exact` answer it returns the ordinal of the plan entry it
     /// grants, the position [`crate::replay_feed::ReadFeed::fill`] was called
     /// with; beside any other answer, 0.
+    #[cfg(test)]
     #[inline(never)]
     pub(crate) fn admit_at(&self) -> (GateAnswer, u32) {
+        self.admit_at_site(true)
+    }
+
+    /// Pure read of whether the next spendable entry in this step's plan is a
+    /// recorded per-set `Sync` matcher peek.
+    ///
+    /// Walks past transparent [`DueShape::ServedWithoutPop`] entries from the
+    /// current cursor without advancing it, calling the feed, or allocating.
+    /// Returns `Ok(false)` when unarmed, uninstalled for the current step,
+    /// exhausted, or when the next entry is not a peek. Returns
+    /// `Err(GatePoisoned)` if the gate mutex was poisoned so the caller fails
+    /// closed.
+    #[inline(never)]
+    pub(crate) fn next_is_peek(&self) -> Result<bool, GatePoisoned> {
+        if !self.is_armed() {
+            return Ok(false);
+        }
+        let now = self.now_step.load(Ordering::Acquire);
+        let inner = self.lock_plan()?;
+        if inner.unusable {
+            return Err(GatePoisoned);
+        }
+        if !inner.installed || inner.step != now {
+            return Ok(false);
+        }
+        for due in inner.due.get(inner.cursor..).unwrap_or(&[]) {
+            if matches!(due.shape(), DueShape::ServedWithoutPop) {
+                continue;
+            }
+            return Ok(due.is_peek());
+        }
+        Ok(false)
+    }
+
+    /// Pure read of whether the entry immediately at the current cursor in this
+    /// step's plan is a recorded `HandOff` ([`DueShape::ServedWithoutPop`])
+    /// naming `expected_seq`.
+    ///
+    /// Used by `CerulionSubscriber::sync_next_arrived` when a per-set `Sync`
+    /// trigger input already holds a parked `next_head` (for example after a
+    /// partial tick stopped at an empty context input): live advances that
+    /// parked frame in the current alignment pass only if `sync_discard_head`
+    /// recorded a `HandOff` for its exact sequence before any subsequent pop on
+    /// this stage. Pure read: does not advance `cursor`, call the feed, or
+    /// allocate. Returns `Err(GatePoisoned)` if the gate mutex was poisoned so
+    /// the caller fails closed.
+    #[inline(never)]
+    pub(crate) fn next_is_handoff(&self, expected_seq: Option<u32>) -> Result<bool, GatePoisoned> {
+        if !self.is_armed() {
+            return Ok(false);
+        }
+        let now = self.now_step.load(Ordering::Acquire);
+        let inner = self.lock_plan()?;
+        if inner.unusable {
+            return Err(GatePoisoned);
+        }
+        if !inner.installed || inner.step != now {
+            return Ok(false);
+        }
+        let Some(due) = inner.due.get(inner.cursor) else {
+            return Ok(false);
+        };
+        Ok(matches!(due.shape(), DueShape::ServedWithoutPop) && due.served_seq() == expected_seq)
+    }
+
+    /// Advance the cursor past one recorded `HandOff`
+    /// ([`DueShape::ServedWithoutPop`]) matching `expected_seq` when
+    /// `sync_discard_head` promotes `next_head` during replay.
+    ///
+    /// Keeping the cursor in lockstep with promoted handoffs prevents a stale
+    /// `HandOff` from remaining at `cursor` across subsequent matcher steps in
+    /// the same alignment pass. Does not call the feed or allocate.
+    #[inline(never)]
+    pub(crate) fn consume_handoff(&self, expected_seq: Option<u32>) {
+        if !self.is_armed() {
+            return;
+        }
+        let now = self.now_step.load(Ordering::Acquire);
+        let Ok(mut inner) = self.lock_plan() else {
+            return;
+        };
+        if !inner.installed || inner.step != now {
+            return;
+        }
+        if let Some(due) = inner.due.get(inner.cursor) {
+            if matches!(due.shape(), DueShape::ServedWithoutPop) && due.served_seq() == expected_seq
+            {
+                inner.cursor += 1;
+            }
+        }
+    }
+
+    /// Site-aware twin of [`Self::admit_at`].
+    ///
+    /// `empty_recorded` states whether the recording stages a `NoFrame` record
+    /// when this call site finds an empty queue (`true` at a boundary drain or
+    /// boundary align pass; `false` at a post-fire per-set `Sync` refill pass,
+    /// where an empty queue stages nothing). When `empty_recorded` is `false`,
+    /// hitting an uninstalled step or the end of `due` increments
+    /// `refused_consults` and returns `(GateAnswer::Withhold, 0)` without
+    /// incrementing `unplanned_consults` or minting `UnplannedConsult`.
+    #[inline(never)]
+    pub(crate) fn admit_at_site(&self, empty_recorded: bool) -> (GateAnswer, u32) {
         // An unarmed stage is UNGATED, which is a different fact from a zero
         // quota: the drain takes today's path byte for byte. Answered here so
         // the arm is produced by the one function that can know it, rather than
@@ -2872,36 +3000,39 @@ impl ReadPlanStage {
         // only meaningful while one IS installed.
         if !inner.installed {
             inner.refused_consults = inner.refused_consults.saturating_add(1);
-            match inner.rule {
-                ConsultRule::Counted => {
-                    inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
-                }
-                // The omission declares that this stage reads nothing this
-                // step, and under a recording that holds a record for every
-                // consult, a consult against that declaration is one the
-                // recording did not make: the same divergence an empty step
-                // plan mints below, minted the same way so the two arms the
-                // plan rules identical really are. `cursor` is the ordinal
-                // because `sweep` resets it to zero at the end of every step
-                // for every armed stage, so the first consult of an omitted
-                // step reads 0 and each one past it reads one more; a constant
-                // 1 would report the second and the tenth consult alike and
-                // spend the stage's violation rim on duplicates. Nothing else
-                // reads a cursor with no plan under it: `sweep` walks
-                // `due[cursor..]`, empty here, and `install_step` resets it.
-                ConsultRule::Recorded => {
-                    let consult = u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
-                    inner.cursor = inner.cursor.saturating_add(1);
-                    Self::retain_violation(
-                        &mut inner,
-                        &self.key,
-                        self.rim,
-                        now,
-                        ReplayReadViolationKind::UnplannedConsult {
-                            consult,
-                            planned: 0,
-                        },
-                    );
+            if empty_recorded {
+                match inner.rule {
+                    ConsultRule::Counted => {
+                        inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
+                    }
+                    // The omission declares that this stage reads nothing this
+                    // step, and under a recording that holds a record for every
+                    // consult, a consult against that declaration is one the
+                    // recording did not make: the same divergence an empty step
+                    // plan mints below, minted the same way so the two arms the
+                    // plan rules identical really are. `cursor` is the ordinal
+                    // because `sweep` resets it to zero at the end of every step
+                    // for every armed stage, so the first consult of an omitted
+                    // step reads 0 and each one past it reads one more; a constant
+                    // 1 would report the second and the tenth consult alike and
+                    // spend the stage's violation rim on duplicates. Nothing else
+                    // reads a cursor with no plan under it: `sweep` walks
+                    // `due[cursor..]`, empty here, and `install_step` resets it.
+                    ConsultRule::Recorded => {
+                        let consult =
+                            u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
+                        inner.cursor = inner.cursor.saturating_add(1);
+                        Self::retain_violation(
+                            &mut inner,
+                            &self.key,
+                            self.rim,
+                            now,
+                            ReplayReadViolationKind::UnplannedConsult {
+                                consult,
+                                planned: 0,
+                            },
+                        );
+                    }
                 }
             }
             return (GateAnswer::Withhold, 0);
@@ -2920,46 +3051,49 @@ impl ReadPlanStage {
         loop {
             let Some(due) = inner.due.get(inner.cursor).copied() else {
                 inner.refused_consults = inner.refused_consults.saturating_add(1);
-                match inner.rule {
-                    // Under a recording whose empty drains wrote nothing, an
-                    // EMPTY step plan is the ORDINARY shape (most steps of a
-                    // gated stage name no read) and a consult against it is the
-                    // enforcement working; a consult past a plan that DID hold
-                    // positions is the plan and the drain disagreeing about how
-                    // many reads the step holds, counted and reported.
-                    ConsultRule::Counted => {
-                        if !inner.due.is_empty() {
-                            inner.unplanned_consults = inner.unplanned_consults.saturating_add(1);
+                if empty_recorded {
+                    match inner.rule {
+                        // Under a recording whose empty drains wrote nothing, an
+                        // EMPTY step plan is the ORDINARY shape (most steps of a
+                        // gated stage name no read) and a consult against it is the
+                        // enforcement working; a consult past a plan that DID hold
+                        // positions is the plan and the drain disagreeing about how
+                        // many reads the step holds, counted and reported.
+                        ConsultRule::Counted => {
+                            if !inner.due.is_empty() {
+                                inner.unplanned_consults =
+                                    inner.unplanned_consults.saturating_add(1);
+                            }
                         }
-                    }
-                    // Under a recording that holds a record for every consult,
-                    // the plan has one position per consult the recording made,
-                    // an empty plan included (it consulted zero times here), so
-                    // a consult with no position left is a schedule the
-                    // recording did not take. One position per consult stays
-                    // the invariant: the divergence is minted and the consult
-                    // withholds.
-                    ConsultRule::Recorded => {
-                        let consult =
-                            u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
-                        let planned = u32::try_from(inner.due.len()).unwrap_or(u32::MAX);
-                        // The cursor keeps COUNTING past the plan under this
-                        // rule, which is what makes `consult` the ordinal of
-                        // this consult within the step rather than the same
-                        // number on every over-run: the recording holds one
-                        // position per consult it made, so a cursor that
-                        // stopped at the end would name the second and the
-                        // tenth over-run alike. Nothing else reads a cursor
-                        // past the plan: `sweep` walks `due[cursor..]`, which
-                        // is already empty here, and `install_step` resets it.
-                        inner.cursor = inner.cursor.saturating_add(1);
-                        Self::retain_violation(
-                            &mut inner,
-                            &self.key,
-                            self.rim,
-                            now,
-                            ReplayReadViolationKind::UnplannedConsult { consult, planned },
-                        );
+                        // Under a recording that holds a record for every consult,
+                        // the plan has one position per consult the recording made,
+                        // an empty plan included (it consulted zero times here), so
+                        // a consult with no position left is a schedule the
+                        // recording did not take. One position per consult stays
+                        // the invariant: the divergence is minted and the consult
+                        // withholds.
+                        ConsultRule::Recorded => {
+                            let consult =
+                                u32::try_from(inner.cursor.saturating_add(1)).unwrap_or(u32::MAX);
+                            let planned = u32::try_from(inner.due.len()).unwrap_or(u32::MAX);
+                            // The cursor keeps COUNTING past the plan under this
+                            // rule, which is what makes `consult` the ordinal of
+                            // this consult within the step rather than the same
+                            // number on every over-run: the recording holds one
+                            // position per consult it made, so a cursor that
+                            // stopped at the end would name the second and the
+                            // tenth over-run alike. Nothing else reads a cursor
+                            // past the plan: `sweep` walks `due[cursor..]`, which
+                            // is already empty here, and `install_step` resets it.
+                            inner.cursor = inner.cursor.saturating_add(1);
+                            Self::retain_violation(
+                                &mut inner,
+                                &self.key,
+                                self.rim,
+                                now,
+                                ReplayReadViolationKind::UnplannedConsult { consult, planned },
+                            );
+                        }
                     }
                 }
                 return (GateAnswer::Withhold, 0);
@@ -3325,6 +3459,20 @@ impl ReadOutcomeStage {
     /// makes the reset killable instead of unkillable.
     pub(crate) fn fold_anchor_for_test(&self) -> FoldAnchor {
         self.lock_inner().fold_anchor
+    }
+}
+
+#[cfg(test)]
+impl ReadPlanStage {
+    /// Poison this gate's mutex for fail-closed unit tests in sibling modules.
+    pub(crate) fn poison_for_test(&self) {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inner.lock().expect("gate not poisoned yet");
+            panic!("poison ReadPlanStage for test");
+        }));
+        std::panic::set_hook(hook);
     }
 }
 
@@ -6929,9 +7077,229 @@ mod tests {
             DueShape::Pops {
                 pops: 2,
                 identity_unstated: false,
+                peek: false,
             }
         );
         assert_eq!(DueRead::decimated(2, Some(9)).pop_count(), 2);
+    }
+
+    #[test]
+    fn due_read_peek_constructor_normalises_zero_and_sets_is_peek() {
+        let zero_none = DueRead::peek(0, None);
+        assert_eq!(zero_none.shape(), DueShape::Nothing);
+        assert!(!zero_none.is_peek());
+        assert_eq!(zero_none.pop_count(), 0);
+
+        let zero_served = DueRead::peek(0, Some(7));
+        assert_eq!(zero_served.shape(), DueShape::ServedWithoutPop);
+        assert_eq!(zero_served.served_seq(), Some(7));
+        assert!(!zero_served.is_peek());
+        assert_eq!(zero_served.pop_count(), 0);
+
+        let one = DueRead::peek(1, Some(12));
+        assert_eq!(
+            one.shape(),
+            DueShape::Pops {
+                pops: 1,
+                identity_unstated: false,
+                peek: true,
+            }
+        );
+        assert!(one.is_peek());
+        assert_eq!(one.pop_count(), 1);
+        assert_eq!(one.served_seq(), Some(12));
+        assert!(!DueRead::pops(1, Some(12)).is_peek());
+        assert!(!DueRead::decimated(1, Some(12)).is_peek());
+        assert!(!DueRead::nothing().is_peek());
+        assert!(!DueRead::served_without_pop(Some(12)).is_peek());
+    }
+
+    #[test]
+    fn next_is_peek_skips_handoffs_and_respects_step_and_poison() {
+        let now = Arc::new(AtomicU64::new(5));
+        let plan = ReadPlanStage::new(
+            plan_key("sync_node", 0, ReadStageRole::Body),
+            ORDINARY_RIM,
+            None,
+            Arc::clone(&now),
+        );
+        // Unarmed returns Ok(false).
+        assert_eq!(plan.next_is_peek(), Ok(false));
+
+        plan.arm(ConsultRule::Recorded).unwrap();
+        // Uninstalled returns Ok(false).
+        assert_eq!(plan.next_is_peek(), Ok(false));
+
+        // Installed for step 5: Drain -> HandOff -> Peek -> Nothing.
+        plan.install_step(
+            5,
+            &[
+                served(1, 10),
+                hand_off(10),
+                DueRead::peek(1, Some(11)),
+                DueRead::nothing(),
+            ],
+        )
+        .unwrap();
+
+        // Wrong step returns Ok(false) without mutating cursor or mismatches.
+        at_step(&now, 6);
+        assert_eq!(plan.next_is_peek(), Ok(false));
+        assert_eq!(plan.mismatches(), 0);
+
+        // Back to step 5: first entry is Drain, not Peek.
+        at_step(&now, 5);
+        assert_eq!(plan.next_is_peek(), Ok(false));
+        // Consuming Drain leaves HandOff then Peek; next_is_peek skips HandOff
+        // without advancing cursor.
+        assert_eq!(plan.admit(), GateAnswer::Exact(served(1, 10)));
+        assert_eq!(plan.next_is_peek(), Ok(true));
+        // Calling twice is pure (cursor did not advance).
+        assert_eq!(plan.next_is_peek(), Ok(true));
+        // Now admit consumes HandOff transparently and grants the Peek.
+        assert_eq!(plan.admit(), GateAnswer::Exact(DueRead::peek(1, Some(11))));
+        // Next entry is Nothing -> Ok(false).
+        assert_eq!(plan.next_is_peek(), Ok(false));
+        assert_eq!(plan.admit(), GateAnswer::Withhold);
+        // Exhausted -> Ok(false).
+        assert_eq!(plan.next_is_peek(), Ok(false));
+
+        // Poisoned mutex returns Err(GatePoisoned) so R-Fail fails closed.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = plan.inner.lock().expect("not poisoned yet");
+            panic!("poison next_is_peek");
+        }));
+        std::panic::set_hook(hook);
+        assert!(caught.is_err());
+        assert_eq!(plan.next_is_peek(), Err(GatePoisoned));
+    }
+
+    #[test]
+    fn next_is_handoff_and_consume_handoff_respect_cursor_seq_step_and_poison() {
+        let now = Arc::new(AtomicU64::new(5));
+        let plan = ReadPlanStage::new(
+            plan_key("sync_node", 0, ReadStageRole::Body),
+            ORDINARY_RIM,
+            None,
+            Arc::clone(&now),
+        );
+        // Unarmed returns Ok(false) and consume_handoff is a no-op.
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(false));
+        plan.consume_handoff(Some(10));
+
+        plan.arm(ConsultRule::Recorded).unwrap();
+        // Uninstalled returns Ok(false).
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(false));
+
+        // Installed for step 5: HandOff(10) -> Peek(11) -> HandOff(11).
+        plan.install_step(5, &[hand_off(10), DueRead::peek(1, Some(11)), hand_off(11)])
+            .unwrap();
+
+        // Wrong step returns Ok(false) without mutating cursor or mismatches.
+        at_step(&now, 6);
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(false));
+        plan.consume_handoff(Some(10));
+        assert_eq!(plan.mismatches(), 0);
+
+        // Back to step 5: matching HandOff at cursor returns Ok(true); wrong
+        // sequence returns Ok(false); neither moves cursor.
+        at_step(&now, 5);
+        assert_eq!(plan.next_is_handoff(Some(99)), Ok(false));
+        assert_eq!(plan.next_is_handoff(None), Ok(false));
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(true));
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(true));
+
+        // Non-matching consume_handoff does not advance cursor.
+        plan.consume_handoff(Some(99));
+        assert_eq!(plan.next_is_handoff(Some(10)), Ok(true));
+
+        // Matching consume_handoff advances cursor onto Peek(11).
+        plan.consume_handoff(Some(10));
+        // Peek(11) is not a HandOff, and next_is_handoff does NOT scan past
+        // Peek(11) to HandOff(11).
+        assert_eq!(plan.next_is_handoff(Some(11)), Ok(false));
+        assert_eq!(plan.next_is_peek(), Ok(true));
+
+        // Consuming Peek(11) exposes HandOff(11).
+        assert_eq!(plan.admit(), GateAnswer::Exact(DueRead::peek(1, Some(11))));
+        assert_eq!(plan.next_is_handoff(Some(11)), Ok(true));
+        plan.consume_handoff(Some(11));
+        assert_eq!(plan.next_is_handoff(Some(11)), Ok(false));
+
+        // Poisoned mutex returns Err(GatePoisoned) so R-Fail fails closed.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = plan.inner.lock().expect("not poisoned yet");
+            panic!("poison next_is_handoff");
+        }));
+        std::panic::set_hook(hook);
+        assert!(caught.is_err());
+        assert_eq!(plan.next_is_handoff(Some(11)), Err(GatePoisoned));
+    }
+
+    #[test]
+    fn admit_at_site_refill_withholds_past_plan_without_unplanned_consult() {
+        let now = Arc::new(AtomicU64::new(3));
+        let plan = ReadPlanStage::new(
+            plan_key("sync_node", 0, ReadStageRole::Body),
+            ORDINARY_RIM,
+            None,
+            Arc::clone(&now),
+        );
+        plan.arm(ConsultRule::Recorded).unwrap();
+
+        // Uninstalled step with empty_recorded = false: withholds and increments
+        // refused_consults without minting UnplannedConsult.
+        assert_eq!(plan.admit_at_site(false), (GateAnswer::Withhold, 0));
+        assert_eq!(plan.refused_consults(), 1);
+        assert_eq!(plan.unplanned_consults(), 0);
+        assert!(plan.take_violations().is_empty());
+
+        // Installed step with one pop: spending it then probing with
+        // empty_recorded = false withholds silently, while empty_recorded = true
+        // still mints UnplannedConsult.
+        plan.install_step(3, &[served(1, 42)]).unwrap();
+        assert_eq!(
+            plan.admit_at_site(true),
+            (GateAnswer::Exact(served(1, 42)), 0)
+        );
+        assert_eq!(plan.admit_at_site(false), (GateAnswer::Withhold, 0));
+        assert_eq!(plan.refused_consults(), 2);
+        assert_eq!(plan.unplanned_consults(), 0);
+        assert!(plan.take_violations().is_empty());
+
+        // Boundary consult past the plan still mints UnplannedConsult.
+        assert_eq!(plan.admit_at_site(true), (GateAnswer::Withhold, 0));
+        assert_eq!(plan.refused_consults(), 3);
+        let violations = plan.take_violations();
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].kind,
+            ReplayReadViolationKind::UnplannedConsult {
+                consult: 2,
+                planned: 1,
+            }
+        );
+
+        // Under ConsultRule::Counted, empty_recorded = false also keeps
+        // unplanned_consults at 0 when past a non-empty plan or uninstalled.
+        plan.disarm();
+        plan.arm(ConsultRule::Counted).unwrap();
+        at_step(&now, 4);
+        assert_eq!(plan.admit_at_site(false), (GateAnswer::Withhold, 0));
+        assert_eq!(plan.unplanned_consults(), 0);
+        plan.install_step(4, &[served(1, 43)]).unwrap();
+        assert_eq!(
+            plan.admit_at_site(true),
+            (GateAnswer::Exact(served(1, 43)), 0)
+        );
+        assert_eq!(plan.admit_at_site(false), (GateAnswer::Withhold, 0));
+        assert_eq!(plan.unplanned_consults(), 0);
+        assert_eq!(plan.admit_at_site(true), (GateAnswer::Withhold, 0));
+        assert_eq!(plan.unplanned_consults(), 1);
     }
 
     #[test]
