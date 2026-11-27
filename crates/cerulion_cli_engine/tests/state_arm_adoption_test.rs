@@ -506,6 +506,70 @@ fn the_worker_arms_from_its_stamped_plan_and_not_from_its_own_environment() {
     );
 }
 
+/// The HOSTED-UNIT seam: a unit that shares its process with other units arms
+/// WITHOUT the fork carrier, and the choice reads the same predicate as its
+/// transport.
+///
+/// A fork of a process running several unit threads copies one thread, so a lock
+/// a sibling holds stays held in the child; such a unit must never reach the
+/// fork attach. The branch is selected by `plan_shares_its_process`, the predicate
+/// `worker_transport` reads to give the same unit a detached transport, so the
+/// two choices cannot drift apart. Inside the branch the unit asks admission as
+/// `PlaneRole::HostedUnit` (the kill switch, not the memory gate) and then
+/// returns the no-fork attach, so the fork attach below it is unreachable for it.
+#[test]
+fn a_hosted_unit_arms_without_fork_from_the_same_predicate_as_its_transport() {
+    let code = code();
+    let body = squash_ws(fn_body(&code, "pub fn graph_run_worker("));
+    let hosted = braced_after(&body, "if plan_shares_its_process(&plan) {");
+    assert!(
+        contains_call(
+            hosted,
+            "admit_capture_plane( crate::state_arm_attach::PlaneRole::HostedUnit { rank }, tag, \
+             runtime.tightest_timing_ns(), )"
+        ),
+        "a hosted unit must ask admission as `PlaneRole::HostedUnit`, so the kill switch \
+         still applies and the fork-memory gate does not"
+    );
+    assert!(
+        contains_call(
+            hosted,
+            "return crate::state_arm_attach::attach_state_capture_no_fork_from( &mut runtime, \
+             tag, crate::state_arm_attach::ArmTagSource::Explicit, rank, &recording_node_ids, )"
+        ),
+        "a hosted unit must RETURN the no-fork attach, so the fork attach after the branch \
+         is never reached for it"
+    );
+    assert!(
+        !hosted.contains("attach_state_capture_from(") && !hosted.contains("PlaneRole::Worker"),
+        "the hosted branch must not reach the fork attach or the forking role"
+    );
+    assert_precedes(
+        &body,
+        "if plan_shares_its_process(&plan) {",
+        "attach_state_capture_from(",
+        "`graph_run_worker`: the hosted branch must be decided BEFORE the fork attach",
+    );
+    assert_precedes(
+        &body,
+        "attach_state_capture_no_fork_from(",
+        LIVE_LOOP,
+        "`graph_run_worker` hosted seam",
+    );
+
+    let transport = squash_ws(fn_body(&code, "fn worker_transport("));
+    assert!(
+        transport.contains("if plan_shares_its_process(plan) {"),
+        "`worker_transport` must pick the detached transport from the same predicate"
+    );
+    let predicate = squash_ws(fn_body(&code, "fn plan_shares_its_process("));
+    assert!(
+        predicate.contains("plan.host.is_some()"),
+        "the predicate is the stamped host: `stamp_hosts` sets it exactly for the units \
+         that share a process"
+    );
+}
+
 /// The RECORDING seam: `graph run --record` arms its runtime too.
 ///
 /// `graph_run` RETURNS into `run_graph_recording` at its recording dispatch,
