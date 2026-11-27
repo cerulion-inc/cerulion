@@ -4518,22 +4518,23 @@ fn silence_notice(topic: &str, source_desc: &str, silent_for: Duration) -> Strin
     )
 }
 
-/// Pinned recipe-3 (layout-sensitive + package-qualified) schema hash for
+/// Pinned (layout-sensitive + package-qualified) schema hash for
 /// `std_msgs/String`, used by `topic_echo` (and the TUI) to pretty-print
 /// known payloads.
 ///
-/// Pinned literal — kept in sync with the generated
+/// Pinned literal, kept in sync with the generated
 /// `<String as ShmMessage>::SCHEMA_HASH` by the
 /// `pinned_hashes_match_generated_constants` test in
-/// `crates/cerulion_cli_engine/tests/integration_test.rs`. After an intentional
-/// hash-recipe change, run that test, copy the actual values from the
-/// failure message, and update these literals (never hand-compute).
+/// `crates/cerulion_cli_engine/tests/integration_test.rs`, and with the
+/// hand-assembled hash stream by `pinned_hashes_are_the_hand_assembled_streams`
+/// in the same file. After an intentional hash-recipe change, take the new
+/// values from the hand-assembled streams, never from the generated side.
 pub const STD_MSGS_STRING_SCHEMA_HASH: u64 = 0xC3D3C3AB405F5F49;
 
-/// Pinned recipe-3 (layout-sensitive + package-qualified) schema hash for
+/// Pinned (layout-sensitive + package-qualified) schema hash for
 /// `sensor_msgs/Image`. See [`STD_MSGS_STRING_SCHEMA_HASH`] for the sync
 /// contract.
-pub const SENSOR_MSGS_IMAGE_SCHEMA_HASH: u64 = 0xBD08DAFCECCFA89E;
+pub const SENSOR_MSGS_IMAGE_SCHEMA_HASH: u64 = 0xF3445F1169091663;
 
 /// The one-time remote-fallback breadcrumb `topic echo` prints when a
 /// frame's type is not compiled locally and is instead decoded via a robot's

@@ -466,11 +466,81 @@ fn generated_workspace_resolves_single_iceoryx2_at_cerulion_core_pin() {
     }
 }
 
+/// The documented schema hash byte stream, assembled by hand from
+/// literals: the length-prefixed qualified name, the fixed-section size,
+/// then per field its length-prefixed name and canonical type and, when the
+/// third element is `Some`, the target hash folded after it (every resolved
+/// nested reference). Never calls into `MessageSchema`.
+fn hand_hash(qname: &str, fixed_size: u64, fields: &[(&str, &str, Option<u64>)]) -> u64 {
+    fn prefixed(bytes: &mut Vec<u8>, text: &str) {
+        bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+    }
+    let mut bytes = Vec::new();
+    prefixed(&mut bytes, qname);
+    bytes.extend_from_slice(&fixed_size.to_le_bytes());
+    for (name, ty, target) in fields {
+        prefixed(&mut bytes, name);
+        prefixed(&mut bytes, ty);
+        if let Some(hash) = target {
+            bytes.extend_from_slice(&hash.to_le_bytes());
+        }
+    }
+    cerulion_core::wire::fnv1a_hash(&bytes)
+}
+
+/// `std_msgs/Header { builtin_interfaces/Time stamp; string frame_id }`,
+/// with the fixed `Time { int32 sec; uint32 nanosec }` inlined.
+fn header_hand_hash() -> u64 {
+    let time = hand_hash(
+        "builtin_interfaces/Time",
+        8,
+        &[("sec", "int32", None), ("nanosec", "uint32", None)],
+    );
+    hand_hash(
+        "std_msgs/Header",
+        8,
+        &[
+            ("stamp", "builtin_interfaces/Time", Some(time)),
+            ("frame_id", "string", None),
+        ],
+    )
+}
+
+/// The pinned literals in `topic_cmd.rs` are the hand-assembled streams of
+/// the vendored `.msg` definitions, so the pins have an oracle that is not
+/// the generated constant they are compared with below.
+#[test]
+fn pinned_hashes_are_the_hand_assembled_streams() {
+    assert_eq!(
+        cerulion_cli_engine::topic_cmd::STD_MSGS_STRING_SCHEMA_HASH,
+        hand_hash("std_msgs/String", 0, &[("data", "string", None)])
+    );
+    // uint32 height, uint32 width, uint8 is_bigendian, pad 3, uint32 step.
+    assert_eq!(
+        cerulion_cli_engine::topic_cmd::SENSOR_MSGS_IMAGE_SCHEMA_HASH,
+        hand_hash(
+            "sensor_msgs/Image",
+            16,
+            &[
+                ("header", "std_msgs/Header", Some(header_hand_hash())),
+                ("height", "uint32", None),
+                ("width", "uint32", None),
+                ("encoding", "string", None),
+                ("is_bigendian", "uint8", None),
+                ("step", "uint32", None),
+                ("data", "uint8[]", None),
+            ],
+        )
+    );
+}
+
 /// The pretty-print pins in `topic_cmd.rs` (and the TUI, which
 /// re-uses these consts) must track the generated layout-sensitive
-/// SCHEMA_HASH constants. After an intentional hash-recipe change, run
-/// this test, copy the actual values from the failure message into the
-/// pinned literals, and re-run to green — never hand-compute them.
+/// SCHEMA_HASH constants. After an intentional hash-recipe change, the
+/// new values come from the hand-assembled streams in
+/// `pinned_hashes_are_the_hand_assembled_streams`, never from the
+/// generated side of this test.
 #[test]
 fn pinned_hashes_match_generated_constants() {
     use cerulion_core::message::ShmMessage;
@@ -495,7 +565,7 @@ fn pinned_hashes_match_generated_constants() {
 // `build_workspace_schema_hashes` producer-side coverage.
 //
 // The runtime's YAML-`schema:`-vs-macro-output divergence warn compares a
-// workspace schema's recipe-3 `schema_hash` against the macro's generated
+// workspace schema's `schema_hash` against the macro's generated
 // `ShmMessage::SCHEMA_HASH`. The CLI builds the workspace side via
 // `graph_cmd::build_workspace_schema_hashes`. These tests pin that the
 // produced hashes MATCH what codegen would compute — crucially for a schema
@@ -509,7 +579,7 @@ use cerulion_core::codegen::{resolve_fixed_nested, FieldDef, FieldType, MessageS
 
 /// Independent oracle: hand-build the same workspace schema SET as IR,
 /// resolve fixed-nested fields over the FULL set (exactly as codegen does
-/// before computing `SCHEMA_HASH`), and return the recipe-3 hash of the
+/// before computing `SCHEMA_HASH`), and return the hash of the
 /// schema named `target`. Built from the IR directly (not via the
 /// YAML-parse path under test), so it is NOT a self-compare.
 fn oracle_hash(set: &mut [MessageSchema], target: &str) -> u64 {
@@ -521,7 +591,7 @@ fn oracle_hash(set: &mut [MessageSchema], target: &str) -> u64 {
 }
 
 /// A FLAT workspace schema (no nested fields): the produced hash must equal
-/// the recipe-3 hash of the same schema. The resolution step is a no-op for
+/// the hash of the same schema. The resolution step is a no-op for
 /// a flat schema, so this is the baseline equality.
 #[test]
 fn build_workspace_schema_hashes_flat_schema_matches_message_schema_hash() {
@@ -629,16 +699,14 @@ fn build_workspace_schema_hashes_fixed_nested_resolves_like_codegen() {
 /// `graph run`'s divergence check with no entry for a port codegen hashes
 /// perfectly well. What still omits is a ref to a type NOTHING can resolve.
 ///
-/// The oracle is independent of the fold: `std_msgs/Header` carries a `string frame_id`, so it is VARIABLE:
-/// `resolve_fixed_nested` cannot inline it and recipe 3 folds only its
-/// qualified NAME, so the bearer's hash is its own IR's and the oracle needs
-/// no set. That makes the VARIABLE arm a presence pin — the value cannot
-/// discriminate, because nothing the fold does can change it — so a FIXED
-/// built-in target (`geometry_msgs/Point`) is asserted alongside it, where
-/// resolution really does fold the target's hash in. That arm carries the
-/// `assert_ne!` differential its sibling above carries: without it, a test
-/// asserting a hash the fold could not have altered proves only that the
-/// entry exists.
+/// The oracle is independent of the fold: the bearer's expected hash is the
+/// hand-assembled stream with `std_msgs/Header`'s own hand-assembled hash
+/// folded after the reference. `std_msgs/Header` carries a `string
+/// frame_id`, so it is VARIABLE and is not inlined, but its hash is folded
+/// all the same, so the value discriminates: a fold that did not resolve
+/// against the corpus would leave it out. A FIXED built-in target
+/// (`geometry_msgs/Point`) is asserted alongside it, where resolution also
+/// inlines the target.
 #[test]
 fn build_workspace_schema_hashes_hashes_a_builtin_nested_ref_and_omits_an_unresolvable_one() {
     let tmp = tempfile::tempdir().unwrap();
@@ -665,18 +733,31 @@ fn build_workspace_schema_hashes_hashes_a_builtin_nested_ref_and_omits_an_unreso
 
     let map = graph_cmd::build_workspace_schema_hashes(tmp.path());
 
-    // HAND ORACLE: Header is variable, so the bearer's hash is its own IR's.
-    let mut stamped = MessageSchema::new("Stamped");
-    stamped.add_field(FieldDef::new(
+    // HAND ORACLE: the variable Header's hash is folded after the reference.
+    let stamped = hand_hash(
+        "Stamped",
+        8,
+        &[
+            ("header", "std_msgs/Header", Some(header_hand_hash())),
+            ("value", "float64", None),
+        ],
+    );
+    assert_eq!(
+        map.get("Stamped").copied(),
+        Some(stamped),
+        "a nested BUILT-IN is resolvable by codegen, so its bearer is hashed \
+         (the fold resolves against the built-in corpus)"
+    );
+    let mut unresolved = MessageSchema::new("Stamped");
+    unresolved.add_field(FieldDef::new(
         "header",
         FieldType::parse("std_msgs/Header").unwrap(),
     ));
-    stamped.add_field(FieldDef::new("value", FieldType::F64));
-    assert_eq!(
-        map.get("Stamped").copied(),
-        Some(stamped.schema_hash()),
-        "a nested BUILT-IN is resolvable by codegen, so its bearer is hashed \
-         (the fold resolves against the built-in corpus)"
+    unresolved.add_field(FieldDef::new("value", FieldType::F64));
+    assert_ne!(
+        stamped,
+        unresolved.schema_hash(),
+        "the Header hash must be in the bearer's hash"
     );
 
     assert!(
@@ -803,7 +884,7 @@ fn build_workspace_schema_hashes_non_string_key_is_warned_and_skipped_not_fatal(
     // Infallible by contract — must not panic.
     let map = graph_cmd::build_workspace_schema_hashes(tmp.path());
 
-    // The valid sibling IS present and matches its recipe-3 hash.
+    // The valid sibling IS present and matches its hash.
     let mut valid = MessageSchema::new("Valid");
     valid.add_field(FieldDef::new("a", FieldType::U32));
     valid.add_field(FieldDef::new("b", FieldType::F64));
@@ -851,7 +932,7 @@ fn build_workspace_schema_hashes_non_string_key_is_warned_and_skipped_not_fatal(
 ///   depth 2 is the regression guard a DIRECT-only check fails.
 /// - FULLY-INTERNAL chain `Top -> Mid -> Leaf` (all in-set, `Leaf` all
 ///   primitives): entire closure in the workspace, all three PRESENT and
-///   matching their resolved recipe-3 hashes.
+///   matching their resolved hashes.
 #[test]
 fn build_workspace_schema_hashes_transitive_unresolvable_ref_is_omitted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -901,28 +982,30 @@ fn build_workspace_schema_hashes_transitive_unresolvable_ref_is_omitted() {
 
     let map = graph_cmd::build_workspace_schema_hashes(tmp.path());
 
-    // BUILT-IN chain: both bearers hashed. HAND ORACLES, no set needed —
-    // `std_msgs/Header` is VARIABLE (its `frame_id` is a string), so
-    // `resolve_fixed_nested` cannot inline it; a variable nested field
-    // contributes only its qualified NAME to recipe 3, and `Middle` is
-    // therefore variable too, so `Outer`'s nested `Middle` stays variable.
-    let mut middle = MessageSchema::new("Middle");
-    middle.add_field(FieldDef::new(
-        "header",
-        FieldType::parse("std_msgs/Header").unwrap(),
-    ));
-    middle.add_field(FieldDef::new("m", FieldType::F64));
+    // BUILT-IN chain: both bearers hashed. HAND ORACLES: `std_msgs/Header`
+    // is VARIABLE (its `frame_id` is a string), so it is not inlined and
+    // `Middle` is variable too, but each variable target's hash is folded
+    // after its reference, two levels deep for `Outer`.
+    let middle = hand_hash(
+        "Middle",
+        8,
+        &[
+            ("header", "std_msgs/Header", Some(header_hand_hash())),
+            ("m", "float64", None),
+        ],
+    );
     assert_eq!(
         map.get("Middle").copied(),
-        Some(middle.schema_hash()),
+        Some(middle),
         "Middle nests a BUILT-IN, which codegen resolves — it is hashed"
     );
-    let mut outer = MessageSchema::new("Outer");
-    outer.add_field(FieldDef::new("middle", FieldType::parse("Middle").unwrap()));
-    outer.add_field(FieldDef::new("o", FieldType::U32));
     assert_eq!(
         map.get("Outer").copied(),
-        Some(outer.schema_hash()),
+        Some(hand_hash(
+            "Outer",
+            4,
+            &[("middle", "Middle", Some(middle)), ("o", "uint32", None)],
+        )),
         "and so is its depth-2 bearer"
     );
 
