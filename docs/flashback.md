@@ -83,6 +83,12 @@ unit captures its node state on its own thread:
   copy of its process. `CERULION_FLASHBACK=off`, the cadence and the ring size
   apply as for any rank.
 
+Each rank's state ring (64 MiB by default, `CERULION_FLASHBACK_STATE_RING_MB`)
+lives in shared memory. On Linux a run checks, before any rank creates its
+ring, that every rank's ring fits in the free space of `/dev/shm` beside the
+scheduler-trace rings. A run whose rings do not fit takes no checkpoints and
+logs a warning; the graph runs normally.
+
 A capture of a run of several worker ranks is resimmable only when its window
 reaches the run's step 0: a mid-run free-run recording of several worker ranks
 is refused, since per-rank resume is not supported. A capture whose window

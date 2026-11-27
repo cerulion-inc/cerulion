@@ -765,25 +765,29 @@ fn create_state_ring(
         }
     };
     let refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
-    // The per-rank ring's SIZE comes from an operator knob rather than a fixed
-    // constant. A capture's pre-window needs `window / cadence + 1` anchors held,
-    // and an anchor is bounded only by the arm-time gate, so this is a property
-    // of the robot rather than of the framework.
-    let (ring_bytes, complaint) = cerulion_core::flashback::resolve_state_ring_bytes(
-        std::env::var(cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV)
-            .ok()
-            .as_deref(),
-    );
+    let (capacity, complaint) = state_ring_capacity();
     if let Some(reason) = complaint {
         tracing::warn!(env = cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV, %reason, "ignoring");
     }
-    let mut owner = match StateRingOwner::create(
-        &ring_tag,
-        cerulion_core::state_ring::capacity_records_for_bytes(ring_bytes as usize),
-        rank,
-        state_ring_run_id(tag),
-        &refs,
-    ) {
+    // The `/dev/shm` free-space check, for THIS ring. `ftruncate` charges no
+    // page, so a ring that does not fit is created without complaint and the
+    // process takes SIGBUS at a later touch, inside a step. Refused here, it is
+    // a named degradation instead. An observation, not a reservation: a sibling
+    // unit's ring created a moment before has charged nothing yet, which is why
+    // the supervisor also checks the whole deployment's rings at once.
+    let created = gate_state_rings(
+        crate::graph_cmd::shm_free_bytes(),
+        cerulion_core::shm_ring::apparent_segment_bytes(
+            cerulion_core::state_ring::STATE_RECORD_SIZE,
+            capacity,
+        ),
+        None,
+    )
+    .and_then(|()| {
+        StateRingOwner::create(&ring_tag, capacity, rank, state_ring_run_id(tag), &refs)
+            .map_err(|e| e.to_string())
+    });
+    let mut owner = match created {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(
@@ -829,6 +833,65 @@ fn create_state_ring(
          and a recorder armed with the same tag discovers it by name"
     );
     Some(owner)
+}
+
+/// The capacity, in records, of a state ring this process creates, and the
+/// complaint about a knob value that was ignored.
+///
+/// The SIZE comes from an operator knob rather than a fixed constant. A
+/// capture's pre-window needs `window / cadence + 1` anchors held, and an anchor
+/// is bounded only by the arm-time gate, so this is a property of the robot
+/// rather than of the framework.
+#[cfg(unix)]
+fn state_ring_capacity() -> (u32, Option<String>) {
+    let (ring_bytes, complaint) = cerulion_core::flashback::resolve_state_ring_bytes(
+        std::env::var(cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV)
+            .ok()
+            .as_deref(),
+    );
+    (
+        cerulion_core::state_ring::capacity_records_for_bytes(ring_bytes as usize),
+        complaint,
+    )
+}
+
+/// The APPARENT bytes one state ring of this process reserves: what `ftruncate`
+/// sizes its segment to, and what a `/dev/shm` free-space check measures
+/// against. A fresh ring charges one page and reaches this figure as it fills.
+#[cfg(unix)]
+pub(crate) fn state_ring_apparent_bytes() -> u64 {
+    cerulion_core::shm_ring::apparent_segment_bytes(
+        cerulion_core::state_ring::STATE_RECORD_SIZE,
+        state_ring_capacity().0,
+    )
+}
+
+/// PURE: may state rings of `state_ring_bytes` be created, beside scheduler-trace
+/// rings of `trace_ring_bytes`?
+///
+/// `free_bytes` is `None` when the free space CANNOT BE TOLD (POSIX SHM on macOS
+/// is not a mounted tmpfs), and that is never a refusal, as for the trace rings.
+/// The trace rings are admitted first, by their own gate, which refuses exactly
+/// when they do not fit on their own: so they are charged here only when they
+/// fit, and a deployment whose trace rings are refused can still hold its state
+/// rings. The sum saturates, so no size wraps into a fit.
+#[cfg(unix)]
+pub(crate) fn gate_state_rings(
+    free_bytes: Option<u64>,
+    state_ring_bytes: u64,
+    trace_ring_bytes: Option<u64>,
+) -> Result<(), String> {
+    let Some(free) = free_bytes else {
+        return Ok(());
+    };
+    let trace = trace_ring_bytes.filter(|t| *t <= free).unwrap_or(0);
+    if free < state_ring_bytes.saturating_add(trace) {
+        return Err(format!(
+            "/dev/shm has {free} bytes free, less than the {state_ring_bytes} bytes this run's \
+             checkpoint state rings reserve beside its {trace} bytes of scheduler-trace rings"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1421,5 +1484,79 @@ mod tests {
         );
         drop(rank0);
         drop(arm);
+    }
+
+    /// A state ring reserves its records plus the ring header, at the size the
+    /// knob names: 64 MiB is 131 072 records of 512 bytes, 1 MiB is 2 048, and
+    /// the header is 65 600 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_ring_reserves_its_records_and_its_header() {
+        let _env = env_lock();
+        let env = cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV;
+        {
+            let _ring = EnvVarGuard::set(env, "64");
+            assert_eq!(state_ring_apparent_bytes(), 131_072 * 512 + 65_600);
+        }
+        let _ring = EnvVarGuard::set(env, "1");
+        assert_eq!(state_ring_apparent_bytes(), 2_048 * 512 + 65_600);
+    }
+
+    /// The `/dev/shm` gate for state rings, on hand numbers.
+    ///
+    /// Two units with a default ring each ask for 2 * 67 174 464 = 134 348 928
+    /// bytes. On a 64 MiB mount (67 108 864 bytes) that is refused, which is the
+    /// shape that would otherwise fault the worker when its rings fill.
+    #[cfg(unix)]
+    #[test]
+    fn the_state_ring_gate_refuses_only_what_it_can_prove_will_not_fit() {
+        const RING: u64 = 67_174_464;
+        assert_eq!(
+            gate_state_rings(None, 2 * RING, Some(1)),
+            Ok(()),
+            "cannot tell is not a refusal"
+        );
+        assert_eq!(gate_state_rings(Some(2 * RING), 2 * RING, None), Ok(()));
+        assert_eq!(
+            gate_state_rings(Some(2 * RING - 1), 2 * RING, None),
+            Err(
+                "/dev/shm has 134348927 bytes free, less than the 134348928 bytes this run's \
+                 checkpoint state rings reserve beside its 0 bytes of scheduler-trace rings"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            gate_state_rings(Some(67_108_864), 2 * RING, None),
+            Err(
+                "/dev/shm has 67108864 bytes free, less than the 134348928 bytes this run's \
+                 checkpoint state rings reserve beside its 0 bytes of scheduler-trace rings"
+                    .to_string()
+            ),
+            "two default rings do not fit a 64 MiB mount"
+        );
+        // Trace rings that fit are charged first: 100 bytes of trace leave 99
+        // for state.
+        assert_eq!(gate_state_rings(Some(199), 99, Some(100)), Ok(()));
+        assert_eq!(
+            gate_state_rings(Some(199), 100, Some(100)),
+            Err(
+                "/dev/shm has 199 bytes free, less than the 100 bytes this run's checkpoint \
+                 state rings reserve beside its 100 bytes of scheduler-trace rings"
+                    .to_string()
+            )
+        );
+        // Trace rings that do not fit on their own are refused by their own
+        // gate and reserve nothing, so they are not charged here.
+        assert_eq!(gate_state_rings(Some(150), 100, Some(151)), Ok(()));
+        // A wrapping sum of these two is 0, which would fit.
+        assert_eq!(
+            gate_state_rings(Some(u64::MAX - 1), u64::MAX - 1, Some(2)),
+            Err(format!(
+                "/dev/shm has {free} bytes free, less than the {free} bytes this run's checkpoint \
+                 state rings reserve beside its 2 bytes of scheduler-trace rings",
+                free = u64::MAX - 1
+            )),
+            "the sum saturates rather than wrapping into a fit"
+        );
     }
 }
