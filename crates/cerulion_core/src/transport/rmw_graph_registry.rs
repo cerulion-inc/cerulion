@@ -9,14 +9,25 @@
 //!
 //! # Writer and doorbell
 //!
-//! The writer sends a full snapshot each time its pair set changes. A
+//! The writer sends its snapshot each time its pair set changes. A
 //! background pump waits on the doorbell event service
-//! [`RMW_GRAPH_DOORBELL_SERVICE_NAME`] and sends the snapshot again when a
-//! reader rings it, or after [`RMW_GRAPH_REPUBLISH_INTERVAL`] when no ring
-//! comes. A reader rings before each drain pass, and the passes are 20 ms
-//! apart, so a live writer answers within a few passes. The writer opens its
-//! ports on the first `add` or `remove`. When that open fails, the pair counts
-//! are kept and the open runs again on the next `add` or `remove`.
+//! [`RMW_GRAPH_DOORBELL_SERVICE_NAME`] and sends again when a reader rings
+//! it, or after [`RMW_GRAPH_REPUBLISH_INTERVAL`] when no ring comes. A
+//! reader rings before each drain pass, and the passes are 20 ms apart.
+//! The writer opens its ports on the first `add` or `remove`. When that open
+//! fails, the pair counts are kept and the open runs again on the next `add`
+//! or `remove`.
+//!
+//! One send carries at most [`send_budget`] parts: an even share of half a
+//! reader queue among the publishers listed on the registry service. A reader
+//! queue then holds two sends of every listed writer, so a send does not push
+//! out the parts of an earlier one. The next send starts at the part after
+//! the last one sent and wraps past the end, so a snapshot of `P` parts lands
+//! whole within `P.div_ceil(send_budget(listed))` sends, even when `P` is
+//! larger than [`RMW_GRAPH_QUEUE_DEPTH`]. A writer alone on the service sends
+//! 64 parts a send. Each other gather that runs at the same time adds rings,
+//! and a queue that overflows then loses parts of a different window on each
+//! send, never the same parts each time.
 //!
 //! # Gather verdict
 //!
@@ -100,7 +111,7 @@ pub const RMW_GRAPH_MAX_WRITERS: usize = 64;
 pub const RMW_GRAPH_MAX_READERS: usize = 16;
 
 /// Per-reader subscriber queue depth (fixed for service v1; at least
-/// `2 * RMW_GRAPH_MAX_WRITERS`).
+/// `2 * RMW_GRAPH_MAX_WRITERS`, so [`send_budget`] is at least one part).
 pub const RMW_GRAPH_QUEUE_DEPTH: usize = 128;
 
 /// Maximum iceoryx2 nodes that may open the registry or doorbell service at
@@ -166,7 +177,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     RMW_GRAPH_QUEUE_DEPTH >= 2 * RMW_GRAPH_MAX_WRITERS,
-    "reader queue depth must hold at least two frames per writer"
+    "reader queue depth must hold two sends of one part from every writer"
 );
 const _: () = assert!(
     RMW_GRAPH_FRAME_LEN * (RMW_GRAPH_MAX_READERS * (RMW_GRAPH_QUEUE_DEPTH + 2) + 2)
@@ -751,7 +762,38 @@ fn report_recovery(latch: &mut FailureRegimeLatch, what: &'static str) {
 // Writer
 // ---------------------------------------------------------------------------
 
+/// How many parts one send of a writer carries when `listed_writers`
+/// publishers are listed on the registry service: an even share of half a
+/// reader queue, and at least one part.
+///
+/// A reader drains its queue once per pass and rings once per pass, so a
+/// writer sends about once between two drains. At this budget a queue holds
+/// two sends of every listed writer, so a send does not push out the parts
+/// of an earlier one.
+#[must_use]
+pub fn send_budget(listed_writers: usize) -> usize {
+    (RMW_GRAPH_QUEUE_DEPTH / (2 * listed_writers.max(1))).max(1)
+}
+
+/// The part indices one send carries and the cursor of the next send: at most
+/// `budget` parts of a `part_count`-part snapshot, from `cursor` on, wrapping
+/// past the last part.
+///
+/// The cursor moves on by every part sent, so successive sends walk the
+/// whole snapshot and a snapshot of more parts than a reader queue holds
+/// still lands whole within `part_count.div_ceil(budget)` sends.
+fn send_window(part_count: usize, cursor: usize, budget: usize) -> (Vec<usize>, usize) {
+    if part_count == 0 {
+        return (Vec::new(), 0);
+    }
+    let start = cursor % part_count;
+    let len = budget.max(1).min(part_count);
+    let parts = (0..len).map(|i| (start + i) % part_count).collect();
+    (parts, (start + len) % part_count)
+}
+
 struct WriterPorts {
+    factory: PortFactory<CerService, [u8], ()>,
     publisher: Publisher<CerService, [u8], ()>,
     writer_id: u128,
 }
@@ -763,7 +805,13 @@ struct WriterState {
     /// generation carries the same snapshot, so a reader may complete a
     /// generation from parts of different sends.
     generation: u32,
+    /// The encoded parts of the current generation, made on its first send.
+    frames: Option<Vec<Vec<u8>>>,
+    /// The part the next send starts at; see [`send_window`].
+    cursor: usize,
     ports: Option<WriterPorts>,
+    /// Frames sent so far, raised once per send after its last frame.
+    frames_sent: u64,
     open_failures: FailureRegimeLatch,
     send_failures: FailureRegimeLatch,
 }
@@ -775,18 +823,20 @@ impl WriterState {
             return false;
         }
         let opened = open_registry_service(node).and_then(|factory| {
-            factory
+            let publisher = factory
                 .publisher_builder()
                 .initial_max_slice_len(RMW_GRAPH_FRAME_LEN)
                 .create()
                 .map_err(|e| TransportError::Internal {
                     reason: format!("rmw graph registry: could not create the publisher: {e:?}"),
-                })
+                })?;
+            Ok((factory, publisher))
         });
         match opened {
-            Ok(publisher) => {
+            Ok((factory, publisher)) => {
                 let writer_id = publisher.id().value();
                 self.ports = Some(WriterPorts {
+                    factory,
                     publisher,
                     writer_id,
                 });
@@ -800,23 +850,37 @@ impl WriterState {
         }
     }
 
-    /// Send every part of the current generation.
+    /// Forget the encoded parts after the pair set changed, so the next send
+    /// encodes the new generation from its first part.
+    fn snapshot_changed(&mut self) {
+        self.frames = None;
+        self.cursor = 0;
+    }
+
+    /// Send the next window of parts of the current generation.
     fn publish(&mut self) {
         let Some(ports) = &self.ports else {
             return;
         };
-        let frames = match encode_snapshot(
-            ports.writer_id,
-            self.generation,
-            self.pairs.keys().map(|(t, ty)| (t.as_str(), ty.as_str())),
-        ) {
-            Ok(frames) => frames,
-            Err(e) => {
-                report_failure(&mut self.send_failures, "encode", &e.to_string());
-                return;
+        if self.frames.is_none() {
+            match encode_snapshot(
+                ports.writer_id,
+                self.generation,
+                self.pairs.keys().map(|(t, ty)| (t.as_str(), ty.as_str())),
+            ) {
+                Ok(frames) => self.frames = Some(frames),
+                Err(e) => {
+                    report_failure(&mut self.send_failures, "encode", &e.to_string());
+                    return;
+                }
             }
-        };
-        for frame in &frames {
+        }
+        let frames = self.frames.as_deref().unwrap_or_default();
+        let budget = send_budget(ports.factory.dynamic_config().number_of_publishers());
+        let (parts, next_cursor) = send_window(frames.len(), self.cursor, budget);
+        let mut count = 0u64;
+        for idx in parts {
+            let frame = &frames[idx];
             let sent = match ports.publisher.loan_slice_uninit(frame.len()) {
                 Ok(sample) => sample
                     .write_from_slice(frame)
@@ -826,10 +890,16 @@ impl WriterState {
                 Err(e) => Err(e.to_string()),
             };
             if let Err(e) = sent {
+                // The next send starts at the part that failed.
+                self.cursor = idx;
+                self.frames_sent += count;
                 report_failure(&mut self.send_failures, "send", &e);
                 return;
             }
+            count += 1;
         }
+        self.cursor = next_cursor;
+        self.frames_sent += count;
         report_recovery(&mut self.send_failures, "send");
     }
 }
@@ -905,7 +975,10 @@ impl RmwGraphWriter {
                 state: Mutex::new(WriterState {
                     pairs: BTreeMap::new(),
                     generation: 0,
+                    frames: None,
+                    cursor: 0,
                     ports: None,
+                    frames_sent: 0,
                     open_failures: FailureRegimeLatch::new(),
                     send_failures: FailureRegimeLatch::new(),
                 }),
@@ -970,7 +1043,17 @@ impl RmwGraphWriter {
         self.shared.rings_answered.load(Ordering::Relaxed)
     }
 
+    /// How many frames this writer has sent. A send raises it once, after
+    /// its last frame, so a raised count means that send is whole.
+    #[must_use]
+    pub fn frames_sent(&self) -> u64 {
+        self.shared.lock().frames_sent
+    }
+
     fn sync(&self, mut state: std::sync::MutexGuard<'_, WriterState>, changed: bool) {
+        if changed {
+            state.snapshot_changed();
+        }
         let opened_now = state.open_ports(&self.transport.node);
         if state.ports.is_none() {
             return;
@@ -1267,6 +1350,10 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn range_vec(a: usize, b: usize) -> Vec<usize> {
+        (a..b).collect()
     }
 
     fn topic_map(rows: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
@@ -1631,6 +1718,43 @@ mod tests {
             encode_snapshot(1, 1, entries),
             Err(RmwGraphFrameError::TooManyParts { count: 65_536 })
         );
+    }
+
+    #[test]
+    fn send_budget_shares_half_a_queue_among_listed_writers() {
+        assert_eq!(send_budget(0), 64);
+        assert_eq!(send_budget(1), 64);
+        assert_eq!(send_budget(2), 32);
+        assert_eq!(send_budget(3), 21);
+        assert_eq!(send_budget(20), 3);
+        assert_eq!(send_budget(64), 1);
+        assert_eq!(send_budget(65), 1);
+        assert_eq!(send_budget(usize::MAX / 4), 1);
+    }
+
+    #[test]
+    fn send_window_walks_a_snapshot_larger_than_the_queue_and_wraps() {
+        // 129 parts, 64 a send: three sends cover every part.
+        assert_eq!(send_window(129, 0, 64), (range_vec(0, 64), 64));
+        assert_eq!(send_window(129, 64, 64), (range_vec(64, 128), 128));
+        let mut third = vec![128];
+        third.extend(range_vec(0, 63));
+        assert_eq!(send_window(129, 128, 64), (third, 63));
+        // A snapshot within the budget goes whole, from the cursor on.
+        assert_eq!(send_window(3, 0, 64), (vec![0, 1, 2], 0));
+        assert_eq!(send_window(3, 2, 64), (vec![2, 0, 1], 2));
+        // A stale cursor past the end and a zero budget stay in bounds.
+        assert_eq!(send_window(3, 7, 1), (vec![1], 2));
+        assert_eq!(send_window(3, 0, 0), (vec![0], 1));
+        assert_eq!(send_window(0, 5, 64), (vec![], 0));
+    }
+
+    #[test]
+    fn send_window_is_the_same_for_the_same_inputs() {
+        assert_eq!(send_window(129, 100, 21), send_window(129, 100, 21));
+        let (parts, next) = send_window(129, 100, 21);
+        assert_eq!(parts, range_vec(100, 121));
+        assert_eq!(next, 121);
     }
 
     #[test]

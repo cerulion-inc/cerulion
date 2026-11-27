@@ -25,9 +25,10 @@ use std::time::{Duration, Instant};
 use cerulion_core::testing::{child_iceoryx_config, kill_child_holding_ports, IsolatedRoot};
 use cerulion_core::transport::dead_node_sweep::sweep_node_config;
 use cerulion_core::transport::rmw_graph_registry::{
-    encode_snapshot, GatherCompleteness, RmwGraphFrameError, RmwGraphGather,
-    MAX_RMW_GRAPH_TOPIC_LEN, RMW_GRAPH_DOORBELL_SERVICE_NAME, RMW_GRAPH_FRAME_LEN,
-    RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH,
+    decode_frame, encode_snapshot, GatherCompleteness, RmwGraphFrameError, RmwGraphGather,
+    RmwGraphGatherFold, RmwGraphWriter, MAX_RMW_GRAPH_TOPIC_LEN, MAX_RMW_GRAPH_TYPE_LEN,
+    RMW_GRAPH_DOORBELL_SERVICE_NAME, RMW_GRAPH_FRAME_LEN, RMW_GRAPH_MAX_NODES,
+    RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH,
     RMW_GRAPH_REGISTRY_SERVICE_NAME,
 };
 use cerulion_core::transport::{TransportConfig, TransportManager};
@@ -263,6 +264,127 @@ fn a_snapshot_larger_than_one_frame_arrives_whole() {
         .topics
         .values()
         .all(|types| types == &BTreeSet::from(["sensor_msgs/msg/JointState".to_string()])));
+}
+
+/// 387 pairs whose topic and type names both take the 256-byte limit. One
+/// entry is 516 bytes, so a 2048-byte frame holds 3 and the snapshot needs
+/// 129 parts, one more than a reader queue holds.
+fn add_a_129_part_snapshot(writer: &RmwGraphWriter) -> Vec<(String, String)> {
+    let type_name = format!("pkg/msg/{}", "T".repeat(MAX_RMW_GRAPH_TYPE_LEN - 8));
+    let pairs: Vec<(String, String)> = (0..387)
+        .map(|i| {
+            let head = format!("/big_{i:03}_");
+            let topic = format!("{head}{}", "x".repeat(MAX_RMW_GRAPH_TOPIC_LEN - head.len()));
+            (topic, type_name.clone())
+        })
+        .collect();
+    for (topic, type_name) in &pairs {
+        writer.add(topic, type_name).expect("pair");
+    }
+    let frames = encode_snapshot(1, 1, pairs.iter().map(|(t, ty)| (t.as_str(), ty.as_str())))
+        .expect("encode");
+    assert_eq!(
+        frames.len(),
+        129,
+        "precondition: the snapshot needs 129 parts"
+    );
+    assert!(frames.len() > RMW_GRAPH_QUEUE_DEPTH);
+    pairs
+}
+
+fn assert_holds_every_pair(
+    topics: &BTreeMap<String, BTreeSet<String>>,
+    pairs: &[(String, String)],
+) {
+    assert_eq!(topics.len(), 387);
+    let first = topics.keys().next().expect("a first topic");
+    assert!(first.starts_with("/big_000_") && first.len() == 256);
+    let last = topics.keys().next_back().expect("a last topic");
+    assert!(last.starts_with("/big_386_") && last.len() == 256);
+    for (topic, type_name) in pairs {
+        assert_eq!(
+            topics.get(topic),
+            Some(&BTreeSet::from([type_name.clone()])),
+            "every pair arrives"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_snapshot_larger_than_the_reader_queue_settles_with_every_pair() {
+    let root = IsolatedRoot::mint("rg_q");
+    let tm = manager("deep_w", &root.config());
+    let reader = manager("deep_r", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    let pairs = add_a_129_part_snapshot(&writer);
+
+    let got = gather(&reader, None, SETTLE_WINDOW);
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
+    assert_holds_every_pair(&got.topics, &pairs);
+}
+
+/// Each ring here is drained only after the send it caused is whole, so every
+/// send lands in the queue at once. A writer alone on the service sends 64
+/// parts a send (a queue of 128 holds two sends of each listed writer), so
+/// the 129 parts need 3 sends and one send is never enough.
+#[test]
+#[serial]
+fn whole_sends_drained_between_rings_deliver_every_part_within_three_rings() {
+    let root = IsolatedRoot::mint("rg_r");
+    let tm = manager("ring_w", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    let pairs = add_a_129_part_snapshot(&writer);
+    let writer_id = writer.writer_id().expect("the writer is live");
+
+    let node = raw_node(&root.config());
+    let subscriber = raw_registry(&node)
+        .subscriber_builder()
+        .create()
+        .expect("raw subscriber");
+    let doorbell_name: ServiceName = RMW_GRAPH_DOORBELL_SERVICE_NAME
+        .try_into()
+        .expect("service name");
+    let bell = node
+        .service_builder(&doorbell_name)
+        .event()
+        .open()
+        .expect("the writer created the doorbell")
+        .notifier_builder()
+        .create()
+        .expect("raw notifier");
+
+    let mut fold = RmwGraphGatherFold::new();
+    let mut complete_after = None;
+    for ring in 1..=3 {
+        let before = writer.frames_sent();
+        bell.notify().expect("ring");
+        let deadline = Instant::now() + SETTLE_WINDOW;
+        while writer.frames_sent() == before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(writer.frames_sent() > before, "ring {ring} was answered");
+        while let Some(sample) = subscriber.receive().expect("receive") {
+            fold.ingest(decode_frame(sample.payload()).expect("a valid frame"));
+        }
+        if ring == 1 {
+            assert!(
+                !fold.is_writer_complete(writer_id),
+                "one send carries fewer parts than the snapshot has"
+            );
+        }
+        if fold.is_writer_complete(writer_id) {
+            complete_after = Some(ring);
+            break;
+        }
+    }
+    assert!(
+        complete_after.is_some(),
+        "every part arrived within 3 rings"
+    );
+    let got = fold.finish(&BTreeSet::from([writer_id]));
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
+    assert_holds_every_pair(&got.topics, &pairs);
 }
 
 #[test]

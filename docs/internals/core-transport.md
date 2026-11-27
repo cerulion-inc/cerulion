@@ -576,11 +576,14 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   the first call, and a failed open keeps the counts and runs again on the next call.
   The writer id is the publisher id, and a gather drops a frame whose writer id is not
   its sender's publisher id. A change sends the snapshot (one generation, one or more
-  parts); the pump sends it again on a doorbell ring or every 500 ms.
-  `gather_rmw_graph(own_writer, window)` waits only for the listed publishers whose
-  owner node is not `Dead` when the gather starts, minus `own_writer`
-  (`required_writers`); it reads the node list and never reaps. No required writer:
-  `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
+  parts); the pump sends again on a doorbell ring or every 500 ms. One send carries at
+  most `send_budget(listed publishers)` parts (an even share of half a reader queue, so
+  a queue holds two sends of every writer) from a cursor that moves on by every part
+  sent, so a snapshot larger than the 128-frame queue still lands whole within
+  `parts.div_ceil(budget)` sends. `gather_rmw_graph(own_writer, window)` waits only for
+  the listed publishers whose owner node is not `Dead` when the gather starts, minus
+  `own_writer` (`required_writers`); it reads the node list and never reaps. No
+  required writer: `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
   names; a change takes new names.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
