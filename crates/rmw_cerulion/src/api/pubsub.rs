@@ -596,24 +596,26 @@ fn list_on_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &str) {
     let Some(writer) = &rt.graph_registry else {
         return;
     };
-    // `AssertUnwindSafe`: the writer recovers its own poisoned locks, and a
-    // panic after the count moved leaves a count that the matching destroy
-    // still removes.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        writer.add(topic, type_name)
-    }));
-    let error = match outcome {
-        Ok(Ok(())) => {
-            report_graph_registry_success(topic);
-            return;
-        }
-        Ok(Err(error)) => error.to_string(),
-        Err(payload) => format!(
-            "graph registry add panicked: {}",
-            panic_message(payload.as_ref())
-        ),
-    };
-    report_graph_registry_failure(topic, &error);
+    contain_panic(|| {
+        // `AssertUnwindSafe`: the writer recovers its own poisoned locks, and
+        // a panic after the count moved leaves a count that the matching
+        // destroy still removes.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.add(topic, type_name)
+        }));
+        let error = match outcome {
+            Ok(Ok(())) => {
+                report_graph_registry_success(topic);
+                return;
+            }
+            Ok(Err(error)) => error.to_string(),
+            Err(payload) => format!(
+                "graph registry add panicked: {}",
+                panic_message(payload.as_ref())
+            ),
+        };
+        report_graph_registry_failure(topic, &error);
+    });
 }
 
 /// Count one less local endpoint on `(topic, type_name)`; the inverse of
@@ -623,23 +625,35 @@ fn unlist_from_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &st
     let Some(writer) = &rt.graph_registry else {
         return;
     };
-    // `AssertUnwindSafe`: see `list_on_graph_registry`.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        writer.remove(topic, type_name)
-    }));
-    if let Err(payload) = outcome {
-        report_graph_registry_failure(
-            topic,
-            &format!(
-                "graph registry remove panicked: {}",
-                panic_message(payload.as_ref())
-            ),
-        );
-    }
+    contain_panic(|| {
+        // `AssertUnwindSafe`: see `list_on_graph_registry`.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.remove(topic, type_name)
+        }));
+        if let Err(payload) = outcome {
+            report_graph_registry_failure(
+                topic,
+                &format!(
+                    "graph registry remove panicked: {}",
+                    panic_message(payload.as_ref())
+                ),
+            );
+        }
+    });
+}
+
+/// Run `work` and drop any panic out of it. For best-effort work whose report
+/// goes through the host's tracing subscriber, which may itself panic: the
+/// handle or answer the caller returns after it must still be returned.
+pub(crate) fn contain_panic(work: impl FnOnce()) {
+    // `AssertUnwindSafe`: `work` only logs and moves its own latch, which
+    // `lock_regime_latch` recovers from poison.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
 }
 
 fn report_graph_registry_success(topic: &str) {
-    if let Some(suppressed_count) = lock_regime_latch(&GRAPH_REGISTRY_FAILURES).on_success() {
+    let recovered = lock_regime_latch(&GRAPH_REGISTRY_FAILURES).on_success();
+    if let Some(suppressed_count) = recovered {
         tracing::info!(
             topic = %topic,
             suppressed_count,

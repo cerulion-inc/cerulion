@@ -48,6 +48,8 @@ use rmw_cerulion::*;
 
 /// Set to "1" only on a spawned child, so a bare `-- --ignored` run does nothing.
 const ENV_CHILD: &str = "CER_RMW_GRAPH_XPROC_CHILD";
+/// Set to "1" on a child that installs [`PanicOnGraphReport`] before rmw init.
+const ENV_PANICKING_LOG: &str = "CER_RMW_GRAPH_XPROC_PANICKING_LOG";
 const CHILD_TEST: &str = "subprocess_child_rmw_process";
 /// The longest a child may take to answer one command before the parent kills
 /// it and fails. It turns a wedged child into a failed test, not a hung one.
@@ -249,6 +251,46 @@ fn render(rows: &[(String, Vec<String>)], prefix: &str) -> String {
         .join(";")
 }
 
+/// The first words of every report the rmw graph registry wiring logs.
+const GRAPH_REPORTS: [&str; 2] = ["rmw graph registry", "topic listing"];
+const HOST_PANIC: &str = "the host's tracing subscriber panicked on a report";
+
+/// A host tracing subscriber that panics on each report of the rmw graph
+/// registry wiring, and on nothing else. rmw installs its own subscriber with
+/// `try_init`, so one the host installed first wins.
+struct PanicOnGraphReport;
+
+impl tracing::Subscriber for PanicOnGraphReport {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        if !event.metadata().target().starts_with("rmw_cerulion::api::") {
+            return;
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        if GRAPH_REPORTS.iter().any(|r| message.0.starts_with(r)) {
+            panic!("{HOST_PANIC}");
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 // =====================================================================
 // THE CHILD: one rmw process on the arm's isolated root.
 // =====================================================================
@@ -448,6 +490,10 @@ impl ChildState {
 fn subprocess_child_rmw_process() {
     if std::env::var(ENV_CHILD).as_deref() != Ok("1") {
         return;
+    }
+    if std::env::var(ENV_PANICKING_LOG).as_deref() == Ok("1") {
+        tracing::subscriber::set_global_default(PanicOnGraphReport)
+            .expect("the first subscriber of this process");
     }
     let config = child_iceoryx_config().expect("the parent sets the isolated root");
     // The singleton first, on the isolated root; `runtime()` then adopts it.
@@ -886,6 +932,51 @@ fn a_failed_allocation_in_a_later_topic_frees_the_types_of_every_earlier_topic()
              5:{bad}:clean;6:{bad}:clean;7:{bad}:clean;8:{bad}:clean;9:0:clean"
         )
     );
+}
+
+/// The host's tracing subscriber panics on every report the rmw graph
+/// registry wiring makes. Each report runs on a handle that is already in the
+/// local graph, or on a listing that already holds its answer, so the
+/// creates, the destroy and the listings still succeed.
+#[test]
+#[serial]
+fn a_panicking_host_subscriber_fails_no_create_destroy_or_listing() {
+    let root = IsolatedRoot::mint("rgxo");
+    let p = prefix("o");
+    let mut lister = Child::spawn_with(&root, "lister", &[(ENV_PANICKING_LOG, "1")]);
+    let mut talker = Child::spawn(&root, "talker");
+    let mut hog = Child::spawn(&root, "hog");
+    assert_eq!(talker.ask(&format!("pub {p}/remote Remote")), "ok");
+    // Two refused names report a failure and a suppressed repeat, and the next
+    // listed endpoint reports the recovery.
+    let long = "L".repeat(250);
+    assert_eq!(lister.ask(&format!("pub {p}/long_a {long}")), "ok");
+    assert_eq!(lister.ask(&format!("pub {p}/long_b {long}")), "ok");
+    assert_eq!(lister.ask(&format!("pub {p}/short Short")), "ok");
+    assert_eq!(lister.ask(&format!("unpub {p}/long_a")), "ok");
+    assert_eq!(lister.ask(&format!("unpub {p}/long_b")), "ok");
+    // Two gathers that cannot open report a failure and a suppressed repeat,
+    // and the next full listing reports the recovery.
+    assert_eq!(hog.ask("hog"), "ok");
+    for _ in 0..2 {
+        assert_eq!(
+            lister.ask(&format!("list {p}")),
+            format!("{p}/short=rmw_gx/msg/Short")
+        );
+    }
+    assert_eq!(hog.ask("unhog"), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/remote=rmw_gx/msg/Remote;{p}/short=rmw_gx/msg/Short")
+    );
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/remote=rmw_gx/msg/Remote;{p}/short=rmw_gx/msg/Short")
+    );
+    // Each of the six reports panicked: per latch a failure, a suppressed
+    // repeat and a recovery.
+    let log = lister.exit_without_destroying();
+    assert_eq!(count(&log, HOST_PANIC), 6, "{log:#?}");
 }
 
 #[test]

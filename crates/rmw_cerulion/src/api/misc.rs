@@ -803,9 +803,9 @@ type TopicTypes = std::collections::BTreeMap<String, std::collections::BTreeSet<
 /// The `(topic, types)` pairs of the other processes on the rmw graph
 /// registry, merged into `topics`. An error or an `Incomplete` verdict leaves
 /// this process's topics in place (an `Incomplete` one adds what was heard) and
-/// reports through [`TOPIC_GATHER_FAILURES`].
+/// reports through [`TOPIC_GATHER_FAILURES`]. The report is panic-contained, so
+/// a panicking host subscriber cannot turn the listing into an error.
 fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
-    use cerulion_core::transport::failure_regime_latch::{lock_regime_latch, RegimeDecision};
     use cerulion_core::transport::rmw_graph_registry::GatherCompleteness;
     let Some(writer) = &rt.graph_registry else {
         return;
@@ -837,9 +837,15 @@ fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
             super::pubsub::panic_message(payload.as_ref())
         )),
     };
-    let mut latch = lock_regime_latch(&TOPIC_GATHER_FAILURES);
+    super::pubsub::contain_panic(|| report_topic_gather(failure));
+}
+
+/// Move [`TOPIC_GATHER_FAILURES`] by one listing and log what it decides.
+fn report_topic_gather(failure: Option<String>) {
+    use cerulion_core::transport::failure_regime_latch::{lock_regime_latch, RegimeDecision};
     let Some(error) = failure else {
-        if let Some(suppressed_count) = latch.on_success() {
+        let recovered = lock_regime_latch(&TOPIC_GATHER_FAILURES).on_success();
+        if let Some(suppressed_count) = recovered {
             tracing::info!(
                 service =
                     cerulion_core::transport::rmw_graph_registry::RMW_GRAPH_REGISTRY_SERVICE_NAME,
@@ -849,7 +855,8 @@ fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
         }
         return;
     };
-    match latch.on_failure() {
+    let decision = lock_regime_latch(&TOPIC_GATHER_FAILURES).on_failure();
+    match decision {
         RegimeDecision::Loud => tracing::warn!(
             service = cerulion_core::transport::rmw_graph_registry::RMW_GRAPH_REGISTRY_SERVICE_NAME,
             error = %error,
