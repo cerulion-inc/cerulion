@@ -211,6 +211,11 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
         "default-namespace ports moved across threads; also a flatness gate",
     ),
     (
+        "dangling_shm_state_iox2_test",
+        "installs the process singleton through `init_with_config`; every arm runs on an \
+         isolated prefix, and the singleton arm needs a process with nothing installed",
+    ),
+    (
         "deliver_history_failure_iox2_test",
         "default-namespace manager: history fault injection",
     ),

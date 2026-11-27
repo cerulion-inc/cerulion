@@ -879,6 +879,11 @@ enum TapDepth {
 }
 
 static INSTANCE: OnceLock<Arc<TransportManager>> = OnceLock::new();
+/// Serializes the first construction of [`INSTANCE`]. `OnceLock` has no stable
+/// fallible initializer, and node creation can fail, so the builder takes this
+/// lock, checks [`INSTANCE`] again and installs only a manager it finished
+/// building. Reads go to [`INSTANCE`] alone and never take it.
+static INSTANCE_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The network EGRESS posture a `graph run` resolves — the
 /// default-visibility policy for a graph with no `network:` block.
@@ -2919,6 +2924,10 @@ impl TransportManager {
     ///   too long for, or outside the charset of, an iceoryx2 node name. An
     ///   `.expect()` here would abort the process with no exit code and no
     ///   diagnostic on a path every `graph run` and every resim shares.
+    /// - [`TransportError::NodeCreation`] if iceoryx2 cannot create the node,
+    ///   for example within its `creation_timeout` when a stopped process left
+    ///   stale shared memory state behind. Nothing is installed, so a later call
+    ///   tries again.
     #[must_use = "transport initialization result must be checked"]
     pub fn init(config: TransportConfig) -> TransportResult<Arc<Self>> {
         Self::init_singleton(config, None)
@@ -2966,17 +2975,13 @@ impl TransportManager {
         #[cfg(unix)]
         crate::fd_limit::raise_open_file_limit();
         validate_subscriber_buffer_size(config.subscriber_buffer_size)?;
-        // The node name is converted HERE, before `get_or_init`, and
-        // not inside the closure. Two reasons:
-        //
-        // * `get_or_init`'s closure cannot return an `Err` — a fallible
-        //   conversion inside it can only panic.
-        // * The closure runs only on the FIRST init, so an unrepresentable name
-        //   handed to a LATER call would be silently ignored rather than refused.
-        //   Validating up front makes the verdict order-independent: the same
-        //   config gets the same answer whether or not this process has already
-        //   initialised. A name that cannot identify a node is a broken config
-        //   even when this call would have reused an existing manager.
+        // The node name is converted HERE, before the singleton is consulted:
+        // the node is built only on the FIRST init, so an unrepresentable name
+        // handed to a LATER call would be silently ignored rather than refused.
+        // Validating up front makes the verdict order-independent: the same
+        // config gets the same answer whether or not this process has already
+        // initialised. A name that cannot identify a node is a broken config
+        // even when this call would have reused an existing manager.
         //
         // Nothing has been created at this point, so a refusal leaves no
         // transport state behind: `INSTANCE` stays unset.
@@ -2995,7 +3000,7 @@ impl TransportManager {
         }
         // Defensive: a supervisor-minted shared config is honored ONLY on
         // the singleton's FIRST init. If the process already initialized the
-        // transport (e.g. a stray default-config `init()`), `get_or_init` below
+        // transport (e.g. a stray default-config `init()`), the code below
         // silently returns THAT manager and IGNORES `ix_config` — the worker would
         // then be on the WRONG iceoryx2 namespace and its cross-group pub/sub would
         // silently never connect. The worker entry is the first init today (so this
@@ -3008,66 +3013,83 @@ impl TransportManager {
                  to connect to co-resident workers"
             );
         }
-        let manager = INSTANCE.get_or_init(|| {
-            // Suppress iceoryx2 "No config file was loaded" warning. Cerulion uses
-            // iceoryx2's defaults intentionally — no custom config file is needed.
-            crate::iceoryx_logger::init_iceoryx_log_level_from_env();
+        if let Some(existing) = INSTANCE.get() {
+            return Ok(Arc::clone(existing));
+        }
+        // A poisoned lock guards no data: it only means an earlier first init
+        // panicked, and `INSTANCE` is still unset, so this call builds anew.
+        let _init = INSTANCE_INIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = INSTANCE.get() {
+            return Ok(Arc::clone(existing));
+        }
+        // Suppress iceoryx2 "No config file was loaded" warning. Cerulion uses
+        // iceoryx2's defaults intentionally — no custom config file is needed.
+        crate::iceoryx_logger::init_iceoryx_log_level_from_env();
 
-            // Every node this manager builds runs on a config with
-            // iceoryx2's automatic dead-node cleanup DISABLED (the same-PID cdylib
-            // reap defeat — see disable_auto_dead_node_cleanup). The shared-config
-            // arm pins the supervisor-minted config (multi-process workers); the
-            // default arm is byte-identical to NodeBuilder's own no-config path
-            // (Config::global_config()) — resolve_singleton_node_config disables
-            // the flags on either.
-            let shared_config = ix_config.is_some();
-            let ix_config = resolve_singleton_node_config(ix_config);
-            let node = NodeBuilder::new()
-                .name(&node_name)
-                .config(&ix_config)
-                .create::<CerService>()
-                .expect("failed to create iceoryx2 node");
+        // Every node this manager builds runs on a config with
+        // iceoryx2's automatic dead-node cleanup DISABLED (the same-PID cdylib
+        // reap defeat — see disable_auto_dead_node_cleanup). The shared-config
+        // arm pins the supervisor-minted config (multi-process workers); the
+        // default arm is byte-identical to NodeBuilder's own no-config path
+        // (Config::global_config()) — resolve_singleton_node_config disables
+        // the flags on either.
+        let shared_config = ix_config.is_some();
+        let ix_config = resolve_singleton_node_config(ix_config);
+        // A failed creation returns before anything is installed, so the
+        // singleton stays unset and a later call, for example after
+        // `cerulion clean`, tries again.
+        let node = NodeBuilder::new()
+            .name(&node_name)
+            .config(&ix_config)
+            .create::<CerService>()
+            .map_err(|e| TransportError::NodeCreation {
+                node_name: config.node_name.clone(),
+                reason: format!("{e:?}"),
+            })?;
 
-            // Restore iceoryx2's crash-recovery reaping at the ONE moment
-            // it is safe — host init, before any cdylib is loaded, where the host
-            // linkage unit sees its own just-created node Alive via the
-            // same-UniqueProcessId fast path (runtime auto-reap stays off).
-            startup_dead_node_sweep(&ix_config);
+        // Restore iceoryx2's crash-recovery reaping at the ONE moment
+        // it is safe — host init, before any cdylib is loaded, where the host
+        // linkage unit sees its own just-created node Alive via the
+        // same-UniqueProcessId fast path (runtime auto-reap stays off).
+        startup_dead_node_sweep(&ix_config);
 
-            // Detect operator-set Linux configs (shmem THP, bounded
-            // RLIMIT_AS, near-exhausted vm.max_map_count) that break our
-            // oversize-freely SHM assumption and warn loudly. Linux-only,
-            // detect-and-warn only (never mutates a machine setting, never aborts);
-            // no-op off Linux. Cold path — runs once per process at init.
-            shm_guard::check_and_warn_shm_safety();
+        // Detect operator-set Linux configs (shmem THP, bounded
+        // RLIMIT_AS, near-exhausted vm.max_map_count) that break our
+        // oversize-freely SHM assumption and warn loudly. Linux-only,
+        // detect-and-warn only (never mutates a machine setting, never aborts);
+        // no-op off Linux. Cold path — runs once per process at init.
+        shm_guard::check_and_warn_shm_safety();
 
-            // Lifecycle bookkeeping (every process that builds a manager would
-            // otherwise print it): `debug!`.
-            tracing::debug!(
-                node_name = %config.node_name,
-                shared_config,
-                "transport manager initialized"
-            );
+        // Lifecycle bookkeeping (every process that builds a manager would
+        // otherwise print it): `debug!`.
+        tracing::debug!(
+            node_name = %config.node_name,
+            shared_config,
+            "transport manager initialized"
+        );
 
-            let network = config.network.map(|c| Arc::new(NetworkManager::new(c)));
+        let network = config.network.map(|c| Arc::new(NetworkManager::new(c)));
 
-            Arc::new_cyclic(|self_weak| Self {
-                node,
-                clock: config.clock,
-                subscriber_buffer_size: config.subscriber_buffer_size,
-                network,
-                bridge_mgr: Arc::new(TopicBridgeManager::new()),
-                degraded_warned: std::sync::Mutex::new(std::collections::HashSet::new()),
-                network_watch_started: std::sync::atomic::AtomicBool::new(false),
-                dynamic_egress: std::sync::Mutex::new(None),
-                dynamic_egress_create: std::sync::Mutex::new(()),
-                replay_sequence_seeds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
-                mirror_registry: std::sync::Mutex::new(None),
-                ingress_build: std::sync::Mutex::new(None),
-                self_weak: self_weak.clone(),
-            })
+        let manager = Arc::new_cyclic(|self_weak| Self {
+            node,
+            clock: config.clock,
+            subscriber_buffer_size: config.subscriber_buffer_size,
+            network,
+            bridge_mgr: Arc::new(TopicBridgeManager::new()),
+            degraded_warned: std::sync::Mutex::new(std::collections::HashSet::new()),
+            network_watch_started: std::sync::atomic::AtomicBool::new(false),
+            dynamic_egress: std::sync::Mutex::new(None),
+            dynamic_egress_create: std::sync::Mutex::new(()),
+            replay_sequence_seeds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            mirror_registry: std::sync::Mutex::new(None),
+            ingress_build: std::sync::Mutex::new(None),
+            self_weak: self_weak.clone(),
         });
-        Ok(Arc::clone(manager))
+        // `INSTANCE` is still unset: this call holds `INSTANCE_INIT`, and
+        // only a holder of it installs a manager.
+        Ok(Arc::clone(INSTANCE.get_or_init(|| manager)))
     }
 
     /// Initialize with default configuration.
@@ -3150,7 +3172,10 @@ impl TransportManager {
             .name(&node_name)
             .config(&ix_config)
             .create::<CerService>()
-            .expect("failed to create iceoryx2 node for test");
+            .map_err(|e| TransportError::NodeCreation {
+                node_name: config.node_name.clone(),
+                reason: format!("{e:?}"),
+            })?;
 
         // Mirror `init()`: surface SHM-safety warnings once per
         // per-test manager (Linux-only; no-op off Linux).
