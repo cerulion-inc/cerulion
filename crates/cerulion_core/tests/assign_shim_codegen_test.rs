@@ -219,6 +219,7 @@ fn signal_schema() -> MessageSchema {
             schema_name: "Child".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     )); // complex variable
     s
@@ -918,6 +919,7 @@ fn fixed_nested_sugar_emission_pins() {
                 alignment: 8,
                 target_hash: 0xBEEF,
             }),
+            target_hash: None,
         },
     ));
     let code = generate_schema(&s);
@@ -938,6 +940,7 @@ fn fixed_nested_sugar_emission_pins() {
             schema_name: "Child".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     let kcode = generate_schema(&k);
@@ -958,6 +961,7 @@ fn with_accessor_name_collision_is_caught() {
             schema_name: "Child".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     let code = generate_schema(&s);
@@ -1207,6 +1211,7 @@ fn keyword_nested_child_leaf_shim_is_r_hash_stripped() {
             schema_name: "Shape".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     let pcode = generate_schema(&parent);

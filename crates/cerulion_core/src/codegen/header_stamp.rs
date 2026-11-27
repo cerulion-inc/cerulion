@@ -463,6 +463,7 @@ mod tests {
                     schema_name: "Leaf".to_string(),
                     package: None,
                     fixed: None,
+                    target_hash: None,
                 }),
                 length: usize::MAX / 4,
             },

@@ -1716,6 +1716,7 @@ mod tests {
             schema_name: name.to_string(),
             package: Some(pkg.to_string()),
             fixed: None,
+            target_hash: None,
         }
     }
 

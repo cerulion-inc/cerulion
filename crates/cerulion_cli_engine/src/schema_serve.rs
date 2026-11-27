@@ -1546,6 +1546,7 @@ acme/Gizmo gizmo
                     schema_name: "Node".to_string(),
                     package: Some("acme".to_string()),
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
@@ -1560,6 +1561,7 @@ acme/Gizmo gizmo
                 schema_name: "Node".to_string(),
                 package: Some("acme".to_string()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         assert_eq!(deps_of(&other, &served), vec!["acme/Node".to_string()]);

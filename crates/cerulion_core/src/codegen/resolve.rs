@@ -430,6 +430,7 @@ impl Resolver {
                             schema_name: schema_name.clone(),
                             package: package.clone(),
                             fixed: Some(child.into()),
+                            target_hash: None,
                         };
                     }
                 }
@@ -470,6 +471,7 @@ impl Resolver {
                 schema_name,
                 package,
                 fixed,
+                ..
             } => match self.lookup(package, schema_name, parent_package) {
                 Ok(found) => {
                     if found.cross_package_bare {
@@ -730,6 +732,7 @@ impl ComposedSizeProbe<'_> {
                             alignment: align,
                             target_hash: 0,
                         }),
+                        target_hash: None,
                     },
                     ComposedClass::NotInlinable | ComposedClass::Overflow => {
                         *fixed = false;
@@ -757,6 +760,7 @@ mod tests {
             schema_name: name.to_string(),
             package: package.map(|s| s.to_string()),
             fixed: None,
+            target_hash: None,
         }
     }
 
