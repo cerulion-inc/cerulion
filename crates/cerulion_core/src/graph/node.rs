@@ -2298,6 +2298,19 @@ impl NodeContext {
         self.node_id = Some(node_id);
     }
 
+    /// Graph node id stamped by `GraphRuntime::build_with_scheduler` before
+    /// `init()`, when present. Not part of the user API.
+    pub(crate) fn node_id(&self) -> Option<&str> {
+        self.node_id.as_deref()
+    }
+
+    /// Test-only setter for `node_id` on contexts built outside `GraphRuntime`.
+    // hot-path-alloc-ok-fn: test-only node identity setup
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_node_id_for_test(&mut self, node_id: impl Into<String>) {
+        self.node_id = Some(node_id.into());
+    }
+
     /// Declare this context's teardown reconciliation line already surfaced,
     /// so a runtime that will never run prints none.
     ///

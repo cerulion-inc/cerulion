@@ -7485,9 +7485,10 @@ impl GraphRuntime {
                 precreated_services.push(transport.precreate_topic_services(&flow.topic, cfg)?);
             }
         }
-        // topic → outstanding counters to register on that topic's publisher.
-        let mut pub_block_by_topic: HashMap<String, Vec<crate::credit::CreditWord>> =
-            HashMap::new();
+        // topic -> (outstanding counter, consumer node, consumer input) entries
+        // to register on that topic's publisher.
+        type PubBlockRegistration = (crate::credit::CreditWord, Arc<str>, Arc<str>);
+        let mut pub_block_by_topic: HashMap<String, Vec<PubBlockRegistration>> = HashMap::new();
         // (consumer node, input) → that consumer's outstanding counter.
         // `block`: consumer (node,input) → (outstanding mirror,
         // defer threshold, shared counters) — everything the consumer's
@@ -7721,7 +7722,11 @@ impl GraphRuntime {
                 pub_block_by_topic
                     .entry(flow.topic.clone())
                     .or_default()
-                    .push(outstanding.clone());
+                    .push((
+                        outstanding.clone(),
+                        Arc::from(edge.node_id.as_str()),
+                        Arc::from(edge.input.as_str()),
+                    ));
                 sub_block_by_input.insert(
                     (edge.node_id.clone(), edge.input.clone()),
                     (outstanding.clone(), threshold as u64, Arc::clone(&counters)),
@@ -8003,7 +8008,11 @@ impl GraphRuntime {
                 pub_block_by_topic
                     .entry(binding.topic.clone())
                     .or_default()
-                    .push(word.clone());
+                    .push((
+                        word.clone(),
+                        Arc::from(binding.consumer_node.as_str()),
+                        Arc::from(binding.consumer_input.as_str()),
+                    ));
                 // Each producer of the edge publishes through its own
                 // connection into the consumer's input (at most 16, so the
                 // count fits a `u32`). Only this half publishes, so only this
@@ -8379,8 +8388,12 @@ impl GraphRuntime {
                              history_size = 0."
                         );
                     }
-                    for ctr in counters {
-                        publisher.register_block_outstanding(ctr.clone());
+                    for (ctr, consumer_node, consumer_input) in counters {
+                        publisher.register_block_outstanding(
+                            ctr.clone(),
+                            Arc::clone(consumer_node),
+                            Arc::clone(consumer_input),
+                        );
                     }
                 }
                 // Wire this output's `promise_within_ms`

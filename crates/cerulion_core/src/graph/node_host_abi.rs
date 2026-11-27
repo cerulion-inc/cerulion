@@ -25,6 +25,17 @@ use crate::wire::WireHeader;
 use super::node::{AnyPublisher, NodeContext};
 use cerulion_node_abi as abi;
 
+/// Cold diagnostic detail for [`HostServiceError::DuplicateBlockCommit`], boxed
+/// so `Result<_, HostServiceError>` stays small on every host callback hot path.
+#[derive(Debug)]
+pub struct DuplicateBlockCommitDetail {
+    pub node_id: String,
+    pub output: String,
+    pub topic: String,
+    pub consumer_node: String,
+    pub consumer_input: String,
+}
+
 /// A host service refusal; all contained Rust values remain host-local.
 #[derive(Debug)]
 pub enum HostServiceError {
@@ -54,6 +65,8 @@ pub enum HostServiceError {
     MissingCapability,
     /// Canonical host-owned accumulator capture/restore failure.
     State(crate::state::StateError),
+    /// A second commit on one output in one fire when the topic has a `block` consumer.
+    DuplicateBlockCommit(Box<DuplicateBlockCommitDetail>),
 }
 
 impl From<LeaseError> for HostServiceError {
@@ -93,8 +106,11 @@ struct BoundPort {
     busy: bool,
     accumulated_borrows: usize,
     offered_this_fire: bool,
+    committed_this_fire: bool,
+    duplicate_block_commit_this_fire: bool,
     observed_frames: Box<[bool]>,
     diagnostics: crate::transport::failure_regime_latch::FailureRegimeLatch,
+    duplicate_block_commits: crate::transport::failure_regime_latch::FailureRegimeLatch,
     // Cold, borrowed nested-flush diagnostic copied until its own terminal.
     pending_nested_error: Option<String>,
 }
@@ -213,6 +229,9 @@ pub struct HostContext {
     native: NodeContext,
     ports: Box<[BoundPort]>,
     call_thread: Option<std::thread::ThreadId>,
+    // Open from `begin_fire` until the tick's node call ends; the per-fire
+    // `block` commit limit applies only inside it, never in init or shutdown.
+    fire_open: bool,
     environment: Arc<HashMap<String, String>>,
     counters: HostLeaseCounters,
     terminal: bool,
@@ -241,6 +260,7 @@ impl HostContext {
             return Err(HostServiceError::InvalidState);
         }
         self.call_thread = None;
+        self.fire_open = false;
         Ok(())
     }
     fn require_node_call(&self) -> Result<(), HostServiceError> {
@@ -412,9 +432,13 @@ impl HostContext {
                         busy: false,
                         accumulated_borrows: 0,
                         offered_this_fire: false,
+                        committed_this_fire: false,
+                        duplicate_block_commit_this_fire: false,
                         observed_frames,
                         pending_nested_error: None,
                         diagnostics:
+                            crate::transport::failure_regime_latch::FailureRegimeLatch::new(),
+                        duplicate_block_commits:
                             crate::transport::failure_regime_latch::FailureRegimeLatch::new(),
                     }
                 })
@@ -422,6 +446,7 @@ impl HostContext {
                 .into_boxed_slice(),
             raw,
             call_thread: None,
+            fire_open: false,
             environment,
             counters: HostLeaseCounters::default(),
             terminal: false,
@@ -527,10 +552,29 @@ impl HostContext {
     /// once before each user tick; retained leases never prevent a fire.
     pub fn begin_fire(&mut self) -> Result<(), HostServiceError> {
         self.admit()?;
+        let node_id = self.native.node_id().unwrap_or("<unknown>");
         for bound in &mut self.ports {
             bound.offered_this_fire = false;
             bound.observed_frames.fill(false);
+            if bound.committed_this_fire && !bound.duplicate_block_commit_this_fire {
+                if let Some(suppressed) = bound.duplicate_block_commits.on_success() {
+                    let topic = match self.native.publisher(&bound.spec.name) {
+                        Some(AnyPublisher::Ipc(publisher)) => publisher.topic(),
+                        None => bound.spec.name.as_str(),
+                    };
+                    tracing::info!(
+                        node_id = %node_id,
+                        output = %bound.spec.name,
+                        topic = %topic,
+                        suppressed_count = suppressed,
+                        "duplicate block commit refusal recovered"
+                    );
+                }
+            }
+            bound.committed_this_fire = false;
+            bound.duplicate_block_commit_this_fire = false;
         }
+        self.fire_open = true;
         Ok(())
     }
 
@@ -802,6 +846,10 @@ impl HostContext {
         if suppressed {
             return Ok(());
         }
+        if let Some(error) = self.check_duplicate_block_commit(index)? {
+            drop(loan);
+            return Err(error);
+        }
         let next_count = self
             .counters
             .committed
@@ -809,6 +857,7 @@ impl HostContext {
             .ok_or(LeaseError::GenerationExhausted)?;
         let publisher = self.output_publisher(index)?;
         publisher.commit_plugin_frame(loan, header, total_size)?;
+        self.ports[index].committed_this_fire = true;
         self.counters.committed = next_count;
         Ok(())
     }
@@ -861,6 +910,9 @@ impl HostContext {
             return Err(LeaseError::InvalidHandle.into());
         };
         *spill_attempted = true;
+        if let Some(error) = self.check_duplicate_block_commit(index)? {
+            return Err(error);
+        }
         let next_count = self
             .counters
             .committed
@@ -873,6 +925,7 @@ impl HostContext {
             .ok_or(LeaseError::GenerationExhausted)?;
         self.output_publisher(index)?
             .commit_plugin_spill(header, payload)?;
+        self.ports[index].committed_this_fire = true;
         self.counters.committed = next_count;
         self.counters.spills = next_spills;
         Ok(())
@@ -1364,6 +1417,7 @@ impl HostContext {
     pub fn revoke(&mut self) {
         self.terminal = true;
         self.call_thread = None;
+        self.fire_open = false;
         let native = &mut self.native;
         let ports = &self.ports;
         let counters = &mut self.counters;
@@ -1397,7 +1451,87 @@ impl HostContext {
         for port in &mut self.ports {
             port.busy = false;
             port.accumulated_borrows = 0;
+            port.committed_this_fire = false;
+            port.duplicate_block_commit_this_fire = false;
         }
+    }
+
+    fn check_duplicate_block_commit(
+        &mut self,
+        index: usize,
+    ) -> Result<Option<HostServiceError>, HostServiceError> {
+        if !self.ports[index].committed_this_fire || !self.fire_open {
+            return Ok(None);
+        }
+        if self.output_publisher(index)?.block_consumer().is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.build_duplicate_block_commit_refusal(index)?))
+    }
+
+    #[cold]
+    // hot-path-alloc-ok-fn: duplicate block commit refusal allocates diagnostic strings only on the cold error path
+    fn build_duplicate_block_commit_refusal(
+        &mut self,
+        index: usize,
+    ) -> Result<HostServiceError, HostServiceError> {
+        use crate::transport::failure_regime_latch::RegimeDecision;
+        let node_id = self.native.node_id().unwrap_or("<unknown>").to_owned();
+        let output = self.ports[index].spec.name.clone();
+        let (topic, consumer_node, consumer_input) = {
+            let publisher = self.output_publisher(index)?;
+            let Some((consumer_node, consumer_input)) = publisher.block_consumer() else {
+                return Err(HostServiceError::InvalidDescriptor);
+            };
+            (
+                publisher.topic().to_owned(),
+                consumer_node.to_owned(),
+                consumer_input.to_owned(),
+            )
+        };
+        let bound = &mut self.ports[index];
+        bound.duplicate_block_commit_this_fire = true;
+        let decision = bound.duplicate_block_commits.on_failure();
+        let total = bound.duplicate_block_commits.total_failures();
+        match decision {
+            RegimeDecision::Loud => tracing::warn!(
+                node_id = %node_id,
+                output = %output,
+                topic = %topic,
+                consumer_node = %consumer_node,
+                consumer_input = %consumer_input,
+                total_failures = total,
+                "refused duplicate commit on block topic in a single fire"
+            ),
+            RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+                node_id = %node_id,
+                output = %output,
+                topic = %topic,
+                consumer_node = %consumer_node,
+                consumer_input = %consumer_input,
+                total_failures = total,
+                suppressed_count = suppressed,
+                "still refusing duplicate commits on block topic in a single fire"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                node_id = %node_id,
+                output = %output,
+                topic = %topic,
+                consumer_node = %consumer_node,
+                consumer_input = %consumer_input,
+                suppressed_count = suppressed,
+                "duplicate block commit refusal suppressed"
+            ),
+        }
+        Ok(HostServiceError::DuplicateBlockCommit(Box::new(
+            DuplicateBlockCommitDetail {
+                node_id,
+                output,
+                topic,
+                consumer_node,
+                consumer_input,
+            },
+        )))
     }
 
     fn admit(&self) -> Result<(), HostServiceError> {
@@ -1490,6 +1624,20 @@ fn write_diagnostic(
         }
         HostServiceError::UnboundOutput(name) => {
             write!(target, "output port '{name}' is not wired in the graph")
+        }
+        HostServiceError::DuplicateBlockCommit(detail) => {
+            let DuplicateBlockCommitDetail {
+                node_id,
+                output,
+                topic,
+                consumer_node,
+                consumer_input,
+            } = detail.as_ref();
+            write!(
+                target,
+                "node '{node_id}' output '{output}' on topic '{topic}' already committed a frame in this fire; \
+                 block consumer '{consumer_node}.{consumer_input}' allows at most one commit per output per fire"
+            )
         }
         other => write!(target, "{other:?}"),
     }
@@ -1692,9 +1840,8 @@ fn classify_failure(error: &HostServiceError, error_token: u64) -> HostCallFailu
         | HostServiceError::Lease(LeaseError::InvalidBudget | LeaseError::InvalidTransition) => 5,
         HostServiceError::InvalidState => abi::status_code::INVALID_STATE,
         HostServiceError::DestroyBusy => abi::status_code::BUSY,
-        HostServiceError::Lease(LeaseError::BudgetExhausted | LeaseError::GenerationExhausted) => {
-            abi::status_code::FAILED
-        }
+        HostServiceError::Lease(LeaseError::BudgetExhausted | LeaseError::GenerationExhausted)
+        | HostServiceError::DuplicateBlockCommit(_) => abi::status_code::FAILED,
     };
     let kind = match error {
         HostServiceError::Transport(error) => error.node_error_kind().map_or(0, |kind| kind.code()),
@@ -2631,6 +2778,16 @@ mod tests {
             (HostServiceError::Panicked, 3),
             (HostServiceError::MissingCapability, 7),
             (HostServiceError::Terminal, 4),
+            (
+                HostServiceError::DuplicateBlockCommit(Box::new(DuplicateBlockCommitDetail {
+                    node_id: "producer".into(),
+                    output: "out".into(),
+                    topic: "bp/out".into(),
+                    consumer_node: "consumer".into(),
+                    consumer_input: "inp".into(),
+                })),
+                2,
+            ),
         ] {
             assert_eq!(
                 classify_failure(&error, 13),
@@ -2649,5 +2806,404 @@ mod tests {
             classify_failure(&HostServiceError::Transport(error), 13).status,
             2
         );
+        // Exact diagnostic bytes for DuplicateBlockCommit through copy_context_diagnostic.
+        let handle = register_context(clock_context(0)).unwrap();
+        let failure = with_context::<()>(handle, |_| {
+            Err(HostServiceError::DuplicateBlockCommit(Box::new(
+                DuplicateBlockCommitDetail {
+                    node_id: "producer".into(),
+                    output: "out".into(),
+                    topic: "bp/out".into(),
+                    consumer_node: "consumer".into(),
+                    consumer_input: "inp".into(),
+                },
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(failure.status, abi::status_code::FAILED);
+        let expected = b"node 'producer' output 'out' on topic 'bp/out' already committed a frame in this fire; block consumer 'consumer.inp' allows at most one commit per output per fire";
+        let mut buf = [0u8; 256];
+        let written = copy_context_diagnostic(handle, failure.error_token, &mut buf).unwrap();
+        assert_eq!(&buf[..written], expected);
+        remove_context(handle).unwrap();
+    }
+
+    #[test]
+    fn duplicate_block_commit_refused_in_commit_output_and_submit_spill() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let transport = crate::testing::TestTransport::new();
+        let mut publisher = transport.publisher(
+            "abi/block/dup",
+            crate::wire::MaxSliceLen::const_new(4096),
+            0,
+        );
+        let word = crate::credit::CreditWord::local(4);
+        publisher.register_block_outstanding_named_for_test(word.clone(), "consumer", "inp");
+        let suppressed = Arc::new(AtomicBool::new(false));
+        publisher.set_replay_suppress(Arc::clone(&suppressed));
+        let mut subscriber = transport.subscriber("abi/block/dup");
+        let layout = PluginWireLayout {
+            schema_hash: 0x1122_3344_5566_7788,
+            fixed_size: 0,
+            variable_fields: 1,
+            alignment: crate::shm_runtime::FRAME_ALIGN as u32,
+        };
+        let env = Arc::new(HashMap::new());
+        let mut native = NodeContext::with_runtime_env(
+            IndexMap::from([("out".to_string(), AnyPublisher::Ipc(publisher))]),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::clone(&env),
+        );
+        native.set_node_id_for_recon("raw_relay".to_string());
+        let host = HostContext::new(
+            native,
+            vec![HostPortSpec {
+                name: "out".into(),
+                direction: LeaseDirection::Write,
+                layout,
+                read_mode: 0,
+                accumulate_cap: None,
+            }],
+            env,
+            2,
+        )
+        .unwrap();
+        let handle = register_context(host).unwrap();
+        let port = with_context(handle, |host| {
+            host.bind_port(handle, 0, layout.schema_hash, LeaseDirection::Write)
+        })
+        .unwrap();
+
+        let expected_diag = "node 'raw_relay' output 'out' on topic 'abi/block/dup' already committed a frame in this fire; block consumer 'consumer.inp' allows at most one commit per output per fire";
+        let read_diag = |token: u64| -> String {
+            let mut buf = [0u8; 256];
+            let len = copy_context_diagnostic(handle, token, &mut buf).unwrap();
+            String::from_utf8(buf[..len].to_vec()).unwrap()
+        };
+
+        // Warm up AdaptiveSizer with small frames across distinct fires so later
+        // loans have capacity < 3040 and exercise the real submit_spill path.
+        let warmup = crate::transport::adaptive_sizer::WINDOW_SIZE as u64;
+        for seq in 0..warmup {
+            with_context(handle, HostContext::begin_fire).unwrap();
+            let loan = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+            with_context(handle, |host| {
+                host.commit_output(handle, port, loan.lease, 48)
+            })
+            .unwrap();
+            let view = subscriber
+                .view_raw_expecting(layout.schema_hash)
+                .unwrap()
+                .expect("warmup frame delivered");
+            assert_eq!(view.header().sequence, seq as u32);
+            drop(view);
+            word.record_drained(1);
+        }
+        assert_eq!(word.outstanding(), 0);
+        let mut expected_committed = warmup;
+        let mut expected_seq = warmup as u32;
+
+        // (a) + (b): First commit_output succeeds; second commit_output in the
+        // same fire is refused with DuplicateBlockCommit, burns no sequence,
+        // does not bump outstanding, and delivers nothing.
+        with_context(handle, HostContext::begin_fire).unwrap();
+        let first = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        assert!(first.capacity < 3040, "sizer must shrink below spill size");
+        // SAFETY: `first.data` is an exclusive live host loan of at least 56 bytes.
+        unsafe {
+            let buf = std::slice::from_raw_parts_mut(first.data, 56);
+            buf[40..44].copy_from_slice(&8u32.to_le_bytes());
+            buf[44..48].copy_from_slice(&8u32.to_le_bytes());
+            buf[48..56].copy_from_slice(b"frame-01");
+        }
+        with_context(handle, |host| {
+            host.commit_output(handle, port, first.lease, 56)
+        })
+        .unwrap();
+        expected_committed += 1;
+        assert_eq!(word.outstanding(), 1);
+
+        let second = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        // SAFETY: `second.data` is an exclusive live host loan of at least 56 bytes.
+        unsafe {
+            let buf = std::slice::from_raw_parts_mut(second.data, 56);
+            buf[40..44].copy_from_slice(&8u32.to_le_bytes());
+            buf[44..48].copy_from_slice(&8u32.to_le_bytes());
+            buf[48..56].copy_from_slice(b"frame-02");
+        }
+        let failure = with_context(handle, |host| {
+            host.commit_output(handle, port, second.lease, 56)
+        })
+        .unwrap_err();
+        assert_eq!(failure.status, abi::status_code::FAILED);
+        assert_eq!(read_diag(failure.error_token), expected_diag);
+        assert_eq!(
+            with_context(handle, |host| Ok(host.outstanding_leases())),
+            Ok(0)
+        );
+        assert_eq!(
+            with_context(handle, |host| Ok(host.counters().committed)),
+            Ok(expected_committed)
+        );
+        assert_eq!(word.outstanding(), 1);
+
+        // (c): Second commit via submit_spill + SpillRelease in the same fire
+        // is also refused cleanly with zero invariant drops or discards.
+        let mut spill_payload = vec![0u8; 3000];
+        spill_payload[0..4].copy_from_slice(&8u32.to_le_bytes());
+        spill_payload[4..8].copy_from_slice(&2992u32.to_le_bytes());
+        spill_payload[8..].fill(0x5a);
+        let third = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        assert!(third.capacity < 3040);
+        let spill_failure = with_context(handle, |host| {
+            host.submit_spill(handle, port, third.lease, &spill_payload, 3040)
+        })
+        .unwrap_err();
+        assert_eq!(spill_failure.status, abi::status_code::FAILED);
+        assert_eq!(read_diag(spill_failure.error_token), expected_diag);
+        with_context(handle, |host| {
+            host.discard_output(handle, port, third.lease, HostDiscardReason::SpillRelease)
+        })
+        .unwrap();
+        assert_eq!(
+            with_context(handle, |host| Ok(host.outstanding_leases())),
+            Ok(0)
+        );
+        assert_eq!(
+            with_context(handle, |host| Ok(host.invariant_failures())),
+            Ok(0)
+        );
+        assert_eq!(
+            with_context(handle, |host| Ok(host.counters())),
+            Ok(HostLeaseCounters {
+                committed: expected_committed,
+                discarded: 0,
+                released: 0,
+                spills: 0,
+            })
+        );
+        assert_eq!(word.outstanding(), 1);
+
+        // Only frame 1 arrived on the subscriber, with exact hand-written bytes.
+        let delivered = subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .expect("first frame delivered");
+        assert_eq!(delivered.header().sequence, expected_seq);
+        assert_eq!(&delivered[48..56], b"frame-01");
+        drop(delivered);
+        assert!(subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .is_none());
+        word.record_drained(1);
+        expected_seq += 1;
+
+        // (h): Replay suppression still releases storage cleanly even after a
+        // first commit in the same fire.
+        suppressed.store(true, Ordering::Relaxed);
+        let sup_loan = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.commit_output(handle, port, sup_loan.lease, 48)
+        })
+        .unwrap();
+        let sup_spill = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.submit_spill(handle, port, sup_spill.lease, &[], 0)
+        })
+        .unwrap();
+        with_context(handle, |host| {
+            host.discard_output(
+                handle,
+                port,
+                sup_spill.lease,
+                HostDiscardReason::SpillRelease,
+            )
+        })
+        .unwrap();
+        suppressed.store(false, Ordering::Relaxed);
+        assert_eq!(word.outstanding(), 0);
+
+        // (d) + (g): Next fire resets the guard. A successful submit_spill sets
+        // the guard, so a second normal commit_output in the same fire is refused.
+        with_context(handle, HostContext::begin_fire).unwrap();
+        let spill_ok = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        assert!(spill_ok.capacity < 3040);
+        with_context(handle, |host| {
+            host.submit_spill(handle, port, spill_ok.lease, &spill_payload, 3040)
+        })
+        .unwrap();
+        with_context(handle, |host| {
+            host.discard_output(
+                handle,
+                port,
+                spill_ok.lease,
+                HostDiscardReason::SpillRelease,
+            )
+        })
+        .unwrap();
+        expected_committed += 1;
+        assert_eq!(word.outstanding(), 1);
+        let after_spill = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        let after_spill_err = with_context(handle, |host| {
+            host.commit_output(handle, port, after_spill.lease, 48)
+        })
+        .unwrap_err();
+        assert_eq!(after_spill_err.status, abi::status_code::FAILED);
+        assert_eq!(read_diag(after_spill_err.error_token), expected_diag);
+        assert_eq!(word.outstanding(), 1);
+        let spill_view = subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .expect("spill frame delivered");
+        assert_eq!(spill_view.header().sequence, expected_seq);
+        assert_eq!(spill_view.len(), 3040);
+        assert_eq!(&spill_view[48..56], &[0x5a; 8]);
+        drop(spill_view);
+        assert!(subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .is_none());
+        word.record_drained(1);
+        expected_seq += 1;
+
+        // (e): A discarded loan before a first commit does not trip the guard.
+        with_context(handle, HostContext::begin_fire).unwrap();
+        let discarded = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.discard_output(handle, port, discarded.lease, HostDiscardReason::TickFailed)
+        })
+        .unwrap();
+        let after_discard = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.commit_output(handle, port, after_discard.lease, 48)
+        })
+        .unwrap();
+        expected_committed += 1;
+        assert_eq!(word.outstanding(), 1);
+        let v = subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .expect("commit after discard delivered");
+        assert_eq!(v.header().sequence, expected_seq);
+        drop(v);
+        word.record_drained(1);
+        expected_seq += 1;
+
+        // (f): A failed first send does not trip the guard; a retry in the same
+        // fire succeeds.
+        with_context(handle, HostContext::begin_fire).unwrap();
+        with_context(handle, |host| {
+            host.with_native(|native| {
+                let Some(AnyPublisher::Ipc(publisher)) = native.publisher_mut("out") else {
+                    panic!("output remains bound");
+                };
+                publisher.set_block_send_hook_for_test(
+                    crate::transport::publisher::BlockSendHook::FailNextSend,
+                );
+            })
+        })
+        .unwrap();
+        let failed_first = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        let send_err = with_context(handle, |host| {
+            host.commit_output(handle, port, failed_first.lease, 48)
+        })
+        .unwrap_err();
+        assert_eq!(send_err.status, abi::status_code::FAILED);
+        assert_eq!(word.outstanding(), 0);
+        // The failed send consumed sequence `expected_seq` inside commit_plugin_frame.
+        expected_seq += 1;
+        let retry = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.commit_output(handle, port, retry.lease, 48)
+        })
+        .unwrap();
+        expected_committed += 1;
+        assert_eq!(word.outstanding(), 1);
+        let retry_view = subscriber
+            .view_raw_expecting(layout.schema_hash)
+            .unwrap()
+            .expect("retry after failed send delivered");
+        assert_eq!(retry_view.header().sequence, expected_seq);
+        drop(retry_view);
+        word.record_drained(1);
+
+        assert_eq!(
+            with_context(handle, |host| Ok(host.counters().committed)),
+            Ok(expected_committed)
+        );
+        assert_eq!(
+            with_context(handle, |host| Ok(host.invariant_failures())),
+            Ok(0)
+        );
+        assert_eq!(
+            with_context(handle, |host| Ok(host.ports[0]
+                .duplicate_block_commits
+                .total_failures())),
+            Ok(3)
+        );
+        remove_context(handle).unwrap();
+    }
+
+    #[test]
+    fn duplicate_block_commit_uses_unknown_fallback_when_node_id_is_unset() {
+        let transport = crate::testing::TestTransport::new();
+        let mut publisher =
+            transport.publisher("abi/block/anon", crate::wire::MaxSliceLen::const_new(64), 0);
+        let word = crate::credit::CreditWord::local(1);
+        publisher.register_block_outstanding_named_for_test(word, "sink", "data");
+        let layout = PluginWireLayout {
+            schema_hash: 0x1122_3344_5566_7788,
+            fixed_size: 24,
+            variable_fields: 0,
+            alignment: crate::shm_runtime::FRAME_ALIGN as u32,
+        };
+        let env = Arc::new(HashMap::new());
+        let native = NodeContext::with_runtime_env(
+            IndexMap::from([("out".to_string(), AnyPublisher::Ipc(publisher))]),
+            IndexMap::new(),
+            Arc::new(VirtualClock::new()),
+            ShutdownSignal::new(),
+            Arc::clone(&env),
+        );
+        let host = HostContext::new(
+            native,
+            vec![HostPortSpec {
+                name: "out".into(),
+                direction: LeaseDirection::Write,
+                layout,
+                read_mode: 0,
+                accumulate_cap: None,
+            }],
+            env,
+            2,
+        )
+        .unwrap();
+        let handle = register_context(host).unwrap();
+        let port = with_context(handle, |host| {
+            host.bind_port(handle, 0, layout.schema_hash, LeaseDirection::Write)
+        })
+        .unwrap();
+        with_context(handle, HostContext::begin_fire).unwrap();
+        let first = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        with_context(handle, |host| {
+            host.commit_output(handle, port, first.lease, 64)
+        })
+        .unwrap();
+        let second = with_context(handle, |host| host.loan_output(handle, port)).unwrap();
+        let failure = with_context(handle, |host| {
+            host.commit_output(handle, port, second.lease, 64)
+        })
+        .unwrap_err();
+        assert_eq!(failure.status, abi::status_code::FAILED);
+        let mut buf = [0u8; 256];
+        let len = copy_context_diagnostic(handle, failure.error_token, &mut buf).unwrap();
+        assert_eq!(
+            &buf[..len],
+            b"node '<unknown>' output 'out' on topic 'abi/block/anon' already committed a frame in this fire; block consumer 'sink.data' allows at most one commit per output per fire"
+        );
+        remove_context(handle).unwrap();
     }
 }
