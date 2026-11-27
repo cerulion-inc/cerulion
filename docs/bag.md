@@ -1335,7 +1335,9 @@ and the frame index and the schedule's fires take memory on top of that; raise `
 usage error (exit 2), and the flag without `--resim` is one too. It is legal
 with or without `--verify`. A separate bound of 200000 reads inside one step,
 a guard against a corrupt recorded run count, is not tunable, and raising the
-flag never raises it. A lockstep recording replays on its one gating clock,
+flag never raises it: a step over it is never expanded, and the rank's read log
+is declined as `verifier_declined_read_log_fold_run`, refused or stood down
+like a rank over the budget, with a re-record as the remedy. A lockstep recording replays on its one gating clock,
 plans no read from the bag and takes no census, so this budget does not limit
 its replay; the frames that attributing a `multi_publisher_topics` topic's
 frames to their writers needs, above, are bounded by the same flag and apply to
