@@ -63,6 +63,15 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
   longer binds in the set, and `WalkError::NestedResolutionFailed` a nested frame whose
   reference does not bind at walk time. A fixed section whose inlined size overflows
   `usize` is `LayoutError::FixedSectionOverflow`, and the walker leaves that schema out.
+- **Every bound reference carries its target's hash in exactly one stamp.** An inlined
+  target's hash is in `NestedFixedInfo::target_hash` (`fixed: Some`); every other bound
+  reference (a variable target, or any element under a `DynamicArray`) carries it in
+  `FieldType::Nested::target_hash`, and the two are never both set. The schema hash recipe
+  does not read `target_hash` yet. No stamp is written for an unbound reference, for a
+  reference inside a reference cycle (decided on the reference graph's strongly connected
+  components, never on input order; warned except for a schema's reference to itself), or
+  for a target whose fixed section cannot be sized (warned, never a panic). `WireLayout::to_json`
+  leaves the key out when it is empty.
 - `from_schemas` returns `Result` and preflights every build through three gates:
   declared fixed size, composed overflow via `composed_overflow_indices`, and
   resolved frame prefix ≤ `u32` for every layout a frame can reach, by name or by hash
