@@ -587,8 +587,16 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   the listed publishers whose owner node is not `Dead` when the gather starts, minus
   `own_writer` (`required_writers`); it reads the node list once and never reaps, and
   reads the publisher list on each pass, so a writer that leaves the list mid-gather
-  stops being required. No required writer: `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
-  names; a change takes new names.
+  stops being required. No required writer: `Settled` at once, no ring. A gather rings at
+  most once per drain pass (`next_pass`): again as soon as a pass brings a frame of a writer
+  that is not whole yet, with 1 ms between passes, else once every 20 ms; so a snapshot of many sends is
+  paced by the writer's answers, not by 20 ms per send. `RmwGraphGatherWindow` ends a
+  gather that has not settled after `idle` with no progress or at `limit` in all
+  (`time_left`); `fixed(d)` sets both to `d`. Static config and frame v1 are
+  fixed for the two service names; a change takes new names. The consumer is
+  `rmw_cerulion`: one writer per process
+  (`Runtime::graph_registry`, none in a replay) and one gather per
+  `rmw_get_topic_names_and_types` (`docs/internals/rmw.md`).
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally

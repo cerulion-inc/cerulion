@@ -25,11 +25,11 @@ use std::time::{Duration, Instant};
 use cerulion_core::testing::{child_iceoryx_config, kill_child_holding_ports, IsolatedRoot};
 use cerulion_core::transport::dead_node_sweep::sweep_node_config;
 use cerulion_core::transport::rmw_graph_registry::{
-    decode_frame, encode_snapshot, GatherCompleteness, RmwGraphFrameError, RmwGraphGather,
-    RmwGraphGatherFold, RmwGraphWriter, MAX_RMW_GRAPH_TOPIC_LEN, MAX_RMW_GRAPH_TYPE_LEN,
-    RMW_GRAPH_DOORBELL_SERVICE_NAME, RMW_GRAPH_FRAME_LEN, RMW_GRAPH_MAX_NODES,
-    RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH,
-    RMW_GRAPH_REGISTRY_SERVICE_NAME,
+    decode_frame, encode_snapshot, send_budget, GatherCompleteness, RmwGraphFrameError,
+    RmwGraphGather, RmwGraphGatherFold, RmwGraphGatherWindow, RmwGraphWriter,
+    MAX_RMW_GRAPH_TOPIC_LEN, MAX_RMW_GRAPH_TYPE_LEN, RMW_GRAPH_DOORBELL_SERVICE_NAME,
+    RMW_GRAPH_FRAME_LEN, RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS,
+    RMW_GRAPH_QUEUE_DEPTH, RMW_GRAPH_REGISTRY_SERVICE_NAME,
 };
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::TransportError;
@@ -107,7 +107,9 @@ fn settled(rows: &[(&str, &[&str])]) -> RmwGraphGather {
 }
 
 fn gather(reader: &TransportManager, own: Option<u128>, window: Duration) -> RmwGraphGather {
-    reader.gather_rmw_graph(own, window).expect("gather")
+    reader
+        .gather_rmw_graph(own, RmwGraphGatherWindow::fixed(window))
+        .expect("gather")
 }
 
 #[test]
@@ -370,6 +372,113 @@ fn a_send_carries_its_share_of_half_a_queue_when_two_writers_are_listed() {
     );
 }
 
+/// The window of the big-snapshot tests: a bound that only a hang reaches.
+/// These tests pin that a writer that keeps answering is heard whole, which
+/// does not depend on how fast a loaded host schedules 64 pump threads, so no
+/// outcome here may hinge on a clock. How fast a gather rings again is pinned
+/// by the pure `next_pass` unit test in `rmw_graph_registry.rs`. The writers'
+/// own interval sends are held, so every send comes from a ring.
+const BIG_SNAPSHOT_WINDOW: RmwGraphGatherWindow = RmwGraphGatherWindow {
+    idle: Duration::from_secs(600),
+    limit: Duration::from_secs(600),
+};
+
+/// With sixteen writers listed, one send carries 4 parts, so the 129-part
+/// snapshot needs 33 sends, one per ring. The gather rings again as each send
+/// arrives and hears every writer whole.
+#[test]
+#[serial]
+fn a_snapshot_that_needs_33_sends_settles_whole() {
+    let root = IsolatedRoot::mint("rg_p");
+    let tm = manager("pace_w", &root.config());
+    let reader = manager("pace_r", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    let pairs = add_a_129_part_snapshot(&writer);
+    writer.hold_timed_sends_for_test(true);
+    let others: Vec<(Arc<TransportManager>, RmwGraphWriter)> = (0..15)
+        .map(|i| {
+            let other = manager(&format!("pace_{i:02}"), &root.config());
+            let other_writer = other.open_rmw_graph_writer();
+            other_writer
+                .add(&format!("/pace/{i:02}"), "pkg/msg/Pace")
+                .expect("pair");
+            other_writer.hold_timed_sends_for_test(true);
+            (other, other_writer)
+        })
+        .collect();
+    assert_eq!(
+        send_budget(others.len() + 1),
+        4,
+        "precondition: 4 parts a send"
+    );
+
+    let got = reader
+        .gather_rmw_graph(None, BIG_SNAPSHOT_WINDOW)
+        .expect("gather");
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
+    assert_eq!(got.topics.len(), 387 + 15);
+    for (topic, type_name) in &pairs {
+        assert_eq!(
+            got.topics.get(topic),
+            Some(&BTreeSet::from([type_name.clone()]))
+        );
+    }
+    for i in 0..15 {
+        assert_eq!(
+            got.topics.get(&format!("/pace/{i:02}")),
+            Some(&BTreeSet::from(["pkg/msg/Pace".to_string()]))
+        );
+    }
+}
+
+/// The widest legal graph: 64 writers listed, so one send carries 1 part and
+/// the 129-part snapshot needs 129 sends, one per ring. The gather lists every
+/// topic of every live writer.
+#[test]
+#[serial]
+fn a_snapshot_that_needs_129_sends_lists_every_topic_of_64_writers() {
+    let root = IsolatedRoot::mint("rg_w");
+    let tm = manager("wide_w", &root.config());
+    let reader = manager("wide_r", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    let pairs = add_a_129_part_snapshot(&writer);
+    writer.hold_timed_sends_for_test(true);
+    let others: Vec<(Arc<TransportManager>, RmwGraphWriter)> = (0..RMW_GRAPH_MAX_WRITERS - 1)
+        .map(|i| {
+            let other = manager(&format!("wide_{i:02}"), &root.config());
+            let other_writer = other.open_rmw_graph_writer();
+            other_writer
+                .add(&format!("/wide/{i:02}"), "pkg/msg/Wide")
+                .expect("pair");
+            other_writer.hold_timed_sends_for_test(true);
+            (other, other_writer)
+        })
+        .collect();
+    assert_eq!(
+        send_budget(others.len() + 1),
+        1,
+        "precondition: 1 part a send"
+    );
+
+    let got = reader
+        .gather_rmw_graph(None, BIG_SNAPSHOT_WINDOW)
+        .expect("gather");
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
+    assert_eq!(got.topics.len(), 387 + 63);
+    for (topic, type_name) in &pairs {
+        assert_eq!(
+            got.topics.get(topic),
+            Some(&BTreeSet::from([type_name.clone()]))
+        );
+    }
+    for i in 0..63 {
+        assert_eq!(
+            got.topics.get(&format!("/wide/{i:02}")),
+            Some(&BTreeSet::from(["pkg/msg/Wide".to_string()]))
+        );
+    }
+}
+
 /// A raw notifier on the doorbell the writers created.
 fn raw_doorbell_notifier(
     node: &iceoryx2::node::Node<Ipc>,
@@ -495,7 +604,7 @@ fn a_gather_with_every_reader_slot_taken_is_an_error_until_one_frees() {
         .map(|_| service.subscriber_builder().create().expect("hold a slot"))
         .collect();
 
-    match reader.gather_rmw_graph(None, SETTLE_WINDOW) {
+    match reader.gather_rmw_graph(None, RmwGraphGatherWindow::fixed(SETTLE_WINDOW)) {
         Err(TransportError::Internal { reason }) => assert!(
             reason.contains("could not create the gather subscriber"),
             "unexpected reason: {reason}"
@@ -640,7 +749,9 @@ fn a_failed_open_keeps_the_counts_and_opens_on_the_next_call() {
         .expect("pair");
     assert_eq!(writer.writer_id(), None, "the open was refused");
     assert!(
-        reader.gather_rmw_graph(None, SETTLE_WINDOW).is_err(),
+        reader
+            .gather_rmw_graph(None, RmwGraphGatherWindow::fixed(SETTLE_WINDOW))
+            .is_err(),
         "a gather cannot open the service either"
     );
 
@@ -711,7 +822,7 @@ fn hostile_frames_are_skipped_and_the_frames_after_them_still_count() {
             }
         })
     };
-    let got = reader.gather_rmw_graph(None, SETTLE_WINDOW);
+    let got = reader.gather_rmw_graph(None, RmwGraphGatherWindow::fixed(SETTLE_WINDOW));
     stop.store(true, Ordering::Relaxed);
     sender.join().expect("sender thread");
 
@@ -746,6 +857,75 @@ fn a_silent_peer_makes_the_gather_incomplete_and_keeps_what_was_heard() {
                 writers_heard: 1,
             },
         }
+    );
+}
+
+/// A peer that sends a part of a new generation every few milliseconds and
+/// never completes one keeps the gather past its idle bound, and the limit
+/// still ends it.
+#[test]
+#[serial]
+fn a_peer_that_never_completes_a_generation_is_cut_at_the_limit() {
+    const WINDOW: RmwGraphGatherWindow = RmwGraphGatherWindow {
+        idle: Duration::from_millis(150),
+        limit: Duration::from_millis(900),
+    };
+    let root = IsolatedRoot::mint("rg_t");
+    let tm = manager("churn_w", &root.config());
+    let reader = manager("churn_r", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    writer.add("/heard", "pkg/msg/Heard").expect("pair");
+
+    let node = raw_node(&root.config());
+    let service = raw_registry(&node);
+    let raw = service
+        .publisher_builder()
+        .initial_max_slice_len(RMW_GRAPH_FRAME_LEN)
+        .create()
+        .expect("raw publisher");
+    let raw_id = raw.id().value();
+    // The thread is joined before any assertion.
+    let stop = Arc::new(AtomicBool::new(false));
+    let sender = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut generation = 1u32;
+            while !stop.load(Ordering::Relaxed) {
+                // Part 0 of 2, empty; part 1 never comes.
+                let mut frame = encode_snapshot(raw_id, generation, [] as [(&str, &str); 0])
+                    .expect("encode")[0]
+                    .clone();
+                frame[26..28].copy_from_slice(&2u16.to_le_bytes());
+                let sample = raw.loan_slice_uninit(frame.len()).expect("loan");
+                sample.write_from_slice(&frame).send().expect("send");
+                generation += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    let started = Instant::now();
+    let got = reader.gather_rmw_graph(None, WINDOW).expect("gather");
+    let took = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    sender.join().expect("sender thread");
+
+    assert_eq!(
+        got,
+        RmwGraphGather {
+            topics: map(&[("/heard", &["pkg/msg/Heard"])]),
+            completeness: GatherCompleteness::Incomplete {
+                live_writers: 2,
+                writers_heard: 1,
+            },
+        }
+    );
+    assert!(
+        took >= WINDOW.limit - Duration::from_millis(50),
+        "new parts kept the gather past its idle bound (took {took:?})"
+    );
+    assert!(
+        took < WINDOW.limit + Duration::from_secs(1),
+        "the limit ended the gather (took {took:?})"
     );
 }
 
