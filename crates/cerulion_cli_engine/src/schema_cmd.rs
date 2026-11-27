@@ -219,7 +219,7 @@ fn schema_info_entries(
         }
         let hash = schema.schema_hash();
         // Parse-time layout (unresolved nested = variable, contributing
-        // nothing) — the same IR the hash above consumed. The hash and the
+        // nothing) - the same IR the hash above consumed. The hash and the
         // layout are both overwritten below with the canonically resolved
         // values where resolution succeeds.
         let wire_fixed_size = schema.wire_fixed_size();
