@@ -121,12 +121,16 @@ use cerulion_core::codegen::CdrCodec;
 use cerulion_core::graph::node_plugin_abi::RawIngress;
 #[cfg(test)]
 use cerulion_core::transport::TransportManager;
+// The shared flood-suppression machine (root AGENTS.md: new flood sites reuse
+// it). The bridge is the one example allowed past the prelude: it speaks DDS.
+use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 use cerulion_go2_dds::messages;
 use cerulion_go2_dds::participant::ParticipantConfig;
-use cerulion_go2_dds::ros2_client::rustdds::DataReaderStatus;
 use cerulion_go2_dds::ros2_client::rustdds::Subscriber as DdsSubscriber;
+use cerulion_go2_dds::ros2_client::rustdds::{DataReaderStatus, StatusEvented};
 use cerulion_go2_dds::ros2_client::{MessageTypeName, Name, Node, Subscription};
 use cerulion_go2_dds::{best_effort_qos, reliable_volatile_qos, Go2Participant};
+use futures::stream::FusedStream;
 use futures::{Stream, StreamExt};
 
 use crate::config::{BridgeConfig, QosMode, TopicMapping};
@@ -151,6 +155,11 @@ pub const BACKOFF_SLICE: Duration = Duration::from_millis(50);
 /// teardown (which itself joins its discovery + event-loop threads) yet short
 /// enough that node teardown never hangs a robot's stop sequence.
 pub const DRAIN_JOIN_DEADLINE: Duration = Duration::from_secs(5);
+/// How often the helper judges every raw route with
+/// [`evaluate_raw_route_health`] once the DDS side is up. The first check
+/// runs one period after the pump first sees it up, which leaves discovery
+/// that long to match every route.
+pub const RAW_ROUTE_HEALTH_PERIOD: Duration = Duration::from_secs(10);
 
 /// One iterate's outcome (the camera `CaptureLoop` contract): ring the
 /// doorbell iff samples were pushed since the previous iterate; sleep `pace`
@@ -717,6 +726,12 @@ pub struct BridgePump {
     /// (re)spawn registers its stop handle here; `iterate` reads `stopping` to
     /// no-op post-shutdown.
     shutdown_coord: Arc<PumpShutdown>,
+    /// When the next raw route health check is due; set one
+    /// [`RAW_ROUTE_HEALTH_PERIOD`] after the pump first sees the DDS side up.
+    next_health_check_at: Option<Instant>,
+    /// One silent-route latch per raw route, in [`PumpStats::raw_routes`]
+    /// order.
+    route_health_latches: Vec<FailureRegimeLatch>,
 }
 
 impl BridgePump {
@@ -730,6 +745,8 @@ impl BridgePump {
             dead_latch: FloodLatch::new(),
             transport: None,
             shutdown_coord: Arc::new(PumpShutdown::new()),
+            next_health_check_at: None,
+            route_health_latches: Vec::new(),
         }
     }
 
@@ -932,16 +949,51 @@ impl BridgePump {
                     pace: Some(BACKOFF_SLICE),
                 }
             }
-            PHASE_UP => PumpOutcome {
+            PHASE_UP => {
                 // Up: ring iff the drain thread pushed since the last iterate.
-                ring: drain.pushed.swap(false, Ordering::AcqRel),
-                pace: Some(POLL_PACE),
-            },
+                let ring = drain.pushed.swap(false, Ordering::AcqRel);
+                self.check_raw_route_health(now);
+                PumpOutcome {
+                    ring,
+                    pace: Some(POLL_PACE),
+                }
+            }
             _ => PumpOutcome {
                 // Unknown phase — defensive: treat as not-yet-up (never rings).
                 ring: false,
                 pace: Some(BACKOFF_SLICE),
             },
+        }
+    }
+}
+
+impl BridgePump {
+    /// Every [`RAW_ROUTE_HEALTH_PERIOD`] of injected time: judge each raw
+    /// route against its siblings and log the silent ones through their
+    /// latches. Helper-thread code, like the rest of [`Self::iterate`].
+    fn check_raw_route_health(&mut self, now: Instant) {
+        let due = *self
+            .next_health_check_at
+            .get_or_insert(now + RAW_ROUTE_HEALTH_PERIOD);
+        if now < due {
+            return;
+        }
+        self.next_health_check_at = Some(now + RAW_ROUTE_HEALTH_PERIOD);
+        let routes = self.stats.raw_routes();
+        let counts: Vec<RawRouteCounts> = routes.iter().map(|r| r.counts()).collect();
+        let verdicts = evaluate_raw_route_health(
+            &counts,
+            self.stats.samples_pushed_total.load(Ordering::Relaxed),
+        );
+        self.route_health_latches
+            .resize_with(routes.len(), FailureRegimeLatch::new);
+        for ((route, verdict), latch) in routes
+            .iter()
+            .zip(verdicts)
+            .zip(self.route_health_latches.iter_mut())
+        {
+            let log = route_health_log(verdict, latch);
+            log_route_health(route, verdict, log, latch.total_failures());
         }
     }
 }
@@ -1134,9 +1186,19 @@ async fn drain_raw_stream(
     let stream = reader
         .as_async_stream()
         .map(|r| r.map(|dcc| dcc.into_value()));
-    futures::pin_mut!(stream);
+    let statuses = reader.as_async_status_stream();
+    futures::pin_mut!(stream, statuses);
     let now_ns = || clock.now_ns();
-    let _route = drain_raw_from_stream(stream, route, &codec, &now_ns, &stats, &route_stats).await;
+    let _route = drain_raw_from_stream(
+        stream,
+        statuses,
+        route,
+        &codec,
+        &now_ns,
+        &stats,
+        &route_stats,
+    )
+    .await;
 }
 
 /// The raw drain loop over an ABSTRACT stream — the raw sibling of
@@ -1147,8 +1209,14 @@ async fn drain_raw_stream(
 /// (a hostile peer's frames must not flood the log) and NEVER burn a wire
 /// sequence (the route's commit rule). Returns the route so tests
 /// can inspect its counters.
-async fn drain_raw_from_stream<E, S>(
+///
+/// `statuses` is the reader's DDS status stream, polled FIRST on every turn
+/// so a writer match is counted before the samples it brings. Each event
+/// updates [`RawRouteStats`] and logs through [`classify_reader_status`];
+/// the loop still ends only when the SAMPLE stream ends.
+async fn drain_raw_from_stream<E, S, T>(
     mut stream: Pin<&mut S>,
+    mut statuses: Pin<&mut T>,
     mut route: RawIngressRoute,
     codec: &CdrCodec,
     now_ns: &dyn Fn() -> u64,
@@ -1156,7 +1224,8 @@ async fn drain_raw_from_stream<E, S>(
     route_stats: &RawRouteStats,
 ) -> RawIngressRoute
 where
-    S: Stream<Item = Result<RawSample, E>>,
+    S: Stream<Item = Result<RawSample, E>> + FusedStream,
+    T: Stream<Item = DataReaderStatus> + FusedStream,
     E: std::fmt::Debug,
 {
     let dds_topic = route_stats.dds_topic.as_str();
@@ -1165,9 +1234,33 @@ where
         .fetch_add(1, Ordering::Relaxed);
     let mut err_streak: u64 = 0;
     let mut route_latch = FloodLatch::new();
-    while let Some(result) = stream.next().await {
+    let mut status_latches = ReaderStatusLatches::default();
+    loop {
+        let next = futures::select_biased! {
+            status = statuses.next() => {
+                if let Some(status) = status {
+                    route_stats.record_status(&status);
+                    let class = classify_reader_status(&status, &mut status_latches);
+                    log_reader_status(route_stats, &status, class);
+                }
+                continue;
+            }
+            sample = stream.next() => sample,
+            complete => None,
+        };
+        let Some(result) = next else { break };
         match result {
             Ok(raw) => {
+                for (status, suppressed) in status_latches.on_sample().into_iter().flatten() {
+                    tracing::info!(
+                        dds_topic = %dds_topic,
+                        topic = %route_stats.cerulion_topic,
+                        status,
+                        suppressed,
+                        "dds_bridge pump: raw route received a sample after a loss or \
+                         rejection regime"
+                    );
+                }
                 if err_streak > 0 {
                     tracing::info!(
                         dds_topic = %dds_topic,
@@ -1253,6 +1346,275 @@ where
          is relaunched"
     );
     route
+}
+
+/// The flood latches for the reader status events that can repeat at the
+/// sample rate. A received sample closes the loss and rejection regimes; a
+/// QoS refusal has no success event, so its regime stays open and re-announces
+/// at each decade (the latch's own rule).
+#[derive(Debug, Default)]
+struct ReaderStatusLatches {
+    incompatible_qos: FailureRegimeLatch,
+    sample_lost: FailureRegimeLatch,
+    sample_rejected: FailureRegimeLatch,
+}
+
+impl ReaderStatusLatches {
+    /// A sample arrived: close the loss and rejection regimes. Returns the
+    /// regimes that closed with suppressed repeats, named for the log.
+    fn on_sample(&mut self) -> [Option<(&'static str, u64)>; 2] {
+        [
+            self.sample_lost.on_success().map(|n| ("sample_lost", n)),
+            self.sample_rejected
+                .on_success()
+                .map(|n| ("sample_rejected", n)),
+        ]
+    }
+}
+
+/// How one reader status event is logged; [`log_reader_status`] maps it to
+/// a level. Pure so the policy is testable without capturing logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderStatusClass {
+    /// A writer matched the reader (`info`).
+    WriterMatched,
+    /// A writer unmatched and others remain (`info`).
+    WriterUnmatched,
+    /// The last matched writer unmatched: the route receives nothing now
+    /// (`warn`).
+    LastWriterUnmatched,
+    /// A writer was refused for incompatible QoS.
+    IncompatibleQos(RegimeDecision),
+    /// rustdds reported lost samples.
+    SampleLost(RegimeDecision),
+    /// rustdds reported rejected samples.
+    SampleRejected(RegimeDecision),
+    /// Liveliness or deadline bookkeeping (`debug`).
+    Bookkeeping,
+}
+
+fn classify_reader_status(
+    status: &DataReaderStatus,
+    latches: &mut ReaderStatusLatches,
+) -> ReaderStatusClass {
+    match status {
+        DataReaderStatus::SubscriptionMatched { current, .. } => {
+            if current.count_change() >= 0 {
+                ReaderStatusClass::WriterMatched
+            } else if current.count() <= 0 {
+                ReaderStatusClass::LastWriterUnmatched
+            } else {
+                ReaderStatusClass::WriterUnmatched
+            }
+        }
+        DataReaderStatus::RequestedIncompatibleQos { .. } => {
+            ReaderStatusClass::IncompatibleQos(latches.incompatible_qos.on_failure())
+        }
+        DataReaderStatus::SampleLost { .. } => {
+            ReaderStatusClass::SampleLost(latches.sample_lost.on_failure())
+        }
+        DataReaderStatus::SampleRejected { .. } => {
+            ReaderStatusClass::SampleRejected(latches.sample_rejected.on_failure())
+        }
+        DataReaderStatus::LivelinessChanged { .. }
+        | DataReaderStatus::RequestedDeadlineMissed { .. } => ReaderStatusClass::Bookkeeping,
+    }
+}
+
+/// Emit one reader status event at the level `class` decided. Every line
+/// carries the route's current counters, so one line reads on its own.
+fn log_reader_status(route: &RawRouteStats, status: &DataReaderStatus, class: ReaderStatusClass) {
+    let dds_topic = route.dds_topic.as_str();
+    let topic = route.cerulion_topic.as_str();
+    let matched_writers = route.matched_writers_current.load(Ordering::Relaxed);
+    let matched_writers_total = route.matched_writers_total.load(Ordering::Relaxed);
+    let received_total = route.received_total.load(Ordering::Relaxed);
+    match class {
+        ReaderStatusClass::WriterMatched => tracing::info!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            matched_writers,
+            matched_writers_total,
+            received_total,
+            status = ?status,
+            "dds_bridge pump: raw route matched a DDS writer"
+        ),
+        ReaderStatusClass::WriterUnmatched => tracing::info!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            matched_writers,
+            matched_writers_total,
+            received_total,
+            status = ?status,
+            "dds_bridge pump: raw route lost a DDS writer, others remain matched"
+        ),
+        ReaderStatusClass::LastWriterUnmatched => tracing::warn!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            matched_writers,
+            matched_writers_total,
+            received_total,
+            status = ?status,
+            "dds_bridge pump: raw route lost its LAST matched DDS writer and receives \
+             nothing until a writer matches again"
+        ),
+        ReaderStatusClass::IncompatibleQos(decision) => {
+            let total_failures = route.incompatible_qos_total.load(Ordering::Relaxed);
+            match decision {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(
+                    dds_topic = %dds_topic,
+                    topic = %topic,
+                    total_failures,
+                    matched_writers,
+                    status = ?status,
+                    "dds_bridge pump: raw route REFUSED a DDS writer for incompatible QoS; \
+                     check the mapping's qos against the writer's (repeats log at debug)"
+                ),
+                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                    dds_topic = %dds_topic,
+                    topic = %topic,
+                    total_failures,
+                    suppressed,
+                    "dds_bridge pump: raw route still refusing a writer for incompatible QoS"
+                ),
+            }
+        }
+        ReaderStatusClass::SampleLost(decision) => {
+            let total_failures = route.sample_lost_total.load(Ordering::Relaxed);
+            match decision {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(
+                    dds_topic = %dds_topic,
+                    topic = %topic,
+                    total_failures,
+                    "dds_bridge pump: raw route DDS reader reports lost samples (repeats \
+                     log at debug)"
+                ),
+                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                    dds_topic = %dds_topic,
+                    topic = %topic,
+                    total_failures,
+                    suppressed,
+                    "dds_bridge pump: raw route still losing samples"
+                ),
+            }
+        }
+        ReaderStatusClass::SampleRejected(decision) => {
+            let total_failures = route.sample_rejected_total.load(Ordering::Relaxed);
+            match decision {
+                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(
+                    dds_topic = %dds_topic,
+                    topic = %topic,
+                    total_failures,
+                    status = ?status,
+                    "dds_bridge pump: raw route DDS reader reports rejected samples (repeats \
+                     log at debug)"
+                ),
+                RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                    dds_topic = %dds_topic,
+                    topic = %topic,
+                    total_failures,
+                    suppressed,
+                    "dds_bridge pump: raw route still rejecting samples"
+                ),
+            }
+        }
+        ReaderStatusClass::Bookkeeping => tracing::debug!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            status = ?status,
+            "dds_bridge pump: raw route reader status"
+        ),
+    }
+}
+
+/// How one periodic health verdict is logged; pure, like
+/// [`classify_reader_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteHealthLog {
+    /// The route is silent; the latch decides loud, repeat or decade.
+    Silent(RegimeDecision),
+    /// A route reported silent before has now received (`info`, once).
+    NowReceiving,
+    /// Nothing to log.
+    Quiet,
+}
+
+/// Fold one verdict into the route's latch. A route with no baseline
+/// leaves the latch alone: nothing is known about it either way.
+fn route_health_log(verdict: RawRouteHealth, latch: &mut FailureRegimeLatch) -> RouteHealthLog {
+    match verdict {
+        RawRouteHealth::SilentNeverMatched | RawRouteHealth::SilentMatchedNoSamples => {
+            RouteHealthLog::Silent(latch.on_failure())
+        }
+        RawRouteHealth::Receiving => {
+            let was_silent = latch.is_failing();
+            latch.on_success();
+            if was_silent {
+                RouteHealthLog::NowReceiving
+            } else {
+                RouteHealthLog::Quiet
+            }
+        }
+        RawRouteHealth::NoBaseline => RouteHealthLog::Quiet,
+    }
+}
+
+/// `total_failures` is the number of checks that found the route silent.
+fn log_route_health(
+    route: &RawRouteStats,
+    verdict: RawRouteHealth,
+    log: RouteHealthLog,
+    total_failures: u64,
+) {
+    let dds_topic = route.dds_topic.as_str();
+    let topic = route.cerulion_topic.as_str();
+    let ros_type = route.ros_type.as_str();
+    let matched_writers = route.matched_writers_current.load(Ordering::Relaxed);
+    let matched_writers_total = route.matched_writers_total.load(Ordering::Relaxed);
+    let incompatible_qos_total = route.incompatible_qos_total.load(Ordering::Relaxed);
+    match (log, verdict) {
+        (RouteHealthLog::Silent(RegimeDecision::Suppressed { suppressed }), _) => {
+            tracing::debug!(
+                dds_topic = %dds_topic,
+                topic = %topic,
+                suppressed,
+                matched_writers,
+                matched_writers_total,
+                "dds_bridge pump: raw route still silent"
+            )
+        }
+        (RouteHealthLog::Silent(_), RawRouteHealth::SilentNeverMatched) => tracing::warn!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            ros_type = %ros_type,
+            total_failures,
+            matched_writers,
+            matched_writers_total,
+            incompatible_qos_total,
+            "dds_bridge pump: raw route SILENT while other routes receive: no DDS writer \
+             has ever matched its reader (check the dds_topic and ros_type, and \
+             incompatible_qos_total)"
+        ),
+        (RouteHealthLog::Silent(_), _) => tracing::warn!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            ros_type = %ros_type,
+            total_failures,
+            matched_writers,
+            matched_writers_total,
+            incompatible_qos_total,
+            "dds_bridge pump: raw route SILENT while other routes receive: a DDS writer \
+             matched its reader, yet no sample has arrived"
+        ),
+        (RouteHealthLog::NowReceiving, _) => tracing::info!(
+            dds_topic = %dds_topic,
+            topic = %topic,
+            matched_writers,
+            received_total = route.received_total.load(Ordering::Relaxed),
+            "dds_bridge pump: raw route reported silent before is now receiving"
+        ),
+        (RouteHealthLog::Quiet, _) => {}
+    }
 }
 
 /// Spawn the drain thread. ALL DDS objects are created ON that thread (module
@@ -1667,6 +2029,7 @@ fn panic_payload_string(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cerulion_go2_dds::ros2_client::rustdds::dds::statusevents::CountWithChange;
 
     #[test]
     fn split_topic_matches_the_spike_semantics() {
@@ -1887,6 +2250,50 @@ mod tests {
 
     // ---- drain_raw_from_stream over a hand-built stream --
 
+    fn writer() -> cerulion_go2_dds::ros2_client::rustdds::GUID {
+        cerulion_go2_dds::ros2_client::rustdds::GUID::from_bytes([7; 16])
+    }
+
+    fn count(count: i32, change: i32) -> CountWithChange {
+        CountWithChange::start_from(count, change)
+    }
+
+    /// A SubscriptionMatched event as rustdds builds it: `total` is the
+    /// cumulative match count, `current` the matched writers now.
+    pub(super) fn matched(total: i32, current: i32, change: i32) -> DataReaderStatus {
+        DataReaderStatus::SubscriptionMatched {
+            total: count(total, change.max(0)),
+            current: count(current, change),
+            writer: writer(),
+        }
+    }
+
+    pub(super) fn incompatible(total: i32) -> DataReaderStatus {
+        use cerulion_go2_dds::ros2_client::rustdds::qos::QosPolicyId;
+        use cerulion_go2_dds::ros2_client::rustdds::QosPolicies;
+        DataReaderStatus::RequestedIncompatibleQos {
+            count: count(total, 1),
+            last_policy_id: QosPolicyId::Reliability,
+            writer: writer(),
+            requested_qos: Box::new(QosPolicies::qos_none()),
+            offered_qos: Box::new(QosPolicies::qos_none()),
+        }
+    }
+
+    pub(super) fn lost(total: i32) -> DataReaderStatus {
+        DataReaderStatus::SampleLost {
+            count: count(total, 1),
+        }
+    }
+
+    pub(super) fn rejected(total: i32) -> DataReaderStatus {
+        use cerulion_go2_dds::ros2_client::rustdds::dds::statusevents::SampleRejectedStatusKind;
+        DataReaderStatus::SampleRejected {
+            count: count(total, 1),
+            last_reason: SampleRejectedStatusKind::BySamplesLimit,
+        }
+    }
+
     /// Fresh isolated transport for the raw-drain tests (per-test SHM root —
     /// parallel-safe; the raw_route_test.rs `build_mgr` pattern).
     fn raw_test_transport(tag: &str) -> Arc<TransportManager> {
@@ -1957,6 +2364,15 @@ mod tests {
     fn run_raw_drain_script(
         tag: &str,
     ) -> (Vec<Vec<u8>>, PumpStats, RawIngressRoute, RawRouteStats) {
+        run_raw_drain_script_with(tag, Vec::new())
+    }
+
+    /// [`run_raw_drain_script`] with a scripted reader status stream beside
+    /// the samples.
+    fn run_raw_drain_script_with(
+        tag: &str,
+        statuses: Vec<DataReaderStatus>,
+    ) -> (Vec<Vec<u8>>, PumpStats, RawIngressRoute, RawRouteStats) {
         use cerulion_core::wire::MaxSliceLen;
         let mgr = raw_test_transport(tag);
         let codec = crate::generic::bridge_codec();
@@ -1981,8 +2397,9 @@ mod tests {
             }),
             Ok(raw_v3_sample(4.0, 5.0, 6.0)),
         ];
-        let stream = futures::stream::iter(items);
-        futures::pin_mut!(stream);
+        let stream = futures::stream::iter(items).fuse();
+        let statuses = futures::stream::iter(statuses).fuse();
+        futures::pin_mut!(stream, statuses);
         // Scripted clock: +100 per publish ATTEMPT (the failed decode
         // consumes a stamp, never a sequence) → stamps 100, 200, 300.
         let t = std::cell::Cell::new(0u64);
@@ -1993,6 +2410,7 @@ mod tests {
         let route_stats = RawRouteStats::new("/raw_dds", &topic, "geometry_msgs/Vector3");
         let route = smol::block_on(drain_raw_from_stream(
             stream,
+            statuses,
             route,
             &codec,
             &now,
@@ -2059,6 +2477,84 @@ mod tests {
         assert_eq!(rb.render(), oracle);
         assert_eq!(a[0], expected_v3_frame(1.0, 2.0, 3.0, 0, 100));
         assert_eq!(a[1], expected_v3_frame(4.0, 5.0, 6.0, 1, 300));
+    }
+
+    /// The reader status stream rides the same drain: a match, two QoS
+    /// refusals, lost and rejected samples, then the last writer unmatching.
+    /// The per-route counters mirror the scripted rustdds totals, and the
+    /// samples cross exactly as without statuses (no status event takes a
+    /// clock stamp or a sequence).
+    #[test]
+    fn reader_status_events_are_counted_beside_unchanged_delivery() {
+        let (frames, stats, route, route_stats) = run_raw_drain_script_with(
+            "status",
+            vec![
+                matched(1, 1, 1),
+                incompatible(1),
+                incompatible(2),
+                lost(3),
+                rejected(1),
+                matched(1, 0, -1),
+            ],
+        );
+        assert_eq!(
+            route_stats.render(),
+            "/raw_dds matched_writers=0 matched_writers_total=1 incompatible_qos=2 \
+             sample_lost=3 sample_rejected=1 received=3 published=2 decode_failures=1 \
+             publish_failures=0 stream_errors=1 last_received_ns=300 last_published_ns=300"
+        );
+        assert_eq!(stats.raw_streams_ended_total.load(Ordering::Relaxed), 1);
+        assert_eq!(route.next_sequence(), 2);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0], expected_v3_frame(1.0, 2.0, 3.0, 0, 100));
+        assert_eq!(frames[1], expected_v3_frame(4.0, 5.0, 6.0, 1, 300));
+    }
+
+    /// The production status stream never ends. The drain must still end
+    /// (and count the end) when the SAMPLE stream ends.
+    #[test]
+    fn the_drain_ends_with_the_sample_stream_while_statuses_stay_open() {
+        use cerulion_core::wire::MaxSliceLen;
+        let mgr = raw_test_transport("open_status");
+        let codec = crate::generic::bridge_codec();
+        let topic = "/pump25/open_status/v3";
+        let route = RawIngressRoute::open(
+            &RawIngress::native(Arc::clone(&mgr)),
+            &codec,
+            "geometry_msgs/Vector3",
+            topic,
+            MaxSliceLen::const_new(4096),
+        )
+        .expect("raw route");
+        let items: Vec<Result<RawSample, &'static str>> = vec![Ok(raw_v3_sample(1.0, 2.0, 3.0))];
+        let stream = futures::stream::iter(items).fuse();
+        let statuses = futures::stream::iter(vec![matched(1, 1, 1)])
+            .chain(futures::stream::pending())
+            .fuse();
+        futures::pin_mut!(stream, statuses);
+        let stats = PumpStats::default();
+        let route_stats = RawRouteStats::new("/raw_dds", topic, "geometry_msgs/Vector3");
+        let now = || 7u64;
+        let route = smol::block_on(drain_raw_from_stream(
+            stream,
+            statuses,
+            route,
+            &codec,
+            &now,
+            &stats,
+            &route_stats,
+        ));
+        assert_eq!(stats.raw_streams_ended_total.load(Ordering::Relaxed), 1);
+        assert_eq!(route.published_total(), 1);
+        assert_eq!(
+            route_stats.counts(),
+            RawRouteCounts {
+                matched_writers_current: 1,
+                matched_writers_total: 1,
+                received_total: 1,
+            }
+        );
+        assert_eq!(route_stats.last_published_ns.load(Ordering::Relaxed), 7);
     }
 
     /// The NOT-FULLY-CONSUMED refusal must ride the
@@ -2132,8 +2628,9 @@ mod tests {
             Ok(v3_with_trailing(9.0, 9.0, 9.0)),
             Ok(raw_v3_sample(4.0, 5.0, 6.0)),
         ];
-        let stream = futures::stream::iter(items);
-        futures::pin_mut!(stream);
+        let stream = futures::stream::iter(items).fuse();
+        let statuses = futures::stream::empty::<DataReaderStatus>().fuse();
+        futures::pin_mut!(stream, statuses);
         let t = std::cell::Cell::new(0u64);
         let now = || {
             t.set(t.get() + 100);
@@ -2143,6 +2640,7 @@ mod tests {
         let route_stats = RawRouteStats::new("/raw_dds", topic, "geometry_msgs/Vector3");
         let route = smol::block_on(drain_raw_from_stream(
             stream,
+            statuses,
             route,
             &codec,
             &now,
@@ -2248,6 +2746,45 @@ mod tests {
         assert_eq!(out.pace, Some(POLL_PACE));
         let out2 = pump.iterate(Instant::now());
         assert!(!out2.ring, "quiet after the swap consumed the push");
+    }
+
+    /// The UP arm judges the raw routes once per RAW_ROUTE_HEALTH_PERIOD of
+    /// injected time, never before the first full period, and folds each
+    /// verdict into that route's latch.
+    #[test]
+    fn iterate_up_arm_checks_raw_route_health_once_per_period() {
+        let mut pump = test_pump();
+        let status = Arc::new(StartupStatus::new());
+        status.set_up();
+        pump.drain = Some(handle(false, status));
+        let silent = Arc::new(RawRouteStats::new("/lowstate", "/go2/lowstate", "a/B"));
+        let sibling = Arc::new(RawRouteStats::new("/sportmodestate", "/go2/s", "a/C"));
+        sibling.received_total.store(40, Ordering::Relaxed);
+        pump.stats
+            .set_raw_routes(vec![Arc::clone(&silent), Arc::clone(&sibling)]);
+
+        let t0 = Instant::now();
+        pump.iterate(t0);
+        pump.iterate(t0 + RAW_ROUTE_HEALTH_PERIOD - Duration::from_millis(1));
+        assert!(
+            pump.route_health_latches.is_empty(),
+            "no check before one full period"
+        );
+        pump.iterate(t0 + RAW_ROUTE_HEALTH_PERIOD);
+        assert_eq!(pump.route_health_latches.len(), 2);
+        assert!(pump.route_health_latches[0].is_failing(), "LowState silent");
+        assert_eq!(pump.route_health_latches[0].total_failures(), 1);
+        assert!(!pump.route_health_latches[1].is_failing());
+
+        // Inside the next period nothing is re-judged.
+        pump.iterate(t0 + RAW_ROUTE_HEALTH_PERIOD + Duration::from_secs(5));
+        assert_eq!(pump.route_health_latches[0].total_failures(), 1);
+
+        // LowState starts receiving: the next check closes its regime.
+        silent.received_total.store(1, Ordering::Relaxed);
+        pump.iterate(t0 + RAW_ROUTE_HEALTH_PERIOD * 2);
+        assert!(!pump.route_health_latches[0].is_failing());
+        assert_eq!(pump.route_health_latches[0].total_failures(), 1);
     }
 
     #[test]
@@ -2623,40 +3160,15 @@ mod tests {
 
 #[cfg(test)]
 mod route_health {
+    use super::tests::{incompatible, lost, matched, rejected};
     use super::*;
-    use cerulion_go2_dds::ros2_client::rustdds::dds::statusevents::{
-        CountWithChange, SampleRejectedStatusKind,
-    };
-    use cerulion_go2_dds::ros2_client::rustdds::qos::QosPolicyId;
-    use cerulion_go2_dds::ros2_client::rustdds::{QosPolicies, GUID};
+    use cerulion_go2_dds::ros2_client::rustdds::dds::statusevents::CountWithChange;
 
     fn counts(current: u64, total: u64, received: u64) -> RawRouteCounts {
         RawRouteCounts {
             matched_writers_current: current,
             matched_writers_total: total,
             received_total: received,
-        }
-    }
-
-    fn writer() -> GUID {
-        GUID::from_bytes([7; 16])
-    }
-
-    fn matched(total: i32, current: i32, change: i32) -> DataReaderStatus {
-        DataReaderStatus::SubscriptionMatched {
-            total: CountWithChange::start_from(total, change.max(0)),
-            current: CountWithChange::start_from(current, change),
-            writer: writer(),
-        }
-    }
-
-    fn incompatible(count: i32) -> DataReaderStatus {
-        DataReaderStatus::RequestedIncompatibleQos {
-            count: CountWithChange::start_from(count, 1),
-            last_policy_id: QosPolicyId::Reliability,
-            writer: writer(),
-            requested_qos: Box::new(QosPolicies::qos_none()),
-            offered_qos: Box::new(QosPolicies::qos_none()),
         }
     }
 
@@ -2765,14 +3277,9 @@ mod route_health {
 
         r.record_status(&incompatible(3));
         assert_eq!(r.incompatible_qos_total.load(Ordering::Relaxed), 3);
-        r.record_status(&DataReaderStatus::SampleLost {
-            count: CountWithChange::start_from(5, 2),
-        });
+        r.record_status(&lost(5));
         assert_eq!(r.sample_lost_total.load(Ordering::Relaxed), 5);
-        r.record_status(&DataReaderStatus::SampleRejected {
-            count: CountWithChange::start_from(4, 1),
-            last_reason: SampleRejectedStatusKind::BySamplesLimit,
-        });
+        r.record_status(&rejected(4));
         assert_eq!(r.sample_rejected_total.load(Ordering::Relaxed), 4);
     }
 
@@ -2795,6 +3302,129 @@ mod route_health {
         );
         r.record_status(&matched(-1, -1, -1));
         assert_eq!(r.counts(), counts(0, 0, 0));
+    }
+
+    #[test]
+    fn reader_status_classes_follow_the_writer_count_and_the_latches() {
+        let mut l = ReaderStatusLatches::default();
+        assert_eq!(
+            classify_reader_status(&matched(1, 1, 1), &mut l),
+            ReaderStatusClass::WriterMatched
+        );
+        assert_eq!(
+            classify_reader_status(&matched(2, 1, -1), &mut l),
+            ReaderStatusClass::WriterUnmatched
+        );
+        assert_eq!(
+            classify_reader_status(&matched(2, 0, -1), &mut l),
+            ReaderStatusClass::LastWriterUnmatched
+        );
+        // Each repeating condition has its own latch: loud, then suppressed.
+        for status in [incompatible(1), lost(1), rejected(1)] {
+            let first = classify_reader_status(&status, &mut l);
+            let second = classify_reader_status(&status, &mut l);
+            let (a, b) = match (first, second) {
+                (ReaderStatusClass::IncompatibleQos(a), ReaderStatusClass::IncompatibleQos(b))
+                | (ReaderStatusClass::SampleLost(a), ReaderStatusClass::SampleLost(b))
+                | (ReaderStatusClass::SampleRejected(a), ReaderStatusClass::SampleRejected(b)) => {
+                    (a, b)
+                }
+                other => panic!("wrong class for {status:?}: {other:?}"),
+            };
+            assert_eq!(a, RegimeDecision::Loud);
+            assert_eq!(b, RegimeDecision::Suppressed { suppressed: 1 });
+        }
+        assert_eq!(
+            classify_reader_status(
+                &DataReaderStatus::RequestedDeadlineMissed {
+                    count: CountWithChange::start_from(1, 1),
+                },
+                &mut l
+            ),
+            ReaderStatusClass::Bookkeeping
+        );
+        assert_eq!(
+            classify_reader_status(
+                &DataReaderStatus::LivelinessChanged {
+                    alive_total: CountWithChange::start_from(1, 1),
+                    not_alive_total: CountWithChange::start_from(0, 0),
+                },
+                &mut l
+            ),
+            ReaderStatusClass::Bookkeeping
+        );
+    }
+
+    #[test]
+    fn a_sample_closes_the_loss_and_rejection_regimes_but_not_the_qos_one() {
+        let mut l = ReaderStatusLatches::default();
+        assert_eq!(
+            l.on_sample(),
+            [None, None],
+            "nothing open, nothing to report"
+        );
+        for _ in 0..3 {
+            classify_reader_status(&lost(1), &mut l);
+        }
+        classify_reader_status(&rejected(1), &mut l);
+        classify_reader_status(&incompatible(1), &mut l);
+        // Lost: loud + 2 suppressed. Rejected: a lone loud re-arms silently.
+        assert_eq!(l.on_sample(), [Some(("sample_lost", 2)), None]);
+        assert_eq!(l.on_sample(), [None, None]);
+        assert!(
+            l.incompatible_qos.is_failing(),
+            "no sample heals a QoS refusal"
+        );
+        assert_eq!(
+            classify_reader_status(&lost(1), &mut l),
+            ReaderStatusClass::SampleLost(RegimeDecision::Loud),
+            "re-armed by the sample"
+        );
+    }
+
+    #[test]
+    fn the_health_log_is_loud_once_then_decades_and_reports_recovery_once() {
+        let mut latch = FailureRegimeLatch::new();
+        let silent = RawRouteHealth::SilentNeverMatched;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.push(route_health_log(silent, &mut latch));
+        }
+        assert_eq!(seen[0], RouteHealthLog::Silent(RegimeDecision::Loud));
+        for (i, log) in seen.iter().enumerate().take(9).skip(1) {
+            assert_eq!(
+                *log,
+                RouteHealthLog::Silent(RegimeDecision::Suppressed {
+                    suppressed: i as u64
+                })
+            );
+        }
+        assert_eq!(
+            seen[9],
+            RouteHealthLog::Silent(RegimeDecision::StillFailing {
+                total: 10,
+                suppressed: 8
+            }),
+            "the tenth silent check re-announces"
+        );
+        assert_eq!(
+            route_health_log(RawRouteHealth::NoBaseline, &mut latch),
+            RouteHealthLog::Quiet
+        );
+        assert!(latch.is_failing(), "no baseline leaves the regime open");
+        assert_eq!(
+            route_health_log(RawRouteHealth::Receiving, &mut latch),
+            RouteHealthLog::NowReceiving
+        );
+        assert_eq!(
+            route_health_log(RawRouteHealth::Receiving, &mut latch),
+            RouteHealthLog::Quiet,
+            "the recovery line is logged once"
+        );
+        assert_eq!(
+            route_health_log(RawRouteHealth::SilentMatchedNoSamples, &mut latch),
+            RouteHealthLog::Silent(RegimeDecision::Loud)
+        );
     }
 
     #[test]
