@@ -3489,7 +3489,10 @@ impl CerulionSubscriber {
     /// stage, gate or credit word, so none of that runs.
     ///
     /// When the gate withholds the take, nothing leaves the queue and the call
-    /// returns `Ok(false)`, as at an empty queue.
+    /// returns `Ok(false)`, as at an empty queue. The take is recorded,
+    /// settled and paid for before `callback` runs, so a take the callback
+    /// makes on this subscriber is recorded after it, and a callback that
+    /// panics leaves the frame it was handed accounted for.
     ///
     /// Returns `Ok(true)` iff a valid sample was delivered to the
     /// callback. Malformed frames are skipped with a warning and
@@ -3576,9 +3579,12 @@ impl CerulionSubscriber {
             }
             let payload = &raw[WireHeader::SIZE..total_size];
             let origin = self.take_origin(&take, sample.origin(), header.sequence, removals);
-            callback(ReceivedMessage::from_publisher(header, payload, origin));
-            // Same serve point as `drain_samples` — one frame, really
-            // delivered.
+            // The take is accounted for before user code runs: a take the
+            // callback makes on this subscriber is then recorded after this
+            // one, in the order the frames left the queue (a replay plans its
+            // admissions in record order), and a callback that panics leaves
+            // the record, the settle and the credit word paid for a frame
+            // that really left the queue.
             self.record_service_cursor_from(&header);
             self.finish_take(
                 take,
@@ -3587,6 +3593,7 @@ impl CerulionSubscriber {
                 TakeEnd::Delivered,
             );
             self.drain_listener_after_removals(removals, drain);
+            callback(ReceivedMessage::from_publisher(header, payload, origin));
             return Ok(true);
         }
     }
@@ -9761,5 +9768,77 @@ mod tests {
             ]
         );
         drop(held);
+    }
+
+    /// A take records its read before the callback runs, so a take the
+    /// callback makes on the same subscriber is recorded after it, in the
+    /// order the frames left the queue. A replay plans its admissions in
+    /// record order, so the other order would feed each callback the other
+    /// frame.
+    ///
+    /// Hand oracle: frames 0 and 1 are queued. The outer take delivers 0 and
+    /// its callback's inner take delivers 1, so the records are `Served 0`
+    /// then `Served 1`.
+    #[test]
+    fn a_take_made_inside_a_take_callback_is_recorded_after_it() {
+        let (_mgr, mut publisher, sub, stage) = take_fixture("take_nested_order");
+        for seq in [0, 1] {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+        }
+        let seen = std::cell::RefCell::new(Vec::new()); // hot-path-alloc-ok: test-only collector.
+        assert!(sub
+            .try_receive_one(|outer| {
+                seen.borrow_mut().push(outer.header().sequence);
+                assert!(sub
+                    .try_receive_one(|inner| seen.borrow_mut().push(inner.header().sequence))
+                    .expect("inner take"));
+            })
+            .expect("outer take"));
+        assert_eq!(seen.into_inner(), vec![0, 1]);
+        let body = ReadSiteRole::Body;
+        assert_eq!(
+            take_records(&stage),
+            vec![
+                (ReadOutcomeKind::Served, 0, 1, None, body),
+                (ReadOutcomeKind::Served, 1, 1, None, body),
+            ]
+        );
+    }
+
+    /// A take whose callback panics has already recorded its read and paid
+    /// the `block` credit word for the frame it removed: the frame left the
+    /// queue, so the record and the word say so whatever the callback did.
+    ///
+    /// Hand oracle, depth 4: two frames are published and counted (2). The
+    /// take removes frame 0 and its callback panics: the stage holds `Served
+    /// 0` and the word counts 1, the one frame still queued.
+    #[test]
+    fn a_take_whose_callback_panics_has_recorded_and_paid_for_its_frame() {
+        let (_mgr, mut publisher, mut sub, stage) = take_fixture("take_callback_panics");
+        let word = crate::credit::CreditWord::local(4);
+        sub.register_block_probe_for_test(
+            word.clone(),
+            4,
+            Arc::new(BackpressureCounters::new()),
+            Arc::from("inp"),
+            16,
+        );
+        for seq in [0, 1] {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+            word.record_published();
+        }
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sub.try_receive_one(|_| panic!("the callback panics"))
+        }));
+        assert!(unwound.is_err(), "the callback's panic unwinds the take");
+        assert_eq!(
+            take_records(&stage),
+            vec![(ReadOutcomeKind::Served, 0, 1, None, ReadSiteRole::Body)]
+        );
+        assert_eq!(word.outstanding(), 1);
     }
 }
