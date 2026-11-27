@@ -45,6 +45,14 @@
 //! on [`SampleQueue`] (`lifetime_drained_total`, bumped by the tick's
 //! `drain_all`).
 //!
+//! Each raw mapping also owns a [`RawRouteStats`] (listed by
+//! [`PumpStats::raw_routes`], rendered per route): the reader's DDS status
+//! stream is drained beside its samples, so writer matches, QoS refusals and
+//! receive counts are visible per route. Once the DDS side is up, the helper
+//! judges every raw route each [`RAW_ROUTE_HEALTH_PERIOD`] with the pure
+//! [`evaluate_raw_route_health`] and warns about a route that is silent while
+//! other ingress receives. Nothing here rebinds or restarts a reader.
+//!
 //! # Lifecycle
 //!
 //! - LAZY spawn on the first iterate; spawn/init failures are loud and
@@ -270,6 +278,11 @@ impl PumpStats {
 /// event carries the current totals. The receive and publish counts are
 /// bumped by the drain loop itself. `last_*_ns` are transport clock stamps
 /// (the same stamp the published frame carries), `0` until the first one.
+///
+/// The rustdds revision this workspace pins reports writer matches, QoS
+/// refusals and missed deadlines; it does not emit lost, rejected or
+/// liveliness events, so `sample_lost_total` and `sample_rejected_total`
+/// stay `0` with it.
 #[derive(Debug)]
 pub struct RawRouteStats {
     /// The DDS topic the reader subscribes to (the config's `dds_topic`).
