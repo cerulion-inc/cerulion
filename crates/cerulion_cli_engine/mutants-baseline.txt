@@ -166,6 +166,19 @@
 #          18 mutants: 12 caught, 2 unviable, 4 missed. The unviable replace
 #          the two admission planners with a default `AdmissionPlan` does not
 #          have. The 4 missed are listed below.
+#          Re-run over the change that refuses a step past the per-step fold
+#          bound at the census and steers a topic read only past the cut
+#          empty: the refusal's sentence (`FoldRunOverrun::sentence`), the
+#          cause's token, sentence and remedy (`VerifierDecline::code`,
+#          `VerifierDecline::reason`, `VerifierDecline::remedy`), and in
+#          src/replay_inject.rs the injection plan that steers such a topic
+#          empty (`plan_topic_injection_covered`, `plan_topic_injection_inner`),
+#          with `--in-diff` that change's diff of the two files, `--re`
+#          'FoldRunOverrun::sentence|plan_topic_injection_covered|plan_topic_injection_inner|VerifierDecline::code|VerifierDecline::reason|VerifierDecline::remedy',
+#          `--exclude-re 'tests::' --cap-lints true --in-place --timeout 300`,
+#          `-- --lib -- replay_engine:: replay_inject::`: 12 mutants: 10
+#          caught, 2 unviable, 0 missed. The unviable replace the two injection
+#          planners with a default `TopicPlan` does not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
