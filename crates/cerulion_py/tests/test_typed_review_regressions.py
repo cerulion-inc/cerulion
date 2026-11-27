@@ -7,7 +7,7 @@ import pytest
 import cerulion
 from cerulion._typed import _descriptors_from_body, _encode_message, _offset
 
-from conftest import unique_topic
+from conftest import fnv1a64, unique_topic
 
 
 def _strings(*items):
@@ -33,6 +33,22 @@ def _field_offset(schemas, body, *path):
         else:
             offset += _offset(_descriptors_from_body(layout, body[offset:])[field_name])
     return offset
+
+
+def _hand_hash(name, fixed_size, fields):
+    """A schema hash assembled from literals: the length-prefixed name, the
+    fixed size, then per field its name, its type and, for a nested
+    reference, the hash of the target type."""
+
+    def prefixed(text):
+        return struct.pack("<Q", len(text)) + text.encode()
+
+    out = prefixed(name) + struct.pack("<Q", fixed_size)
+    for field, ty, target in fields:
+        out += prefixed(field) + prefixed(ty)
+        if target is not None:
+            out += struct.pack("<Q", target)
+    return fnv1a64(out)
 
 
 def _pair(session, schemas, schema, name):
@@ -424,7 +440,19 @@ def test_view_refuses_nested_resolution_after_a_schema_change(session):
     for stale in (lambda: view.n, lambda: view.id, lambda: child.data, lambda: view.copy()):
         with pytest.raises(cerulion.SchemaError, match="changed after"):
             stale()
-    assert frame.view().id == 1  # a fresh view resolves against the new set
+    # The hash of OuterG folds the hash of InnerG, so the change moved
+    # OuterG's hash: the frame keeps the hash it was published under and a
+    # fresh view against the changed set refuses it instead of reading its
+    # bytes through the new layout.
+    old_inner = _hand_hash("InnerG", 0, [("data", "uint8[]", None)])
+    new_inner = _hand_hash("InnerG", 0, [("data", "string", None)])
+    old_outer = _hand_hash("OuterG", 4, [("id", "uint32", None), ("n", "InnerG", old_inner)])
+    new_outer = _hand_hash("OuterG", 4, [("id", "uint32", None), ("n", "InnerG", new_inner)])
+    assert old_outer != new_outer
+    assert frame.schema_hash == old_outer
+    assert schemas.schema_hash("OuterG") == new_outer
+    with pytest.raises(cerulion.SchemaMismatch, match="does not match layout"):
+        frame.view()
     frame.release()
 
 
