@@ -2795,6 +2795,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                         // ACCEPTED frame and not what the read popped: the count
                         // is enforced and the identity is not.
                         (ReadKind::Decimated, n) => DueRead::decimated(n, *served_seq),
+                        (_, n) if sited.role == ReadSiteRole::Peek => DueRead::peek(n, *served_seq),
                         (_, n) => DueRead::pops(n, *served_seq),
                     }
                 }
@@ -5699,6 +5700,85 @@ mod tests {
         assert_eq!(
             drain.per_step.iter().map(|s| s.step).collect::<Vec<_>>(),
             vec![0, 1]
+        );
+    }
+
+    /// On a single-stage (`Body`-only) per-set `Sync` input, `plan_edge_admission`
+    /// maps `ReadSiteRole::Drain` to `DueRead::pops`, `ReadSiteRole::Peek` to
+    /// `DueRead::peek`, and `HandOff` to `DueRead::served_without_pop`, sharing
+    /// the drain writer run across `Drain`, `Peek`, and `HandOff`. On a two-stage
+    /// input (`Body` + `Drain`), `ReadSiteRole::Peek` is still refused with
+    /// `RecordShape::PeekOnGatedStage`.
+    #[test]
+    fn plan_edge_admission_marks_peek_and_preserves_handoff_on_single_stage() {
+        let single = StageTable::new(
+            &inputs("sync_node", &["a"]),
+            &census("sync_node", 0, &[ReadStageRole::Body]),
+        );
+        let reads = vec![
+            on_site(ReadSiteRole::Drain, annotation_read(0xAA)),
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(10), 1),
+            sited(0, ReadSiteRole::Peek, ReadKind::DrainedBatch, Some(11), 1),
+            on_site(
+                ReadSiteRole::Drain,
+                RecordedRead::read(0, ReadKind::DrainedBatch, Some(11), 0, true),
+            ),
+        ];
+        let topic = TopicAdmission {
+            topic: "/a".to_string(),
+            multi_publisher: false,
+            edges: vec![AdmissionEdge {
+                node_id: "sync_node".to_string(),
+                input: "a".to_string(),
+                mode: ConsumeMode::EachFifo,
+                reads,
+            }],
+        };
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &single)
+        else {
+            panic!("single-stage Sync input with Peek plans cleanly");
+        };
+        assert_eq!(plans.len(), 1);
+        let step0 = &plans[0].per_step[0];
+        assert_eq!(
+            step0.due,
+            vec![
+                DueRead::pops(1, Some(10)),
+                DueRead::peek(1, Some(11)),
+                DueRead::served_without_pop(Some(11)),
+            ]
+        );
+        assert!(!step0.due[0].is_peek());
+        assert!(step0.due[1].is_peek());
+        assert!(!step0.due[2].is_peek());
+        // `writer_run_site(Peek) == writer_run_site(Drain) == 1`: all three
+        // records inherit the drain-site writer run `0xAA`.
+        assert_eq!(step0.identity[0].writer, Some(0xAA));
+        assert!(step0.identity[0].annotated);
+        assert_eq!(step0.identity[1].writer, Some(0xAA));
+        assert!(!step0.identity[1].annotated);
+        assert_eq!(step0.identity[2].writer, Some(0xAA));
+        assert_eq!(step0.identity[2].popped, 0);
+
+        // Adversarial: two-stage input still refuses Peek with PeekOnGatedStage.
+        let split = StageTable::new(
+            &inputs("sync_node", &["a"]),
+            &census("sync_node", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        let AdmissionPlan::Refused(refusal) = plan_edge_admission(&topic, &split) else {
+            panic!("two-stage input with Peek must be refused");
+        };
+        assert_eq!(
+            refusal.reason,
+            AdmissionRefusalReason::UnenforceableRecord {
+                key: StageKey {
+                    node: "sync_node".to_string(),
+                    input_idx: 0,
+                    role: ReadStageRole::Drain,
+                },
+                step: 0,
+                shape: RecordShape::PeekOnGatedStage,
+            }
         );
     }
 }

@@ -850,7 +850,11 @@ pub mod wire;
 /// Compiler-independent node table; legacy Rust boundaries require a rebuild.
 ///
 /// v33: host-side per-consumer `block` credit slots; the stable node table is unchanged.
-pub const CERULION_ABI_VERSION: u32 = 33;
+///
+/// v34: `DueShape::Pops` gains `peek: bool` inside existing tail padding so a
+/// replay read gate distinguishes recorded per-set `Sync` matcher peeks from
+/// drains; the stable node table is unchanged.
+pub const CERULION_ABI_VERSION: u32 = 34;
 
 // Re-export commonly used types
 #[cfg(unix)]
