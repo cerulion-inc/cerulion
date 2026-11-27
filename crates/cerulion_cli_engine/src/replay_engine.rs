@@ -14321,8 +14321,9 @@ fn wiring_may_block_the_gate(
     // (`cerulion_core::graph::runtime::node_per_set_capable` over the node's entry
     // and the drain-discipline knob), never a restatement of its three terms here.
     per_set_capable: bool,
-    // A FED stage is fed by (writer, sequence), so a per-publisher sequence
-    // blocks nothing there (the core drops the blocker on a fed stage too).
+    // A FED stage is fed by (writer, sequence), so neither a per-publisher
+    // sequence nor a per-set `Sync` trigger input blocks the gate there (the
+    // core drops both blockers on a fed stage too).
     fed: bool,
 ) -> bool {
     if config.is_multi_publisher(topic) && !fed {
@@ -14339,7 +14340,7 @@ fn wiring_may_block_the_gate(
         Some(cerulion_core::graph::node::MacroPolicy::Sync { .. })
             | Some(cerulion_core::graph::node::MacroPolicy::UnboundedSync)
     );
-    per_set_policy
+    !fed && per_set_policy
         && per_set_capable
         && info
             .input_meta()

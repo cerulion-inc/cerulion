@@ -30759,12 +30759,13 @@ fn a_format_nine_resumed_bag_stands_a_stopped_unified_latest_sink_down_by_name_a
 /// the restored pair is aligned at every step: a neutral `--resim all`
 /// stands the Sync owed-fire rule down by name (`sync_unfired_since_anchor`)
 /// instead of reporting a fire-schedule difference at step 4. A `--verify`
-/// of that bag is fed by read identity, which refuses a per-set Sync stage
-/// before its first step (`read_identity_ungateable_stage`, exit 2), so the
-/// `--verify` that reaches the rule replays its queues: the same bag stamped
-/// at trace format 7, which passes with the same note. Each replay that
-/// reaches the rule logs one WARN. At trace format 10 the same part states
-/// the sink running, so the restored pair is a finding at step 4.
+/// of that bag is fed by read identity, which refuses a resumed stopped Sync
+/// sink with zero reads in the slice before its first step
+/// (`read_log_no_coverage`, exit 2), so the `--verify` that reaches the rule
+/// replays its queues: the same bag stamped at trace format 7, which passes
+/// with the same note. Each replay that reaches the rule logs one WARN. At
+/// trace format 10 the same part states the sink running, so the restored
+/// pair is a finding at step 4.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
@@ -30808,11 +30809,13 @@ fn a_format_nine_resumed_bag_stands_a_stopped_sync_sink_down_by_name_and_warns()
         "sync_unfired_since_anchor",
     );
     let (refused, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
-    let err = refused.expect_err("a fed --verify refuses the per-set Sync stage");
+    let err = refused.expect_err(
+        "a fed --verify refuses the resumed stopped Sync sink with zero reads in the slice",
+    );
     let ReplayError::ReadLogNotEnforceable { cause, .. } = &err else {
         panic!("expected ReadLogNotEnforceable, got {err:?}");
     };
-    assert_eq!(cause, "read_identity_ungateable_stage", "{err:?}");
+    assert_eq!(cause, "read_log_no_coverage", "{err:?}");
     assert_eq!(err.exit_code(), 2);
     let unfed = write_stop_bag_with(
         &dir,
@@ -52417,6 +52420,699 @@ fn the_oracle_catches_a_feed_by_timestamp() {
             "the oracle caught no divergence on {name} under the timestamp feed"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-set Sync trigger inputs: fed by recorded identity under `--verify`
+// ---------------------------------------------------------------------------
+
+/// One aligned member observation: `(writer_bits, seq_bits, payload_hash)`.
+type RiSyncMember = (u64, u64, u64);
+/// One aligned two-input Sync set observed in `tick()`.
+type RiSyncSet = (RiSyncMember, RiSyncMember);
+
+static RI_SYNC_SETS: std::sync::Mutex<Vec<RiSyncSet>> = std::sync::Mutex::new(Vec::new());
+
+fn ri_sync_hash_vector3(x: f64, y: f64, z: f64) -> u64 {
+    let mut bytes = [0u8; 24];
+    bytes[0..8].copy_from_slice(&x.to_le_bytes());
+    bytes[8..16].copy_from_slice(&y.to_le_bytes());
+    bytes[16..24].copy_from_slice(&z.to_le_bytes());
+    cerulion_core::wire::fnv1a_hash(&bytes)
+}
+
+fn ri_sync_log(ax: f64, ay: f64, az: f64, bx: f64, by: f64, bz: f64) {
+    let ma = (ax.to_bits(), ay.to_bits(), ri_sync_hash_vector3(ax, ay, az));
+    let mb = (bx.to_bits(), by.to_bits(), ri_sync_hash_vector3(bx, by, bz));
+    RI_SYNC_SETS.lock().unwrap().push((ma, mb));
+}
+
+fn ri_sync_take() -> Vec<RiSyncSet> {
+    std::mem::take(&mut *RI_SYNC_SETS.lock().unwrap())
+}
+
+/// Slow writer at 15 ms (3x slower than `RiWriterNode`'s 5 ms) so a per-set
+/// Sync node reading both runs real `PeekNext` descents and `Advance` handoffs.
+#[cerulion_node(period_ms = 15)]
+#[derive(Default)]
+struct RiSyncSlowWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiSyncSlowWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 11.0;
+        Ok(())
+    }
+}
+
+/// Per-set `Sync` consumer with mismatched-rate trigger inputs (`a` shallow so
+/// catch-up steps exercise `drop_oldest` evictions and multi-set bursts).
+#[cerulion_node(sync_window_ms = 50)]
+#[derive(Default)]
+struct RiPerSetSyncNode {
+    #[input(trigger, depth = 4)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl RiPerSetSyncNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_sync_log(self.a.x, self.a.y, self.a.z, self.b.x, self.b.y, self.b.z);
+        self.out.x = 3.0;
+        self.out.y = self.a.y * 1_000.0 + self.b.y;
+        self.out.z = self.a.z + self.b.z;
+        Ok(())
+    }
+}
+
+/// Narrow-window per-set `Sync` consumer (10 ms window) for exercising window
+/// death (`DiscardTie`) and post-fire trailing `FillRefill` with an empty
+/// partner queue.
+#[cerulion_node(sync_window_ms = 10)]
+#[derive(Default)]
+struct RiWindowDeathSyncNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl RiWindowDeathSyncNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_sync_log(self.a.x, self.a.y, self.a.z, self.b.x, self.b.y, self.b.z);
+        self.out.x = 3.0;
+        self.out.y = self.a.x * 1_000.0 + self.b.x;
+        self.out.z = self.a.z + self.b.z;
+        Ok(())
+    }
+}
+
+fn ri_sync_yaml() -> &'static str {
+    "name: risync\nprefix: risync\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: w2\n    type: ri_sync_slow_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: fuse\n    type: ri_per_set_sync_node\n    inputs:\n      - name: a\n        source: w1/out\n      - name: b\n        source: w2/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn ri_sync_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 1.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiSyncSlowWriterNodeEntry::with_state(
+                RiSyncSlowWriterNode {
+                    writer: 2.0,
+                    ..Default::default()
+                },
+            )),
+        ),
+        ("fuse", Box::new(RiPerSetSyncNodeEntry::new())),
+    ])
+}
+
+/// Record the per-set Sync descent/burst/eviction fixture and return its
+/// recording alongside the live-observed aligned sets.
+fn ri_sync_record_live() -> (Recording, Vec<RiSyncSet>) {
+    // Mostly 5 ms steps (driving 3:1 mismatched-rate descents, peeks, and
+    // handoffs) with periodic 40 ms catch-up steps (driving depth-4
+    // drop_oldest evictions on `a` and multi-set Sync bursts in one step).
+    let mut deltas = vec![DELTA_MS; 75];
+    for step in [18, 36, 54, 68] {
+        deltas[step] = 40;
+    }
+    ri_sync_take();
+    let rec = record_reference_impl(ri_sync_yaml(), ri_sync_factories, &[], &deltas, 16, true);
+    let sets = ri_sync_take();
+    (rec, sets)
+}
+
+/// Count `(peeks, handoffs, max_fires_in_step)` recorded for `node` in `rec`.
+fn ri_sync_trace_stats(rec: &Recording, node: &str) -> (usize, usize, usize) {
+    let idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == node)
+        .expect("node in manifest") as u32;
+    let mut peeks = 0usize;
+    let mut handoffs = 0usize;
+    let mut fires_by_step: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
+    for r in &rec.trace {
+        if r.node_idx != idx {
+            continue;
+        }
+        if r.record_type == RECORD_TYPE_FIRE {
+            *fires_by_step.entry(r.step).or_default() += 1;
+        } else if r.record_type == RECORD_TYPE_READ_OUTCOME {
+            let (_, kind, role) =
+                cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+            let popped = unpack_read_outcome_popped(r.duration_ns);
+            if role == ReadSiteRole::Peek && kind == READ_OUTCOME_DRAINED_BATCH && popped > 0 {
+                peeks += 1;
+            }
+            if role == ReadSiteRole::Drain
+                && kind == READ_OUTCOME_DRAINED_BATCH
+                && popped == 0
+                && r.fire_time_ns != READ_OUTCOME_NO_FRAME
+            {
+                handoffs += 1;
+            }
+        }
+    }
+    let max_burst = fires_by_step.values().copied().max().unwrap_or(0);
+    (peeks, handoffs, max_burst)
+}
+
+/// A free-run bag of a per-set `Sync` node with two inputs at mismatched rates
+/// (driving real `Peek`, `Advance` handoffs, `drop_oldest` evictions, and
+/// multi-set bursts) replays under `--verify` with `ReadIdentityReport::Fed`,
+/// zero violations, every replayed set matching the live set (member writer,
+/// sequence, and payload hash), and byte-identical repeated replays and
+/// `--report` JSON.
+#[test]
+#[serial]
+fn identity_fed_replay_reproduces_per_set_sync_sets_with_descents_and_bursts() {
+    let (rec, live_sets) = ri_sync_record_live();
+    let (peeks, handoffs, max_burst) = ri_sync_trace_stats(&rec, "fuse");
+    assert!(
+        peeks >= 3,
+        "PREMISE: mismatched rates drive >= 3 Peek records, got {peeks}"
+    );
+    assert!(
+        handoffs >= 1,
+        "PREMISE: improving peeks drive >= 1 Advance handoff, got {handoffs}"
+    );
+    assert!(
+        max_burst >= 2,
+        "PREMISE: catch-up step drives a multi-set Sync burst (>= 2 fires), got {max_burst}"
+    );
+    assert!(
+        live_sets.len() >= RI_MIN_READS,
+        "PREMISE: live run produced {} sets, below floor {RI_MIN_READS}",
+        live_sets.len()
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_per_set_sync.mcap");
+    ri_bag(&rec, &bag, ri_free_run_recorder_json());
+
+    let report_1 = dir.path().join("report_1.json");
+    ri_sync_take();
+    let (outcome_1, _) = ri_replay_reporting(
+        &bag,
+        ri_sync_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report_1.clone()),
+    );
+    let sets_1 = ri_sync_take();
+    let outcome_1 = outcome_1.expect("first --verify replay of per-set Sync bag runs");
+    ri_assert_fed(&outcome_1);
+    assert!(
+        outcome_1.passed,
+        "first replay must pass: {:?}",
+        outcome_1.violations
+    );
+    assert!(
+        outcome_1.violations.is_empty(),
+        "first replay has zero violations: {:?}",
+        outcome_1.violations
+    );
+    assert_eq!(
+        sets_1, live_sets,
+        "every replayed Sync set must equal the live set (writer, seq, payload hash)"
+    );
+
+    // Determinism: a second replay produces byte-identical sets and --report JSON.
+    let report_2 = dir.path().join("report_2.json");
+    ri_sync_take();
+    let (outcome_2, _) = ri_replay_reporting(
+        &bag,
+        ri_sync_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report_2.clone()),
+    );
+    let sets_2 = ri_sync_take();
+    let outcome_2 = outcome_2.expect("second --verify replay runs");
+    ri_assert_fed(&outcome_2);
+    assert!(outcome_2.passed, "{:?}", outcome_2.violations);
+    assert_eq!(sets_2, live_sets);
+    assert_eq!(
+        std::fs::read(&report_1).unwrap(),
+        std::fs::read(&report_2).unwrap(),
+        "repeated --verify replays must produce byte-identical --report JSON"
+    );
+}
+
+/// Edge: a per-set `Sync` node experiencing window death (`DiscardTie` queue
+/// refill) and post-fire trailing `FillRefill` (one partner fills a head after
+/// a tied fire while the other partner's queue is empty) passes `--verify`
+/// cleanly with zero `UnplannedConsult` violations and identical sets.
+#[test]
+#[serial]
+fn identity_fed_replay_handles_per_set_sync_window_death_and_trailing_refill() {
+    const WD_A_TOPIC: &str = "/risync_wd/a";
+    const WD_B_TOPIC: &str = "/risync_wd/b";
+    let yaml = "name: risync_wd\nprefix: risync_wd\nnodes:\n\
+         \x20 - id: fuse\n    type: ri_window_death_sync_node\n    inputs:\n      - name: a\n        source: /risync_wd/a\n      - name: b\n        source: /risync_wd/b\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || factories(vec![("fuse", Box::new(RiWindowDeathSyncNodeEntry::new()))]);
+
+    // 10 cycles of 4 steps (5 ms each, 10 ms window):
+    //   step 4c:   a publishes 1 frame (head at t), b publishes nothing.
+    //   step 4c+1..4c+2: quiet (head ages 15 ms > 10 ms window).
+    //   step 4c+3: a publishes 2 frames (first replaces dead head via DiscardTie
+    //              and matches b; second is popped by trailing FillRefill while
+    //              b's queue is empty), b publishes 1 frame.
+    let cycles = 10usize;
+    let total_steps = cycles * 4;
+    let mut a_steps = vec![Vec::new(); total_steps];
+    let mut b_steps = vec![Vec::new(); total_steps];
+    for c in 0..cycles {
+        let base = (c * 10) as f64;
+        a_steps[c * 4] = vec![base + 1.0];
+        a_steps[c * 4 + 3] = vec![base + 2.0, base + 3.0];
+        b_steps[c * 4 + 3] = vec![base + 1.0];
+    }
+    let drives = [
+        ExternalDrive {
+            topic: WD_A_TOPIC.to_string(),
+            per_step: a_steps,
+        },
+        ExternalDrive {
+            topic: WD_B_TOPIC.to_string(),
+            per_step: b_steps,
+        },
+    ];
+    ri_sync_take();
+    let rec = record_uniform_with_read_log(yaml, make, &drives, total_steps);
+    let live_sets = ri_sync_take();
+    assert!(
+        live_sets.len() >= 8,
+        "PREMISE: window-death fixture fired >= 8 aligned sets, got {}",
+        live_sets.len()
+    );
+    // Verify at least one firing step had more `a` pops than `b` pops
+    // (proving DiscardTie + trailing FillRefill occurred while `b` was empty).
+    let fuse_idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == "fuse")
+        .expect("fuse in manifest") as u32;
+    let mut a_pops_on_fire_step = 0usize;
+    let mut b_pops_on_fire_step = 0usize;
+    for r in &rec.trace {
+        if r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == fuse_idx && r.step == 3 {
+            let (input_idx, kind, _) =
+                cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+            if kind == READ_OUTCOME_DRAINED_BATCH {
+                let popped = unpack_read_outcome_popped(r.duration_ns) as usize;
+                if input_idx == 0 {
+                    a_pops_on_fire_step += popped;
+                } else if input_idx == 1 {
+                    b_pops_on_fire_step += popped;
+                }
+            }
+        }
+    }
+    assert!(
+        a_pops_on_fire_step >= 2 && b_pops_on_fire_step == 1,
+        "PREMISE: step 3 pops a (DiscardTie + trailing FillRefill) while b pops 1 and goes empty (a={a_pops_on_fire_step}, b={b_pops_on_fire_step})"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_sync_window_death.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+
+    ri_sync_take();
+    let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let replayed_sets = ri_sync_take();
+    let outcome = outcome.expect("window-death per-set Sync bag replays under --verify");
+    ri_assert_fed(&outcome);
+    assert!(
+        outcome.passed,
+        "window-death + trailing refill must pass with zero UnplannedConsult: {:?}",
+        outcome.violations
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!(replayed_sets, live_sets);
+}
+
+/// MUTANT (`oracle-mutants`): feeding a recorded `Peek` its next frame in file
+/// order instead of its recorded frame is caught by both the Sync set oracle
+/// and `--verify`'s `SequenceMismatch` check.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_a_peek_fed_its_next_frame() {
+    let (rec, live_sets) = ri_sync_record_live();
+    let (peeks, _, _) = ri_sync_trace_stats(&rec, "fuse");
+    assert!(peeks >= 3, "PREMISE: fixture has >= 3 peeks, got {peeks}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_sync_peek_mutant.mcap");
+    ri_bag(&rec, &bag, ri_free_run_recorder_json());
+
+    let guard = cerulion_cli_engine::replay_feed::mutants::peek_feeds_next_frame();
+    ri_sync_take();
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_sync_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let replayed_sets = ri_sync_take();
+    drop(guard);
+
+    let outcome = outcome.expect("mutant replay runs to verdict");
+    assert_ne!(
+        live_sets, replayed_sets,
+        "the set oracle must catch a peek fed its next frame"
+    );
+    assert!(
+        !outcome.passed,
+        "--verify must fail when a peek is fed its next frame"
+    );
+    let read_verdict = outcome
+        .read_log_verdict
+        .as_ref()
+        .expect("peek mutant must produce a read_log_verdict");
+    assert!(
+        read_verdict
+            .unmet
+            .iter()
+            .any(|u| u.cause == "sequence_mismatch" && u.node_id == "fuse"),
+        "expected sequence_mismatch on fuse in read_log_verdict.unmet; got {:?}",
+        read_verdict.unmet
+    );
+}
+
+/// 25 ms periodic writer for the partial-tick parked-peek Sync regression.
+#[cerulion_node(period_ms = 25)]
+#[derive(Default)]
+struct RiSync25msWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiSync25msWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 11.0;
+        Ok(())
+    }
+}
+
+/// Per-set `Sync` node declaring inputs in order `a` (trigger), `ctx`
+/// (non-trigger context), `b` (trigger). While `ctx` has no frame yet, a tick
+/// consumes `a` and stops at empty `ctx` before reading `b`, leaving `b`'s head
+/// and parked peek intact across the step boundary.
+#[cerulion_node(sync_window_ms = 50)]
+#[derive(Default)]
+struct RiPartialTickSyncNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input]
+    ctx: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl RiPartialTickSyncNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_sync_log(self.a.x, self.a.y, self.a.z, self.b.x, self.b.y, self.b.z);
+        self.out.x = self.ctx.x;
+        self.out.y = self.a.x * 1_000.0 + self.b.y;
+        self.out.z = self.a.z + self.b.z;
+        Ok(())
+    }
+}
+
+/// Regression: after a partial Sync tick stops at an empty context input and
+/// leaves a parked peek on `b`, the next boundary has two frames queued on `a`
+/// (so `a`'s successor is recorded as a post-fire refill, not a `Peek`). Live
+/// keeps the parked pair `(a=2@50ms, b=1@25ms)` and then aligns `(a=3@50ms,
+/// b=2@50ms)` on refill. Fed `--verify` replay must deliver the exact same
+/// hand-written pairs rather than mistaking `a`'s refill for partner absence
+/// and advancing `b` past `b=1`.
+#[test]
+#[serial]
+fn identity_fed_replay_preserves_parked_peek_after_partial_sync_tick() {
+    const A_TOPIC: &str = "/risync_partial/a";
+    const CTX_TOPIC: &str = "/risync_partial/ctx";
+    let yaml = "name: risync_partial\nprefix: risync_partial\nnodes:\n\
+         \x20 - id: wb\n    type: ri_sync_25ms_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: fuse\n    type: ri_partial_tick_sync_node\n    inputs:\n      - name: a\n        source: /risync_partial/a\n      - name: ctx\n        source: /risync_partial/ctx\n      - name: b\n        source: wb/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            (
+                "wb",
+                Box::new(RiSync25msWriterNodeEntry::with_state(
+                    RiSync25msWriterNode {
+                        writer: 2.0,
+                        ..Default::default()
+                    },
+                )),
+            ),
+            ("fuse", Box::new(RiPartialTickSyncNodeEntry::new())),
+        ])
+    };
+
+    // Step schedule (virtual clock starts at 0 ms; ExternalDrive stamps at
+    // t_pre before step_ms, while Period node wb stamps at t_post inside
+    // step_ms):
+    //   step 0 (delta 25 ms, 0->25): wb fires at 25 ms (b=1@25ms). a is empty,
+    //          so fuse fills b=1 into B.frozen and waits.
+    //   step 1 (delta 10 ms, 25->35): quiet; advances clock to 35 ms.
+    //   step 2 (delta 15 ms, 35->50): ExternalDrive publishes a=1 at t_pre=35ms,
+    //          wb fires at t_post=50ms (b=2@50ms). Boundary aligns a=1@35ms
+    //          with b=1@25ms (span 10 ms), probes a (empty -> gate passes),
+    //          peeks b=2@50ms (span 15 ms > 10 ms -> parks b=2 in next_head).
+    //          ctx is empty -> partial tick consumes a=1, stops before b,
+    //          leaving B.frozen=b=1 and B.next_head=b=2.
+    //   step 3 (delta 5 ms, 50->55): ExternalDrive publishes ctx=1.0 and two
+    //          frames a=2, a=3 at t_pre=50ms; wb does not fire (next fire at
+    //          75 ms). Boundary pops a=2 (a=3 queued) and re-offers b=1 (b=2
+    //          parked). Both inputs have a successor, so live refuses descent
+    //          and fires (a=2, b=1), then refill pops a=3 (Drain) and promotes
+    //          b=2 to fire (a=3, b=2).
+    let deltas = [25u64, 10, 15, 5];
+    let drives = [
+        ExternalDrive {
+            topic: A_TOPIC.to_string(),
+            per_step: vec![vec![], vec![], vec![1.0], vec![2.0, 3.0]],
+        },
+        ExternalDrive {
+            topic: CTX_TOPIC.to_string(),
+            per_step: vec![vec![], vec![], vec![], vec![1.0]],
+        },
+    ];
+
+    let expected_pair = |a_val: f64, b_cnt: f64| -> RiSyncSet {
+        let bx = 2.0_f64;
+        let bz = bx * 1_000_000.0 + b_cnt * 11.0;
+        (
+            (
+                a_val.to_bits(),
+                0.0_f64.to_bits(),
+                ri_sync_hash_vector3(a_val, 0.0, 0.0),
+            ),
+            (
+                bx.to_bits(),
+                b_cnt.to_bits(),
+                ri_sync_hash_vector3(bx, b_cnt, bz),
+            ),
+        )
+    };
+    let expected_sets = vec![expected_pair(2.0, 1.0), expected_pair(3.0, 2.0)];
+
+    ri_sync_take();
+    let rec = record_reference_impl(yaml, make, &drives, &deltas, 16, true);
+    let live_sets = ri_sync_take();
+    assert_eq!(
+        live_sets, expected_sets,
+        "PREMISE: live run must deliver hand-written pairs (a=2,b=1) and (a=3,b=2)"
+    );
+
+    // Pin the exact recorded read-log shape: step 2 recorded a Peek on `b`
+    // with zero HandOffs (peek stayed parked), and step 3 recorded 2 Drains on
+    // `a` (boundary + refill, zero Peeks) and 0 records on `b`.
+    let fuse_idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == "fuse")
+        .expect("fuse in manifest") as u32;
+    let mut step2_b_peeks = 0usize;
+    let mut step2_b_handoffs = 0usize;
+    let mut step3_a_drains = 0usize;
+    let mut step3_a_peeks = 0usize;
+    let mut step3_b_records = 0usize;
+    for r in &rec.trace {
+        if r.record_type != RECORD_TYPE_READ_OUTCOME || r.node_idx != fuse_idx {
+            continue;
+        }
+        let (input_idx, kind, role) =
+            cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+        let popped = unpack_read_outcome_popped(r.duration_ns);
+        if r.step == 2 && input_idx == 2 {
+            if role == ReadSiteRole::Peek && kind == READ_OUTCOME_DRAINED_BATCH && popped > 0 {
+                step2_b_peeks += 1;
+            }
+            if role == ReadSiteRole::Drain
+                && kind == READ_OUTCOME_DRAINED_BATCH
+                && popped == 0
+                && r.fire_time_ns != READ_OUTCOME_NO_FRAME
+            {
+                step2_b_handoffs += 1;
+            }
+        } else if r.step == 3 {
+            if input_idx == 0 && kind == READ_OUTCOME_DRAINED_BATCH && popped > 0 {
+                if role == ReadSiteRole::Peek {
+                    step3_a_peeks += 1;
+                } else {
+                    step3_a_drains += 1;
+                }
+            } else if input_idx == 2 {
+                step3_b_records += 1;
+            }
+        }
+    }
+    assert_eq!(
+        (step2_b_peeks, step2_b_handoffs),
+        (1, 0),
+        "PREMISE: step 2 must park one Peek on b without advancing it"
+    );
+    assert_eq!(
+        (step3_a_drains, step3_a_peeks, step3_b_records),
+        (2, 0, 0),
+        "PREMISE: step 3 must record 2 Drains (0 Peeks) on a and 0 records on b"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_sync_partial_tick_parked_peek.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+
+    let report_1 = dir.path().join("report_1.json");
+    ri_sync_take();
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        make,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report_1.clone()),
+    );
+    let replayed_sets = ri_sync_take();
+    let outcome = outcome.expect("partial-tick parked-peek Sync bag replays under --verify");
+    ri_assert_fed(&outcome);
+    assert_eq!(
+        replayed_sets, expected_sets,
+        "replayed Sync sets must keep parked peek pair (a=2,b=1) instead of advancing b to b=2"
+    );
+    assert!(
+        outcome.passed,
+        "partial-tick parked-peek Sync replay must pass --verify cleanly: {:?}",
+        outcome.violations
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+
+    // Determinism: a second --verify replay produces byte-identical sets and
+    // --report JSON.
+    let report_2 = dir.path().join("report_2.json");
+    ri_sync_take();
+    let (outcome_2, _) = ri_replay_reporting(
+        &bag,
+        make,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report_2.clone()),
+    );
+    let replayed_sets_2 = ri_sync_take();
+    let outcome_2 = outcome_2.expect("second partial-tick replay runs");
+    ri_assert_fed(&outcome_2);
+    assert!(outcome_2.passed, "{:?}", outcome_2.violations);
+    assert_eq!(replayed_sets_2, expected_sets);
+    assert_eq!(
+        std::fs::read(&report_1).unwrap(),
+        std::fs::read(&report_2).unwrap(),
+        "repeated --verify replays must produce byte-identical --report JSON"
+    );
+
+    // Companion arm: same partial-tick parked peek on step 2, but step 3 has
+    // only one frame on `a` (no queued successor), so live advances the parked
+    // peek `b=2` (recording a HandOff on `b`) and delivers `(a=2, b=2)`.
+    // Replay must still allow that recorded HandOff to advance.
+    let advance_drives = [
+        ExternalDrive {
+            topic: A_TOPIC.to_string(),
+            per_step: vec![vec![], vec![], vec![1.0], vec![2.0]],
+        },
+        ExternalDrive {
+            topic: CTX_TOPIC.to_string(),
+            per_step: vec![vec![], vec![], vec![], vec![1.0]],
+        },
+    ];
+    let expected_advance_sets = vec![expected_pair(2.0, 2.0)];
+    ri_sync_take();
+    let rec_adv = record_reference_impl(yaml, make, &advance_drives, &deltas, 16, true);
+    let live_adv_sets = ri_sync_take();
+    assert_eq!(
+        live_adv_sets, expected_advance_sets,
+        "PREMISE: live run with no successor on a advances parked b=2 and delivers (a=2,b=2)"
+    );
+    let bag_adv = dir.path().join("ri_sync_partial_tick_parked_advance.mcap");
+    ri_bag_labelled(&rec_adv, &bag_adv, ri_free_run_recorder_json(), false);
+
+    ri_sync_take();
+    let (outcome_adv, _) = ri_replay(&bag_adv, make, replay_engine::ReplayPurpose::Verify);
+    let replayed_adv_sets = ri_sync_take();
+    let outcome_adv = outcome_adv.expect("advancing parked-peek Sync bag replays under --verify");
+    ri_assert_fed(&outcome_adv);
+    assert_eq!(
+        replayed_adv_sets, expected_advance_sets,
+        "replayed Sync sets must advance parked b=2 when its HandOff is recorded"
+    );
+    assert!(
+        outcome_adv.passed,
+        "advancing parked-peek Sync replay must pass --verify cleanly: {:?}",
+        outcome_adv.violations
+    );
+    assert!(
+        outcome_adv.violations.is_empty(),
+        "{:?}",
+        outcome_adv.violations
+    );
 }
 
 // ---------------------------------------------------------------------------
