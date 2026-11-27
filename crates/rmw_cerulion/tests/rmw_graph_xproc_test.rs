@@ -859,6 +859,37 @@ fn a_failed_allocation_at_every_point_frees_everything_and_leaves_the_out_param_
 
 #[test]
 #[serial]
+fn a_failed_allocation_in_a_later_topic_frees_the_types_of_every_earlier_topic() {
+    let root = IsolatedRoot::mint("rgxn");
+    let p = prefix("n");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    // Two topics in sorted order: `a_mixed` with two types, one from each
+    // process, then `b_single` with one. The names array (its buffer and two
+    // strings) and the types buffer make four allocations, `a_mixed`'s types
+    // array (its buffer and two strings) three more, and `b_single`'s (its
+    // buffer and one string) the last two. Budgets 7 and 8 fail inside
+    // `b_single`, after `a_mixed`'s array is whole; the ledger balances only
+    // when that earlier array is freed too.
+    assert_eq!(lister.ask(&format!("sub {p}/a_mixed Zulu")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/a_mixed Alpha")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/b_single Bravo")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/a_mixed=rmw_gx/msg/Alpha,rmw_gx/msg/Zulu;{p}/b_single=rmw_gx/msg/Bravo")
+    );
+    let bad = RMW_RET_BAD_ALLOC;
+    assert_eq!(
+        lister.ask("faults"),
+        format!(
+            "0:{bad}:clean;1:{bad}:clean;2:{bad}:clean;3:{bad}:clean;4:{bad}:clean;\
+             5:{bad}:clean;6:{bad}:clean;7:{bad}:clean;8:{bad}:clean;9:0:clean"
+        )
+    );
+}
+
+#[test]
+#[serial]
 fn one_pair_lists_once_for_two_processes_and_until_its_last_local_endpoint_leaves() {
     let root = IsolatedRoot::mint("rgxj");
     let p = prefix("j");
