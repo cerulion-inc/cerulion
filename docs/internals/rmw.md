@@ -1250,7 +1250,9 @@ with rmw-specific additions:
   `rmw_get_topic_names_and_types` collects EVERY record's type from the local graph, drops
   the read lock, gathers the other writers (`gather_rmw_graph(own writer id, 600 ms)`,
   inside `catch_unwind`), and fills `types[i]` with every type of a topic, sorted
-  (`fill_names_and_multi_types`). A gather error or an `Incomplete` verdict still returns
+  (`fill_names_and_multi_types`). The window is a bound, not a wait: a writer whose
+  snapshot needs more sends than the gather can ring in 600 ms is cut, and its heard pairs
+  are returned with the `Incomplete` warning. A gather error or an `Incomplete` verdict still returns
   the local and heard pairs with `RMW_RET_OK`, through one process-wide latch, never a line
   per call. A writer whose process exited is not waited for (its node is `Dead`). The
   registry carries no endpoint info, so every other graph query stays local, and a remote

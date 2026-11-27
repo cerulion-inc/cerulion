@@ -783,10 +783,14 @@ unsafe fn fill_from_endpoint_map(
 // identity — `runtime::ros_topic_to_cerulion`), so every names-and-types
 // query serves them VERBATIM: a name round-trips create → query unchanged.
 
-/// How long a topic listing waits for the other processes' writers on the rmw
-/// graph registry. A live writer answers the doorbell within a few 20 ms
-/// passes, so this bounds only a writer that does not answer; it covers one
-/// interval send (500 ms), which serves a writer whose doorbell could not open.
+/// The longest a topic listing waits for the other processes' writers on the
+/// rmw graph registry. The gather rings again as soon as a ring brings new
+/// parts, so a live writer is heard as fast as it answers; this bounds a
+/// writer that does not answer, and covers one interval send (500 ms), which
+/// serves a writer whose doorbell could not open. A writer whose snapshot
+/// needs more sends than fit in the window is cut: the listing returns its
+/// heard pairs and the `Incomplete` warning names the writers it did not hear
+/// whole.
 const TOPIC_GATHER_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
 
 /// One regime for the whole process: a listing that cannot reach the registry,
@@ -827,7 +831,8 @@ fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
                     live_writers,
                     writers_heard,
                 } => Some(format!(
-                    "heard {writers_heard} of {live_writers} live writers in the window"
+                    "heard {writers_heard} of {live_writers} live writers whole in {} ms",
+                    TOPIC_GATHER_WINDOW.as_millis()
                 )),
             }
         }

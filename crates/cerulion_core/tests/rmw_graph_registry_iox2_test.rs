@@ -25,10 +25,10 @@ use std::time::{Duration, Instant};
 use cerulion_core::testing::{child_iceoryx_config, kill_child_holding_ports, IsolatedRoot};
 use cerulion_core::transport::dead_node_sweep::sweep_node_config;
 use cerulion_core::transport::rmw_graph_registry::{
-    decode_frame, encode_snapshot, GatherCompleteness, RmwGraphFrameError, RmwGraphGather,
-    RmwGraphGatherFold, RmwGraphWriter, MAX_RMW_GRAPH_TOPIC_LEN, MAX_RMW_GRAPH_TYPE_LEN,
-    RMW_GRAPH_DOORBELL_SERVICE_NAME, RMW_GRAPH_FRAME_LEN, RMW_GRAPH_MAX_NODES,
-    RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH,
+    decode_frame, encode_snapshot, send_budget, GatherCompleteness, RmwGraphFrameError,
+    RmwGraphGather, RmwGraphGatherFold, RmwGraphWriter, MAX_RMW_GRAPH_TOPIC_LEN,
+    MAX_RMW_GRAPH_TYPE_LEN, RMW_GRAPH_DOORBELL_SERVICE_NAME, RMW_GRAPH_FRAME_LEN,
+    RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH,
     RMW_GRAPH_REGISTRY_SERVICE_NAME,
 };
 use cerulion_core::transport::{TransportConfig, TransportManager};
@@ -368,6 +368,61 @@ fn a_send_carries_its_share_of_half_a_queue_when_two_writers_are_listed() {
         32,
         "one send with two writers listed"
     );
+}
+
+/// The window `rmw_get_topic_names_and_types` gives its gather.
+const LISTING_WINDOW: Duration = Duration::from_millis(600);
+
+/// With sixteen writers listed, one send carries 4 parts, so the 129-part
+/// snapshot needs 33 sends, one per ring. A gather that rang once per 20 ms
+/// pass would need at least 32 pauses, 640 ms, past the listing window. A
+/// gather that rings again as soon as a ring brings new parts hears it whole
+/// inside the window.
+#[test]
+#[serial]
+fn a_snapshot_that_needs_33_sends_settles_inside_the_listing_window() {
+    let root = IsolatedRoot::mint("rg_p");
+    let tm = manager("pace_w", &root.config());
+    let reader = manager("pace_r", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    let pairs = add_a_129_part_snapshot(&writer);
+    let others: Vec<(Arc<TransportManager>, RmwGraphWriter)> = (0..15)
+        .map(|i| {
+            let other = manager(&format!("pace_{i:02}"), &root.config());
+            let other_writer = other.open_rmw_graph_writer();
+            other_writer
+                .add(&format!("/pace/{i:02}"), "pkg/msg/Pace")
+                .expect("pair");
+            (other, other_writer)
+        })
+        .collect();
+    assert_eq!(
+        send_budget(others.len() + 1),
+        4,
+        "precondition: 4 parts a send"
+    );
+
+    let started = Instant::now();
+    let got = gather(&reader, None, LISTING_WINDOW);
+    let took = started.elapsed();
+    assert_eq!(
+        got.completeness,
+        GatherCompleteness::Settled,
+        "the gather took {took:?}"
+    );
+    assert_eq!(got.topics.len(), 387 + 15);
+    for (topic, type_name) in &pairs {
+        assert_eq!(
+            got.topics.get(topic),
+            Some(&BTreeSet::from([type_name.clone()]))
+        );
+    }
+    for i in 0..15 {
+        assert_eq!(
+            got.topics.get(&format!("/pace/{i:02}")),
+            Some(&BTreeSet::from(["pkg/msg/Pace".to_string()]))
+        );
+    }
 }
 
 /// A raw notifier on the doorbell the writers created.

@@ -13,7 +13,10 @@
 //! background pump waits on the doorbell event service
 //! [`RMW_GRAPH_DOORBELL_SERVICE_NAME`] and sends again when a reader rings
 //! it, or after [`RMW_GRAPH_REPUBLISH_INTERVAL`] when no ring comes. A
-//! reader rings before each drain pass, and the passes are 20 ms apart.
+//! reader rings at most once per drain pass. It rings again as soon as a pass
+//! brings parts it did not hold, with 1 ms between passes, so a writer whose
+//! snapshot needs many sends is paced by its own answers. With no new part
+//! it rings once every 20 ms.
 //! The writer opens its ports on the first `add` or `remove`. When that open
 //! fails, the pair counts are kept and the open runs again on the next `add`
 //! or `remove`.
@@ -132,8 +135,15 @@ pub const RMW_GRAPH_MAX_NODES: usize = RMW_GRAPH_MAX_WRITERS + RMW_GRAPH_MAX_REA
 /// opened or rung on the writer or the reader side.
 pub const RMW_GRAPH_REPUBLISH_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The pause between two drain passes of a gather.
+/// The pause between two drain passes of a gather while no writer sends new
+/// parts. A ring then goes out once per pass.
 const GATHER_POLL: Duration = Duration::from_millis(20);
+
+/// The pause between two drain passes while new parts arrive. A live writer
+/// answers a ring within a few milliseconds, so one ring per [`GATHER_POLL`]
+/// would hear a snapshot of many sends several times slower than the writer
+/// can send it.
+const GATHER_STREAM_POLL: Duration = Duration::from_millis(1);
 
 /// Maximum doorbell listeners (one per live writer process).
 pub const RMW_GRAPH_DOORBELL_MAX_LISTENERS: usize = RMW_GRAPH_MAX_WRITERS;
@@ -537,15 +547,18 @@ impl RmwGraphGatherFold {
         Self::default()
     }
 
-    /// Record one decoded snapshot part frame.
-    pub fn ingest(&mut self, frame: RmwGraphFrame) {
+    /// Record one decoded snapshot part frame. Returns whether the fold
+    /// stored a part it did not hold: `false` for a malformed index, a part of
+    /// a generation no newer than the writer's newest complete one, a part
+    /// whose `part_count` disagrees with its generation, and a repeat.
+    pub fn ingest(&mut self, frame: RmwGraphFrame) -> bool {
         if frame.part_count == 0 || frame.part_index >= frame.part_count {
-            return;
+            return false;
         }
         let writer = self.writers.entry(frame.writer_id).or_default();
         if let Some((complete_gen, _)) = &writer.newest_complete {
             if frame.generation <= *complete_gen {
-                return;
+                return false;
             }
         }
         let buf = writer
@@ -558,12 +571,17 @@ impl RmwGraphGatherFold {
             });
         if buf.part_count != frame.part_count {
             buf.inconsistent = true;
-            return;
+            return false;
         }
         if buf.inconsistent {
-            return;
+            return false;
         }
-        buf.parts.entry(frame.part_index).or_insert(frame.entries);
+        match buf.parts.entry(frame.part_index) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(frame.entries);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => return false,
+        }
         if buf.is_complete() {
             if let Some(done) = writer.pending.remove(&frame.generation) {
                 let entries = done.parts.into_values().flatten().collect();
@@ -571,6 +589,7 @@ impl RmwGraphGatherFold {
                 writer.pending.retain(|&g, _| g > frame.generation);
             }
         }
+        true
     }
 
     /// Whether `writer_id` has delivered at least one complete generation.
@@ -773,10 +792,10 @@ fn report_recovery(latch: &mut FailureRegimeLatch, what: &'static str) {
 /// publishers are listed on the registry service: an even share of half a
 /// reader queue, and at least one part.
 ///
-/// A reader drains its queue once per pass and rings once per pass, so a
-/// writer sends about once between two drains. At this budget a queue holds
-/// two sends of every listed writer, so a send does not push out the parts
-/// of an earlier one.
+/// A reader drains its queue once per pass and rings at most once per pass
+/// (see the module docs), so a writer sends about once between two drains.
+/// At this budget a queue holds two sends of every listed writer, so a send
+/// does not push out the parts of an earlier one.
 #[must_use]
 pub fn send_budget(listed_writers: usize) -> usize {
     (RMW_GRAPH_QUEUE_DEPTH / (2 * listed_writers.max(1))).max(1)
@@ -1203,14 +1222,22 @@ fn dead_nodes(config: &iceoryx2::config::Config) -> BTreeSet<u128> {
     dead
 }
 
-/// Drain at most one queue of frames into `fold`. Returns how many frames
-/// were refused: frames that fail to decode, and frames whose writer id is
-/// not the id of the publisher that sent them.
+/// What one drain pass took from the queue.
+struct Drained {
+    /// Frames refused: frames that fail to decode, and frames whose writer id
+    /// is not the id of the publisher that sent them.
+    malformed: usize,
+    /// Whether the fold stored at least one part it did not hold.
+    new_parts: bool,
+}
+
+/// Drain at most one queue of frames into `fold`.
 fn drain_into(
     subscriber: &Subscriber<CerService, [u8], ()>,
     fold: &mut RmwGraphGatherFold,
-) -> usize {
+) -> Drained {
     let mut malformed = 0usize;
+    let mut new_parts = false;
     for _ in 0..RMW_GRAPH_QUEUE_DEPTH {
         match subscriber.receive() {
             Ok(Some(sample)) => match decode_frame(sample.payload()) {
@@ -1224,7 +1251,7 @@ fn drain_into(
                         "frame writer id is not its publisher id",
                     );
                 }
-                Ok(frame) => fold.ingest(frame),
+                Ok(frame) => new_parts |= fold.ingest(frame),
                 Err(e) => {
                     malformed += 1;
                     report_failure(
@@ -1241,12 +1268,46 @@ fn drain_into(
                     "receive",
                     &e.to_string(),
                 );
-                return malformed;
+                return Drained {
+                    malformed,
+                    new_parts,
+                };
             }
         }
     }
     report_recovery(&mut lock_regime_latch(&RECEIVE_FAILURES), "receive");
-    malformed
+    Drained {
+        malformed,
+        new_parts,
+    }
+}
+
+/// What a gather that has not settled does before its next drain pass:
+/// whether it rings the doorbell first, and how long it pauses.
+///
+/// `new_parts` is whether the pass that just ended stored a part the fold did
+/// not hold, `since_ring` the time since the last ring, and `since_new_part`
+/// the time since the last pass that stored one (`None` before the first).
+/// A pass with new parts rings again, so a writer whose snapshot needs many
+/// sends is paced by its own answers. With no new part a ring goes out once
+/// per [`GATHER_POLL`], as for a writer that does not answer. The pause is
+/// [`GATHER_STREAM_POLL`] while parts arrived within the last [`GATHER_POLL`],
+/// else [`GATHER_POLL`]. A ring goes out at most once per drain pass, so a
+/// reader queue still holds every send that reaches it between two drains
+/// (see [`send_budget`]).
+fn next_pass(
+    new_parts: bool,
+    since_ring: Duration,
+    since_new_part: Option<Duration>,
+) -> (bool, Duration) {
+    let ring = new_parts || since_ring >= GATHER_POLL;
+    let streaming = since_new_part.is_some_and(|d| d < GATHER_POLL);
+    let pause = if streaming {
+        GATHER_STREAM_POLL
+    } else {
+        GATHER_POLL
+    };
+    (ring, pause)
 }
 
 /// The reader's doorbell notifier for one gather. Without one the gather
@@ -1307,8 +1368,12 @@ pub(crate) fn gather_from_node(
     let mut fold = RmwGraphGatherFold::new();
     let mut malformed = 0usize;
     let deadline = Instant::now() + window;
+    let mut ring = true;
+    let mut rung_at = Instant::now();
+    let mut new_part_at: Option<Instant> = None;
     loop {
-        if let Some(bell) = &bell {
+        if let (true, Some(bell)) = (ring, &bell) {
+            rung_at = Instant::now();
             match bell.notify() {
                 Ok(_) => report_recovery(
                     &mut lock_regime_latch(&GATHER_DOORBELL_FAILURES),
@@ -1321,12 +1386,23 @@ pub(crate) fn gather_from_node(
                 ),
             }
         }
-        malformed += drain_into(&subscriber, &mut fold);
+        let drained = drain_into(&subscriber, &mut fold);
+        malformed += drained.malformed;
         required = required_writers(&listed_writers(&factory), &dead, own_writer);
-        if fold.is_settled(&required) || Instant::now() >= deadline {
+        let now = Instant::now();
+        if fold.is_settled(&required) || now >= deadline {
             break;
         }
-        std::thread::sleep(GATHER_POLL);
+        if drained.new_parts {
+            new_part_at = Some(now);
+        }
+        let (ring_next, pause) = next_pass(
+            drained.new_parts,
+            now - rung_at,
+            new_part_at.map(|at| now - at),
+        );
+        ring = ring_next;
+        std::thread::sleep(pause.min(deadline - now));
     }
     let gather = fold.finish(&required);
     if gather.completeness.is_settled() && malformed == 0 {
@@ -1749,6 +1825,75 @@ mod tests {
             encode_snapshot(1, 1, entries),
             Err(RmwGraphFrameError::TooManyParts { count: 65_536 })
         );
+    }
+
+    #[test]
+    fn next_pass_rings_on_new_parts_and_once_per_poll_without_them() {
+        let ms = Duration::from_millis;
+        // (new_parts, since_ring, since_new_part) -> (ring, pause)
+        let rows = [
+            ((true, ms(0), Some(ms(0))), (true, ms(1))),
+            ((true, ms(25), Some(ms(0))), (true, ms(1))),
+            ((false, ms(1), Some(ms(1))), (false, ms(1))),
+            ((false, ms(19), Some(ms(19))), (false, ms(1))),
+            ((false, ms(20), Some(ms(19))), (true, ms(1))),
+            ((false, ms(19), Some(ms(20))), (false, ms(20))),
+            ((false, ms(20), Some(ms(20))), (true, ms(20))),
+            ((false, ms(0), None), (false, ms(20))),
+            ((false, ms(20), None), (true, ms(20))),
+            ((false, ms(500), None), (true, ms(20))),
+        ];
+        for ((new_parts, since_ring, since_new_part), expected) in rows {
+            assert_eq!(
+                next_pass(new_parts, since_ring, since_new_part),
+                expected,
+                "new_parts={new_parts} since_ring={since_ring:?} since_new_part={since_new_part:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ingest_reports_only_parts_the_fold_did_not_hold() {
+        let mut fold = RmwGraphGatherFold::new();
+        let rows: [(RmwGraphFrame, bool, &str); 9] = [
+            (
+                make_frame(7, 1, 0, 2, &[("/a", "pkg/msg/A")]),
+                true,
+                "first part",
+            ),
+            (
+                make_frame(7, 1, 0, 2, &[("/a", "pkg/msg/A")]),
+                false,
+                "repeat",
+            ),
+            (make_frame(7, 1, 0, 3, &[]), false, "part count disagrees"),
+            (
+                make_frame(7, 1, 1, 2, &[("/b", "pkg/msg/B")]),
+                false,
+                "inconsistent generation",
+            ),
+            (make_frame(7, 2, 2, 2, &[]), false, "index past the count"),
+            (make_frame(7, 2, 0, 0, &[]), false, "zero part count"),
+            (
+                make_frame(7, 3, 0, 1, &[("/c", "pkg/msg/C")]),
+                true,
+                "completes generation 3",
+            ),
+            (
+                make_frame(7, 3, 0, 1, &[("/c", "pkg/msg/C")]),
+                false,
+                "complete generation",
+            ),
+            (
+                make_frame(7, 2, 0, 1, &[("/old", "pkg/msg/Old")]),
+                false,
+                "older generation",
+            ),
+        ];
+        for (frame, stored, case) in rows {
+            assert_eq!(fold.ingest(frame), stored, "{case}");
+        }
+        assert!(fold.is_writer_complete(7));
     }
 
     #[test]
