@@ -12324,22 +12324,10 @@ fn graph_run_supervisor(
     let mut _capture_plane: Option<std::sync::Arc<cerulion_core::state_arm::MappedStateArm>> = None;
     #[cfg(unix)]
     let armed_tag: Option<String> = {
-        // An anchor forks the rank's process; a fork copies only the forking
-        // thread and every lock another thread holds at that instant, so a
-        // process running several units cannot be anchored by a fork.
-        let state_arm_tag = match (state_arm_tag.as_deref(), units.plan.splits_any()) {
-            (Some(_), true) => {
-                tracing::warn!(
-                    graph = %config.identity(),
-                    hosts = ?units.plan.split_hosts().map(|(h, _)| h).collect::<Vec<_>>(),
-                    "flashback checkpoints are OFF for this run: at least one process hosts \
-                     more than one executor unit, and a checkpoint forks its process, which \
-                     copies one thread, so this run takes none"
-                );
-                None
-            }
-            (tag, _) => tag.map(str::to_string),
-        };
+        // A process that hosts several executor units is armed like any other:
+        // each of its units attaches WITHOUT the fork carrier (`graph_run_worker`,
+        // `plan_shares_its_process`), since a fork would copy one thread and leave
+        // a lock a sibling unit holds held in the child.
         let armed = state_arm_tag.as_deref().and_then(|tag| {
             // Every worker plan carries the SAME `handed_quantum_ns` by
             // construction (multiprocess.rs: it is the min over the full graph),

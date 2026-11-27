@@ -551,6 +551,13 @@ this section is the opt-out's machinery.)
   budget grows. Observable: `last_anchor_direct()`. The cost: a deferred node's
   user-written encoder (serde field, hand `CerulionState`) runs on the unit thread,
   unbounded in time (`state_anchor_direct_iox2_test`).
+- The caller: `graph_run_worker` arms a unit whose plan shares its process
+  (`plan_shares_its_process`, the stamped `WorkerPlan::host`, the same predicate
+  that picks its detached transport) through
+  `state_arm_attach::attach_state_capture_no_fork_from`, as `PlaneRole::HostedUnit`
+  (kill switch and knobs apply, the fork-memory gate does not). A single-unit
+  worker keeps the fork carrier. Proof over the real binary:
+  `cerulion_cli/tests/flashback_split_units_e2e_test.rs`.
 
 ## Clock model
 

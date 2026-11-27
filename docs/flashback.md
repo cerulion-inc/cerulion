@@ -62,11 +62,30 @@ units runs them in one worker process, which mints the rings like any
 multi-process run. Each capture records which of the two it is; see
 [Limitations](#limitations).
 
-A run takes no checkpoints when any of its processes hosts several executor
-units, whatever its shape: that `--single-process` run, or a multi-process run
-with a process group that holds an `isolate: true` node beside others, or that
-the graph's profile splits into units. A capture of such a run is resimmable
-only when its window reaches the run's step 0.
+A process that hosts several executor units takes a checkpoint in every unit,
+whatever its shape: that `--single-process` run, or a multi-process run with a
+process group that holds an `isolate: true` node beside others, or that the
+graph's profile splits into units. Each unit is its own rank, with its own
+state ring. A single-unit worker copies its process with a fork to take a
+checkpoint; a unit that shares its process cannot, because a fork copies one
+thread and a lock a sibling unit holds would stay held in the copy. So each such
+unit captures its node state on its own thread:
+
+- Per checkpoint, a unit encodes at most 64 KiB inline plus at most the free
+  part of its own state ring, and no write waits for the recorder. A node whose
+  state does not fit is recorded as skipped, and its encoder is not run again
+  until the ring has more room.
+- A node encoder you wrote (a `#[cerulion(serde)]` field or a hand-written
+  `CerulionState`) runs on the unit's thread, and nothing bounds its time. That
+  unit's tick pauses while it runs, its sibling units do not, and a capture
+  longer than the wedge alarm's threshold raises the alarm for that rank.
+- `CERULION_FLASHBACK_MAX_STATE_MB` does not apply to such a unit: it makes no
+  copy of its process. `CERULION_FLASHBACK=off`, the cadence and the ring size
+  apply as for any rank.
+
+A capture of a run of several worker ranks is resimmable only when its window
+reaches the run's step 0: a mid-run free-run recording of several worker ranks
+is refused, since per-rank resume is not supported.
 
 ---
 
@@ -250,8 +269,9 @@ of every read it holds. A capture recorded below format 11 is refused under
 `--verify` when a single-writer read in it continues a writer run begun before
 the capture (`read_identity_absent`, with a message to record the run again);
 `--resim all` without `--verify` replays it. A process that runs several
-executor units takes no checkpoints. A mid-run free-run recording of several
-worker ranks is refused, since per-rank resume is not supported.
+executor units takes a checkpoint in each unit, on that unit's own thread. A
+mid-run free-run recording of several worker ranks is refused, since per-rank
+resume is not supported.
 
 ---
 
