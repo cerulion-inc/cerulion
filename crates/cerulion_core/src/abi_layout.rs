@@ -322,7 +322,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 34;
+const EXPECTED_ABI: u32 = 35;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -688,7 +688,10 @@ static EXPECTED: &[Expected] = &[
         // `dump_measured_table`). v30 adds `records_batch_frames: AtomicBool`,
         // which takes offset rank 6: `role` moves from rank 6 to 7 and
         // `annotates_every_read` from 7 to 8, and every other field keeps its
-        // rank (MEASURED via `dump_measured_table`).
+        // rank (MEASURED via `dump_measured_table`). v35 adds
+        // `records_single_takes: AtomicBool`, which takes offset rank 7: `role`
+        // moves from rank 7 to 8 and `annotates_every_read` from 8 to 9, and
+        // every other field keeps its rank (MEASURED via `dump_measured_table`).
         fields: &[
             "input_idx",
             "role",
@@ -696,13 +699,14 @@ static EXPECTED: &[Expected] = &[
             "armed",
             "records_every_consult",
             "records_batch_frames",
+            "records_single_takes",
             "annotates_every_read",
             "pending",
             "inner",
         ],
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[3, 7, 1, 4, 5, 6, 8, 2, 0],
+            ranks: &[3, 8, 1, 4, 5, 6, 7, 9, 2, 0],
         },
     },
     Expected {
@@ -1214,8 +1218,10 @@ fn the_staged_wire_discriminants_are_pinned() {
             ReadOutcomeKind::Decimated.wire(),
             ReadOutcomeKind::Truncated.wire(),
             ReadOutcomeKind::Producer.wire(),
+            ReadOutcomeKind::BatchFrame.wire(),
+            ReadOutcomeKind::Taken.wire(),
         ],
-        [1, 2, 3, 4, 5, 6, 7],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
         "abi_layout: a `ReadOutcomeKind` wire value moved. These discriminants ARE the \
          kind-6 record's low-16 half; renumbering one silently re-labels every read in every bag \
          recorded before the change."

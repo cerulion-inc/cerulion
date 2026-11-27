@@ -48,6 +48,11 @@ fn only_the_roles_that_fork_are_gated() {
         "a supervisor holds the word and never anchors — it installs no state-ring \
          producer, and `take_anchor` returns at its first line without one"
     );
+    assert!(
+        !PlaneRole::HostedUnit { rank: 0 }.pays_the_fork_cost(),
+        "a unit that shares its process is armed without the fork carrier, so its anchor \
+         copies no memory"
+    );
 }
 
 /// THE HEADLINE: a SUPERVISOR over the ceiling still arms the plane, so
@@ -549,6 +554,60 @@ fn a_worker_over_the_ceiling_declines_for_itself_and_says_which_rank() {
     assert!(
         !logs_contain("exits 8"),
         "…and NOT a verdict the resim has no code for: its contract runs 0 to 6"
+    );
+}
+
+/// A unit that shares its process is ADMITTED over the memory ceiling, and a forking
+/// worker at the same ceiling is refused.
+///
+/// Its anchor starts no child and copies no memory, so the ceiling, which prices that
+/// copy, says nothing about it. The worker refusal in the same body is the control:
+/// without it this arm would pass a gate that had stopped working.
+#[test]
+#[serial_test::serial]
+#[tracing_test::traced_test]
+fn a_hosted_unit_over_the_ceiling_is_admitted_because_it_never_forks() {
+    let _env = clean_env();
+    let _low = over_the_forced_ceiling();
+    let _cadence = EnvGuard::set(cerulion_core::flashback::FLASHBACK_CADENCE_MS_ENV, "250");
+    let tag = unique_tag("hosted_gate");
+
+    assert!(
+        admit_capture_plane(PlaneRole::Worker { rank: 4 }, &tag, Some(1_000_000)).is_none(),
+        "precondition: a forking worker is over the forced ceiling"
+    );
+    let projection = admit_capture_plane(PlaneRole::HostedUnit { rank: 5 }, &tag, Some(1_000_000))
+        .expect("a hosted unit is not judged by the memory gate");
+    assert_eq!(
+        projection.cadence_steps, 250,
+        "the cadence knob still applies to it: 250 ms over a 1 ms quantum"
+    );
+    assert_line_at!(
+        "WARN",
+        "Flashback STATE capture is OFF",
+        "the worker's refusal is the only refusal line: the hosted unit says nothing"
+    );
+    assert!(
+        !plane_exists(&tag),
+        "admission creates nothing: a hosted unit opens the word its plan names"
+    );
+}
+
+/// The kill switch is run-level policy, and a hosted unit obeys it like every role.
+#[test]
+#[serial_test::serial]
+#[tracing_test::traced_test]
+fn the_kill_switch_stops_a_hosted_unit() {
+    let _env = clean_env();
+    let _off = EnvGuard::set(cerulion_core::flashback::FLASHBACK_ENV, "off");
+    let tag = unique_tag("hosted_killswitch");
+    assert!(
+        admit_capture_plane(PlaneRole::HostedUnit { rank: 1 }, &tag, Some(1_000_000)).is_none(),
+        "`CERULION_FLASHBACK=off` refuses a hosted unit"
+    );
+    assert!(
+        logs_contain("Flashback is OFF for this run"),
+        "and says why, in this process's own log"
     );
 }
 

@@ -29,6 +29,10 @@ Pipeline order (each stage feeds the next; the order is load-bearing):
    warning panics: an unresolved or ambiguous reference silently changes the
    parent's WIRE LAYOUT while the schema hash stays equal, a wire-skew hazard,
    never a cosmetic one.
+   Resolution also stamps every reference it does not inline with its target's
+   resolved hash (`FieldType::Nested::target_hash`); the corpus has no reference
+   cycle, so every reference carries one stamp
+   (`schema_hash_pin_test::every_corpus_reference_carries_its_target_hash_in_exactly_one_stamp`).
 5. **`generate_schema`** per schema, emitting three items per message: the unit
    marker (`pub struct <Name>;` carrying `impl ShmMessage`), the SHM-backed accessor
    `<Name>Shm`, and the heap-owned `<Name>Snapshot` replay/round-trip companion.

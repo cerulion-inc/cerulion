@@ -267,6 +267,7 @@ fn overflow_chain_ir() -> Vec<MessageSchema> {
         schema_name: name.to_string(),
         package: None,
         fixed: None,
+        target_hash: None,
     };
     let mut s1 = MessageSchema::new("S1");
     s1.add_field(FieldDef::new("b", array(nested("S0"))));
@@ -756,6 +757,7 @@ fn field_type_json_shapes_are_pinned() {
                 schema_name: "Header".into(),
                 package: Some("std_msgs".into()),
                 fixed: None,
+                target_hash: None,
             },
             r#"{"Nested":{"schema_name":"Header","package":"std_msgs","fixed":null}}"#,
         ),
@@ -769,6 +771,7 @@ fn field_type_json_shapes_are_pinned() {
                     alignment: 4,
                     target_hash: 5,
                 }),
+                target_hash: None,
             },
             concat!(
                 r#"{"Nested":{"schema_name":"Time","package":null,"#,
@@ -1522,6 +1525,7 @@ fn a_bare_store_reference_hashes_as_ros_2_introspection_names_it() {
         schema_name: name.to_string(),
         package: Some(package.to_string()),
         fixed: None,
+        target_hash: None,
     };
     let message = |package: &str, name: &str, members: Vec<(&str, FieldType)>| {
         let mut schema = MessageSchema::new_in_package(name, package);

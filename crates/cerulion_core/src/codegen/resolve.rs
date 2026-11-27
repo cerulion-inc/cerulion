@@ -35,6 +35,15 @@
 //!    `wire_fixed_size()` and recipe-3 `schema_hash()` see the true inlined
 //!    layout and fold in the target's full hash (recipe 3 — a
 //!    layout change inside an inlined target bumps every embedder's hash).
+//! 3. Stamps every other bound reference (a variable target, or any
+//!    element under a `DynamicArray`) with the target's own resolved
+//!    `schema_hash` in `FieldType::Nested::target_hash`, also bottom-up.
+//!    The two stamps are exclusive: an inlined target's hash lives in
+//!    [`NestedFixedInfo::target_hash`]. A reference inside a reference
+//!    cycle (its target reaches back to the parent, at any array depth) is
+//!    not stamped: its target's hash would depend on the parent's own. This
+//!    rule reads only the reference graph, never the order of the input,
+//!    so a schema outside the cycle gets the same stamps in every order.
 //!
 //! Reference resolution follows rosidl semantics: qualified (`pkg/Msg`)
 //! → exact; unqualified → same package first, then the single legacy
@@ -43,8 +52,10 @@
 //! rosidl would REJECT, so it always emits a loud warning.
 //!
 //! Warnings are produced for: unresolvable references (unknown target,
-//! ambiguous bare name), reference cycles, duplicate schema definitions,
-//! cross-package bare bindings, and typo'd `DynamicArray` element types.
+//! ambiguous bare name), reference cycles (one per reference that is not
+//! stamped, a schema's reference to itself excepted), targets whose fixed
+//! section cannot be sized, duplicate schema definitions, cross-package
+//! bare bindings, and typo'd `DynamicArray` element types.
 //! Unresolvable references are left untouched — they keep the
 //! conservative variable classification. Missing schemas are NOT an
 //! error here: workspace YAML schemas and partial vendoring must keep
@@ -125,19 +136,13 @@ pub fn resolve_fixed_nested(schemas: &mut [MessageSchema]) -> Vec<String> {
     for idx in 0..resolver.snapshot.len() {
         resolver.fixedness_of(idx);
     }
+    resolver.memoize_hashes_targets_first();
 
     // Rewrite phase: mark resolved-fixed Nested references on the live
     // schemas using the memoized fixedness of the pre-rewrite snapshot.
-    for schema in schemas.iter_mut() {
-        let parent_package = schema.package.clone();
-        let parent_name = schema.name.clone();
+    for (parent_idx, schema) in schemas.iter_mut().enumerate() {
         for field in &mut schema.fields {
-            resolver.rewrite_field(
-                &mut field.field_type,
-                &field.name,
-                &parent_name,
-                &parent_package,
-            );
+            resolver.rewrite_field(&mut field.field_type, &field.name, parent_idx, false);
         }
     }
 
@@ -206,8 +211,8 @@ fn element_type_of_mut(field_type: &mut FieldType) -> &mut FieldType {
 }
 
 /// Internal state for one resolution run: the immutable pre-rewrite
-/// snapshot, lookup registries, the fixedness memo, and accumulated
-/// warnings.
+/// snapshot, lookup registries, the fixedness and hash memos, and
+/// accumulated warnings.
 struct Resolver {
     /// Pre-rewrite copy of the schemas, so fixedness computation does not
     /// depend on rewrite order.
@@ -216,13 +221,45 @@ struct Resolver {
     index: NestedIndex,
     /// Memoized fixedness per snapshot index.
     memo: Vec<Option<Fixedness>>,
-    /// Memoized fully-resolved layout per snapshot index (recipe 3). Only
-    /// populated for recursively-fixed schemas (the only ones that get
-    /// inlined into a parent's fixed section). Computed bottom-up.
-    resolved_info: Vec<Option<ResolvedFixed>>,
+    /// Memoized fully-resolved layout per snapshot index. Only computed
+    /// for recursively-fixed schemas (the only ones that get inlined into a
+    /// parent's fixed section). Computed bottom-up; `Err` names the field
+    /// whose composed size overflows.
+    resolved_info: Vec<Option<Result<ResolvedFixed, String>>>,
+    /// Memoized resolved `schema_hash` per snapshot index, fixed or
+    /// variable: the value stamped as `target_hash` on a reference that is
+    /// not inlined. `Err` when the target's fixed section cannot be sized.
+    resolved_hash: Vec<Option<Result<u64, String>>>,
+    /// Strongly connected component of each snapshot index in the
+    /// reference graph (every nested reference, at any array depth). Two
+    /// schemas share a component iff each reaches the other, so a
+    /// reference inside one component is a reference cycle.
+    component: Vec<usize>,
+    /// Every snapshot index, each after every schema it reaches outside
+    /// its own component: the order
+    /// [`memoize_hashes_targets_first`](Self::memoize_hashes_targets_first)
+    /// fills the hash memo in.
+    targets_first: Vec<usize>,
     /// In-progress DFS markers for cycle detection.
     visiting: Vec<bool>,
     warnings: Vec<String>,
+}
+
+/// How one nested reference binds within the set being resolved, at its
+/// position in the parent (inside a `DynamicArray` or not).
+enum Binding {
+    /// The reference names no schema of the set, or an ambiguous one.
+    Unbound(String),
+    /// A recursively fixed target at an inlinable position (not under a
+    /// `DynamicArray`): the field lives in the parent's fixed section.
+    Inline(Bound),
+    /// A target the parent references but does not inline (a variable
+    /// target, or any target under a `DynamicArray`), outside the parent's
+    /// reference cycle: its resolved hash is stamped as `target_hash`.
+    Referenced(Bound),
+    /// A target in the parent's own reference cycle. Its hash would depend
+    /// on the parent's, so no `target_hash` is stamped.
+    Cyclic(Bound),
 }
 
 impl Resolver {
@@ -243,11 +280,18 @@ impl Resolver {
             }
         }
         let len = schemas.len();
+        let component = reference_components(schemas, &index);
+        // Tarjan closes a component only after every component it reaches.
+        let mut targets_first: Vec<usize> = (0..len).collect();
+        targets_first.sort_by_key(|&idx| component[idx]);
         Self {
             snapshot: schemas.to_vec(),
             index,
             memo: vec![None; len],
             resolved_info: vec![None; len],
+            resolved_hash: vec![None; len],
+            component,
+            targets_first,
             visiting: vec![false; len],
             warnings,
         }
@@ -272,6 +316,31 @@ impl Resolver {
                 (Miss::Unknown, Some(pkg)) => format!("unknown schema '{pkg}/{name}'"),
                 (Miss::Unknown, None) => format!("unknown schema '{name}'"),
             })
+    }
+
+    /// Bind the reference `package`/`schema_name` held by the snapshot
+    /// schema at `parent_idx`. `under_dynamic` is true for a reference
+    /// inside a `DynamicArray` (at any depth), which is never inlined.
+    ///
+    /// Precondition: the fixedness memo is fully populated.
+    fn bind(
+        &self,
+        package: &Option<String>,
+        schema_name: &str,
+        parent_idx: usize,
+        under_dynamic: bool,
+    ) -> Binding {
+        let found = match self.lookup(package, schema_name, &self.snapshot[parent_idx].package) {
+            Ok(found) => found,
+            Err(reason) => return Binding::Unbound(reason),
+        };
+        if !under_dynamic && matches!(self.memo[found.idx], Some(Fixedness::Fixed { .. })) {
+            Binding::Inline(found)
+        } else if self.component[found.idx] == self.component[parent_idx] {
+            Binding::Cyclic(found)
+        } else {
+            Binding::Referenced(found)
+        }
     }
 
     /// Memoized recursive fixedness of the schema at `idx` (DFS with
@@ -361,21 +430,33 @@ impl Resolver {
         }
     }
 
+    /// The snapshot schema at `idx` with every nested reference stamped
+    /// as the rewrite phase stamps it ([`resolve_ft_for_layout`](Self::resolve_ft_for_layout)),
+    /// so the `MessageSchema` methods read the true inlined layout and the
+    /// recipe lives in exactly one place. Works on a clone: the snapshot
+    /// is never mutated (determinism and order-independence).
+    fn resolved_clone_of(&mut self, idx: usize) -> Result<MessageSchema, String> {
+        let mut resolved = self.snapshot[idx].clone();
+        for field in &mut resolved.fields {
+            field.field_type = self.resolve_ft_for_layout(&field.field_type, idx, false)?;
+        }
+        Ok(resolved)
+    }
+
     /// Bottom-up, memoized full layout of the recursively-fixed schema at
-    /// `idx` (recipe 3). Builds a clone of the snapshot schema with
-    /// EVERY nested ref resolved first (recursively), then reads
-    /// `wire_fixed_size()` / `wire_alignment()` / `schema_hash()` off that
-    /// fully-resolved clone — so the values reflect the true inlined
-    /// `#[repr(C)]` layout and the recursive hash, with the recipe living in
-    /// exactly one place (the `MessageSchema` methods).
+    /// `idx`, read off [`resolved_clone_of`](Self::resolved_clone_of)
+    /// through the checked size arithmetic. `Err` names the field whose
+    /// composed size overflows; the inlining site in
+    /// [`rewrite_field`](Self::rewrite_field) panics with it, a hash-only
+    /// site degrades to no stamp.
     ///
     /// Precondition: `self.memo[idx]` is `Fixed` (only fixed schemas are
     /// inlined). Fixed schemas are acyclic — a reference cycle is downgraded
     /// to `Variable` by [`fixedness_of`](Self::fixedness_of) — so the
     /// recursion terminates; the memo also prevents recomputation.
-    fn resolved_fixed_of(&mut self, idx: usize) -> ResolvedFixed {
-        if let Some(r) = self.resolved_info[idx] {
-            return r;
+    fn resolved_fixed_of(&mut self, idx: usize) -> Result<ResolvedFixed, String> {
+        if let Some(r) = &self.resolved_info[idx] {
+            return r.clone();
         }
         debug_assert!(
             matches!(self.memo[idx], Some(Fixedness::Fixed { .. })),
@@ -387,166 +468,322 @@ impl Resolver {
                 has_large_array: true
             })
         );
-
-        // Work on a clone so the snapshot is never mutated (determinism +
-        // order-independence). Resolve each field's nested refs first.
-        let mut resolved = self.snapshot[idx].clone();
-        let parent_package = resolved.package.clone();
-        for fi in 0..resolved.fields.len() {
-            let ft = resolved.fields[fi].field_type.clone();
-            resolved.fields[fi].field_type = self.resolve_ft_for_layout(&ft, &parent_package);
-        }
-
-        let info = ResolvedFixed {
-            wire_fixed_size: resolved.wire_fixed_size(),
-            wire_alignment: resolved.wire_alignment(),
-            schema_hash: resolved.schema_hash(),
-            has_large_array,
-        };
-        self.resolved_info[idx] = Some(info);
+        let info = self.resolved_clone_of(idx).and_then(|resolved| {
+            Ok(ResolvedFixed {
+                wire_fixed_size: resolved.checked_wire_fixed_size()?,
+                wire_alignment: resolved.wire_alignment(),
+                schema_hash: resolved.checked_schema_hash()?,
+                has_large_array,
+            })
+        });
+        self.resolved_info[idx] = Some(info.clone());
         info
     }
 
-    /// Return a copy of `ft` with every recursively-fixed nested reference
-    /// stamped with its [`NestedFixedInfo`] (resolved bottom-up via
-    /// [`resolved_fixed_of`](Self::resolved_fixed_of)). Recurses into
-    /// `FixedArray` elements. Variable / unresolvable nested refs are
-    /// returned unchanged (they stay `fixed: None`).
+    /// Memoized resolved `schema_hash` of the schema at `idx`, fixed or
+    /// variable: the value a reference that does not inline the schema
+    /// carries as `target_hash`. Uses the checked size arithmetic, so a
+    /// hostile definition (a bag's schema doc, a peer-served closure) is an
+    /// `Err`, never a panic.
+    ///
+    /// Terminates: every reference it follows leaves the schema's reference
+    /// cycle ([`Binding::Cyclic`] is never followed), so the calls walk the
+    /// acyclic graph of components. Once
+    /// [`memoize_hashes_targets_first`](Self::memoize_hashes_targets_first)
+    /// has run, every call is a memo hit.
+    fn resolved_hash_of(&mut self, idx: usize) -> Result<u64, String> {
+        if let Some(r) = &self.resolved_hash[idx] {
+            return r.clone();
+        }
+        let hash = if matches!(self.memo[idx], Some(Fixedness::Fixed { .. })) {
+            self.resolved_fixed_of(idx).map(|info| info.schema_hash)
+        } else {
+            self.resolved_clone_of(idx)
+                .and_then(|resolved| resolved.checked_schema_hash())
+        };
+        self.resolved_hash[idx] = Some(hash.clone());
+        hash
+    }
+
+    /// Fill the hash memo (and, through it, the layout memo of every fixed
+    /// schema) in [`targets_first`](Self::targets_first) order. Each
+    /// schema's targets are then memoized before it is hashed, so the stack
+    /// does not grow with the length of a reference chain: a chain of
+    /// dynamic arrays or of variable targets, which the fixedness walk does
+    /// not follow, is hashed link by link. An `Err` stays in the memo; the
+    /// rewrite phase warns it per reference.
+    ///
+    /// Precondition: the fixedness memo is fully populated.
+    fn memoize_hashes_targets_first(&mut self) {
+        for pos in 0..self.targets_first.len() {
+            let _ = self.resolved_hash_of(self.targets_first[pos]);
+        }
+    }
+
+    /// Return `ft` with every nested reference stamped as
+    /// [`rewrite_field`](Self::rewrite_field) stamps it, recursing into
+    /// array elements: an inlined target gets `fixed`, a referenced one
+    /// `target_hash`, anything else neither. Every arm rebuilds the
+    /// reference, so a stamp left by an earlier resolution never survives.
+    /// `Err` only when an inlined target's composed size overflows (the
+    /// parent then has no fixed section); a hash that cannot be computed
+    /// leaves `target_hash` empty, and the rewrite phase warns per reference.
     fn resolve_ft_for_layout(
         &mut self,
         ft: &FieldType,
-        parent_package: &Option<String>,
-    ) -> FieldType {
-        match ft {
+        parent_idx: usize,
+        under_dynamic: bool,
+    ) -> Result<FieldType, String> {
+        Ok(match ft {
             FieldType::Nested {
                 schema_name,
                 package,
                 ..
             } => {
-                if let Ok(found) = self.lookup(package, schema_name, parent_package) {
-                    if matches!(self.memo[found.idx], Some(Fixedness::Fixed { .. })) {
-                        let child = self.resolved_fixed_of(found.idx);
-                        return FieldType::Nested {
-                            schema_name: schema_name.clone(),
-                            package: package.clone(),
-                            fixed: Some(child.into()),
-                        };
-                    }
+                let (fixed, target_hash) =
+                    match self.bind(package, schema_name, parent_idx, under_dynamic) {
+                        Binding::Inline(found) => {
+                            (Some(self.resolved_fixed_of(found.idx)?.into()), None)
+                        }
+                        Binding::Referenced(found) => (None, self.resolved_hash_of(found.idx).ok()),
+                        Binding::Unbound(_) | Binding::Cyclic(_) => (None, None),
+                    };
+                FieldType::Nested {
+                    schema_name: schema_name.clone(),
+                    package: package.clone(),
+                    fixed,
+                    target_hash,
                 }
-                // Fallthrough (lookup Err or target Variable): leave the ref
-                // unchanged (`fixed: None`). Under this method's contract —
-                // it only runs for the fields of an already-`Fixed` schema,
-                // whose every nested ref resolved Ok to a Fixed target — the
-                // Err branch is effectively unreachable; the Variable branch
-                // cannot occur either (a Variable field would have made the
-                // parent Variable). Kept defensive. Any genuine lookup Err is
-                // separately reported by `rewrite_field`, so it is not
-                // silently dropped here.
-                ft.clone()
             }
             FieldType::FixedArray {
                 element_type,
                 length,
             } => FieldType::FixedArray {
-                element_type: Box::new(self.resolve_ft_for_layout(element_type, parent_package)),
+                element_type: Box::new(self.resolve_ft_for_layout(
+                    element_type,
+                    parent_idx,
+                    under_dynamic,
+                )?),
                 length: *length,
             },
+            FieldType::DynamicArray { element_type } => FieldType::DynamicArray {
+                element_type: Box::new(self.resolve_ft_for_layout(
+                    element_type,
+                    parent_idx,
+                    true,
+                )?),
+            },
             other => other.clone(),
-        }
+        })
     }
 
-    /// Rewrite one field type in place (recursing into FixedArray
-    /// elements): set `fixed: Some(info)` on Nested references whose
-    /// target is recursively fixed; warn on unresolvable references.
+    /// Rewrite one field type of the schema at `parent_idx` in place
+    /// (recursing into array elements): set `fixed: Some(info)` on a
+    /// reference that inlines a recursively fixed target, `target_hash` on
+    /// one that references a target without inlining it, and clear both
+    /// everywhere else. Warns on unresolvable references, on references
+    /// inside a reference cycle, and on targets that have no hash.
     fn rewrite_field(
         &mut self,
         ft: &mut FieldType,
         field_name: &str,
-        parent_name: &str,
-        parent_package: &Option<String>,
+        parent_idx: usize,
+        under_dynamic: bool,
     ) {
         match ft {
             FieldType::Nested {
                 schema_name,
                 package,
                 fixed,
-            } => match self.lookup(package, schema_name, parent_package) {
-                Ok(found) => {
-                    if found.cross_package_bare {
-                        // rosidl would reject this reference (unqualified
-                        // means same-package, `Header` excepted). We
-                        // resolve it, but never silently — the binding can
-                        // flip when a second package later defines the
-                        // same bare name.
-                        let target = self.snapshot[found.idx].qualified_name();
+                target_hash,
+            } => {
+                // Re-resolution is authoritative: every arm writes both
+                // stamps, so a stamp from a prior resolution against a
+                // different (fuller) schema set never survives. A stale
+                // `fixed` would route the field into the fixed section with
+                // a layout the current set cannot produce.
+                *fixed = None;
+                *target_hash = None;
+                let parent_name = self.snapshot[parent_idx].name.clone();
+                // A DynamicArray element keeps the array's own warning text:
+                // its layout is unaffected either way.
+                let (prefix, consequence) = if under_dynamic {
+                    (
+                        "array element: ",
+                        "array stays opaque-bytes (layout unaffected)",
+                    )
+                } else {
+                    (
+                        "",
+                        "field stays conservatively variable (opaque-bytes accessors, not zero-copy)",
+                    )
+                };
+                match self.bind(package, schema_name, parent_idx, under_dynamic) {
+                    Binding::Unbound(reason) => {
                         self.warnings.push(format!(
-                            "{parent_name}.{field_name}: unqualified reference '{schema_name}' \
-                             resolved CROSS-PACKAGE to '{target}' — rosidl would reject this; \
-                             qualify the reference in the .msg file"
+                            "{parent_name}.{field_name}: {prefix}{reason} — {consequence}" // dash-ok
                         ));
                     }
-                    // Re-resolution is authoritative:
-                    // stamp the resolved layout for a fixed target and
-                    // CLEAR a stale flag for a variable one. A stale `Some`
-                    // from a prior resolution against a different (fuller)
-                    // schema set must not survive — it would route the field
-                    // into the fixed section with a layout the current set
-                    // cannot produce.
-                    if matches!(self.memo[found.idx], Some(Fixedness::Fixed { .. })) {
-                        // Recipe 3: stamp the target's full resolved
-                        // layout (size / alignment / recursive hash), computed
-                        // bottom-up so nested-of-nested is already populated.
-                        let child = self.resolved_fixed_of(found.idx);
-                        *fixed = Some(child.into());
-                    } else {
-                        // Variable (or unresolved-to-variable) target: clear
-                        // any stale flag. Genuinely-variable is a fact, but a
-                        // leftover `Some` from a fuller set must not survive.
-                        *fixed = None;
+                    Binding::Inline(found) => {
+                        self.warn_cross_package_bare(&found, schema_name, field_name, &parent_name);
+                        // Bottom-up: nested-of-nested is already populated.
+                        // A composed overflow here is the set
+                        // `composed_overflow_indices` preflights.
+                        match self.resolved_fixed_of(found.idx) {
+                            Ok(child) => *fixed = Some(child.into()),
+                            Err(e) => panic!("{e}"),
+                        }
+                    }
+                    Binding::Referenced(found) => {
+                        self.warn_cross_package_bare(&found, schema_name, field_name, &parent_name);
+                        match self.resolved_hash_of(found.idx) {
+                            Ok(hash) => *target_hash = Some(hash),
+                            Err(reason) => {
+                                let target = self.snapshot[found.idx].qualified_name();
+                                self.warnings.push(format!(
+                                    "{parent_name}.{field_name}: {prefix}'{target}' has no wire \
+                                     hash ({reason}); the reference carries no target hash"
+                                ));
+                            }
+                        }
+                    }
+                    Binding::Cyclic(found) => {
+                        self.warn_cross_package_bare(&found, schema_name, field_name, &parent_name);
+                        // A self reference (`Node[] children` on `Node`)
+                        // loses nothing: the parent's own layout is already
+                        // in its own hash.
+                        if found.idx != parent_idx {
+                            let parent = self.snapshot[parent_idx].qualified_name();
+                            let target = self.snapshot[found.idx].qualified_name();
+                            self.warnings.push(format!(
+                                "{parent_name}.{field_name}: {prefix}'{target}' is in a reference \
+                                 cycle with '{parent}'; the reference carries no target hash, so \
+                                 a layout change in '{target}' does not change the hash of \
+                                 '{parent}'"
+                            ));
+                        }
                     }
                 }
-                Err(reason) => {
-                    if fixed.is_some() {
-                        // Clear a stale flag from a prior resolution run
-                        // against a different schema set — conservative
-                        // variable is the only safe classification for a
-                        // reference that no longer resolves.
-                        *fixed = None;
-                    }
-                    self.warnings.push(format!(
-                        "{parent_name}.{field_name}: {reason} — field stays conservatively \
-                         variable (opaque-bytes accessors, not zero-copy)"
-                    ));
-                }
-            },
+            }
             FieldType::FixedArray { element_type, .. } => {
-                self.rewrite_field(element_type, field_name, parent_name, parent_package);
+                self.rewrite_field(element_type, field_name, parent_idx, under_dynamic);
             }
             FieldType::DynamicArray { element_type } => {
-                // The element reference is intentionally NOT rewritten — a
-                // dynamic array of fixed nested types still lives in the
-                // variable payload (the ARRAY is variable; typed-slice
-                // access is a separate, additive feature). But a TYPO'd
-                // element type would otherwise get zero diagnostics
-                // anywhere — look it up purely for the
-                // unknown-reference warning.
-                if let FieldType::Nested {
-                    schema_name,
-                    package,
-                    ..
-                } = element_type.as_ref()
-                {
-                    if let Err(reason) = self.lookup(package, schema_name, parent_package) {
-                        self.warnings.push(format!(
-                            "{parent_name}.{field_name}: array element: {reason} — array stays \
-                             opaque-bytes (layout unaffected)"
-                        ));
-                    }
-                }
+                // The array lives in the variable payload whatever its
+                // element is, so the element is never inlined; it is
+                // stamped with the target's hash like any other reference.
+                self.rewrite_field(element_type, field_name, parent_idx, true);
             }
             _ => {}
         }
     }
+
+    /// rosidl would reject a cross-package bare reference (unqualified
+    /// means same-package, `Header` excepted). It resolves, but never
+    /// silently: the binding can flip when a second package later defines
+    /// the same bare name.
+    fn warn_cross_package_bare(
+        &mut self,
+        found: &Bound,
+        schema_name: &str,
+        field_name: &str,
+        parent_name: &str,
+    ) {
+        if found.cross_package_bare {
+            let target = self.snapshot[found.idx].qualified_name();
+            self.warnings.push(format!(
+                "{parent_name}.{field_name}: unqualified reference '{schema_name}' resolved CROSS-PACKAGE to '{target}' — rosidl would reject this; qualify the reference in the .msg file" // dash-ok
+            ));
+        }
+    }
+}
+
+/// The strongly connected component of every schema in the reference
+/// graph: an edge `S -> T` for each nested reference of `S`, at any array
+/// depth, that binds to `T` through `index` (iterative Tarjan). Components
+/// are numbered in the order the walk closes them, which depends on the
+/// input order. A component closes only after every component it reaches,
+/// so a target's number is never above its referrer's; nothing else about
+/// a number is ever read.
+fn reference_components(schemas: &[MessageSchema], index: &NestedIndex) -> Vec<usize> {
+    let edges: Vec<Vec<usize>> = schemas
+        .iter()
+        .map(|schema| {
+            schema
+                .fields
+                .iter()
+                .filter_map(|field| match element_type_of(&field.field_type) {
+                    FieldType::Nested {
+                        schema_name,
+                        package,
+                        ..
+                    } => index
+                        .bind(package.as_deref(), schema_name, schema.package.as_deref())
+                        .ok()
+                        .map(|bound| bound.idx),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+
+    let len = schemas.len();
+    let mut order: Vec<Option<usize>> = vec![None; len];
+    let mut low = vec![0usize; len];
+    let mut on_stack = vec![false; len];
+    let mut stack = Vec::new();
+    let mut component = vec![0usize; len];
+    let mut next_order = 0usize;
+    let mut next_component = 0usize;
+    for root in 0..len {
+        if order[root].is_some() {
+            continue;
+        }
+        // (node, index of the next outgoing edge to visit)
+        let mut calls = vec![(root, 0usize)];
+        order[root] = Some(next_order);
+        low[root] = next_order;
+        next_order += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&(node, edge)) = calls.last() {
+            if let Some(&target) = edges[node].get(edge) {
+                if let Some(call) = calls.last_mut() {
+                    call.1 += 1;
+                }
+                match order[target] {
+                    None => {
+                        order[target] = Some(next_order);
+                        low[target] = next_order;
+                        next_order += 1;
+                        stack.push(target);
+                        on_stack[target] = true;
+                        calls.push((target, 0));
+                    }
+                    Some(target_order) if on_stack[target] => {
+                        low[node] = low[node].min(target_order);
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
+            calls.pop();
+            if let Some(&(caller, _)) = calls.last() {
+                low[caller] = low[caller].min(low[node]);
+            }
+            if Some(low[node]) == order[node] {
+                while let Some(member) = stack.pop() {
+                    on_stack[member] = false;
+                    component[member] = next_component;
+                    if member == node {
+                        break;
+                    }
+                }
+                next_component += 1;
+            }
+        }
+    }
+    component
 }
 
 /// Accumulator for one schema's fixedness walk.
@@ -560,8 +797,8 @@ struct FixednessAcc {
 /// classification — sizes play no part in fixedness) but whose composed
 /// fixed-section arithmetic overflows — the exact set
 /// [`resolve_fixed_nested`] would PANIC materializing as nested targets
-/// (`resolved_fixed_of` sizes each fixed target through the panicking
-/// `wire_fixed_size`). A caller folding UNTRUSTED declarations (a
+/// (the rewrite panics when an inlined target's composed size overflows;
+/// a target that is only referenced is warned instead). A caller folding UNTRUSTED declarations (a
 /// workspace `.msg` store acquired over the wire, hand-edited YAML, a
 /// peer-served schema doc) runs this to a fixpoint BEFORE resolution —
 /// drop the reported definitions, re-probe (a drop can flip a bare
@@ -730,6 +967,7 @@ impl ComposedSizeProbe<'_> {
                             alignment: align,
                             target_hash: 0,
                         }),
+                        target_hash: None,
                     },
                     ComposedClass::NotInlinable | ComposedClass::Overflow => {
                         *fixed = false;
@@ -757,6 +995,7 @@ mod tests {
             schema_name: name.to_string(),
             package: package.map(|s| s.to_string()),
             fixed: None,
+            target_hash: None,
         }
     }
 
@@ -1068,15 +1307,23 @@ mod tests {
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(!schemas[1].is_definitely_fixed());
         assert_eq!(schemas[1].variable_field_count(), 1);
-        // Element reference NOT rewritten (array stays opaque).
-        if let FieldType::DynamicArray { element_type } = &schemas[1].fields[0].field_type {
-            assert!(matches!(
-                element_type.as_ref(),
-                FieldType::Nested { fixed: None, .. }
-            ));
-        } else {
-            panic!("expected DynamicArray");
-        }
+        // The element is never inlined (the array stays opaque); it carries
+        // the target's hash instead.
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        assert_eq!(
+            schemas[1].fields[0].field_type,
+            FieldType::DynamicArray {
+                element_type: Box::new(stamped("Point", "geometry_msgs", Some(point))),
+            }
+        );
     }
 
     #[test]
@@ -1500,5 +1747,841 @@ mod tests {
             build(&["c", "a", "b"]),
             "a same-size reorder in a level-3 leaf must propagate to the level-1 root hash"
         );
+    }
+
+    // ---- Target hash stamps on references that are not inlined ----
+
+    /// The documented recipe-3 byte stream (`MessageSchema::schema_hash`),
+    /// assembled by hand from literals: the length-prefixed qualified name,
+    /// the fixed-section size, then per field its length-prefixed name and
+    /// canonical type and, for an inlined target only, that target's hash.
+    /// Never calls into `MessageSchema`.
+    fn recipe3_hash(qname: &str, fixed_size: u64, fields: &[(&str, &str, Option<u64>)]) -> u64 {
+        fn prefixed(bytes: &mut Vec<u8>, text: &str) {
+            bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        prefixed(&mut bytes, qname);
+        bytes.extend_from_slice(&fixed_size.to_le_bytes());
+        for (name, ty, inlined) in fields {
+            prefixed(&mut bytes, name);
+            prefixed(&mut bytes, ty);
+            if let Some(hash) = inlined {
+                bytes.extend_from_slice(&hash.to_le_bytes());
+            }
+        }
+        crate::wire::fnv1a_hash(&bytes)
+    }
+
+    /// A qualified reference as the rewrite leaves a non-inlined one.
+    fn stamped(name: &str, package: &str, target_hash: Option<u64>) -> FieldType {
+        FieldType::Nested {
+            schema_name: name.to_string(),
+            package: Some(package.to_string()),
+            fixed: None,
+            target_hash,
+        }
+    }
+
+    fn dynamic(element: FieldType) -> FieldType {
+        FieldType::DynamicArray {
+            element_type: Box::new(element),
+        }
+    }
+
+    /// `demo/Inner { string label; <id_type> id }`.
+    fn inner(id_type: FieldType) -> MessageSchema {
+        let mut s = MessageSchema::new_in_package("Inner", "demo");
+        s.add_field(FieldDef::new("label", FieldType::String));
+        s.add_field(FieldDef::new("id", id_type));
+        s
+    }
+
+    /// `demo/Outer { demo/Inner inner; uint8 tag }`.
+    fn outer() -> MessageSchema {
+        let mut s = MessageSchema::new_in_package("Outer", "demo");
+        s.add_field(FieldDef::new("inner", nested("Inner", Some("demo"))));
+        s.add_field(FieldDef::new("tag", FieldType::U8));
+        s
+    }
+
+    fn inner_hash(id_type: &str) -> u64 {
+        recipe3_hash(
+            "demo/Inner",
+            4,
+            &[("label", "string", None), ("id", id_type, None)],
+        )
+    }
+
+    /// `demo/Outer`'s recipe-3 hash, from an implementation outside this
+    /// repository: both `Inner` definitions give it.
+    const OUTER_RECIPE3_HASH: u64 = 0x2ab5685f302463b2;
+
+    #[test]
+    fn a_variable_target_reference_is_stamped_with_the_target_hash_and_moves_no_hash() {
+        assert_eq!(
+            recipe3_hash(
+                "demo/Outer",
+                1,
+                &[("inner", "demo/Inner", None), ("tag", "uint8", None)]
+            ),
+            OUTER_RECIPE3_HASH,
+            "the hand-assembled stream must reproduce the outside value"
+        );
+        assert_ne!(inner_hash("uint32"), inner_hash("float32"));
+        for (id_type, id_name) in [(FieldType::U32, "uint32"), (FieldType::F32, "float32")] {
+            let mut schemas = vec![inner(id_type), outer()];
+            let warnings = resolve_fixed_nested(&mut schemas);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            assert_eq!(
+                schemas[1].fields[0].field_type,
+                stamped("Inner", "demo", Some(inner_hash(id_name))),
+                "Inner {{ {id_name} id }}"
+            );
+            assert_eq!(schemas[1].schema_hash(), OUTER_RECIPE3_HASH);
+        }
+    }
+
+    /// `builtin_interfaces/Time`, `std_msgs/Header`, `geometry_msgs/Point`,
+    /// `Quaternion`, `Pose` (fields in `pose_fields` order), `PoseArray`
+    /// and `PoseStamped`, spelled as the vendored `.msg` files spell them.
+    fn pose_family(pose_fields: [(&str, &str); 2]) -> Vec<MessageSchema> {
+        let mut time = MessageSchema::new_in_package("Time", "builtin_interfaces");
+        time.add_field(FieldDef::new("sec", FieldType::I32));
+        time.add_field(FieldDef::new("nanosec", FieldType::U32));
+        let mut header = MessageSchema::new_in_package("Header", "std_msgs");
+        header.add_field(FieldDef::new(
+            "stamp",
+            nested("Time", Some("builtin_interfaces")),
+        ));
+        header.add_field(FieldDef::new("frame_id", FieldType::String));
+        let mut quat = MessageSchema::new_in_package("Quaternion", "geometry_msgs");
+        for f in ["x", "y", "z", "w"] {
+            quat.add_field(FieldDef::new(f, FieldType::F64));
+        }
+        let mut pose = MessageSchema::new_in_package("Pose", "geometry_msgs");
+        for (name, ty) in pose_fields {
+            pose.add_field(FieldDef::new(name, nested(ty, Some("geometry_msgs"))));
+        }
+        let mut pose_array = MessageSchema::new_in_package("PoseArray", "geometry_msgs");
+        pose_array.add_field(FieldDef::new("header", nested("Header", Some("std_msgs"))));
+        pose_array.add_field(FieldDef::new(
+            "poses",
+            dynamic(nested("Pose", Some("geometry_msgs"))),
+        ));
+        let mut pose_stamped = MessageSchema::new_in_package("PoseStamped", "geometry_msgs");
+        pose_stamped.add_field(FieldDef::new("header", nested("Header", Some("std_msgs"))));
+        pose_stamped.add_field(FieldDef::new("pose", nested("Pose", Some("geometry_msgs"))));
+        vec![
+            time,
+            header,
+            point_schema("geometry_msgs"),
+            quat,
+            pose,
+            pose_array,
+            pose_stamped,
+        ]
+    }
+
+    const POSITION_FIRST: [(&str, &str); 2] =
+        [("position", "Point"), ("orientation", "Quaternion")];
+    const ORIENTATION_FIRST: [(&str, &str); 2] =
+        [("orientation", "Quaternion"), ("position", "Point")];
+    /// Read off the wire from a stock ROS 2 Jazzy publisher.
+    const POSE_WIRE_HASH: u64 = 0x8db061f3f9baff7d;
+    /// Read off the wire from a stock ROS 2 Jazzy publisher.
+    const POSE_STAMPED_WIRE_HASH: u64 = 0x7bae8da2598b0993;
+    /// `geometry_msgs/PoseArray`'s recipe-3 hash, from an implementation
+    /// outside this repository: both `Pose` field orders give it.
+    const POSE_ARRAY_RECIPE3_HASH: u64 = 0x26b786e1cb2b91bc;
+
+    fn header_hash() -> u64 {
+        let time = recipe3_hash(
+            "builtin_interfaces/Time",
+            8,
+            &[("sec", "int32", None), ("nanosec", "uint32", None)],
+        );
+        recipe3_hash(
+            "std_msgs/Header",
+            8,
+            &[
+                ("stamp", "builtin_interfaces/Time", Some(time)),
+                ("frame_id", "string", None),
+            ],
+        )
+    }
+
+    fn pose_hash(pose_fields: [(&str, &str); 2]) -> u64 {
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        let quat = recipe3_hash(
+            "geometry_msgs/Quaternion",
+            32,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+                ("w", "float64", None),
+            ],
+        );
+        let fields: Vec<(&str, String, Option<u64>)> = pose_fields
+            .iter()
+            .map(|(name, ty)| {
+                let hash = if *ty == "Point" { point } else { quat };
+                (*name, format!("geometry_msgs/{ty}"), Some(hash))
+            })
+            .collect();
+        let fields: Vec<(&str, &str, Option<u64>)> = fields
+            .iter()
+            .map(|(name, ty, hash)| (*name, ty.as_str(), *hash))
+            .collect();
+        recipe3_hash("geometry_msgs/Pose", 56, &fields)
+    }
+
+    #[test]
+    fn a_dynamic_array_element_is_stamped_with_the_target_hash_and_never_inlined() {
+        assert_eq!(pose_hash(POSITION_FIRST), POSE_WIRE_HASH);
+        assert_ne!(pose_hash(ORIENTATION_FIRST), POSE_WIRE_HASH);
+        for pose_fields in [POSITION_FIRST, ORIENTATION_FIRST] {
+            let mut schemas = pose_family(pose_fields);
+            let warnings = resolve_fixed_nested(&mut schemas);
+            assert!(warnings.is_empty(), "{warnings:?}");
+            let pose_array = &schemas[5];
+            assert_eq!(
+                pose_array.fields[0].field_type,
+                stamped("Header", "std_msgs", Some(header_hash()))
+            );
+            assert_eq!(
+                pose_array.fields[1].field_type,
+                dynamic(stamped(
+                    "Pose",
+                    "geometry_msgs",
+                    Some(pose_hash(pose_fields))
+                ))
+            );
+            assert_eq!(pose_array.schema_hash(), POSE_ARRAY_RECIPE3_HASH);
+        }
+    }
+
+    #[test]
+    fn an_inlined_target_keeps_its_hash_in_the_fixed_stamp_only() {
+        let mut schemas = pose_family(POSITION_FIRST);
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let pose_stamped = &schemas[6];
+        assert_eq!(
+            pose_stamped.fields[0].field_type,
+            stamped("Header", "std_msgs", Some(header_hash()))
+        );
+        match &pose_stamped.fields[1].field_type {
+            FieldType::Nested {
+                fixed: Some(info),
+                target_hash: None,
+                ..
+            } => assert_eq!(info.target_hash, POSE_WIRE_HASH),
+            other => panic!("pose must inline with no target_hash, got {other:?}"),
+        }
+        assert_eq!(pose_stamped.schema_hash(), POSE_STAMPED_WIRE_HASH);
+    }
+
+    /// `demo/A { demo/B b; string s }`, `demo/B { demo/A a; string s }` and
+    /// `demo/T { demo/A a }`, in the order `names` gives.
+    fn two_cycle_with_referrer(names: [&str; 3]) -> Vec<MessageSchema> {
+        names
+            .iter()
+            .map(|name| {
+                let mut s = MessageSchema::new_in_package(*name, "demo");
+                match *name {
+                    "A" => {
+                        s.add_field(FieldDef::new("b", nested("B", Some("demo"))));
+                        s.add_field(FieldDef::new("s", FieldType::String));
+                    }
+                    "B" => {
+                        s.add_field(FieldDef::new("a", nested("A", Some("demo"))));
+                        s.add_field(FieldDef::new("s", FieldType::String));
+                    }
+                    _ => s.add_field(FieldDef::new("a", nested("A", Some("demo")))),
+                }
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_reference_cycle_is_not_stamped_and_an_outside_referrer_is_stamped_in_every_order() {
+        let a_hash = recipe3_hash("demo/A", 0, &[("b", "demo/B", None), ("s", "string", None)]);
+        let t_hash = recipe3_hash("demo/T", 0, &[("a", "demo/A", None)]);
+        let mut expected_warnings = vec![
+            "A.b: 'demo/B' is in a reference cycle with 'demo/A'; the reference carries no \
+             target hash, so a layout change in 'demo/B' does not change the hash of 'demo/A'"
+                .to_string(),
+            "B.a: 'demo/A' is in a reference cycle with 'demo/B'; the reference carries no \
+             target hash, so a layout change in 'demo/A' does not change the hash of 'demo/B'"
+                .to_string(),
+        ];
+        expected_warnings.sort();
+        for names in [["A", "B", "T"], ["T", "B", "A"], ["B", "T", "A"]] {
+            let mut schemas = two_cycle_with_referrer(names);
+            let mut cycle_warnings: Vec<String> = resolve_fixed_nested(&mut schemas)
+                .into_iter()
+                .filter(|w| w.contains("is in a reference cycle"))
+                .collect();
+            cycle_warnings.sort();
+            assert_eq!(cycle_warnings, expected_warnings, "order {names:?}");
+            for schema in &schemas {
+                let expected = match schema.name.as_str() {
+                    "A" => stamped("B", "demo", None),
+                    "B" => stamped("A", "demo", None),
+                    _ => stamped("A", "demo", Some(a_hash)),
+                };
+                assert_eq!(schema.fields[0].field_type, expected, "order {names:?}");
+            }
+            let t = schemas.iter().find(|s| s.name == "T").unwrap();
+            assert_eq!(t.schema_hash(), t_hash, "order {names:?}");
+        }
+    }
+
+    #[test]
+    fn a_self_reference_through_a_dynamic_array_is_silent_and_unstamped() {
+        let mut node = MessageSchema::new_in_package("Node", "demo");
+        node.add_field(FieldDef::new("name", FieldType::String));
+        node.add_field(FieldDef::new(
+            "children",
+            dynamic(nested("Node", Some("demo"))),
+        ));
+        let mut schemas = vec![node];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            schemas[0].fields[1].field_type,
+            dynamic(stamped("Node", "demo", None))
+        );
+    }
+
+    #[test]
+    fn a_cycle_through_a_dynamic_array_warns_once_per_reference() {
+        let mut tree = MessageSchema::new_in_package("Tree", "demo");
+        tree.add_field(FieldDef::new(
+            "leaves",
+            dynamic(nested("Leaf", Some("demo"))),
+        ));
+        let mut leaf = MessageSchema::new_in_package("Leaf", "demo");
+        leaf.add_field(FieldDef::new("parent", nested("Tree", Some("demo"))));
+        let mut schemas = vec![tree, leaf];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert_eq!(
+            warnings,
+            vec![
+                "Tree.leaves: array element: 'demo/Leaf' is in a reference cycle with \
+                 'demo/Tree'; the reference carries no target hash, so a layout change in \
+                 'demo/Leaf' does not change the hash of 'demo/Tree'"
+                    .to_string(),
+                "Leaf.parent: 'demo/Tree' is in a reference cycle with 'demo/Leaf'; the \
+                 reference carries no target hash, so a layout change in 'demo/Tree' does \
+                 not change the hash of 'demo/Leaf'"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            schemas[0].fields[0].field_type,
+            dynamic(stamped("Leaf", "demo", None))
+        );
+        assert_eq!(
+            schemas[1].fields[0].field_type,
+            stamped("Tree", "demo", None)
+        );
+    }
+
+    /// `uint64[N]` with `N * 8` just inside `usize`, so two of them in one
+    /// fixed section overflow the size arithmetic.
+    fn huge_u64_array() -> FieldType {
+        FieldType::FixedArray {
+            element_type: Box::new(FieldType::U64),
+            length: usize::MAX / 8,
+        }
+    }
+
+    #[test]
+    fn a_target_whose_fixed_section_cannot_be_sized_is_warned_never_a_panic() {
+        // A variable schema and a fixed one whose composed fixed sections
+        // overflow, referenced only where they are not inlined: directly
+        // (the variable one) and under a DynamicArray (both).
+        let mut hostile_variable = MessageSchema::new_in_package("V", "demo");
+        hostile_variable.add_field(FieldDef::new("s", FieldType::String));
+        hostile_variable.add_field(FieldDef::new("a", huge_u64_array()));
+        hostile_variable.add_field(FieldDef::new("b", huge_u64_array()));
+        let mut hostile_fixed = MessageSchema::new_in_package("F", "demo");
+        hostile_fixed.add_field(FieldDef::new("a", huge_u64_array()));
+        hostile_fixed.add_field(FieldDef::new("b", huge_u64_array()));
+        let mut direct = MessageSchema::new_in_package("P", "demo");
+        direct.add_field(FieldDef::new("v", nested("V", Some("demo"))));
+        let mut variable_array = MessageSchema::new_in_package("Q", "demo");
+        variable_array.add_field(FieldDef::new("vs", dynamic(nested("V", Some("demo")))));
+        let mut fixed_array = MessageSchema::new_in_package("R", "demo");
+        fixed_array.add_field(FieldDef::new("fs", dynamic(nested("F", Some("demo")))));
+        let mut schemas = vec![
+            hostile_variable,
+            hostile_fixed,
+            direct,
+            variable_array,
+            fixed_array,
+        ];
+
+        let warnings = resolve_fixed_nested(&mut schemas);
+
+        let prefixes = [
+            "P.v: 'demo/V' has no wire hash (schema `V` field `b`: fixed-section size overflows",
+            "Q.vs: array element: 'demo/V' has no wire hash (schema `V` field `b`: fixed-section \
+             size overflows",
+            "R.fs: array element: 'demo/F' has no wire hash (schema `F` field `b`: fixed-section \
+             size overflows",
+        ];
+        assert_eq!(warnings.len(), prefixes.len(), "{warnings:?}");
+        for (warning, prefix) in warnings.iter().zip(prefixes) {
+            assert!(warning.starts_with(prefix), "{warning}");
+            assert!(
+                warning.ends_with("; the reference carries no target hash"),
+                "{warning}"
+            );
+        }
+        assert_eq!(schemas[2].fields[0].field_type, stamped("V", "demo", None));
+        assert_eq!(
+            schemas[3].fields[0].field_type,
+            dynamic(stamped("V", "demo", None))
+        );
+        assert_eq!(
+            schemas[4].fields[0].field_type,
+            dynamic(stamped("F", "demo", None))
+        );
+    }
+
+    #[test]
+    fn an_unbound_dynamic_array_element_under_a_fixed_array_warns_and_stays_unstamped() {
+        let mut s = MessageSchema::new_in_package("Grid", "demo");
+        s.add_field(FieldDef::new(
+            "rows",
+            dynamic(FieldType::FixedArray {
+                element_type: Box::new(nested("Missing", Some("demo"))),
+                length: 3,
+            }),
+        ));
+        let mut schemas = vec![s];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("Grid.rows: array element: unknown schema 'demo/Missing'"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[0].ends_with("array stays opaque-bytes (layout unaffected)"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            schemas[0].fields[0].field_type,
+            dynamic(FieldType::FixedArray {
+                element_type: Box::new(stamped("Missing", "demo", None)),
+                length: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_target_hash_cleared_on_reresolution() {
+        let mut full = vec![inner(FieldType::U32), outer()];
+        assert!(resolve_fixed_nested(&mut full).is_empty());
+        let resolved_outer = full[1].clone();
+        assert_eq!(
+            resolved_outer.fields[0].field_type,
+            stamped("Inner", "demo", Some(inner_hash("uint32")))
+        );
+
+        // The target is gone: the stamp goes with it.
+        let mut alone = vec![resolved_outer.clone()];
+        let warnings = resolve_fixed_nested(&mut alone);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("unknown schema 'demo/Inner'"),
+            "{warnings:?}"
+        );
+        assert_eq!(
+            alone[0].fields[0].field_type,
+            stamped("Inner", "demo", None)
+        );
+
+        // The target changed: the stamp follows the current definition.
+        let mut changed = vec![inner(FieldType::F32), resolved_outer.clone()];
+        assert!(resolve_fixed_nested(&mut changed).is_empty());
+        assert_eq!(
+            changed[1].fields[0].field_type,
+            stamped("Inner", "demo", Some(inner_hash("float32")))
+        );
+
+        // The target turned fixed: the hash moves into the fixed stamp.
+        let mut fixed_inner = MessageSchema::new_in_package("Inner", "demo");
+        fixed_inner.add_field(FieldDef::new("id", FieldType::U32));
+        let mut now_fixed = vec![fixed_inner, resolved_outer];
+        assert!(resolve_fixed_nested(&mut now_fixed).is_empty());
+        let fixed_hash = recipe3_hash("demo/Inner", 4, &[("id", "uint32", None)]);
+        match &now_fixed[1].fields[0].field_type {
+            FieldType::Nested {
+                fixed: Some(info),
+                target_hash: None,
+                ..
+            } => assert_eq!(info.target_hash, fixed_hash),
+            other => panic!("expected an inlined Inner with no target_hash, got {other:?}"),
+        }
+
+        // And back to variable: the fixed stamp is cleared, the hash returns.
+        let mut variable_again = vec![inner(FieldType::U32), now_fixed[1].clone()];
+        assert!(resolve_fixed_nested(&mut variable_again).is_empty());
+        assert_eq!(
+            variable_again[1].fields[0].field_type,
+            stamped("Inner", "demo", Some(inner_hash("uint32")))
+        );
+    }
+
+    #[test]
+    fn stale_stamps_on_a_dynamic_array_element_are_replaced() {
+        let mut list = MessageSchema::new_in_package("PoseList", "test_msgs");
+        list.add_field(FieldDef::new(
+            "points",
+            dynamic(FieldType::Nested {
+                schema_name: "Point".to_string(),
+                package: Some("geometry_msgs".to_string()),
+                fixed: Some(NestedFixedInfo {
+                    has_large_array: false,
+                    fixed_size: 24,
+                    alignment: 8,
+                    target_hash: 0xdead,
+                }),
+                target_hash: Some(0xbeef),
+            }),
+        ));
+        let mut schemas = vec![point_schema("geometry_msgs"), list];
+        assert!(resolve_fixed_nested(&mut schemas).is_empty());
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        assert_eq!(
+            schemas[1].fields[0].field_type,
+            dynamic(stamped("Point", "geometry_msgs", Some(point)))
+        );
+    }
+
+    #[test]
+    fn resolving_a_resolved_set_again_changes_nothing() {
+        let mut once = pose_family(POSITION_FIRST);
+        once.extend(two_cycle_with_referrer(["A", "B", "T"]));
+        let first_warnings = resolve_fixed_nested(&mut once);
+        let mut twice = once.clone();
+        let second_warnings = resolve_fixed_nested(&mut twice);
+        assert_eq!(first_warnings, second_warnings);
+        for (a, b) in once.iter().zip(&twice) {
+            let types = |s: &MessageSchema| -> Vec<FieldType> {
+                s.fields.iter().map(|f| f.field_type.clone()).collect()
+            };
+            assert_eq!(types(a), types(b), "{}", a.qualified_name());
+            assert_eq!(a.schema_hash(), b.schema_hash(), "{}", a.qualified_name());
+        }
+    }
+
+    #[test]
+    fn a_cross_package_bare_dynamic_array_element_is_stamped_and_warned() {
+        let mut user = MessageSchema::new_in_package("Cloud", "third_msgs");
+        user.add_field(FieldDef::new("points", dynamic(nested("Point", None))));
+        let mut schemas = vec![point_schema("geometry_msgs"), user];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "Cloud.points: unqualified reference 'Point' resolved CROSS-PACKAGE to \
+                 'geometry_msgs/Point'"
+            ),
+            "{warnings:?}"
+        );
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        assert_eq!(
+            schemas[1].fields[0].field_type,
+            dynamic(FieldType::Nested {
+                schema_name: "Point".to_string(),
+                package: None,
+                fixed: None,
+                target_hash: Some(point),
+            })
+        );
+    }
+
+    #[test]
+    fn a_three_cycle_with_a_spur_stamps_only_the_edges_that_leave_the_cycle() {
+        // demo/A -> B -> C -> A, and C -> D (the spur) with D outside the
+        // cycle. Every schema holds a string, so none is inlined.
+        let spec: [(&str, &[&str]); 4] =
+            [("A", &["B"]), ("B", &["C"]), ("C", &["A", "D"]), ("D", &[])];
+        let build = |order: [usize; 4]| -> Vec<MessageSchema> {
+            order
+                .iter()
+                .map(|&i| {
+                    let (name, targets) = spec[i];
+                    let mut s = MessageSchema::new_in_package(name, "demo");
+                    for target in targets {
+                        s.add_field(FieldDef::new(
+                            target.to_lowercase(),
+                            nested(target, Some("demo")),
+                        ));
+                    }
+                    s.add_field(FieldDef::new("s", FieldType::String));
+                    s
+                })
+                .collect()
+        };
+        let d_hash = recipe3_hash("demo/D", 0, &[("s", "string", None)]);
+        for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1]] {
+            let mut schemas = build(order);
+            let warnings = resolve_fixed_nested(&mut schemas);
+            let cycle_warnings = warnings
+                .iter()
+                .filter(|w| w.contains("is in a reference cycle"))
+                .count();
+            assert_eq!(cycle_warnings, 3, "order {order:?}: {warnings:?}");
+            let c = schemas.iter().find(|s| s.name == "C").unwrap();
+            assert_eq!(c.fields[0].field_type, stamped("A", "demo", None));
+            assert_eq!(c.fields[1].field_type, stamped("D", "demo", Some(d_hash)));
+            for name in ["A", "B"] {
+                let schema = schemas.iter().find(|s| s.name == name).unwrap();
+                assert!(
+                    matches!(
+                        schema.fields[0].field_type,
+                        FieldType::Nested {
+                            fixed: None,
+                            target_hash: None,
+                            ..
+                        }
+                    ),
+                    "order {order:?}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn references_under_mixed_array_layers_are_stamped_at_their_depth() {
+        let mut holder = MessageSchema::new_in_package("Holder", "demo");
+        // A fixed array of a variable target: not inlined, stamped.
+        holder.add_field(FieldDef::new(
+            "inners",
+            FieldType::FixedArray {
+                element_type: Box::new(nested("Inner", Some("demo"))),
+                length: 2,
+            },
+        ));
+        // A dynamic array of fixed arrays of a fixed target: never inlined
+        // under the dynamic array, stamped with the fixed target's hash.
+        holder.add_field(FieldDef::new(
+            "triangles",
+            dynamic(FieldType::FixedArray {
+                element_type: Box::new(nested("Point", Some("geometry_msgs"))),
+                length: 3,
+            }),
+        ));
+        let mut schemas = vec![inner(FieldType::U32), point_schema("geometry_msgs"), holder];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let point = recipe3_hash(
+            "geometry_msgs/Point",
+            24,
+            &[
+                ("x", "float64", None),
+                ("y", "float64", None),
+                ("z", "float64", None),
+            ],
+        );
+        assert_eq!(
+            schemas[2].fields[0].field_type,
+            FieldType::FixedArray {
+                element_type: Box::new(stamped("Inner", "demo", Some(inner_hash("uint32")))),
+                length: 2,
+            }
+        );
+        assert_eq!(
+            schemas[2].fields[1].field_type,
+            dynamic(FieldType::FixedArray {
+                element_type: Box::new(stamped("Point", "geometry_msgs", Some(point))),
+                length: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn a_duplicate_definition_stamps_the_later_one() {
+        let mut schemas = vec![inner(FieldType::U32), inner(FieldType::F32), outer()];
+        let warnings = resolve_fixed_nested(&mut schemas);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("duplicate schema definition for 'demo/Inner'"));
+        assert_eq!(
+            schemas[2].fields[0].field_type,
+            stamped("Inner", "demo", Some(inner_hash("float32")))
+        );
+    }
+
+    #[test]
+    fn two_independent_resolutions_of_a_stamped_set_are_identical() {
+        let build = || {
+            let mut set = pose_family(POSITION_FIRST);
+            set.extend(two_cycle_with_referrer(["B", "T", "A"]));
+            set
+        };
+        let mut first = build();
+        let mut second = build();
+        assert_eq!(
+            resolve_fixed_nested(&mut first),
+            resolve_fixed_nested(&mut second)
+        );
+        for (a, b) in first.iter().zip(&second) {
+            for (fa, fb) in a.fields.iter().zip(&b.fields) {
+                assert_eq!(fa.field_type, fb.field_type, "{}", a.qualified_name());
+            }
+        }
+    }
+
+    // ---- Resolution depth ----
+
+    /// The stack size the test harness gives each test thread.
+    const TEST_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+    /// Links in [`reference_chain`]: at one stack frame per link, the
+    /// chain needs far more than [`TEST_THREAD_STACK_BYTES`]. Even, so the
+    /// last link is an array element.
+    const CHAIN_LINKS: usize = 20_000;
+
+    /// The type link `link` of [`reference_chain`] spells for its `next`
+    /// field: a direct reference on an even link, an array element on an
+    /// odd one.
+    fn chain_next_type(link: usize) -> String {
+        if link.is_multiple_of(2) {
+            format!("acme/L{}", link + 1)
+        } else {
+            format!("acme/L{}[]", link + 1)
+        }
+    }
+
+    /// `acme/L0` to `acme/L{CHAIN_LINKS}`: each link holds one `next`
+    /// reference to the following link, alternately direct (to a variable
+    /// target) and as a `DynamicArray` element; the last link is
+    /// `{ uint8 x }`. Every link but the last is variable, so the fixedness
+    /// walk stops after two links, and only the target hash stamps follow
+    /// the chain to its end.
+    fn reference_chain() -> Vec<MessageSchema> {
+        let mut chain: Vec<MessageSchema> = (0..CHAIN_LINKS)
+            .map(|link| {
+                let mut s = MessageSchema::new_in_package(format!("L{link}"), "acme");
+                let next = nested(&format!("L{}", link + 1), Some("acme"));
+                let next = if link.is_multiple_of(2) {
+                    next
+                } else {
+                    dynamic(next)
+                };
+                s.add_field(FieldDef::new("next", next));
+                s
+            })
+            .collect();
+        let mut last = MessageSchema::new_in_package(format!("L{CHAIN_LINKS}"), "acme");
+        last.add_field(FieldDef::new("x", FieldType::U8));
+        chain.push(last);
+        chain
+    }
+
+    /// The recipe-3 hash of chain link `link`, assembled by hand. A
+    /// variable target's hash is never folded into recipe 3, so each link's
+    /// hash reads only its own fields.
+    fn chain_link_hash(link: usize) -> u64 {
+        let name = format!("acme/L{link}");
+        if link == CHAIN_LINKS {
+            recipe3_hash(&name, 1, &[("x", "uint8", None)])
+        } else {
+            recipe3_hash(&name, 0, &[("next", &chain_next_type(link), None)])
+        }
+    }
+
+    /// Resolve `schemas` on a thread with the test harness's stack size, so
+    /// the depth a resolution reaches does not depend on the thread that
+    /// runs the test.
+    fn resolve_on_test_thread_stack(
+        mut schemas: Vec<MessageSchema>,
+    ) -> (Vec<MessageSchema>, Vec<String>) {
+        std::thread::Builder::new()
+            .stack_size(TEST_THREAD_STACK_BYTES)
+            .spawn(move || {
+                let warnings = resolve_fixed_nested(&mut schemas);
+                (schemas, warnings)
+            })
+            .expect("spawn the resolution thread")
+            .join()
+            .expect("the resolution thread returns")
+    }
+
+    fn assert_chain_stamped(schemas: &[MessageSchema]) {
+        for schema in schemas {
+            let Some(link) = schema
+                .name
+                .strip_prefix('L')
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                panic!("not a chain link: {}", schema.name);
+            };
+            if link == CHAIN_LINKS {
+                continue;
+            }
+            let next = stamped(
+                &format!("L{}", link + 1),
+                "acme",
+                Some(chain_link_hash(link + 1)),
+            );
+            let expected = if link.is_multiple_of(2) {
+                next
+            } else {
+                dynamic(next)
+            };
+            assert_eq!(schema.fields[0].field_type, expected, "acme/L{link}.next");
+            assert_eq!(schema.schema_hash(), chain_link_hash(link), "acme/L{link}");
+        }
+    }
+
+    #[test]
+    fn a_long_reference_chain_is_stamped_on_a_test_thread_stack() {
+        assert_eq!(chain_next_type(0), "acme/L1");
+        assert_eq!(chain_next_type(1), "acme/L2[]");
+        let (resolved, warnings) = resolve_on_test_thread_stack(reference_chain());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_chain_stamped(&resolved);
+    }
+
+    #[test]
+    fn a_long_reference_chain_listed_last_link_first_is_stamped_the_same() {
+        let mut chain = reference_chain();
+        chain.reverse();
+        let (resolved, warnings) = resolve_on_test_thread_stack(chain);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_chain_stamped(&resolved);
     }
 }

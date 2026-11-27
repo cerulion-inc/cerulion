@@ -35,7 +35,7 @@ Parsing, dispatch and exit codes only. Read `crates/cerulion_cli_engine/AGENTS.m
   no account request and no netd spawn, against positive-control sentinels.
 - E2E binaries drive the REAL binary; run each `#[serial]` one alone with
   `-- --test-threads=1`. Build fixtures first:
-  - `mp_record`, `mp_execution_mode`, `verifier_budget_cli`, `network_gateway{,_mp}` e2e:
+  - `mp_record`, `mp_execution_mode`, `flashback_split_units`, `verifier_budget_cli`, `network_gateway{,_mp}` e2e:
     `cargo build -p test_node_macro_period_cdylib -p test_node_macro_data_trigger_cdylib`;
     `mp_auto_partition`: those two + `..._trigger_block_cdylib`
   - `replay_cli_test`: `period`, `data_trigger`, `period_{perturbed,panic}`, `test_node_nondeterministic_cdylib`.

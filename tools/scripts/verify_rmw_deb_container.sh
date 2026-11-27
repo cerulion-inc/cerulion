@@ -14,16 +14,14 @@
 #      must report `rmw_cerulion` as the implementation it LOADED (the
 #      identifier rclpy returns, never the variable this script exported).
 #
-# NOT proved here, on purpose: cross-process topic discovery for the ros2
-# CLI graph tools. `ros2 topic list`, `ros2 topic echo` (daemon or not, with
-# or without an explicit type) and rclpy's get_topic_names_and_types() from
-# a third process see only that process's own /parameter_events and /rosout
-# under rmw_cerulion, never the talker's /chatter, because the rmw's endpoint
-# discovery is process-local today (a product gap, recorded as such; the
-# talker and listener still meet, because pub/sub rendezvous is by name on
-# the shared-memory service). A `ros2 topic echo` check stood here through
-# six box attempts and could never pass; `cerulion topic list` and
-# `cerulion topic echo` are the tools that read the shared-memory plane.
+# NOT proved here: cross-process topic discovery for the ros2 CLI graph
+# tools. The rmw lists the topics of every rmw_cerulion process on the host in
+# rmw_get_topic_names_and_types (`ros2 topic list -t`, `ros2 topic hz`), which
+# crates/rmw_cerulion/tests/rmw_graph_xproc_test.rs pins through the C ABI.
+# Every other graph query stays process-local, so `ros2 topic info` counts
+# only its own endpoints. This script checks that the talker and listener
+# meet; `cerulion topic list` and `cerulion topic echo` read the shared-memory
+# plane.
 #   4. The heap hook: `cerulion ros2 run --adopt-take ...` is refused (exit
 #      69) with a direct-launch recipe naming the SHIPPED hook path; a talker
 #      run with CERULION_HEAPHOOK_DEBUG=1 prints the hook's own load

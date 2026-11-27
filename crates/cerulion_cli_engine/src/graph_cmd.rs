@@ -7700,6 +7700,9 @@ pub fn graph_run(
 ///
 /// Mp workers are always network-free: the separate gateway process owns the
 /// robot's whole network plane.
+///
+/// The transport choice and the checkpoint carrier choice read one predicate,
+/// [`plan_shares_its_process`], so the two cannot drift apart.
 fn worker_transport(
     plan: &crate::multiprocess::WorkerPlan,
     clock: Arc<dyn cerulion_core::clock::Clock>,
@@ -7711,12 +7714,21 @@ fn worker_transport(
         subscriber_buffer_size: 16,
         network: None,
     };
-    let transport = if plan.host.is_some() {
+    let transport = if plan_shares_its_process(plan) {
         cerulion_core::TransportManager::detached_with_config(config, ix_config)?
     } else {
         cerulion_core::TransportManager::init_with_config(config, ix_config)?
     };
     Ok(transport)
+}
+
+/// True when this plan's executor unit runs in one process with other units
+/// ([`WorkerPlan::host`](crate::multiprocess::WorkerPlan::host) is stamped exactly
+/// for those). Such a unit gets a detached transport, and its runtime is armed for
+/// checkpoints without the fork carrier: a fork copies one thread, so a lock a
+/// sibling unit's thread holds at that instant would stay held in the child.
+fn plan_shares_its_process(plan: &crate::multiprocess::WorkerPlan) -> bool {
+    plan.host.is_some()
 }
 
 /// Under the `oracle-mutants` feature, setting this variable makes a process
@@ -8782,6 +8794,24 @@ pub fn graph_run_worker(
                 return None;
             }
         };
+        // A unit that shares its process with other units is armed WITHOUT the
+        // fork carrier and captures on its own thread. It still asks admission (the
+        // kill switch and the knobs), but the memory gate does not judge it: no
+        // child copies its memory.
+        if plan_shares_its_process(&plan) {
+            crate::state_arm_attach::admit_capture_plane(
+                crate::state_arm_attach::PlaneRole::HostedUnit { rank },
+                tag,
+                runtime.tightest_timing_ns(),
+            )?;
+            return crate::state_arm_attach::attach_state_capture_no_fork_from(
+                &mut runtime,
+                tag,
+                crate::state_arm_attach::ArmTagSource::Explicit,
+                rank,
+                &recording_node_ids,
+            );
+        }
         // THIS WORKER decides whether IT can afford
         // to be checkpointed, on ITS OWN resident memory.
         //
@@ -12294,22 +12324,18 @@ fn graph_run_supervisor(
     let mut _capture_plane: Option<std::sync::Arc<cerulion_core::state_arm::MappedStateArm>> = None;
     #[cfg(unix)]
     let armed_tag: Option<String> = {
-        // An anchor forks the rank's process; a fork copies only the forking
-        // thread and every lock another thread holds at that instant, so a
-        // process running several units cannot be anchored by a fork.
-        let state_arm_tag = match (state_arm_tag.as_deref(), units.plan.splits_any()) {
-            (Some(_), true) => {
-                tracing::warn!(
-                    graph = %config.identity(),
-                    hosts = ?units.plan.split_hosts().map(|(h, _)| h).collect::<Vec<_>>(),
-                    "flashback checkpoints are OFF for this run: at least one process hosts \
-                     more than one executor unit, and a checkpoint forks its process, which \
-                     copies one thread, so this run takes none"
-                );
-                None
-            }
-            (tag, _) => tag.map(str::to_string),
-        };
+        // Every rank creates its own state ring, so the deployment's rings are
+        // checked against `/dev/shm` together, before any rank creates one: a
+        // check per rank cannot see a sibling's ring, which charges no page
+        // until it fills. Decided once, here, like the kill switch: a tag that
+        // is not stamped is a plane no rank opens.
+        let state_arm_tag = state_arm_tag.filter(|_| {
+            deployment_state_rings_fit(config.identity(), plan.workers.len(), no_rings)
+        });
+        // A process that hosts several executor units is armed like any other:
+        // each of its units attaches WITHOUT the fork carrier (`graph_run_worker`,
+        // `plan_shares_its_process`), since a fork would copy one thread and leave
+        // a lock a sibling unit holds held in the child.
         let armed = state_arm_tag.as_deref().and_then(|tag| {
             // Every worker plan carries the SAME `handed_quantum_ns` by
             // construction (multiprocess.rs: it is the min over the full graph),
@@ -12408,11 +12434,7 @@ fn graph_run_supervisor(
         // plus a 40 KiB one) fits with room to spare. A gate that rejects a
         // deployment it could have admitted costs the run its whole capture
         // plane, so the arithmetic has to be the arithmetic.
-        let departure_bytes =
-            cerulion_core::trace_ring::apparent_ring_bytes(DEPARTURE_RING_CAPACITY);
-        let plan_bytes = ring_bytes
-            .saturating_mul(plan.workers.len() as u64)
-            .saturating_add(departure_bytes);
+        let plan_bytes = trace_plan_bytes(plan.workers.len());
         // Written `if !no_rings` rather than `if no_rings { .. } else { .. }` so
         // the stamp below sits in a block whose GOVERNING CONDITION is exactly
         // the flag — which is what makes the structural pin a real pin: any
@@ -17967,9 +17989,10 @@ pub fn render_recorder_json(
         // in which every complete checkpoint part of a stopped node carries
         // the stopped flag, v11 one in which every read site names its
         // writer again at every checkpoint window head and the boundary there
-        // carries the reopen flag, and v12 one in which every fire that
-        // stopped its node is followed by a NODE-STOP record, all five also
-        // every bag this binary writes.
+        // carries the reopen flag, v12 one in which every fire that
+        // stopped its node is followed by a NODE-STOP record, and v13 one in
+        // which every single-frame take is a read record, all six also every
+        // bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17979,7 +18002,7 @@ pub fn render_recorder_json(
             // THIS binary's claims, with whether THIS run folds identical runs
             // read from the one switch. The node stops, window heads, stops,
             // identity and consult terms are tested first, so every bag this
-            // binary writes stamps 12 with folding on or off.
+            // binary writes stamps 13 with folding on or off.
             crate::replay_engine::RecorderClaims::of_this_recorder(
                 cerulion_core::read_outcome::fold_enabled(),
             ),
@@ -21343,6 +21366,56 @@ fn gate_trace_ring(free_bytes: Option<u64>, apparent_bytes: u64) -> TraceRingGat
     }
 }
 
+/// The APPARENT bytes a deployment of `workers` ranks reserves for its
+/// scheduler-trace rings: one full ring per rank plus the supervisor's departure
+/// ring at its own, much smaller, size.
+#[cfg(unix)]
+fn trace_plan_bytes(workers: usize) -> u64 {
+    cerulion_core::trace_ring::apparent_ring_bytes(
+        cerulion_core::trace_ring::default_capacity_records(),
+    )
+    .saturating_mul(workers as u64)
+    .saturating_add(cerulion_core::trace_ring::apparent_ring_bytes(
+        DEPARTURE_RING_CAPACITY,
+    ))
+}
+
+/// PURE: what a deployment of `workers` ranks asks of `/dev/shm`: one state ring
+/// of `state_ring_bytes` per rank, and its trace rings unless `no_rings`.
+#[cfg(unix)]
+fn deployment_shm_ask(workers: usize, state_ring_bytes: u64, no_rings: bool) -> (u64, Option<u64>) {
+    (
+        state_ring_bytes.saturating_mul(workers as u64),
+        (!no_rings).then(|| trace_plan_bytes(workers)),
+    )
+}
+
+/// Whether this deployment's checkpoint state rings fit in `/dev/shm`, one per
+/// rank, beside the trace rings it provisions unless `no_rings`. A refusal is
+/// one loud warn: the run takes no checkpoints and runs normally.
+#[cfg(unix)]
+fn deployment_state_rings_fit(graph: &str, workers: usize, no_rings: bool) -> bool {
+    let (state_bytes, trace_bytes) = deployment_shm_ask(
+        workers,
+        crate::state_arm_attach::state_ring_apparent_bytes(),
+        no_rings,
+    );
+    match crate::state_arm_attach::gate_state_rings(shm_free_bytes(), state_bytes, trace_bytes) {
+        Ok(()) => true,
+        Err(reason) => {
+            tracing::warn!(
+                graph = %graph,
+                workers,
+                error = %reason,
+                "this run cannot provision its checkpoint state rings, so it takes no Flashback \
+                 checkpoints. The graph runs normally. Free space under /dev/shm, or lower \
+                 CERULION_FLASHBACK_STATE_RING_MB"
+            );
+            false
+        }
+    }
+}
+
 /// Read `/dev/shm`'s free bytes, on the one platform where
 /// that path means anything.
 ///
@@ -21352,7 +21425,7 @@ fn gate_trace_ring(free_bytes: Option<u64>, apparent_bytes: u64) -> TraceRingGat
 /// `/dev/shm` mount behind them, so a `statvfs` there describes an unrelated
 /// filesystem (or fails), and either way it is not evidence about the ring.
 #[cfg(all(unix, target_os = "linux"))]
-fn shm_free_bytes() -> Option<u64> {
+pub(crate) fn shm_free_bytes() -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(std::ffi::OsStr::new("/dev/shm").as_bytes())
         .expect("a literal path contains no interior NUL");
@@ -21375,7 +21448,7 @@ fn shm_free_bytes() -> Option<u64> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn shm_free_bytes() -> Option<u64> {
+pub(crate) fn shm_free_bytes() -> Option<u64> {
     None
 }
 
@@ -27505,6 +27578,25 @@ process_groups:
         );
     }
 
+    /// A deployment asks for one state ring per rank and, unless `--no-rings`,
+    /// one trace ring per rank plus the departure ring. Three ranks with
+    /// default rings: 3 * 67 174 464 state bytes, and 3 * 42 008 640 + 106 560
+    /// trace bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_deployment_asks_for_a_state_ring_and_a_trace_ring_per_rank() {
+        assert_eq!(
+            deployment_shm_ask(3, 67_174_464, false),
+            (201_523_392, Some(126_132_480))
+        );
+        assert_eq!(
+            deployment_shm_ask(3, 67_174_464, true),
+            (201_523_392, None),
+            "`--no-rings` provisions no trace ring, so none is charged"
+        );
+        assert_eq!(deployment_shm_ask(1, 7, false), (7, Some(42_115_200)));
+    }
+
     /// The `/dev/shm` gate refuses only on POSITIVE evidence,
     /// and it is pinned on both sides of its boundary.
     #[cfg(unix)]
@@ -31571,17 +31663,18 @@ nodes:
             )
         );
         assert_eq!(
-            v["trace_format"], 12,
+            v["trace_format"], 13,
             "every bag this binary writes carries read-site roles, folds runs, \
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
              read stage's window, flags every complete checkpoint part of a stopped \
-             node, names every read site's writer at every checkpoint window head \
-             AND records every stop: a reader below 11 never mirrors the reopen, so \
-             an ungated stage near its rim reports a false read_log_diverged, and \
-             never checks the flags word; a reader below 12 refuses a bag that \
-             holds a stop record as an unknown record kind, and the stamp makes it \
-             refuse one that holds none by its format"
+             node, names every read site's writer at every checkpoint window head, \
+             records every stop AND records every single-frame take: a reader below \
+             11 never mirrors the reopen, so an ungated stage near its rim reports a \
+             false read_log_diverged, and never checks the flags word; a reader below \
+             12 refuses a bag that holds a stop record as an unknown record kind; and \
+             a reader below 13 would replay every take unrecorded, so the stamp makes \
+             each of them refuse the bag by its format"
         );
     }
 
@@ -31593,12 +31686,13 @@ nodes:
     /// Each later term overrides the free-run arm in turn: the role term takes
     /// it to 5, folding to 6, the consult record to 7, read identity to 8,
     /// per-frame batch identity to 9, checkpoint stops to 10, checkpoint
-    /// window heads to 11 and node stops to the 12 asserted here.
+    /// window heads to 11, node stops to 12 and single takes to the 13 asserted
+    /// here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_the_node_stops_format() {
+    fn a_free_run_recorder_json_stamps_free_run_and_the_single_take_format() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -31616,9 +31710,10 @@ nodes:
         // every consumed frame of a batch is named. 10, not 9: every complete
         // checkpoint part of a stopped node carries the stopped flag. 11, not
         // 10: every read site names its writer at every checkpoint window head.
-        // 12, not 11: every stop is a NODE-STOP record (`stamp_trace_format`'s
-        // hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 12);
+        // 12, not 11: every stop is a NODE-STOP record. 13, not 12: every
+        // single-frame take is a recorded read (`stamp_trace_format`'s hand
+        // table pins the whole matrix).
+        assert_eq!(v["trace_format"], 13);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -31653,7 +31748,7 @@ nodes:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"node_inputs":{{}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"node_inputs":{{}},"os":"{}","recorded_at_ns":7,"trace_format":13}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,

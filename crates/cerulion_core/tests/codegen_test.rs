@@ -366,6 +366,7 @@ fn test_nested_only_schema_uses_variable_emission_with_raw_bytes_accessors() {
             schema_name: "Point".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     schema.add_field(FieldDef::new(
@@ -374,6 +375,7 @@ fn test_nested_only_schema_uses_variable_emission_with_raw_bytes_accessors() {
             schema_name: "Quaternion".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
 
@@ -415,6 +417,7 @@ fn test_nested_field_inside_fixed_schema_uses_shm_companion() {
             schema_name: "Point".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
 
@@ -633,6 +636,7 @@ fn test_length_prefix_injectivity() {
             schema_name: "c".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     let mut s2 = MessageSchema::new("Probe");
@@ -642,6 +646,7 @@ fn test_length_prefix_injectivity() {
             schema_name: "bc".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     assert_eq!(
@@ -1033,6 +1038,7 @@ fn test_complex_variable_field_falls_back_to_raw_bytes_accessors() {
             schema_name: "Vector3".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     twist.add_field(FieldDef::new(
@@ -1041,6 +1047,7 @@ fn test_complex_variable_field_falls_back_to_raw_bytes_accessors() {
             schema_name: "Vector3".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
 
@@ -1396,6 +1403,7 @@ fn variable_schema_with_no_fixed_fields_emits_marker_fixed_section() {
             schema_name: "Vector3".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     s.add_field(FieldDef::new(
@@ -1404,6 +1412,7 @@ fn variable_schema_with_no_fixed_fields_emits_marker_fixed_section() {
             schema_name: "Vector3".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     let code = generate_schema(&s);
@@ -1803,6 +1812,7 @@ fn marker_doc_complex_variable_field_shows_raw_bytes_accessors() {
             schema_name: "Vector3".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         },
     ));
     let code = generate_schema(&s);
@@ -1899,6 +1909,7 @@ fn fixed_parent_with_transitive_large_array_derives_default() {
                 alignment: 8,
                 target_hash: 0,
             }),
+            target_hash: None,
         },
     ));
 

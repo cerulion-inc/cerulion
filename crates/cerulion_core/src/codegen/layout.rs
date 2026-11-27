@@ -376,6 +376,7 @@ impl LayoutResolver {
                 schema_name,
                 package,
                 fixed,
+                ..
             } => {
                 debug_assert!(
                     fixed.is_some(),
@@ -509,6 +510,7 @@ mod tests {
                 schema_name: "Point".into(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         pose.add_field(FieldDef::new(
@@ -517,6 +519,7 @@ mod tests {
                 schema_name: "Quaternion".into(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         vec![point, quat, pose]
@@ -667,6 +670,7 @@ mod tests {
                     schema_name: "Point".into(),
                     package: Some("geometry_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
                 length: 4,
             },
@@ -700,6 +704,7 @@ mod tests {
                 schema_name: "Inner".into(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         outer.add_field(FieldDef::new("flag", FieldType::Bool));
@@ -749,6 +754,7 @@ mod tests {
             schema_name: "Ghost".into(),
             package: Some("nope".into()),
             fixed: stamp,
+            target_hash: None,
         };
         assert_eq!(
             resolver.try_layout_of("geometry_msgs/Pose"),

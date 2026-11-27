@@ -634,6 +634,7 @@ fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType,
             schema_name: parts[1].to_string(),
             package: Some(parts[0].to_string()),
             fixed: None,
+            target_hash: None,
         });
     }
 
@@ -660,11 +661,13 @@ fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType,
             schema_name: "Time".to_string(),
             package: Some("builtin_interfaces".to_string()),
             fixed: None,
+            target_hash: None,
         }),
         "duration" => Ok(FieldType::Nested {
             schema_name: "Duration".to_string(),
             package: Some("builtin_interfaces".to_string()),
             fixed: None,
+            target_hash: None,
         }),
         // Assume anything else is a message type from the same package.
         //
@@ -715,6 +718,7 @@ fn parse_ros_type(ros_type: &str, bounds: &mut FieldBounds) -> Result<FieldType,
             schema_name: other.to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         }),
     }
 }

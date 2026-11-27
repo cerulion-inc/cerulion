@@ -487,6 +487,7 @@ mod tests {
                         schema_name: "TransformStamped".to_string(),
                         package: Some("geometry_msgs".to_string()),
                         fixed: None,
+                        target_hash: None,
                     }),
                 },
             }],

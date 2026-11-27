@@ -6755,6 +6755,7 @@ mod big_array_attr_tests {
                 alignment: 8,
                 target_hash: 0,
             }),
+            target_hash: None,
         }
     }
 

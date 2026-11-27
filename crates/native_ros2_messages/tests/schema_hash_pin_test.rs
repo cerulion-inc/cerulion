@@ -35,7 +35,7 @@
 //!   edit not propagating, or the parse → resolve → generate pipeline
 //!   diverging from the parse → resolve → test pipeline.
 
-use cerulion_core::codegen::{parse_rosmsg, resolve_fixed_nested, MessageSchema};
+use cerulion_core::codegen::{parse_rosmsg, resolve_fixed_nested, FieldType, MessageSchema};
 use cerulion_core::message::ShmMessage;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -276,4 +276,82 @@ fn vendored_hashes_match_the_hashes_a_live_rmw_publisher_puts_on_the_wire() {
         mismatches.len(),
         mismatches.join("\n"),
     );
+}
+
+/// `geometry_msgs/Pose` as a stock ROS 2 Jazzy `rclpy` publisher puts it on
+/// the wire (read by the Jazzy lane's schema hash capture). `Pose` holds
+/// only fixed fields, so no change to how nested references are hashed can
+/// move it.
+const POSE_WIRE_HASH: u64 = 0x8db061f3f9baff7d;
+
+/// Every nested reference of the resolved corpus, at any array depth.
+fn nested_refs(ft: &FieldType, out: &mut Vec<FieldType>) {
+    match ft {
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            nested_refs(element_type, out)
+        }
+        FieldType::Nested { .. } => out.push(ft.clone()),
+        _ => {}
+    }
+}
+
+#[test]
+fn every_corpus_reference_carries_its_target_hash_in_exactly_one_stamp() {
+    let corpus = resolved_corpus();
+    let mut problems: Vec<String> = Vec::new();
+    let mut unlined = 0usize;
+    for ((package, name), schema) in corpus {
+        let mut refs = Vec::new();
+        for field in &schema.fields {
+            nested_refs(&field.field_type, &mut refs);
+        }
+        for r in refs {
+            let FieldType::Nested {
+                schema_name,
+                package: Some(target_package),
+                fixed,
+                target_hash,
+            } = &r
+            else {
+                problems.push(format!("{package}/{name}: unqualified reference {r:?}"));
+                continue;
+            };
+            let target = schema_for(target_package, schema_name).schema_hash();
+            let stamp = match (fixed, target_hash) {
+                (Some(info), None) => info.target_hash,
+                (None, Some(hash)) => {
+                    unlined += 1;
+                    *hash
+                }
+                _ => {
+                    problems.push(format!(
+                        "{package}/{name} -> {target_package}/{schema_name}: \
+                         fixed {fixed:?}, target_hash {target_hash:?}"
+                    ));
+                    continue;
+                }
+            };
+            if stamp != target {
+                problems.push(format!(
+                    "{package}/{name} -> {target_package}/{schema_name}: stamp 0x{stamp:016x}, \
+                     target hash 0x{target:016x}"
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(unlined > 0, "the corpus has variable references");
+
+    let pose_array = schema_for("geometry_msgs", "PoseArray");
+    let FieldType::DynamicArray { element_type } = &pose_array.fields[1].field_type else {
+        panic!("geometry_msgs/PoseArray.poses must be a dynamic array");
+    };
+    assert!(matches!(
+        element_type.as_ref(),
+        FieldType::Nested {
+            fixed: None,
+            target_hash: Some(POSE_WIRE_HASH),
+            ..
+        }
+    ));
 }

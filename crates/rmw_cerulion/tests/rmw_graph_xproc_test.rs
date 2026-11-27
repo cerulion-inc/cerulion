@@ -1,0 +1,1123 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// The crate root is `#![cfg(unix)]`, so on a non-unix target this test
+// file must compile to NOTHING or its `use rmw_cerulion::…` items vanish.
+#![cfg(unix)]
+//! `rmw_get_topic_names_and_types` lists the topics of other processes on the
+//! same host, with their exact types, through the rmw graph registry.
+//!
+//! Every arm runs its rmw processes as children of this test binary (the
+//! `#[ignore]`d `subprocess_child_rmw_process`, inert without its environment),
+//! all on one isolated iceoryx2 root that the arm owns and removes at its end.
+//! The test process itself opens no transport. Each child obeys one command per
+//! stdin line (create or destroy an endpoint, list, gather, exit) and answers
+//! each with one `XPROC_REPLY` line, so the arms run in lockstep with no sleep.
+//! Every listing is compared with a hand-written string. The arms that count
+//! log lines read the child's stderr after it has exited.
+//!
+//! The children share the machine's iceoryx2 and spawn processes, so run serial:
+//!
+//! ```bash
+//! cargo test -p rmw_cerulion --test rmw_graph_xproc_test -- --test-threads=1
+//! ```
+
+use serial_test::serial;
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::io::{BufRead, BufReader, Write};
+use std::os::raw::{c_char, c_void};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use cerulion_core::testing::{
+    child_iceoryx_config, IsolatedRoot, CHILD_IOX2_PREFIX_ENV, CHILD_IOX2_ROOT_ENV,
+};
+use cerulion_core::transport::dead_node_sweep::sweep_node_config;
+use cerulion_core::transport::rmw_graph_registry::{
+    GatherCompleteness, RmwGraphGatherWindow, RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS,
+    RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH, RMW_GRAPH_REGISTRY_SERVICE_NAME,
+};
+use cerulion_core::transport::{TransportConfig, TransportManager};
+use cerulion_core::wire::MaxSliceLen;
+use iceoryx2::node::NodeBuilder;
+use iceoryx2::prelude::ServiceName;
+use iceoryx2::service::ipc_threadsafe::Service as CerService;
+use rmw_cerulion::ffi::{self, RMW_RET_OK};
+use rmw_cerulion::*;
+
+/// Set to "1" only on a spawned child, so a bare `-- --ignored` run does nothing.
+const ENV_CHILD: &str = "CER_RMW_GRAPH_XPROC_CHILD";
+/// Set to "1" on a child that installs [`PanicOnGraphReport`] before rmw init.
+const ENV_PANICKING_LOG: &str = "CER_RMW_GRAPH_XPROC_PANICKING_LOG";
+const CHILD_TEST: &str = "subprocess_child_rmw_process";
+/// The longest a child may take to answer one command before the parent kills
+/// it and fails. It turns a wedged child into a failed test, not a hung one.
+const REPLY_DEADLINE: Duration = Duration::from_secs(60);
+const REPLY: &str = "XPROC_REPLY ";
+/// The window of the child's `gather` command: long enough that a writer the
+/// gather still waits for shows as `Incomplete` rather than a lucky `Settled`.
+const GATHER_WINDOW: Duration = Duration::from_secs(5);
+
+const ROS_TYPE_DOUBLE: u8 = 2;
+const RMW_RET_INVALID_ARGUMENT: i32 = 11;
+const RMW_RET_BAD_ALLOC: i32 = 10;
+
+// =====================================================================
+// Type support: `rmw_gx__msg/<Name>` is the ROS graph type `rmw_gx/msg/<Name>`.
+// =====================================================================
+
+fn cstr(s: &str) -> *const c_char {
+    CString::new(s).expect("cstr").into_raw()
+}
+
+fn point_ts(name: &str) -> *const ffi::rosidl_message_type_support_t {
+    let members: Vec<_> = ["x", "y", "z"]
+        .iter()
+        .zip([0u32, 8, 16])
+        .map(
+            |(field, offset)| ffi::rosidl_typesupport_introspection_c__MessageMember {
+                name_: cstr(field),
+                type_id_: ROS_TYPE_DOUBLE,
+                offset_: offset,
+                ..Default::default()
+            },
+        )
+        .collect();
+    let members = Box::leak(members.into_boxed_slice());
+    let mm = Box::leak(Box::new(
+        ffi::rosidl_typesupport_introspection_c__MessageMembers {
+            message_namespace_: cstr("rmw_gx__msg"),
+            message_name_: cstr(name),
+            member_count_: members.len() as u32,
+            size_of_: 3 * std::mem::size_of::<f64>(),
+            members_: members.as_ptr(),
+            ..Default::default()
+        },
+    ));
+    Box::leak(Box::new(ffi::rosidl_message_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_c"),
+        data: mm as *const _ as *const c_void,
+        ..Default::default()
+    }))
+}
+
+fn default_qos() -> ffi::rmw_qos_profile_t {
+    ffi::rmw_qos_profile_t {
+        history: ffi::RMW_QOS_POLICY_HISTORY_KEEP_LAST,
+        depth: 8,
+        reliability: ffi::RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+        durability: ffi::RMW_QOS_POLICY_DURABILITY_VOLATILE,
+        deadline: ffi::rmw_time_t { sec: 0, nsec: 0 },
+        lifespan: ffi::rmw_time_t { sec: 0, nsec: 0 },
+        liveliness: ffi::RMW_QOS_POLICY_LIVELINESS_AUTOMATIC,
+        liveliness_lease_duration: ffi::rmw_time_t { sec: 0, nsec: 0 },
+        avoid_ros_namespace_conventions: false,
+    }
+}
+
+// =====================================================================
+// Allocators: a plain malloc one, and a countdown one that fails after a
+// budget and keeps a ledger of every pointer it handed out and freed.
+// =====================================================================
+
+extern "C" {
+    fn malloc(size: usize) -> *mut c_void;
+    fn free(ptr: *mut c_void);
+}
+
+unsafe extern "C" fn malloc_allocate(size: usize, _state: *mut c_void) -> *mut c_void {
+    malloc(size)
+}
+
+unsafe extern "C" fn malloc_deallocate(ptr: *mut c_void, _state: *mut c_void) {
+    free(ptr)
+}
+
+fn malloc_allocator() -> ffi::rcutils_allocator_t {
+    let mut a: ffi::rcutils_allocator_t = unsafe { std::mem::zeroed() };
+    a.allocate = Some(malloc_allocate);
+    a.deallocate = Some(malloc_deallocate);
+    a
+}
+
+/// The callbacks never panic (an unwind out of an `extern "C"` fn aborts);
+/// the child reads the ledger after the call.
+#[derive(Default)]
+struct FaultAlloc {
+    remaining: AtomicUsize,
+    allocated: Mutex<Vec<usize>>,
+    freed: Mutex<Vec<usize>>,
+}
+
+impl FaultAlloc {
+    fn with_budget(n: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(n),
+            ..Default::default()
+        }
+    }
+
+    /// Every pointer handed out was freed exactly once, and nothing else was.
+    fn balanced(&self) -> bool {
+        let mut allocated = self.allocated.lock().expect("ledger").clone();
+        let mut freed = self.freed.lock().expect("ledger").clone();
+        allocated.sort_unstable();
+        freed.sort_unstable();
+        allocated == freed
+    }
+}
+
+unsafe extern "C" fn fault_allocate(size: usize, state: *mut c_void) -> *mut c_void {
+    let st = &*(state as *const FaultAlloc);
+    if st
+        .remaining
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .is_err()
+    {
+        return std::ptr::null_mut();
+    }
+    let p = malloc(size);
+    if !p.is_null() {
+        st.allocated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(p as usize);
+    }
+    p
+}
+
+unsafe extern "C" fn fault_deallocate(ptr: *mut c_void, state: *mut c_void) {
+    let st = &*(state as *const FaultAlloc);
+    let mut freed = st.freed.lock().unwrap_or_else(|e| e.into_inner());
+    // Record first and free at most once, so a double free shows in the
+    // ledger instead of corrupting the heap.
+    let again = freed.contains(&(ptr as usize));
+    freed.push(ptr as usize);
+    if !again {
+        free(ptr);
+    }
+}
+
+fn fault_allocator(state: &FaultAlloc) -> ffi::rcutils_allocator_t {
+    let mut a: ffi::rcutils_allocator_t = unsafe { std::mem::zeroed() };
+    a.allocate = Some(fault_allocate);
+    a.deallocate = Some(fault_deallocate);
+    a.state = state as *const FaultAlloc as *mut c_void;
+    a
+}
+
+/// Read a filled `rmw_names_and_types_t` as `(name, types)` rows in the order
+/// the C ABI returned them, then free every allocation through `allocator`.
+unsafe fn take_names_and_types(
+    nat: &mut ffi::rmw_names_and_types_t,
+    allocator: &ffi::rcutils_allocator_t,
+) -> Vec<(String, Vec<String>)> {
+    let dealloc = allocator.deallocate.expect("deallocate");
+    let mut rows = Vec::with_capacity(nat.names.size);
+    for i in 0..nat.names.size {
+        let name = *nat.names.data.add(i);
+        let types = &mut *nat.types.add(i);
+        let mut type_names = Vec::with_capacity(types.size);
+        for k in 0..types.size {
+            let t = *types.data.add(k);
+            type_names.push(CStr::from_ptr(t).to_str().expect("utf-8").to_string());
+            dealloc(t as *mut c_void, allocator.state);
+        }
+        if !types.data.is_null() {
+            dealloc(types.data as *mut c_void, allocator.state);
+        }
+        rows.push((
+            CStr::from_ptr(name).to_str().expect("utf-8").to_string(),
+            type_names,
+        ));
+        dealloc(name as *mut c_void, allocator.state);
+    }
+    if !nat.types.is_null() {
+        dealloc(nat.types as *mut c_void, allocator.state);
+    }
+    if !nat.names.data.is_null() {
+        dealloc(nat.names.data as *mut c_void, allocator.state);
+    }
+    rows
+}
+
+/// `topic=type,type;topic=type` over the rows whose name starts with `prefix`.
+fn render(rows: &[(String, Vec<String>)], prefix: &str) -> String {
+    rows.iter()
+        .filter(|(name, _)| name.starts_with(prefix))
+        .map(|(name, types)| format!("{name}={}", types.join(",")))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// The first words of every report the rmw graph registry wiring logs.
+const GRAPH_REPORTS: [&str; 2] = ["rmw graph registry", "topic listing"];
+const HOST_PANIC: &str = "the host's tracing subscriber panicked on a report";
+
+/// A host tracing subscriber that panics on each report of the rmw graph
+/// registry wiring, and on nothing else. rmw installs its own subscriber with
+/// `try_init`, so one the host installed first wins.
+struct PanicOnGraphReport;
+
+impl tracing::Subscriber for PanicOnGraphReport {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        if !event.metadata().target().starts_with("rmw_cerulion::api::") {
+            return;
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        if GRAPH_REPORTS.iter().any(|r| message.0.starts_with(r)) {
+            panic!("{HOST_PANIC}");
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// =====================================================================
+// THE CHILD: one rmw process on the arm's isolated root.
+// =====================================================================
+
+struct ChildState {
+    node: *mut ffi::rmw_node_t,
+    type_supports: HashMap<String, usize>,
+    publishers: HashMap<String, *mut ffi::rmw_publisher_t>,
+    subscriptions: HashMap<String, *mut ffi::rmw_subscription_t>,
+    natives: Vec<cerulion_core::transport::publisher::CerulionPublisher>,
+    /// Every reader slot of the registry service, held by `hog`.
+    held_slots: Vec<iceoryx2::port::subscriber::Subscriber<CerService, [u8], ()>>,
+    raw_node: Option<iceoryx2::node::Node<CerService>>,
+}
+
+impl ChildState {
+    /// Take every reader slot of the registry service, opened with the
+    /// registry's own static config, so a gather cannot open its subscriber.
+    fn hog(&mut self) {
+        let config = child_iceoryx_config().expect("the isolated root");
+        let node = self.raw_node.get_or_insert_with(|| {
+            NodeBuilder::new()
+                .config(&sweep_node_config(&config))
+                .create::<CerService>()
+                .expect("raw node")
+        });
+        let name: ServiceName = RMW_GRAPH_REGISTRY_SERVICE_NAME
+            .try_into()
+            .expect("service name");
+        let service = node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .subscriber_max_buffer_size(RMW_GRAPH_QUEUE_DEPTH)
+            .max_subscribers(RMW_GRAPH_MAX_READERS)
+            .max_publishers(RMW_GRAPH_MAX_WRITERS)
+            .max_nodes(RMW_GRAPH_MAX_NODES)
+            .history_size(0)
+            .enable_safe_overflow(true)
+            .open_or_create()
+            .expect("registry service");
+        self.held_slots = (0..RMW_GRAPH_MAX_READERS)
+            .map(|_| service.subscriber_builder().create().expect("hold a slot"))
+            .collect();
+    }
+
+    fn ts(&mut self, name: &str) -> *const ffi::rosidl_message_type_support_t {
+        *self
+            .type_supports
+            .entry(name.to_string())
+            .or_insert_with(|| point_ts(name) as usize) as *const _
+    }
+
+    unsafe fn list(&self) -> Vec<(String, Vec<String>)> {
+        let mut allocator = malloc_allocator();
+        let mut nat: ffi::rmw_names_and_types_t = std::mem::zeroed();
+        let ret = rmw_get_topic_names_and_types(self.node, &mut allocator, false, &mut nat);
+        assert_eq!(ret, RMW_RET_OK, "rmw_get_topic_names_and_types");
+        take_names_and_types(&mut nat, &allocator)
+    }
+
+    /// One command line in, one reply payload out.
+    unsafe fn run(&mut self, line: &str) -> String {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let qos = default_qos();
+        match words.as_slice() {
+            ["pub", topic, type_name] => {
+                let ts = self.ts(type_name);
+                let topic_c = CString::new(*topic).expect("topic");
+                let opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+                let p = rmw_create_publisher(self.node, ts, topic_c.as_ptr(), &qos, &opts);
+                assert!(!p.is_null(), "create publisher on {topic}");
+                self.publishers.insert(topic.to_string(), p);
+                "ok".into()
+            }
+            ["sub", topic, type_name] => {
+                let ts = self.ts(type_name);
+                let topic_c = CString::new(*topic).expect("topic");
+                let opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+                let s = rmw_create_subscription(self.node, ts, topic_c.as_ptr(), &qos, &opts);
+                assert!(!s.is_null(), "create subscription on {topic}");
+                self.subscriptions.insert(topic.to_string(), s);
+                "ok".into()
+            }
+            ["unpub", topic] => {
+                let p = self
+                    .publishers
+                    .remove(*topic)
+                    .expect("a publisher to destroy");
+                assert_eq!(rmw_destroy_publisher(self.node, p), RMW_RET_OK);
+                "ok".into()
+            }
+            ["unsub", topic] => {
+                let s = self
+                    .subscriptions
+                    .remove(*topic)
+                    .expect("a subscription to destroy");
+                assert_eq!(rmw_destroy_subscription(self.node, s), RMW_RET_OK);
+                "ok".into()
+            }
+            ["native", topic] => {
+                let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+                let p = rt
+                    .transport
+                    .create_publisher(topic, MaxSliceLen::const_new(4096), 0)
+                    .expect("native publisher");
+                self.natives.push(p);
+                "ok".into()
+            }
+            ["list", prefix] => render(&self.list(), prefix),
+            ["gather", prefix] => {
+                let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+                let own = rt.graph_registry.as_ref().and_then(|w| w.writer_id());
+                let gather = rt
+                    .transport
+                    .gather_rmw_graph(own, RmwGraphGatherWindow::fixed(GATHER_WINDOW))
+                    .expect("gather");
+                let verdict = match gather.completeness {
+                    GatherCompleteness::Settled => "settled".to_string(),
+                    GatherCompleteness::Incomplete {
+                        live_writers,
+                        writers_heard,
+                    } => format!("incomplete:{live_writers}:{writers_heard}"),
+                };
+                let rows: Vec<(String, Vec<String>)> = gather
+                    .topics
+                    .into_iter()
+                    .map(|(t, types)| (t, types.into_iter().collect()))
+                    .collect();
+                format!("{verdict} {}", render(&rows, prefix))
+            }
+            ["nulls"] => {
+                let mut allocator = malloc_allocator();
+                let mut nat: ffi::rmw_names_and_types_t = std::mem::zeroed();
+                let codes = [
+                    rmw_get_topic_names_and_types(
+                        std::ptr::null(),
+                        &mut allocator,
+                        false,
+                        &mut nat,
+                    ),
+                    rmw_get_topic_names_and_types(self.node, std::ptr::null_mut(), false, &mut nat),
+                    rmw_get_topic_names_and_types(
+                        self.node,
+                        &mut allocator,
+                        false,
+                        std::ptr::null_mut(),
+                    ),
+                ];
+                codes.map(|c| c.to_string()).join(",")
+            }
+            ["faults"] => self.fault_walk(),
+            ["hog"] => {
+                self.hog();
+                "ok".into()
+            }
+            ["unhog"] => {
+                self.held_slots.clear();
+                "ok".into()
+            }
+            other => panic!("unknown child command {other:?}"),
+        }
+    }
+
+    /// Fail the allocator at the first, second, ... allocation until a call
+    /// succeeds. One `budget:ret:state` row per call, where `state` is `clean`
+    /// when the ledger balances and (for a failed call) the out-param is empty.
+    unsafe fn fault_walk(&self) -> String {
+        let mut rows = Vec::new();
+        for budget in 0..64 {
+            let state = FaultAlloc::with_budget(budget);
+            let mut allocator = fault_allocator(&state);
+            let mut nat: ffi::rmw_names_and_types_t = std::mem::zeroed();
+            let ret = rmw_get_topic_names_and_types(self.node, &mut allocator, false, &mut nat);
+            let empty = nat.names.size == 0 && nat.names.data.is_null() && nat.types.is_null();
+            if ret == RMW_RET_OK {
+                take_names_and_types(&mut nat, &allocator);
+            }
+            let clean = state.balanced() && (ret == RMW_RET_OK || empty);
+            rows.push(format!(
+                "{budget}:{ret}:{}",
+                if clean { "clean" } else { "dirty" }
+            ));
+            if ret == RMW_RET_OK {
+                break;
+            }
+        }
+        rows.join(";")
+    }
+}
+
+/// `#[ignore]`d: only an arm spawns it, with `ENV_CHILD=1` and the root.
+// `process::exit` is the point of the `exit` command: the process dies with
+// every endpoint live and nothing dropped, as a ROS process does when it ends.
+#[allow(clippy::disallowed_methods)]
+#[test]
+#[ignore]
+fn subprocess_child_rmw_process() {
+    if std::env::var(ENV_CHILD).as_deref() != Ok("1") {
+        return;
+    }
+    if std::env::var(ENV_PANICKING_LOG).as_deref() == Ok("1") {
+        tracing::subscriber::set_global_default(PanicOnGraphReport)
+            .expect("the first subscriber of this process");
+    }
+    let config = child_iceoryx_config().expect("the parent sets the isolated root");
+    // The singleton first, on the isolated root; `runtime()` then adopts it.
+    let manager = TransportManager::init_with_config(
+        TransportConfig {
+            node_name: format!("rmw_cerulion_{}", std::process::id()),
+            ..Default::default()
+        },
+        config,
+    )
+    .expect("the child initialises the transport on the isolated root");
+    let mut out = std::io::stdout().lock();
+    unsafe {
+        let mut options: Box<ffi::rmw_init_options_t> = Box::new(std::mem::zeroed());
+        let allocator: ffi::rcutils_allocator_t = std::mem::zeroed();
+        assert_eq!(rmw_init_options_init(&mut *options, allocator), RMW_RET_OK);
+        let context: *mut ffi::rmw_context_t = Box::leak(Box::new(std::mem::zeroed()));
+        assert_eq!(rmw_init(&*options, context), RMW_RET_OK);
+        let node = rmw_create_node(context, cstr("graph_xproc_child"), cstr("/"));
+        assert!(!node.is_null(), "node");
+        let rt = rmw_cerulion::runtime::runtime().expect("runtime");
+        assert!(
+            std::sync::Arc::ptr_eq(&rt.transport, &manager),
+            "the rmw runtime did not adopt the isolated transport"
+        );
+        let mut state = ChildState {
+            node,
+            type_supports: HashMap::new(),
+            publishers: HashMap::new(),
+            subscriptions: HashMap::new(),
+            natives: Vec::new(),
+            held_slots: Vec::new(),
+            raw_node: None,
+        };
+        // A leading newline: libtest has printed `test <name> ... ` already.
+        writeln!(out).expect("reply");
+        writeln!(out, "{REPLY}ready").expect("reply");
+        out.flush().expect("flush");
+        for line in std::io::stdin().lock().lines() {
+            let line = line.expect("stdin");
+            if line.trim() == "exit" {
+                std::process::exit(0);
+            }
+            let reply = state.run(&line);
+            writeln!(out, "{REPLY}{reply}").expect("reply");
+            out.flush().expect("flush");
+        }
+    }
+    std::process::exit(0);
+}
+
+// =====================================================================
+// THE PARENT
+// =====================================================================
+
+/// A child rmw process. Dropping it kills and reaps a child that still runs.
+struct Child {
+    name: &'static str,
+    process: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    replies: Receiver<String>,
+    stderr: Arc<Mutex<Vec<String>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Child {
+    fn spawn(root: &IsolatedRoot, name: &'static str) -> Child {
+        Self::spawn_with(root, name, &[])
+    }
+
+    fn spawn_with(root: &IsolatedRoot, name: &'static str, envs: &[(&str, &str)]) -> Child {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut command = std::process::Command::new(exe);
+        command
+            .args([
+                "--exact",
+                CHILD_TEST,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(ENV_CHILD, "1")
+            .env(CHILD_IOX2_ROOT_ENV, &root.root)
+            .env(CHILD_IOX2_PREFIX_ENV, &root.prefix)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut process = command.spawn().expect("spawn child");
+        let stdin = process.stdin.take();
+        let stdout = process.stdout.take().expect("child stdout");
+        let child_stderr = process.stderr.take().expect("child stderr");
+        let (tx, replies) = std::sync::mpsc::channel();
+        // Drain stdout to its end even after the parent stops reading, so the
+        // child never fails a write on a closed pipe.
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Some(at) = line.find(REPLY) {
+                    let _ = tx.send(line[at + REPLY.len()..].to_string());
+                }
+            }
+        });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&stderr);
+        let stderr_reader = std::thread::spawn(move || {
+            for line in BufReader::new(child_stderr).lines() {
+                let Ok(line) = line else { break };
+                eprintln!("[{name}] {line}");
+                sink.lock().expect("stderr lines").push(line);
+            }
+        });
+        let mut child = Child {
+            name,
+            process,
+            stdin,
+            replies,
+            stderr,
+            stderr_reader: Some(stderr_reader),
+        };
+        assert_eq!(child.reply("start"), "ready");
+        child
+    }
+
+    fn reply(&mut self, what: &str) -> String {
+        match self.replies.recv_timeout(REPLY_DEADLINE) {
+            Ok(reply) => reply,
+            Err(RecvTimeoutError::Timeout) => {
+                panic!(
+                    "child {} gave no reply to `{what}` in {REPLY_DEADLINE:?}",
+                    self.name
+                )
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("child {} exited before it replied to `{what}`", self.name)
+            }
+        }
+    }
+
+    fn ask(&mut self, command: &str) -> String {
+        let stdin = self.stdin.as_mut().expect("child stdin");
+        writeln!(stdin, "{command}").expect("write a command");
+        stdin.flush().expect("flush a command");
+        self.reply(command)
+    }
+
+    /// Send a signal to this child, by the process id this test started.
+    fn signal(&self, signal: &str) {
+        let status = std::process::Command::new("kill")
+            .args([signal, &self.process.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill {signal} child {}", self.name);
+    }
+
+    /// End the child with `process::exit(0)`, every endpoint still live, wait
+    /// until it is gone, and return every line it wrote to stderr.
+    fn exit_without_destroying(mut self) -> Vec<String> {
+        let stdin = self.stdin.as_mut().expect("child stdin");
+        writeln!(stdin, "exit").expect("write exit");
+        stdin.flush().expect("flush exit");
+        let deadline = Instant::now() + REPLY_DEADLINE;
+        loop {
+            match self.process.try_wait().expect("try_wait") {
+                Some(status) => {
+                    assert!(status.success(), "child {} exited with {status}", self.name);
+                    break;
+                }
+                None if Instant::now() > deadline => {
+                    panic!("child {} did not exit in {REPLY_DEADLINE:?}", self.name)
+                }
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("stderr reader");
+        }
+        self.stderr.lock().expect("stderr lines").clone()
+    }
+}
+
+/// How many of `lines` contain `text`.
+fn count(lines: &[String], text: &str) -> usize {
+    lines.iter().filter(|l| l.contains(text)).count()
+}
+
+/// A scratch directory removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn mint(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        if let Ok(None) = self.process.try_wait() {
+            let _ = self.process.kill();
+        }
+        let _ = self.process.wait();
+    }
+}
+
+/// A topic prefix no other arm uses.
+fn prefix(arm: &str) -> String {
+    format!("/rgx_{arm}_{}", std::process::id())
+}
+
+#[test]
+#[serial]
+fn another_process_lists_a_childs_publisher_and_subscription_only_topic_with_exact_types() {
+    let root = IsolatedRoot::mint("rgxa");
+    let p = prefix("a");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(
+        talker.ask(&format!("pub {p}/joint_states JointState")),
+        "ok"
+    );
+    assert_eq!(talker.ask(&format!("sub {p}/commands Command")), "ok");
+    assert_eq!(lister.ask(&format!("pub {p}/local Local")), "ok");
+    let expected = format!(
+        "{p}/commands=rmw_gx/msg/Command;{p}/joint_states=rmw_gx/msg/JointState;\
+         {p}/local=rmw_gx/msg/Local"
+    );
+    assert_eq!(lister.ask(&format!("list {p}")), expected);
+    assert_eq!(talker.ask(&format!("list {p}")), expected);
+}
+
+#[test]
+#[serial]
+fn a_destroyed_endpoint_leaves_the_listing_of_another_process() {
+    let root = IsolatedRoot::mint("rgxb");
+    let p = prefix("b");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(
+        talker.ask(&format!("pub {p}/joint_states JointState")),
+        "ok"
+    );
+    assert_eq!(talker.ask(&format!("sub {p}/commands Command")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/commands=rmw_gx/msg/Command;{p}/joint_states=rmw_gx/msg/JointState")
+    );
+    assert_eq!(talker.ask(&format!("unpub {p}/joint_states")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/commands=rmw_gx/msg/Command")
+    );
+    assert_eq!(talker.ask(&format!("unsub {p}/commands")), "ok");
+    assert_eq!(lister.ask(&format!("list {p}")), "");
+}
+
+#[test]
+#[serial]
+fn a_process_that_exits_without_destroying_leaves_the_listing_and_is_not_waited_for() {
+    let root = IsolatedRoot::mint("rgxc");
+    let p = prefix("c");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(
+        talker.ask(&format!("pub {p}/joint_states JointState")),
+        "ok"
+    );
+    assert_eq!(
+        lister.ask(&format!("gather {p}")),
+        format!("settled {p}/joint_states=rmw_gx/msg/JointState")
+    );
+    talker.exit_without_destroying();
+    // The exited process's port is still listed on the registry service; its
+    // node is dead, so the gather does not wait for it and drops its pairs.
+    assert_eq!(lister.ask(&format!("gather {p}")), "settled ");
+    assert_eq!(lister.ask(&format!("list {p}")), "");
+}
+
+#[test]
+#[serial]
+fn a_topic_a_native_publisher_created_first_lists_with_the_ros_type() {
+    let root = IsolatedRoot::mint("rgxd");
+    let p = prefix("d");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(lister.ask(&format!("native {p}/native_first")), "ok");
+    assert_eq!(lister.ask(&format!("list {p}")), "");
+    assert_eq!(talker.ask(&format!("pub {p}/native_first Gamma")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/native_first=rmw_gx/msg/Gamma")
+    );
+}
+
+#[test]
+#[serial]
+fn two_processes_with_different_types_on_one_topic_list_both_sorted() {
+    let root = IsolatedRoot::mint("rgxe");
+    let p = prefix("e");
+    let mut first = Child::spawn(&root, "first");
+    let mut second = Child::spawn(&root, "second");
+    assert_eq!(first.ask(&format!("sub {p}/shared Zulu")), "ok");
+    assert_eq!(second.ask(&format!("pub {p}/shared Alpha")), "ok");
+    let expected = format!("{p}/shared=rmw_gx/msg/Alpha,rmw_gx/msg/Zulu");
+    assert_eq!(first.ask(&format!("list {p}")), expected);
+    assert_eq!(second.ask(&format!("list {p}")), expected);
+}
+
+#[test]
+#[serial]
+fn two_listings_of_the_same_graph_are_byte_identical_whatever_the_creation_order() {
+    let root = IsolatedRoot::mint("rgxf");
+    let p = prefix("f");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut forward = Child::spawn(&root, "forward");
+    let mut backward = Child::spawn(&root, "backward");
+    for (topic, ty) in [("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie")] {
+        assert_eq!(forward.ask(&format!("pub {p}/fwd/{topic} {ty}")), "ok");
+    }
+    for (topic, ty) in [("c", "Charlie"), ("b", "Bravo"), ("a", "Alpha")] {
+        assert_eq!(backward.ask(&format!("pub {p}/bwd/{topic} {ty}")), "ok");
+    }
+    let expected = format!(
+        "{p}/bwd/a=rmw_gx/msg/Alpha;{p}/bwd/b=rmw_gx/msg/Bravo;{p}/bwd/c=rmw_gx/msg/Charlie;\
+         {p}/fwd/a=rmw_gx/msg/Alpha;{p}/fwd/b=rmw_gx/msg/Bravo;{p}/fwd/c=rmw_gx/msg/Charlie"
+    );
+    assert_eq!(lister.ask(&format!("list {p}")), expected);
+    assert_eq!(lister.ask(&format!("list {p}")), expected);
+}
+
+#[test]
+#[serial]
+fn an_endpoint_whose_type_name_is_over_the_frame_bound_is_created_but_listed_only_locally() {
+    let root = IsolatedRoot::mint("rgxg");
+    let p = prefix("g");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    // `rmw_gx/msg/` is 11 bytes, so a 250-byte name makes a 261-byte type name,
+    // over the registry's 256-byte bound.
+    let long = "L".repeat(250);
+    assert_eq!(talker.ask(&format!("pub {p}/long {long}")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/short Short")), "ok");
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/long=rmw_gx/msg/{long};{p}/short=rmw_gx/msg/Short")
+    );
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/short=rmw_gx/msg/Short")
+    );
+    // The destroy of the refused endpoint succeeds and removes nothing else.
+    assert_eq!(talker.ask(&format!("unpub {p}/long")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/short=rmw_gx/msg/Short")
+    );
+    let talker_log = talker.exit_without_destroying();
+    assert_eq!(
+        count(&talker_log, "an endpoint is not listed for other processes"),
+        1,
+        "the refused name logs once: {talker_log:#?}"
+    );
+}
+
+#[test]
+#[serial]
+fn a_listing_with_a_null_argument_is_refused() {
+    let root = IsolatedRoot::mint("rgxh");
+    let mut lister = Child::spawn(&root, "lister");
+    let refused = RMW_RET_INVALID_ARGUMENT;
+    assert_eq!(
+        lister.ask("nulls"),
+        format!("{refused},{refused},{refused}")
+    );
+}
+
+#[test]
+#[serial]
+fn a_failed_allocation_at_every_point_frees_everything_and_leaves_the_out_param_empty() {
+    let root = IsolatedRoot::mint("rgxi");
+    let p = prefix("i");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    // One topic with two types, one from each process: the names array (its
+    // buffer and one string), the types buffer, and the topic's types array
+    // (its buffer and two strings) make six allocations.
+    assert_eq!(lister.ask(&format!("sub {p}/mixed Zulu")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/mixed Alpha")), "ok");
+    let bad = RMW_RET_BAD_ALLOC;
+    assert_eq!(
+        lister.ask("faults"),
+        format!(
+            "0:{bad}:clean;1:{bad}:clean;2:{bad}:clean;3:{bad}:clean;4:{bad}:clean;\
+             5:{bad}:clean;6:0:clean"
+        )
+    );
+}
+
+#[test]
+#[serial]
+fn a_failed_allocation_in_a_later_topic_frees_the_types_of_every_earlier_topic() {
+    let root = IsolatedRoot::mint("rgxn");
+    let p = prefix("n");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    // Two topics in sorted order: `a_mixed` with two types, one from each
+    // process, then `b_single` with one. The names array (its buffer and two
+    // strings) and the types buffer make four allocations, `a_mixed`'s types
+    // array (its buffer and two strings) three more, and `b_single`'s (its
+    // buffer and one string) the last two. Budgets 7 and 8 fail inside
+    // `b_single`, after `a_mixed`'s array is whole; the ledger balances only
+    // when that earlier array is freed too.
+    assert_eq!(lister.ask(&format!("sub {p}/a_mixed Zulu")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/a_mixed Alpha")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/b_single Bravo")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/a_mixed=rmw_gx/msg/Alpha,rmw_gx/msg/Zulu;{p}/b_single=rmw_gx/msg/Bravo")
+    );
+    let bad = RMW_RET_BAD_ALLOC;
+    assert_eq!(
+        lister.ask("faults"),
+        format!(
+            "0:{bad}:clean;1:{bad}:clean;2:{bad}:clean;3:{bad}:clean;4:{bad}:clean;\
+             5:{bad}:clean;6:{bad}:clean;7:{bad}:clean;8:{bad}:clean;9:0:clean"
+        )
+    );
+}
+
+/// The host's tracing subscriber panics on every report the rmw graph
+/// registry wiring makes. Each report runs on a handle that is already in the
+/// local graph, or on a listing that already holds its answer, so the
+/// creates, the destroy and the listings still succeed.
+#[test]
+#[serial]
+fn a_panicking_host_subscriber_fails_no_create_destroy_or_listing() {
+    let root = IsolatedRoot::mint("rgxo");
+    let p = prefix("o");
+    let mut lister = Child::spawn_with(&root, "lister", &[(ENV_PANICKING_LOG, "1")]);
+    let mut talker = Child::spawn(&root, "talker");
+    let mut hog = Child::spawn(&root, "hog");
+    assert_eq!(talker.ask(&format!("pub {p}/remote Remote")), "ok");
+    // Two refused names report a failure and a suppressed repeat, and the next
+    // listed endpoint reports the recovery.
+    let long = "L".repeat(250);
+    assert_eq!(lister.ask(&format!("pub {p}/long_a {long}")), "ok");
+    assert_eq!(lister.ask(&format!("pub {p}/long_b {long}")), "ok");
+    assert_eq!(lister.ask(&format!("pub {p}/short Short")), "ok");
+    assert_eq!(lister.ask(&format!("unpub {p}/long_a")), "ok");
+    assert_eq!(lister.ask(&format!("unpub {p}/long_b")), "ok");
+    // Two gathers that cannot open report a failure and a suppressed repeat,
+    // and the next full listing reports the recovery.
+    assert_eq!(hog.ask("hog"), "ok");
+    for _ in 0..2 {
+        assert_eq!(
+            lister.ask(&format!("list {p}")),
+            format!("{p}/short=rmw_gx/msg/Short")
+        );
+    }
+    assert_eq!(hog.ask("unhog"), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/remote=rmw_gx/msg/Remote;{p}/short=rmw_gx/msg/Short")
+    );
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/remote=rmw_gx/msg/Remote;{p}/short=rmw_gx/msg/Short")
+    );
+    // Every report the host subscriber saw panicked, and every call above
+    // still answered. Per latch there is a failure, a suppressed repeat and a
+    // recovery, but the suppressed repeat is a `debug!` and `cerulion_core`
+    // builds `tracing` with `release_max_level_info`: a release build never
+    // emits it. So the count is three per latch in a debug build and two in a
+    // release build (a failure and a recovery).
+    let log = lister.exit_without_destroying();
+    let reports_per_latch = if cfg!(debug_assertions) { 3 } else { 2 };
+    assert_eq!(count(&log, HOST_PANIC), 2 * reports_per_latch, "{log:#?}");
+}
+
+#[test]
+#[serial]
+fn one_pair_lists_once_for_two_processes_and_until_its_last_local_endpoint_leaves() {
+    let root = IsolatedRoot::mint("rgxj");
+    let p = prefix("j");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    let mut other = Child::spawn(&root, "other");
+    assert_eq!(talker.ask(&format!("pub {p}/shared Same")), "ok");
+    assert_eq!(other.ask(&format!("pub {p}/shared Same")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/counted Count")), "ok");
+    assert_eq!(talker.ask(&format!("sub {p}/counted Count")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/counted=rmw_gx/msg/Count;{p}/shared=rmw_gx/msg/Same")
+    );
+    assert_eq!(talker.ask(&format!("unpub {p}/counted")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/counted=rmw_gx/msg/Count;{p}/shared=rmw_gx/msg/Same")
+    );
+    assert_eq!(talker.ask(&format!("unsub {p}/counted")), "ok");
+    assert_eq!(talker.ask(&format!("unpub {p}/shared")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/shared=rmw_gx/msg/Same")
+    );
+}
+
+/// The lister logs at info, so its recovery line is visible.
+const LISTER_LOG: (&str, &str) = ("RUST_LOG", "rmw_cerulion=info,cerulion_core=warn");
+const MISSED: &str = "topic listing may miss topics of other processes; it returns";
+const HEARD_AGAIN: &str = "topic listing hears every other process again";
+
+#[test]
+#[serial]
+fn a_listing_that_cannot_hear_a_stopped_process_returns_its_own_topics_and_warns_once() {
+    let root = IsolatedRoot::mint("rgxk");
+    let p = prefix("k");
+    let mut lister = Child::spawn_with(&root, "lister", &[LISTER_LOG]);
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(lister.ask(&format!("pub {p}/local Local")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/remote Remote")), "ok");
+    let both = format!("{p}/local=rmw_gx/msg/Local;{p}/remote=rmw_gx/msg/Remote");
+    assert_eq!(lister.ask(&format!("list {p}")), both);
+    // A stopped process keeps its live node and its writer, and answers no
+    // doorbell: every listing ends its window `Incomplete`.
+    talker.signal("-STOP");
+    for _ in 0..3 {
+        assert_eq!(
+            lister.ask(&format!("list {p}")),
+            format!("{p}/local=rmw_gx/msg/Local")
+        );
+    }
+    talker.signal("-CONT");
+    assert_eq!(lister.ask(&format!("list {p}")), both);
+    let log = lister.exit_without_destroying();
+    assert_eq!(count(&log, MISSED), 1, "{log:#?}");
+    assert_eq!(count(&log, HEARD_AGAIN), 1, "{log:#?}");
+}
+
+#[test]
+#[serial]
+fn a_listing_whose_gather_cannot_open_returns_its_own_topics_and_warns_once() {
+    let root = IsolatedRoot::mint("rgxl");
+    let p = prefix("l");
+    let mut lister = Child::spawn_with(&root, "lister", &[LISTER_LOG]);
+    let mut talker = Child::spawn(&root, "talker");
+    let mut hog = Child::spawn(&root, "hog");
+    assert_eq!(lister.ask(&format!("pub {p}/local Local")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/remote Remote")), "ok");
+    assert_eq!(hog.ask("hog"), "ok");
+    for _ in 0..3 {
+        assert_eq!(
+            lister.ask(&format!("list {p}")),
+            format!("{p}/local=rmw_gx/msg/Local")
+        );
+    }
+    assert_eq!(hog.ask("unhog"), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/local=rmw_gx/msg/Local;{p}/remote=rmw_gx/msg/Remote")
+    );
+    let log = lister.exit_without_destroying();
+    assert_eq!(count(&log, MISSED), 1, "{log:#?}");
+    assert!(
+        log.iter()
+            .any(|l| l.contains(MISSED) && l.contains("could not create the gather subscriber")),
+        "the warning names the cause: {log:#?}"
+    );
+    assert_eq!(count(&log, HEARD_AGAIN), 1, "{log:#?}");
+}
+
+#[test]
+#[serial]
+fn a_replayed_process_neither_lists_its_topics_for_others_nor_reads_theirs() {
+    let root = IsolatedRoot::mint("rgxm");
+    let logs = ScratchDir::mint("rgx_delivery_logs");
+    let logs_dir = logs.0.to_str().expect("utf-8 path").to_string();
+    let p = prefix("m");
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(talker.ask(&format!("pub {p}/live Live")), "ok");
+
+    // Recording keeps the live answer: both ways.
+    let mut recorder = Child::spawn_with(
+        &root,
+        "recorder",
+        &[("CERULION_RMW_DELIVERY_LOG", logs_dir.as_str())],
+    );
+    assert_eq!(recorder.ask(&format!("pub {p}/replayed Replayed")), "ok");
+    let both = format!("{p}/live=rmw_gx/msg/Live;{p}/replayed=rmw_gx/msg/Replayed");
+    assert_eq!(recorder.ask(&format!("list {p}")), both);
+    assert_eq!(talker.ask(&format!("list {p}")), both);
+    recorder.exit_without_destroying();
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/live=rmw_gx/msg/Live")
+    );
+
+    let log = std::fs::read_dir(&logs.0)
+        .expect("the recording directory")
+        .map(|e| e.expect("entry").path())
+        .find(|path| path.to_string_lossy().ends_with(".rdl.mcap"))
+        .expect("the recorder wrote a delivery log");
+    let log = log.to_str().expect("utf-8 path").to_string();
+    let mut replayed =
+        Child::spawn_with(&root, "replayed", &[("CERULION_RMW_REPLAY", log.as_str())]);
+    assert_eq!(replayed.ask(&format!("pub {p}/replayed Replayed")), "ok");
+    assert_eq!(
+        replayed.ask(&format!("list {p}")),
+        format!("{p}/replayed=rmw_gx/msg/Replayed")
+    );
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/live=rmw_gx/msg/Live")
+    );
+}

@@ -44,7 +44,14 @@
 //! monolith `graph run` (incl. --record)   create + arm, then attach as rank 0
 //! multi-process SUPERVISOR                create + arm, hold for the run's life
 //! `graph run-worker`                      OPEN the word its plan named, rank N
+//! one of several units in a run-worker    OPEN the same way, armed without fork
 //! ```
+//!
+//! A worker that is ONE executor unit anchors through the fork carrier. A unit that
+//! shares its process with other units cannot: a fork copies only the forking
+//! thread, so a lock a sibling unit's thread holds at that instant stays held in
+//! the child. Such a unit is armed with `GraphRuntime::attach_state_arm_no_fork`
+//! and captures on its own thread ([`attach_state_capture_no_fork_from`]).
 //!
 //! # The tag
 //!
@@ -162,9 +169,27 @@ pub fn attach_state_arm_by_tag_from(
     tag: &str,
     source: ArmTagSource,
 ) -> bool {
+    open_and_attach(
+        runtime,
+        tag,
+        source,
+        cerulion_core::GraphRuntime::attach_state_arm,
+    )
+}
+
+/// The open and its report, shared by the fork and the no-fork attach so the two
+/// cannot drift in how loudly a failed open is reported. `attach` is the runtime
+/// arm to call on a successful open.
+#[cfg(unix)]
+fn open_and_attach(
+    runtime: &mut cerulion_core::GraphRuntime,
+    tag: &str,
+    source: ArmTagSource,
+    attach: fn(&mut cerulion_core::GraphRuntime, std::sync::Arc<MappedStateArm>),
+) -> bool {
     match cerulion_core::state_arm::MappedStateArm::open_unowned(tag) {
         Ok(arm) => {
-            runtime.attach_state_arm(std::sync::Arc::new(arm));
+            attach(runtime, std::sync::Arc::new(arm));
             tracing::info!(
                 tag = %tag,
                 source = ?source,
@@ -297,12 +322,12 @@ pub fn arm_capture_plane(
             tag = %tag,
             cadence_steps = projection.cadence_steps,
             cadence_ms = projection.cadence_ms,
-            "Flashback capture plane ARMED for this deployment — every rank anchors \
-             node state every {} step(s). This process holds the word and anchors nothing; each \
-             WORKER pays one front-loaded copy of ITS OWN private memory per anchor and reserves \
-             its own state ring, and each decides for itself whether it can afford to. \
-             `CERULION_FLASHBACK=off` disables it",
-            projection.cadence_steps
+            "Flashback capture plane ARMED for this deployment: every rank anchors node state \
+             every `cadence_steps` steps. This process holds the word and anchors nothing. Every rank \
+             reserves its own state ring. A worker that runs one executor unit pays one \
+             front-loaded copy of ITS OWN private memory per anchor, and decides for itself \
+             whether it can afford to. A unit that shares its process with other units makes no \
+             copy: it captures on its own thread. `CERULION_FLASHBACK=off` disables it"
         ),
         PlaneRole::Monolith | PlaneRole::Worker { .. } => tracing::info!(
             tag = %tag,
@@ -315,6 +340,18 @@ pub fn arm_capture_plane(
              {} step(s). Standing cost: one front-loaded copy of this process's private memory \
              per anchor, plus the state ring reserved above. `CERULION_FLASHBACK=off` disables it",
             projection.cadence_steps
+        ),
+        // Unreachable: a hosted unit opens the word its plan names and never creates
+        // one. Stated, not `unreachable!()`ed, for the reason `report_arm_refusal`
+        // gives, and in this role's own words: it makes no copy.
+        PlaneRole::HostedUnit { .. } => tracing::info!(
+            tag = %tag,
+            cadence_steps = projection.cadence_steps,
+            cadence_ms = projection.cadence_ms,
+            ring_bytes = projection.ring_bytes,
+            "Flashback capture plane ARMED: this executor unit anchors node state every \
+             `cadence_steps` steps on its own thread, with no fork. Standing cost: the state ring \
+             reserved above. `CERULION_FLASHBACK=off` disables it"
         ),
     }
     Some(std::sync::Arc::new(arm))
@@ -334,10 +371,16 @@ pub enum PlaneRole {
     /// refusal would silence every worker, so only run-level policy (the kill
     /// switch) may refuse it.
     Supervisor,
-    /// One `graph run-worker`, opening a plane its supervisor created and doing the
-    /// forking. Its refusal means THIS RANK captures nothing while its peers carry
-    /// on.
+    /// One `graph run-worker` that is ONE executor unit, opening a plane its
+    /// supervisor created and doing the forking. Its refusal means THIS RANK
+    /// captures nothing while its peers carry on.
     Worker { rank: u32 },
+    /// One executor unit of a `graph run-worker` process that runs several units,
+    /// opening the plane like a [`PlaneRole::Worker`]. It never forks: it is armed
+    /// with `GraphRuntime::attach_state_arm_no_fork` and encodes its deferred node
+    /// state on its own thread, so the memory gate does not apply to it. The kill
+    /// switch and the cadence and ring knobs do.
+    HostedUnit { rank: u32 },
 }
 
 #[cfg(unix)]
@@ -355,20 +398,26 @@ impl PlaneRole {
     /// A SUPERVISOR answers `false`, and structurally rather than by convention:
     /// the fork lives in `GraphRuntime::take_anchor`, which returns at its first
     /// line unless a state-ring producer is installed, and a producer is installed
-    /// only by `attach_state_capture_*`. The supervisor calls neither — it never
-    /// builds a live loop at all, it spawns workers and joins them — so it holds
+    /// only by `attach_state_capture_*`. The supervisor calls neither (it never
+    /// builds a live loop at all, it spawns workers and joins them), so it holds
     /// the word, allocates no ring, and copies nothing. Pricing its resident memory
     /// prices a fork that cannot happen.
+    ///
+    /// A HOSTED UNIT answers `false` too: its runtime is armed without the fork
+    /// carrier, so its anchor starts no child and copies no memory. What it pays
+    /// instead is time on its own unit thread, which a resident-memory ceiling does
+    /// not measure.
     pub fn pays_the_fork_cost(self) -> bool {
         match self {
             Self::Monolith | Self::Worker { .. } => true,
-            Self::Supervisor => false,
+            Self::Supervisor | Self::HostedUnit { .. } => false,
         }
     }
 }
 
 /// The admission decision (the kill switch, the knobs, and the arm-time
-/// projection), asked by EVERY process that would fork.
+/// projection), asked by EVERY process that anchors. Only a role that forks
+/// ([`PlaneRole::pays_the_fork_cost`]) is also judged by the memory gate.
 ///
 /// Returns the projection when this process is admitted; `None` (having said why,
 /// out loud, in this process's own log) when it is not.
@@ -527,7 +576,7 @@ fn report_arm_refusal(
         PlaneRole::Monolith => "this run has NO capture plane at all, so any bag recorded of \
              it carries NO node-state anchors and is NOT resimmable"
             .to_string(),
-        PlaneRole::Worker { rank } => format!(
+        PlaneRole::Worker { rank } | PlaneRole::HostedUnit { rank } => format!(
             "rank {rank} captures NOTHING while its peers carry on, so every anchor of this run \
              LACKS rank {rank}'s records. A resim of a capture from this run whose window reaches \
              step 0 reads no anchor at all and reaches a verdict whatever the ring count. One \
@@ -548,7 +597,7 @@ fn report_arm_refusal(
     };
     let rank = match role {
         PlaneRole::Monolith | PlaneRole::Supervisor => None,
-        PlaneRole::Worker { rank } => Some(rank),
+        PlaneRole::Worker { rank } | PlaneRole::HostedUnit { rank } => Some(rank),
     };
     match refusal {
         ArmRefusal::StateTooLarge => tracing::warn!(
@@ -636,6 +685,33 @@ pub fn attach_state_capture_from(
     create_state_ring(runtime, tag, rank, node_ids)
 }
 
+/// [`attach_state_capture_from`] for an executor unit that shares its process with
+/// other units: the runtime is armed WITHOUT the fork carrier
+/// (`GraphRuntime::attach_state_arm_no_fork`), and the state ring is the same
+/// per-rank ring, created the same way.
+///
+/// The arm and the ring are per unit: each unit is its own rank, opens the word
+/// itself, and reserves its own ring. A process split into N units therefore
+/// reserves N rings (`CERULION_FLASHBACK_STATE_RING_MB` each).
+#[cfg(unix)]
+pub fn attach_state_capture_no_fork_from(
+    runtime: &mut cerulion_core::GraphRuntime,
+    tag: &str,
+    source: ArmTagSource,
+    rank: u32,
+    node_ids: &[String],
+) -> Option<cerulion_core::state_ring::StateRingOwner> {
+    if !open_and_attach(
+        runtime,
+        tag,
+        source,
+        cerulion_core::GraphRuntime::attach_state_arm_no_fork,
+    ) {
+        return None;
+    }
+    create_state_ring(runtime, tag, rank, node_ids)
+}
+
 /// Attach a plane THIS process just created.
 ///
 /// The owner half of [`attach_state_capture_from`], and the reason it is a
@@ -689,25 +765,29 @@ fn create_state_ring(
         }
     };
     let refs: Vec<&str> = node_ids.iter().map(String::as_str).collect();
-    // The per-rank ring's SIZE comes from an operator knob rather than a fixed
-    // constant. A capture's pre-window needs `window / cadence + 1` anchors held,
-    // and an anchor is bounded only by the arm-time gate, so this is a property
-    // of the robot rather than of the framework.
-    let (ring_bytes, complaint) = cerulion_core::flashback::resolve_state_ring_bytes(
-        std::env::var(cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV)
-            .ok()
-            .as_deref(),
-    );
+    let (capacity, complaint) = state_ring_capacity();
     if let Some(reason) = complaint {
         tracing::warn!(env = cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV, %reason, "ignoring");
     }
-    let mut owner = match StateRingOwner::create(
-        &ring_tag,
-        cerulion_core::state_ring::capacity_records_for_bytes(ring_bytes as usize),
-        rank,
-        state_ring_run_id(tag),
-        &refs,
-    ) {
+    // The `/dev/shm` free-space check, for THIS ring. `ftruncate` charges no
+    // page, so a ring that does not fit is created without complaint and the
+    // process takes SIGBUS at a later touch, inside a step. Refused here, it is
+    // a named degradation instead. An observation, not a reservation: a sibling
+    // unit's ring created a moment before has charged nothing yet, which is why
+    // the supervisor also checks the whole deployment's rings at once.
+    let created = gate_state_rings(
+        crate::graph_cmd::shm_free_bytes(),
+        cerulion_core::shm_ring::apparent_segment_bytes(
+            cerulion_core::state_ring::STATE_RECORD_SIZE,
+            capacity,
+        ),
+        None,
+    )
+    .and_then(|()| {
+        StateRingOwner::create(&ring_tag, capacity, rank, state_ring_run_id(tag), &refs)
+            .map_err(|e| e.to_string())
+    });
+    let mut owner = match created {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(
@@ -753,6 +833,65 @@ fn create_state_ring(
          and a recorder armed with the same tag discovers it by name"
     );
     Some(owner)
+}
+
+/// The capacity, in records, of a state ring this process creates, and the
+/// complaint about a knob value that was ignored.
+///
+/// The SIZE comes from an operator knob rather than a fixed constant. A
+/// capture's pre-window needs `window / cadence + 1` anchors held, and an anchor
+/// is bounded only by the arm-time gate, so this is a property of the robot
+/// rather than of the framework.
+#[cfg(unix)]
+fn state_ring_capacity() -> (u32, Option<String>) {
+    let (ring_bytes, complaint) = cerulion_core::flashback::resolve_state_ring_bytes(
+        std::env::var(cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV)
+            .ok()
+            .as_deref(),
+    );
+    (
+        cerulion_core::state_ring::capacity_records_for_bytes(ring_bytes as usize),
+        complaint,
+    )
+}
+
+/// The APPARENT bytes one state ring of this process reserves: what `ftruncate`
+/// sizes its segment to, and what a `/dev/shm` free-space check measures
+/// against. A fresh ring charges one page and reaches this figure as it fills.
+#[cfg(unix)]
+pub(crate) fn state_ring_apparent_bytes() -> u64 {
+    cerulion_core::shm_ring::apparent_segment_bytes(
+        cerulion_core::state_ring::STATE_RECORD_SIZE,
+        state_ring_capacity().0,
+    )
+}
+
+/// PURE: may state rings of `state_ring_bytes` be created, beside scheduler-trace
+/// rings of `trace_ring_bytes`?
+///
+/// `free_bytes` is `None` when the free space CANNOT BE TOLD (POSIX SHM on macOS
+/// is not a mounted tmpfs), and that is never a refusal, as for the trace rings.
+/// The trace rings are admitted first, by their own gate, which refuses exactly
+/// when they do not fit on their own: so they are charged here only when they
+/// fit, and a deployment whose trace rings are refused can still hold its state
+/// rings. The sum saturates, so no size wraps into a fit.
+#[cfg(unix)]
+pub(crate) fn gate_state_rings(
+    free_bytes: Option<u64>,
+    state_ring_bytes: u64,
+    trace_ring_bytes: Option<u64>,
+) -> Result<(), String> {
+    let Some(free) = free_bytes else {
+        return Ok(());
+    };
+    let trace = trace_ring_bytes.filter(|t| *t <= free).unwrap_or(0);
+    if free < state_ring_bytes.saturating_add(trace) {
+        return Err(format!(
+            "/dev/shm has {free} bytes free, less than the {state_ring_bytes} bytes this run's \
+             checkpoint state rings reserve beside its {trace} bytes of scheduler-trace rings"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -927,47 +1066,15 @@ mod tests {
         assert_eq!(state_arm_tag_for_run(u128::MAX).len(), 8 + 32);
     }
 
-    /// A FAILED attach creates NO state ring.
-    ///
-    /// # Why this needs its own arm rather than following from the others
-    ///
-    /// EVERY `graph run` derives an arm tag, so this path is taken on
-    /// every run on every robot — and on the overwhelming majority there is no
-    /// recorder and no arm word. A state ring is a 64 MiB SHM reservation by
-    /// default, so a carrier that created one anyway would charge every robot
-    /// that much, permanently, for a feature nobody asked for.
-    ///
-    /// NOTHING else catches it. Every functional arm in the suite drives the
-    /// path where the attach SUCCEEDS, and a ring created on the failing path is
-    /// invisible to all of them: the run behaves identically, the coverage
-    /// manifest is unaffected, and the recorder that would notice does not
-    /// exist. Dropping the early return leaves every other state test green,
-    /// which is why the oracle here is the SHM OBJECT
-    /// — the only place the cost is observable.
+    /// A one-node graph (`n`, a 100 ms `Period` closure node with no declared
+    /// state) under `identity` and `prefix`, built for a test.
     #[cfg(unix)]
-    #[test]
-    fn a_failed_attach_creates_no_state_ring() {
+    fn one_node_runtime(identity: &str, prefix: &str) -> cerulion_core::GraphRuntime {
         use cerulion_core::graph::config::{GraphConfig, NodeDef, OutputDef};
         use cerulion_core::graph::node::{ClosureNodeEntry, NodeEntry, NodeInfo};
         use cerulion_core::MacroPolicy;
         use indexmap::IndexMap;
         use std::sync::Arc;
-
-        // A tag nothing has armed — no recorder ever created this word.
-        let tag = format!(
-            "c5_noarm_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .subsec_nanos()
-        );
-        let ring_name = cerulion_core::state_ring::state_ring_shm_name(&tag, 0)
-            .expect("an ordinary rank names a ring");
-        assert!(
-            !cerulion_core::shm_ring::shm_object_exists(&ring_name),
-            "precondition: this run's ring name must start unused"
-        );
 
         let config = GraphConfig {
             level_assignments: None,
@@ -976,8 +1083,8 @@ mod tests {
             process_group_order: Default::default(),
             multi_publisher_topics: Vec::new(),
             name: None,
-            identity: "noarm".to_string(),
-            prefix: "c53na".to_string(),
+            identity: identity.to_string(),
+            prefix: prefix.to_string(),
             nodes: vec![NodeDef {
                 isolate: None,
                 params: Default::default(),
@@ -1004,9 +1111,52 @@ mod tests {
             )),
         );
         let clock = Arc::new(cerulion_core::VirtualClock::new());
-        let mut runtime =
-            cerulion_core::GraphRuntime::build_for_test_barrier(config, factories, clock, 8)
-                .expect("the pin graph builds");
+        cerulion_core::GraphRuntime::build_for_test_barrier(config, factories, clock, 8)
+            .expect("the pin graph builds")
+    }
+
+    /// A tag no other test or run can be using.
+    #[cfg(unix)]
+    fn unique_tag(stem: &str) -> String {
+        format!(
+            "{stem}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        )
+    }
+
+    /// A FAILED attach creates NO state ring.
+    ///
+    /// # Why this needs its own arm rather than following from the others
+    ///
+    /// EVERY `graph run` derives an arm tag, so this path is taken on
+    /// every run on every robot, and on the overwhelming majority there is no
+    /// recorder and no arm word. A state ring is a 64 MiB SHM reservation by
+    /// default, so a carrier that created one anyway would charge every robot
+    /// that much, permanently, for a feature nobody asked for.
+    ///
+    /// NOTHING else catches it. Every functional arm in the suite drives the
+    /// path where the attach SUCCEEDS, and a ring created on the failing path is
+    /// invisible to all of them: the run behaves identically, the coverage
+    /// manifest is unaffected, and the recorder that would notice does not
+    /// exist. Dropping the early return leaves every other state test green,
+    /// which is why the oracle here is the SHM OBJECT,
+    /// the only place the cost is observable.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_attach_creates_no_state_ring() {
+        // A tag nothing has armed: no recorder ever created this word.
+        let tag = unique_tag("c5_noarm");
+        let ring_name = cerulion_core::state_ring::state_ring_shm_name(&tag, 0)
+            .expect("an ordinary rank names a ring");
+        assert!(
+            !cerulion_core::shm_ring::shm_object_exists(&ring_name),
+            "precondition: this run's ring name must start unused"
+        );
+        let mut runtime = one_node_runtime("noarm", "c53na");
 
         let owner = attach_state_capture_from(
             &mut runtime,
@@ -1030,6 +1180,127 @@ mod tests {
             "a run nobody is checkpointing must not reserve a state ring — `{ring_name}` \
              exists, which is 64 MiB per graph run charged to every robot"
         );
+    }
+
+    /// The no-fork attach of a unit that shares its process fails the same way:
+    /// no word, so no arm and no ring.
+    #[cfg(unix)]
+    #[test]
+    fn a_hosted_units_failed_attach_creates_no_state_ring() {
+        let tag = unique_tag("hosted_noarm");
+        let ring_name = cerulion_core::state_ring::state_ring_shm_name(&tag, 2)
+            .expect("an ordinary rank names a ring");
+        let mut runtime = one_node_runtime("hostednoarm", "c53hn");
+
+        let owner = attach_state_capture_no_fork_from(
+            &mut runtime,
+            &tag,
+            ArmTagSource::Explicit,
+            2,
+            &["n".to_string()],
+        );
+        assert!(owner.is_none(), "no word exists, so nothing may be armed");
+        assert!(runtime.state_arm().is_none());
+        assert!(
+            !cerulion_core::shm_ring::shm_object_exists(&ring_name),
+            "a failed hosted attach must not reserve `{ring_name}`"
+        );
+    }
+
+    /// A unit that shares its process is armed WITHOUT the fork carrier and
+    /// anchors into its OWN rank's ring.
+    ///
+    /// Each oracle is something only the no-fork arm produces. The fork arm takes
+    /// the fork-exclusion sweep at attach (`state_arm_fork_sweep` is `Some`); this one
+    /// takes none. Its anchor reports a direct stream (`last_anchor_direct`), which a
+    /// fork-armed runtime never does. The node here declares no state, so the
+    /// inline walk defers it and the direct stream refuses it without entering its
+    /// encoder: one failed node, one not entered, no records, and one
+    /// `CaptureFailed` SKIP at step 0 in rank 5's ring with the fixed detail below.
+    #[cfg(unix)]
+    #[test]
+    fn a_hosted_unit_is_armed_without_fork_and_anchors_into_its_own_ring() {
+        use cerulion_core::state::SkipCause;
+        use cerulion_core::state_ring::{StateAnchorEvent, StateAssembler, StateRingConsumer};
+
+        let tag = unique_tag("hosted_arm");
+        let arm = MappedStateArm::create_owned(&tag).expect("create the arm word");
+        // Cadence 4 from step 0: the first step is due.
+        arm.arm(4, 0);
+        let mut runtime = one_node_runtime("hostedarm", "c53ha");
+
+        let owner = attach_state_capture_no_fork_from(
+            &mut runtime,
+            &tag,
+            ArmTagSource::Explicit,
+            5,
+            &["n".to_string()],
+        )
+        .expect("the word exists, so the unit arms and creates its ring");
+        assert!(runtime.state_arm().is_some(), "the runtime is armed");
+        assert!(
+            runtime.state_arm_fork_sweep().is_none(),
+            "a unit armed without fork takes no fork-exclusion sweep"
+        );
+        for rank in [0, 4, 6] {
+            let other = cerulion_core::state_ring::state_ring_shm_name(&tag, rank)
+                .expect("an ordinary rank names a ring");
+            assert!(
+                !cerulion_core::shm_ring::shm_object_exists(&other),
+                "only rank 5's ring may exist, found rank {rank}'s"
+            );
+        }
+
+        runtime.step(std::time::Duration::from_millis(100));
+        assert_eq!(
+            runtime.last_anchor_direct(),
+            Some(cerulion_core::state_carrier::DirectStreamStats {
+                streamed_nodes: 0,
+                refused_nodes: 0,
+                failed_nodes: 1,
+                not_entered_nodes: 1,
+                records: 0,
+            }),
+            "step 0 is due, so the anchor ran and its deferred node went to the direct stream"
+        );
+        assert!(
+            !runtime.capture_child_in_flight(),
+            "no capture child was started"
+        );
+
+        let mut consumer = StateRingConsumer::open(owner.name()).expect("open rank 5's ring");
+        let mut assembler = StateAssembler::passthrough();
+        let mut events = Vec::new();
+        consumer
+            .drain(&mut assembler, &mut events)
+            .expect("drain the ring");
+        events.extend(assembler.finish());
+        let skips: Vec<(u64, u32, SkipCause, String)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StateAnchorEvent::Skipped {
+                    step,
+                    node_idx,
+                    cause,
+                    detail,
+                    ..
+                } => Some((*step, *node_idx, *cause, detail.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            skips,
+            vec![(
+                0,
+                0,
+                SkipCause::CaptureFailed,
+                "node declares no `state_shape()`, so its anchor cannot be framed".to_string()
+            )],
+            "rank 5's ring holds the one SKIP of its one node: {events:?}"
+        );
+        assert_eq!(events.len(), 1, "and nothing else: {events:?}");
+        drop(owner);
+        drop(arm);
     }
 
     /// The env var's NAME is a cross-process contract: the recorder sets it and
@@ -1213,5 +1484,79 @@ mod tests {
         );
         drop(rank0);
         drop(arm);
+    }
+
+    /// A state ring reserves its records plus the ring header, at the size the
+    /// knob names: 64 MiB is 131 072 records of 512 bytes, 1 MiB is 2 048, and
+    /// the header is 65 600 bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_ring_reserves_its_records_and_its_header() {
+        let _env = env_lock();
+        let env = cerulion_core::flashback::FLASHBACK_STATE_RING_MB_ENV;
+        {
+            let _ring = EnvVarGuard::set(env, "64");
+            assert_eq!(state_ring_apparent_bytes(), 131_072 * 512 + 65_600);
+        }
+        let _ring = EnvVarGuard::set(env, "1");
+        assert_eq!(state_ring_apparent_bytes(), 2_048 * 512 + 65_600);
+    }
+
+    /// The `/dev/shm` gate for state rings, on hand numbers.
+    ///
+    /// Two units with a default ring each ask for 2 * 67 174 464 = 134 348 928
+    /// bytes. On a 64 MiB mount (67 108 864 bytes) that is refused, which is the
+    /// shape that would otherwise fault the worker when its rings fill.
+    #[cfg(unix)]
+    #[test]
+    fn the_state_ring_gate_refuses_only_what_it_can_prove_will_not_fit() {
+        const RING: u64 = 67_174_464;
+        assert_eq!(
+            gate_state_rings(None, 2 * RING, Some(1)),
+            Ok(()),
+            "cannot tell is not a refusal"
+        );
+        assert_eq!(gate_state_rings(Some(2 * RING), 2 * RING, None), Ok(()));
+        assert_eq!(
+            gate_state_rings(Some(2 * RING - 1), 2 * RING, None),
+            Err(
+                "/dev/shm has 134348927 bytes free, less than the 134348928 bytes this run's \
+                 checkpoint state rings reserve beside its 0 bytes of scheduler-trace rings"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            gate_state_rings(Some(67_108_864), 2 * RING, None),
+            Err(
+                "/dev/shm has 67108864 bytes free, less than the 134348928 bytes this run's \
+                 checkpoint state rings reserve beside its 0 bytes of scheduler-trace rings"
+                    .to_string()
+            ),
+            "two default rings do not fit a 64 MiB mount"
+        );
+        // Trace rings that fit are charged first: 100 bytes of trace leave 99
+        // for state.
+        assert_eq!(gate_state_rings(Some(199), 99, Some(100)), Ok(()));
+        assert_eq!(
+            gate_state_rings(Some(199), 100, Some(100)),
+            Err(
+                "/dev/shm has 199 bytes free, less than the 100 bytes this run's checkpoint \
+                 state rings reserve beside its 100 bytes of scheduler-trace rings"
+                    .to_string()
+            )
+        );
+        // Trace rings that do not fit on their own are refused by their own
+        // gate and reserve nothing, so they are not charged here.
+        assert_eq!(gate_state_rings(Some(150), 100, Some(151)), Ok(()));
+        // A wrapping sum of these two is 0, which would fit.
+        assert_eq!(
+            gate_state_rings(Some(u64::MAX - 1), u64::MAX - 1, Some(2)),
+            Err(format!(
+                "/dev/shm has {free} bytes free, less than the {free} bytes this run's checkpoint \
+                 state rings reserve beside its 2 bytes of scheduler-trace rings",
+                free = u64::MAX - 1
+            )),
+            "the sum saturates rather than wrapping into a fit"
+        );
     }
 }

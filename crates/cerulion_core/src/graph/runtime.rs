@@ -18375,6 +18375,23 @@ impl GraphRuntime {
         }
     }
 
+    /// Adopt the RECORDING's single-take rule on every wired stage: is a take
+    /// through `CerulionSubscriber::try_receive_one` or its owned twin a
+    /// recorded read, which consults the replay read gate, stages its record
+    /// and pays the `block` credit word? A recorder at trace format 13 makes
+    /// it one, and a replay of such a bag keeps the stages' creation value; a
+    /// bag declared below format 13 recorded no take, and a replay of it must
+    /// take the same unrecorded path, or its read log, its read gate and its
+    /// credit words would each part from the recording's. Called once per
+    /// replay, before the first step, whether or not the read log verifier is
+    /// active; a recording run never calls it.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn set_read_log_records_single_takes(&self, recorded: bool) {
+        for (_node, stage) in &self.read_outcome_stages {
+            stage.adopt_single_take_records(recorded);
+        }
+    }
+
     /// Reopen the writer runs of every read-outcome stage whose owning node id
     /// `keep` accepts, in wiring order: the next annotated read of each read
     /// site of such a stage stages its writer's annotation again, whatever the

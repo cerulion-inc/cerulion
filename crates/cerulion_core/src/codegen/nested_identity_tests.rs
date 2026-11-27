@@ -17,6 +17,7 @@ fn nested(name: &str, package: Option<&str>) -> FieldType {
         schema_name: name.to_string(),
         package: package.map(str::to_string),
         fixed: None,
+        target_hash: None,
     }
 }
 

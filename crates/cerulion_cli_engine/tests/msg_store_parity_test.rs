@@ -170,6 +170,7 @@ fn s1_a_store_type_nesting_a_builtin_hashes_like_codegen() {
                 schema_name: "Header".to_string(),
                 package: Some("std_msgs".to_string()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         stamped.add_field(FieldDef::new("v", FieldType::F64));
@@ -222,6 +223,7 @@ fn s1_a_store_type_with_a_same_package_bare_ref_resolves_like_codegen() {
                 schema_name: "Inner".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         s.add_field(FieldDef::new("w", FieldType::F64));
@@ -1107,6 +1109,7 @@ fn r4_the_hash_map_and_decoder_layouts_derive_from_the_same_post_scrub_set() {
                 schema_name: "Inner".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         s
@@ -1143,6 +1146,7 @@ fn r4_the_hash_map_and_decoder_layouts_derive_from_the_same_post_scrub_set() {
                         schema_name: "Filler".to_string(),
                         package: None,
                         fixed: None,
+                        target_hash: None,
                     }),
                     length: 4,
                 },
@@ -1214,6 +1218,7 @@ fn r4_a_composed_overflow_nested_target_degrades_instead_of_panicking_resolution
                 schema_name: "Outer".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         s.add_field(FieldDef::new("w", FieldType::F64));
@@ -1265,6 +1270,7 @@ fn r4_the_closure_walk_binds_a_bare_ref_same_package_first() {
                     schema_name: "Inner".to_string(),
                     package: None,
                     fixed: None,
+                    target_hash: None,
                 },
             ));
             s
@@ -1587,6 +1593,7 @@ fn r8_the_closure_walk_binds_the_resolver_identity_not_the_qualified_string() {
                     schema_name: "Widget".to_string(),
                     package: Some("acme5".to_string()),
                     fixed: None,
+                    target_hash: None,
                 },
             ));
             s
@@ -1762,6 +1769,7 @@ fn r8_a_bare_nested_ref_colliding_with_a_builtin_stays_ambiguous_for_replay() {
                 schema_name: "Vector3".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         oracle_hash(&mut [s], "Host")
@@ -1846,6 +1854,7 @@ fn r9_a_qualified_nested_ref_binds_the_store_identity_at_replay() {
                 schema_name: "Widget".to_string(),
                 package: Some("acme6".to_string()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         s.add_field(FieldDef::new("tail", FieldType::F64));
@@ -1943,6 +1952,7 @@ fn r10_a_store_shadowing_a_builtin_at_the_same_key_keeps_its_bare_alias() {
                     schema_name: "Vector3".to_string(),
                     package: None,
                     fixed: None,
+                    target_hash: None,
                 },
             ));
             s
@@ -2018,6 +2028,7 @@ fn r10_a_partially_removed_store_definition_propagates_to_the_registry_tiers() {
                     schema_name: "Widget".to_string(),
                     package: Some("acme7".to_string()),
                     fixed: None,
+                    target_hash: None,
                 },
             ));
             s.add_field(FieldDef::new("tail", FieldType::F64));
@@ -2105,6 +2116,7 @@ fn r11_a_qualified_ref_core_leaves_unresolved_walks_nothing() {
                     schema_name: "T9".to_string(),
                     package: Some("p9".to_string()),
                     fixed: None,
+                    target_hash: None,
                 },
             ));
             s.add_field(FieldDef::new("tail", FieldType::F64));
@@ -2164,6 +2176,7 @@ fn r11_store_schema_info_resolves_workspace_yaml_refs_like_the_hash_surface() {
                 schema_name: "Inner11".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         wrap.add_field(FieldDef::new("t", FieldType::F64));
@@ -2208,6 +2221,7 @@ fn r11_store_schema_info_resolves_workspace_yaml_refs_like_the_hash_surface() {
                 schema_name: "Inner11".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         s.add_field(FieldDef::new("t", FieldType::F64));
@@ -3560,6 +3574,7 @@ fn r24_an_omitted_stem_owner_beside_a_surviving_store_key_is_skipped_in_the_hash
                 schema_name: "Header".to_string(),
                 package: Some("std_msgs".to_string()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         other.add_field(FieldDef::new("a", FieldType::U32));
@@ -5404,6 +5419,7 @@ fn r39_a_store_type_nesting_a_builtin_hashes_on_the_graph_surface() {
                 schema_name: "Time".to_string(),
                 package: Some("builtin_interfaces".to_string()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         stamped.add_field(FieldDef::new("v", FieldType::F64));

@@ -1532,7 +1532,7 @@ mod tests {
     /// window-head cause on it.
     const FROM_START: FeedBagFacts = FeedBagFacts {
         begins_mid_run: false,
-        trace_format: Some(12),
+        trace_format: Some(13),
     };
 
     /// A bag that begins mid-run, recorded at trace format 10.

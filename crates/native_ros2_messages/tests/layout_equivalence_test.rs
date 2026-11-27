@@ -484,6 +484,7 @@ fn fixed_array_of_nested_matches_repr_c_oracle() {
                 schema_name: "Point".into(),
                 package: Some("geometry_msgs".into()),
                 fixed: None,
+                target_hash: None,
             }),
             length: 3,
         },
