@@ -136,6 +136,7 @@ pub fn resolve_fixed_nested(schemas: &mut [MessageSchema]) -> Vec<String> {
     for idx in 0..resolver.snapshot.len() {
         resolver.fixedness_of(idx);
     }
+    resolver.memoize_hashes_targets_first();
 
     // Rewrite phase: mark resolved-fixed Nested references on the live
     // schemas using the memoized fixedness of the pre-rewrite snapshot.
@@ -234,6 +235,11 @@ struct Resolver {
     /// schemas share a component iff each reaches the other, so a
     /// reference inside one component is a reference cycle.
     component: Vec<usize>,
+    /// Every snapshot index, each after every schema it reaches outside
+    /// its own component: the order
+    /// [`memoize_hashes_targets_first`](Self::memoize_hashes_targets_first)
+    /// fills the hash memo in.
+    targets_first: Vec<usize>,
     /// In-progress DFS markers for cycle detection.
     visiting: Vec<bool>,
     warnings: Vec<String>,
@@ -275,6 +281,9 @@ impl Resolver {
         }
         let len = schemas.len();
         let component = reference_components(schemas, &index);
+        // Tarjan closes a component only after every component it reaches.
+        let mut targets_first: Vec<usize> = (0..len).collect();
+        targets_first.sort_by_key(|&idx| component[idx]);
         Self {
             snapshot: schemas.to_vec(),
             index,
@@ -282,6 +291,7 @@ impl Resolver {
             resolved_info: vec![None; len],
             resolved_hash: vec![None; len],
             component,
+            targets_first,
             visiting: vec![false; len],
             warnings,
         }
@@ -478,7 +488,9 @@ impl Resolver {
     ///
     /// Terminates: every reference it follows leaves the schema's reference
     /// cycle ([`Binding::Cyclic`] is never followed), so the calls walk the
-    /// acyclic graph of components.
+    /// acyclic graph of components. Once
+    /// [`memoize_hashes_targets_first`](Self::memoize_hashes_targets_first)
+    /// has run, every call is a memo hit.
     fn resolved_hash_of(&mut self, idx: usize) -> Result<u64, String> {
         if let Some(r) = &self.resolved_hash[idx] {
             return r.clone();
@@ -491,6 +503,21 @@ impl Resolver {
         };
         self.resolved_hash[idx] = Some(hash.clone());
         hash
+    }
+
+    /// Fill the hash memo (and, through it, the layout memo of every fixed
+    /// schema) in [`targets_first`](Self::targets_first) order. Each
+    /// schema's targets are then memoized before it is hashed, so the stack
+    /// does not grow with the length of a reference chain: a chain of
+    /// dynamic arrays or of variable targets, which the fixedness walk does
+    /// not follow, is hashed link by link. An `Err` stays in the memo; the
+    /// rewrite phase warns it per reference.
+    ///
+    /// Precondition: the fixedness memo is fully populated.
+    fn memoize_hashes_targets_first(&mut self) {
+        for pos in 0..self.targets_first.len() {
+            let _ = self.resolved_hash_of(self.targets_first[pos]);
+        }
     }
 
     /// Return `ft` with every nested reference stamped as
@@ -675,7 +702,9 @@ impl Resolver {
 /// graph: an edge `S -> T` for each nested reference of `S`, at any array
 /// depth, that binds to `T` through `index` (iterative Tarjan). Components
 /// are numbered in the order the walk closes them, which depends on the
-/// input order, so only equality of two numbers is ever read.
+/// input order. A component closes only after every component it reaches,
+/// so a target's number is never above its referrer's; nothing else about
+/// a number is ever read.
 fn reference_components(schemas: &[MessageSchema], index: &NestedIndex) -> Vec<usize> {
     let edges: Vec<Vec<usize>> = schemas
         .iter()
@@ -2434,5 +2463,125 @@ mod tests {
                 assert_eq!(fa.field_type, fb.field_type, "{}", a.qualified_name());
             }
         }
+    }
+
+    // ---- Resolution depth ----
+
+    /// The stack size the test harness gives each test thread.
+    const TEST_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
+    /// Links in [`reference_chain`]: at one stack frame per link, the
+    /// chain needs far more than [`TEST_THREAD_STACK_BYTES`]. Even, so the
+    /// last link is an array element.
+    const CHAIN_LINKS: usize = 20_000;
+
+    /// The type link `link` of [`reference_chain`] spells for its `next`
+    /// field: a direct reference on an even link, an array element on an
+    /// odd one.
+    fn chain_next_type(link: usize) -> String {
+        if link.is_multiple_of(2) {
+            format!("acme/L{}", link + 1)
+        } else {
+            format!("acme/L{}[]", link + 1)
+        }
+    }
+
+    /// `acme/L0` to `acme/L{CHAIN_LINKS}`: each link holds one `next`
+    /// reference to the following link, alternately direct (to a variable
+    /// target) and as a `DynamicArray` element; the last link is
+    /// `{ uint8 x }`. Every link but the last is variable, so the fixedness
+    /// walk stops after two links, and only the target hash stamps follow
+    /// the chain to its end.
+    fn reference_chain() -> Vec<MessageSchema> {
+        let mut chain: Vec<MessageSchema> = (0..CHAIN_LINKS)
+            .map(|link| {
+                let mut s = MessageSchema::new_in_package(format!("L{link}"), "acme");
+                let next = nested(&format!("L{}", link + 1), Some("acme"));
+                let next = if link.is_multiple_of(2) {
+                    next
+                } else {
+                    dynamic(next)
+                };
+                s.add_field(FieldDef::new("next", next));
+                s
+            })
+            .collect();
+        let mut last = MessageSchema::new_in_package(format!("L{CHAIN_LINKS}"), "acme");
+        last.add_field(FieldDef::new("x", FieldType::U8));
+        chain.push(last);
+        chain
+    }
+
+    /// The recipe-3 hash of chain link `link`, assembled by hand. A
+    /// variable target's hash is never folded into recipe 3, so each link's
+    /// hash reads only its own fields.
+    fn chain_link_hash(link: usize) -> u64 {
+        let name = format!("acme/L{link}");
+        if link == CHAIN_LINKS {
+            recipe3_hash(&name, 1, &[("x", "uint8", None)])
+        } else {
+            recipe3_hash(&name, 0, &[("next", &chain_next_type(link), None)])
+        }
+    }
+
+    /// Resolve `schemas` on a thread with the test harness's stack size, so
+    /// the depth a resolution reaches does not depend on the thread that
+    /// runs the test.
+    fn resolve_on_test_thread_stack(
+        mut schemas: Vec<MessageSchema>,
+    ) -> (Vec<MessageSchema>, Vec<String>) {
+        std::thread::Builder::new()
+            .stack_size(TEST_THREAD_STACK_BYTES)
+            .spawn(move || {
+                let warnings = resolve_fixed_nested(&mut schemas);
+                (schemas, warnings)
+            })
+            .expect("spawn the resolution thread")
+            .join()
+            .expect("the resolution thread returns")
+    }
+
+    fn assert_chain_stamped(schemas: &[MessageSchema]) {
+        for schema in schemas {
+            let Some(link) = schema
+                .name
+                .strip_prefix('L')
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                panic!("not a chain link: {}", schema.name);
+            };
+            if link == CHAIN_LINKS {
+                continue;
+            }
+            let next = stamped(
+                &format!("L{}", link + 1),
+                "acme",
+                Some(chain_link_hash(link + 1)),
+            );
+            let expected = if link.is_multiple_of(2) {
+                next
+            } else {
+                dynamic(next)
+            };
+            assert_eq!(schema.fields[0].field_type, expected, "acme/L{link}.next");
+            assert_eq!(schema.schema_hash(), chain_link_hash(link), "acme/L{link}");
+        }
+    }
+
+    #[test]
+    fn a_long_reference_chain_is_stamped_on_a_test_thread_stack() {
+        assert_eq!(chain_next_type(0), "acme/L1");
+        assert_eq!(chain_next_type(1), "acme/L2[]");
+        let (resolved, warnings) = resolve_on_test_thread_stack(reference_chain());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_chain_stamped(&resolved);
+    }
+
+    #[test]
+    fn a_long_reference_chain_listed_last_link_first_is_stamped_the_same() {
+        let mut chain = reference_chain();
+        chain.reverse();
+        let (resolved, warnings) = resolve_on_test_thread_stack(chain);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_chain_stamped(&resolved);
     }
 }
