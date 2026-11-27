@@ -32,11 +32,16 @@ use super::publish::PublishTraceEntry;
 
 /// Schema-hash recipe identifier persisted with every JSONL record.
 ///
-/// Recipe `3` = layout-sensitive hash over the **qualified** name
+/// Recipe `4` = layout-sensitive hash over the **qualified** name
 /// (`pkg/Name`) + `wire_fixed_size()` + per-field name/`canonical_str()`,
-/// where a fixed-resolved nested field also folds in its target's full
-/// recursive hash (see `codegen::MessageSchema::schema_hash` for the
-/// canonical recipe).
+/// where every resolved nested reference (a direct field, a `FixedArray`
+/// or a `DynamicArray` element, an inlined or a variable target) also
+/// folds in its target's full recursive hash (see
+/// `codegen::MessageSchema::schema_hash` for the canonical recipe).
+/// Recipe `3` folded the target hash of an inlined (fixed) target only, so
+/// a layout change inside a variable target or a dynamic array element
+/// left the parent's hash unchanged
+/// (`codegen::MessageSchema::schema_hash_recipe3`).
 /// Recipe `2` was the length-prefixed layout hash over the **bare**
 /// name (no package qualification, no nested-layout fold).
 /// Recipe `1` was the earlier name-only `fnv1a(schema_name)` hash;
@@ -52,7 +57,7 @@ use super::publish::PublishTraceEntry;
 /// "absent key = recipe 1" default lives in readers (the CLI's
 /// `parse_jsonl_record` is key-based and tolerates both shapes) rather
 /// than in a `#[serde(default)]` attribute.
-pub const HASH_RECIPE: u32 = 3;
+pub const HASH_RECIPE: u32 = 4;
 
 /// Retention policy: when the total bag-directory size exceeds the
 /// configured limits, the oldest file(s) get deleted.
@@ -391,11 +396,11 @@ mod tests {
         assert!(lines[0].contains("\"ts_ns\":1000000"));
         assert!(lines[0].contains("\"schema_hash\":\"0x00000000DEADBEEF\""));
         // Every persisted record carries the hash-recipe marker
-        // (recipe 3 = layout + qualified name + nested fold) so older
-        // recordings stay diagnosable (absent key = recipe 1).
+        // (recipe 4 = layout + qualified name + every nested target hash)
+        // so older recordings stay diagnosable (absent key = recipe 1).
         for line in &lines {
             assert!(
-                line.contains("\"hash_recipe\":3"),
+                line.contains("\"hash_recipe\":4"),
                 "every record must carry the recipe marker; got: {line}"
             );
         }
