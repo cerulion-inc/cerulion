@@ -65,7 +65,7 @@ sha2 = "0.11"
 # build dependency via aws-lc-sys) is deliberate: rust_crypto pulls rsa 0.9,
 # which cargo-deny rejects for RUSTSEC-2023-0071 with no fixed release.
 # accountd is outside default-members, so plain cargo builds stay C-toolchain-free.
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs"] }
 # Random device seeds, session/refresh tokens, device/user codes, account ids.
 getrandom = "0.4"
 # Safe OAuth authorization-URL construction (query-param encoding).
