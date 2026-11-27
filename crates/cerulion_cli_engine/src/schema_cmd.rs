@@ -219,9 +219,9 @@ fn schema_info_entries(
         }
         let hash = schema.schema_hash();
         // Parse-time layout (unresolved nested = variable, contributing
-        // nothing) — the same IR the hash above consumed. Overwritten
-        // below with canonically resolved values where resolution
-        // succeeds; the hash is NOT recomputed.
+        // nothing) — the same IR the hash above consumed. The hash and the
+        // layout are both overwritten below with the canonically resolved
+        // values where resolution succeeds.
         let wire_fixed_size = schema.wire_fixed_size();
 
         results.push(SchemaEntry {
@@ -1099,17 +1099,12 @@ pub(crate) fn workspace_yaml_files(schemas_dir: &Path) -> Vec<std::path::PathBuf
 /// unified renderer then flags it loudly on its field line as
 /// `(… unknown type — no schema found)`.
 ///
-/// The displayed HASH is deliberately NOT recomputed: it stays the
-/// single-file unresolved-parse value, where a nested field contributes
-/// only its schema name (see [`MessageSchema::schema_hash`] — the
-/// nested `target_hash` fold and the `wire_fixed_size` input only
-/// change for RESOLVED IR, which this function never hashes). So a
-/// workspace entry with a fixed-nested field intentionally renders a
-/// pair of DIFFERENT provenance: the RESOLVED wire fixed size (the true
-/// inlined SHM layout, equal to what the built-in path and a generated
-/// `WIRE_FIXED_SIZE` would report) next to the UNRESOLVED recipe hash
-/// (the wire-contract value). Both are individually correct —
-/// do not "fix" either to match the other's provenance.
+/// The displayed HASH is the RESOLVED layout's: the value a node built from
+/// the entry stamps on the wire, which folds the hash of every nested
+/// reference (see [`MessageSchema::schema_hash`]). The single-file
+/// unresolved parse hash leaves a nested `std_msgs/Header` out and matches no
+/// frame, so it is kept only where no resolved layout exists (an entry
+/// declared in more than one file).
 ///
 /// An entry NAME declared in MORE THAN ONE workspace file
 /// is a workspace inconsistency — which definition "wins" would be
@@ -1183,6 +1178,7 @@ fn enrich_entries_with_resolved_layout(schemas_dir: &Path, entries: &mut [Schema
             entry.schema_hash = None;
         }
         if let Some(layout) = representable_layout(layout, "schema info layout enrichment") {
+            entry.schema_hash = Some(layout.schema_hash);
             entry.wire_fixed_size = layout.fixed_size;
             entry.wire_fixed_size_resolved = true;
             for field in entry.fields.iter_mut() {
@@ -4578,16 +4574,20 @@ pub fn schema_list(schemas_dir: &Path) -> SchemaListing {
                     // definition — one the preflight dropped is unhashed before
                     // the resolver is asked (its name may now resolve to a
                     // lower tier's twin), a composed-over one is refused by
-                    // `representable_layout`. The hash itself stays the
-                    // parse-time value `schema info` displays.
-                    let schema_hash = (refusal.is_none()
+                    // `representable_layout`. The hash is the resolved
+                    // layout's, the value `schema info` displays and a node
+                    // built from the definition stamps on the wire.
+                    let schema_hash = if refusal.is_none()
                         && preflight_survivors.contains(&schema.schema_hash())
-                        && representable_layout(
+                    {
+                        representable_layout(
                             resolver.layout_of(&schema.name),
                             "schema list workspace rows",
                         )
-                        .is_some())
-                    .then(|| schema.schema_hash());
+                        .map(|l| l.schema_hash)
+                    } else {
+                        None
+                    };
                     workspace.push(WorkspaceSchemaEntry {
                         name: schema.name.clone(),
                         schema_hash,
@@ -5666,10 +5666,9 @@ mod tests {
                 cerulion_core::SchemaDoc {
                     qualified: "acme/Gadget".to_string(),
                     encoding: cerulion_core::SchemaEncoding::Msg,
-                    // Variable (has a `string`), so the root's RESOLVED hash +
-                    // wire fixed size equal the UNRESOLVED single-file parse
-                    // (no fixed-nested folding) — making an independent
-                    // `parse_rosmsg` oracle exact.
+                    // Variable (has a `string`), so it adds nothing to the
+                    // root's fixed size and the parse oracle for the size stays
+                    // exact; the root's hash folds the hash of this type.
                     text: "int32 n\nstring label\n".to_string(),
                     deps: vec![],
                 },
@@ -5681,6 +5680,20 @@ mod tests {
         // plus the locally-computed wire identity — anchored to an INDEPENDENT
         // `parse_rosmsg` oracle over the fabricated closure (not presence-only).
         let widget_oracle = parse_rosmsg(WIDGET_MSG, "Widget", Some("acme")).unwrap();
+        let gadget_hash = hand_hash(
+            "acme/Gadget",
+            4,
+            &[("n", "int32", None), ("label", "string", None)],
+        );
+        let widget_hash = hand_hash(
+            "acme/Widget",
+            8,
+            &[
+                ("header", "std_msgs/Header", Some(header_wire_hash_oracle())),
+                ("gadget", "acme/Gadget", Some(gadget_hash)),
+                ("x", "float64", None),
+            ],
+        );
         assert!(out.starts_with("schema: acme/Widget\n"), "GOT:\n{out}");
         assert!(
             out.contains(
@@ -5690,8 +5703,8 @@ mod tests {
             "provenance line:\n{out}"
         );
         assert!(
-            out.contains(&format!("\nhash: 0x{:016x}\n", widget_oracle.schema_hash())),
-            "hash must equal the independent parse oracle:\n{out}"
+            out.contains(&format!("\nhash: 0x{widget_hash:016x}\n")),
+            "hash must equal the hand-built stream that folds both targets:\n{out}"
         );
         assert!(
             out.contains(&format!(
@@ -5967,6 +5980,87 @@ mod tests {
         assert_eq!(info.entries[0].description, "Camera image");
         assert_eq!(info.entries[0].field_count, 3);
         assert!(info.entries[0].schema_hash.is_some_and(|h| h != 0));
+    }
+
+    /// A schema hash assembled by hand from literals: the length-prefixed
+    /// name, the fixed size, then per field its name, type and (for a
+    /// nested reference) the hash of the target.
+    fn hand_hash(name: &str, fixed: u64, fields: &[(&str, &str, Option<u64>)]) -> u64 {
+        fn prefixed(bytes: &mut Vec<u8>, text: &str) {
+            bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        prefixed(&mut bytes, name);
+        bytes.extend_from_slice(&fixed.to_le_bytes());
+        for (field, ty, target) in fields {
+            prefixed(&mut bytes, field);
+            prefixed(&mut bytes, ty);
+            if let Some(h) = target {
+                bytes.extend_from_slice(&h.to_le_bytes());
+            }
+        }
+        cerulion_core::wire::fnv1a_hash(&bytes)
+    }
+
+    /// The wire hash of `std_msgs/Header`, which folds the hash of `Time`.
+    fn header_wire_hash_oracle() -> u64 {
+        let time = hand_hash(
+            "builtin_interfaces/Time",
+            8,
+            &[("sec", "int32", None), ("nanosec", "uint32", None)],
+        );
+        hand_hash(
+            "std_msgs/Header",
+            8,
+            &[
+                ("stamp", "builtin_interfaces/Time", Some(time)),
+                ("frame_id", "string", None),
+            ],
+        )
+    }
+
+    /// `Stamped { std_msgs/Header header; float64 value }` as the wire
+    /// carries it: the hash folds the hash of `Header`.
+    fn stamped_wire_hash_oracle() -> u64 {
+        hand_hash(
+            "Stamped",
+            8,
+            &[
+                ("header", "std_msgs/Header", Some(header_wire_hash_oracle())),
+                ("value", "float64", None),
+            ],
+        )
+    }
+
+    const STAMPED_YAML: &str =
+        "schemas:\n  Stamped:\n    fields:\n      std_msgs/Header header:\n      float64 value:\n";
+
+    #[test]
+    fn schema_info_of_a_yaml_type_with_a_nested_header_prints_the_wire_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("stamped.yaml"), STAMPED_YAML).unwrap();
+
+        let info = schema_info(tmp.path(), "stamped").unwrap();
+        assert_eq!(info.entries.len(), 1);
+        assert_eq!(
+            info.entries[0].schema_hash,
+            Some(stamped_wire_hash_oracle())
+        );
+    }
+
+    #[test]
+    fn schema_list_of_a_yaml_type_with_a_nested_header_prints_the_wire_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("stamped.yaml"), STAMPED_YAML).unwrap();
+
+        let listing = schema_list(tmp.path());
+        let row = listing
+            .workspace
+            .iter()
+            .find(|e| e.name == "Stamped")
+            .expect("the workspace type is listed");
+        assert_eq!(row.schema_hash, Some(stamped_wire_hash_oracle()));
     }
 
     #[test]

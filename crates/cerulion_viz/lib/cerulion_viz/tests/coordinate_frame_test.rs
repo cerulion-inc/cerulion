@@ -121,12 +121,63 @@ fn layout_of(qname: &str) -> WireLayout {
     resolver.layout_of(qname).expect("schema resolves")
 }
 
+/// The hash the walker keys on and a producer stamps: the RESOLVED layout's,
+/// which folds the hash of every nested type. The parse-time
+/// `MessageSchema::schema_hash()` of an unresolved schema leaves a nested
+/// `std_msgs/Header` out and matches no frame.
 fn schema_hash_of(qname: &str) -> u64 {
-    schemas_under_test()
-        .iter()
-        .find(|s| s.qualified_name() == qname)
-        .unwrap_or_else(|| panic!("{qname} in the set"))
-        .schema_hash()
+    layout_of(qname).schema_hash
+}
+
+fn prefixed(bytes: &mut Vec<u8>, text: &str) {
+    bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+}
+
+/// `probe/StampedVideo` hashed from a byte stream assembled by hand from
+/// literals: its `std_msgs/Header` field folds the hash of `Header`, which
+/// folds the hash of `builtin_interfaces/Time`.
+fn stamped_video_wire_hash_oracle() -> u64 {
+    use cerulion_core::wire::fnv1a_hash;
+    let mut time = Vec::new();
+    prefixed(&mut time, "builtin_interfaces/Time");
+    time.extend_from_slice(&8u64.to_le_bytes());
+    for (name, ty) in [("sec", "int32"), ("nanosec", "uint32")] {
+        prefixed(&mut time, name);
+        prefixed(&mut time, ty);
+    }
+    let mut header = Vec::new();
+    prefixed(&mut header, "std_msgs/Header");
+    header.extend_from_slice(&8u64.to_le_bytes());
+    prefixed(&mut header, "stamp");
+    prefixed(&mut header, "builtin_interfaces/Time");
+    header.extend_from_slice(&fnv1a_hash(&time).to_le_bytes());
+    prefixed(&mut header, "frame_id");
+    prefixed(&mut header, "string");
+
+    let mut video = Vec::new();
+    prefixed(&mut video, STAMPED_VIDEO_QNAME);
+    // header is variable; u64 at 0 and u32 at 8 end at 12, and the fixed
+    // section rounds up to its 8-byte alignment: 16 bytes.
+    video.extend_from_slice(&16u64.to_le_bytes());
+    prefixed(&mut video, "header");
+    prefixed(&mut video, "std_msgs/Header");
+    video.extend_from_slice(&fnv1a_hash(&header).to_le_bytes());
+    prefixed(&mut video, "time_frame");
+    prefixed(&mut video, "uint64");
+    prefixed(&mut video, "video_height");
+    prefixed(&mut video, "uint32");
+    prefixed(&mut video, "video_data");
+    prefixed(&mut video, "uint8[]");
+    fnv1a_hash(&video)
+}
+
+#[test]
+fn the_stamped_video_frame_carries_the_wire_hash_of_its_nested_header() {
+    assert_eq!(
+        schema_hash_of(STAMPED_VIDEO_QNAME),
+        stamped_video_wire_hash_oracle()
+    );
 }
 
 fn height_map_schema_hash() -> u64 {
