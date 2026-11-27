@@ -7700,6 +7700,9 @@ pub fn graph_run(
 ///
 /// Mp workers are always network-free: the separate gateway process owns the
 /// robot's whole network plane.
+///
+/// The transport choice and the checkpoint carrier choice read one predicate,
+/// [`plan_shares_its_process`], so the two cannot drift apart.
 fn worker_transport(
     plan: &crate::multiprocess::WorkerPlan,
     clock: Arc<dyn cerulion_core::clock::Clock>,
@@ -7711,12 +7714,21 @@ fn worker_transport(
         subscriber_buffer_size: 16,
         network: None,
     };
-    let transport = if plan.host.is_some() {
+    let transport = if plan_shares_its_process(plan) {
         cerulion_core::TransportManager::detached_with_config(config, ix_config)?
     } else {
         cerulion_core::TransportManager::init_with_config(config, ix_config)?
     };
     Ok(transport)
+}
+
+/// True when this plan's executor unit runs in one process with other units
+/// ([`WorkerPlan::host`](crate::multiprocess::WorkerPlan::host) is stamped exactly
+/// for those). Such a unit gets a detached transport, and its runtime is armed for
+/// checkpoints without the fork carrier: a fork copies one thread, so a lock a
+/// sibling unit's thread holds at that instant would stay held in the child.
+fn plan_shares_its_process(plan: &crate::multiprocess::WorkerPlan) -> bool {
+    plan.host.is_some()
 }
 
 /// Under the `oracle-mutants` feature, setting this variable makes a process
@@ -8782,6 +8794,24 @@ pub fn graph_run_worker(
                 return None;
             }
         };
+        // A unit that shares its process with other units is armed WITHOUT the
+        // fork carrier and captures on its own thread. It still asks admission (the
+        // kill switch and the knobs), but the memory gate does not judge it: no
+        // child copies its memory.
+        if plan_shares_its_process(&plan) {
+            crate::state_arm_attach::admit_capture_plane(
+                crate::state_arm_attach::PlaneRole::HostedUnit { rank },
+                tag,
+                runtime.tightest_timing_ns(),
+            )?;
+            return crate::state_arm_attach::attach_state_capture_no_fork_from(
+                &mut runtime,
+                tag,
+                crate::state_arm_attach::ArmTagSource::Explicit,
+                rank,
+                &recording_node_ids,
+            );
+        }
         // THIS WORKER decides whether IT can afford
         // to be checkpointed, on ITS OWN resident memory.
         //
