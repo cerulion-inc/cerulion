@@ -210,7 +210,7 @@ jobs:
       contents: read
     # QEMU user-mode runs arm64 at roughly 5-20x slowdown; a from-scratch
     # clang+bindgen+rustc build of the whole dep tree, the exchange test-target
-    # pre-build and the three exchanges (the in-process serial suite is deferred on
+    # pre-build and the four exchanges (the in-process serial suite is deferred on
     # this leg) fit under this ceiling (GitHub caps at 6 h; this run measured ~65 min).
     timeout-minutes: 350
     steps:
@@ -318,12 +318,12 @@ jobs:
           bash tools/ci/rmw-distros/gate_selftest.sh </dev/null
 
           # Scope on this emulated leg: build + nm symbol audit + the staged-
-          # library digest + 3 fresh-process rclpy exchanges (both directions) +
+          # library digest + 4 fresh-process rclpy exchanges (both directions and the topic listing) +
           # the wrong-payload self-test + the 3 rclcpp talker/listener pairs.
           # The in-process serial suite is skipped
           # (RMW_GATE_SKIP_SERIAL_SUITE=1); the POLICY line names the two tests
           # that drove the skip, so the gate reports what it judged.
-          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test + 3 rclcpp talker/listener pairs; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
+          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 4 fresh-process rclpy exchanges + the wrong-payload self-test + 3 rclcpp talker/listener pairs; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
           echo "POLICY detail: rmw_wait_event_test::a_nine_entity_hop_drains_and_probes_only_what_fired breaches its per-hop drain budget under emulation (timing-sensitive)."
           echo "POLICY detail: rmw_shadow_take_test::c_copied_then_malformed_frame_retires_the_shadow_instead_of_recycling_it terminates the harness by SIGBUS under emulation (undiagnosed, under investigation)."
           bash tools/ci/rmw-distros/gate.sh foxy </dev/null
@@ -374,4 +374,4 @@ jobs:
           grep -qE '^POLICY: emulated aarch64 Foxy ' "$plain" \
             || { echo "::error::the POLICY line that names the deferred tests is absent"; exit 1; }
 
-          echo "Foxy aarch64 (QEMU) PASSED: planted-failure self-test + real arm64 compile + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + wrong-payload self-test (glibc 2.31, aarch64)."
+          echo "Foxy aarch64 (QEMU) PASSED: planted-failure self-test + real arm64 compile + symbol audit + staged-library digest + 4 fresh-process rclpy exchanges + wrong-payload self-test (glibc 2.31, aarch64)."
