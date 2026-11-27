@@ -588,7 +588,9 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   `own_writer` (`required_writers`); it reads the node list once and never reaps, and
   reads the publisher list on each pass, so a writer that leaves the list mid-gather
   stops being required. No required writer: `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
-  names; a change takes new names.
+  names; a change takes new names. The consumer is `rmw_cerulion`: one writer per process
+  (`Runtime::graph_registry`, none in a replay) and one gather per
+  `rmw_get_topic_names_and_types` (`docs/internals/rmw.md`).
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
