@@ -199,7 +199,7 @@ pub struct Runtime {
     /// local publisher and subscription counts its `(topic, type_name)` pair
     /// here, so `rmw_get_topic_names_and_types` in another process lists it.
     /// `None` in a replayed process, which answers from its own endpoints
-    /// only. No port opens until the first endpoint.
+    /// only. No port opens until the first `add` or `remove`.
     pub graph_registry: Option<RmwGraphWriter>,
 }
 

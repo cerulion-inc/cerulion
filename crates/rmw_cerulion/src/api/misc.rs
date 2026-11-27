@@ -791,7 +791,7 @@ const TOPIC_GATHER_WINDOW: std::time::Duration = std::time::Duration::from_milli
 
 /// One regime for the whole process: a listing that cannot reach the registry,
 /// or does not hear every writer, does so on every call while the cause
-/// lasts, and rosbag2 lists topics about ten times a second.
+/// lasts, and a polling tool such as rosbag2 lists topics again and again.
 static TOPIC_GATHER_FAILURES: std::sync::Mutex<
     cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
 > = std::sync::Mutex::new(
@@ -801,8 +801,9 @@ static TOPIC_GATHER_FAILURES: std::sync::Mutex<
 type TopicTypes = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
 
 /// The `(topic, types)` pairs of the other processes on the rmw graph
-/// registry, merged into `topics`. Every error and every `Incomplete` verdict
-/// still keeps what was heard, and reports through [`TOPIC_GATHER_FAILURES`].
+/// registry, merged into `topics`. An error or an `Incomplete` verdict leaves
+/// this process's topics in place (an `Incomplete` one adds what was heard) and
+/// reports through [`TOPIC_GATHER_FAILURES`].
 fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
     use cerulion_core::transport::failure_regime_latch::{lock_regime_latch, RegimeDecision};
     use cerulion_core::transport::rmw_graph_registry::GatherCompleteness;
