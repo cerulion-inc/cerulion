@@ -691,6 +691,55 @@ unsafe fn fill_names_and_types(
     RMW_RET_OK
 }
 
+/// [`fill_names_and_types`] for names that carry one or more types each: every
+/// name's types fill its `types[i]` in sorted order. On an allocation failure
+/// everything already allocated is freed and the out-param is left empty.
+unsafe fn fill_names_and_multi_types(
+    out: *mut ffi::rmw_names_and_types_t,
+    allocator: *mut ffi::rcutils_allocator_t,
+    entries: &TopicTypes,
+) -> rmw_ret_t {
+    let nat = &mut *out;
+    let names: Vec<String> = entries.keys().cloned().collect();
+    let ret = fill_string_array(&mut nat.names, allocator, &names);
+    if ret != RMW_RET_OK {
+        return ret;
+    }
+    if entries.is_empty() {
+        nat.types = std::ptr::null_mut();
+        return RMW_RET_OK;
+    }
+    let types = ffi::allocator_alloc(
+        allocator,
+        entries.len() * std::mem::size_of::<ffi::rcutils_string_array_t>(),
+    ) as *mut ffi::rcutils_string_array_t;
+    if types.is_null() {
+        free_string_array(&mut nat.names, allocator);
+        return ffi::RMW_RET_BAD_ALLOC;
+    }
+    for (i, type_set) in entries.values().enumerate() {
+        let slot = types.add(i);
+        std::ptr::write_bytes(slot, 0, 1);
+        let type_names: Vec<String> = type_set.iter().cloned().collect();
+        let ret = fill_string_array(slot, allocator, &type_names);
+        if ret != RMW_RET_OK {
+            // `fill_string_array` already freed this slot; free the filled
+            // ones before it, the buffer and the names, which the caller's
+            // fini cannot reach because `nat.types` was never assigned.
+            for j in 0..i {
+                free_string_array(types.add(j), allocator);
+            }
+            if let Some(dealloc) = (*allocator).deallocate {
+                dealloc(types as *mut std::os::raw::c_void, (*allocator).state);
+            }
+            free_string_array(&mut nat.names, allocator);
+            return ret;
+        }
+    }
+    nat.types = types;
+    RMW_RET_OK
+}
+
 /// Direction-filtered names-and-types over ONE (type,count) registry map
 /// — the services / clients by-node queries (they must not
 /// conflate servers with clients). Publishers/subscriptions use the
@@ -734,6 +783,91 @@ unsafe fn fill_from_endpoint_map(
 // identity — `runtime::ros_topic_to_cerulion`), so every names-and-types
 // query serves them VERBATIM: a name round-trips create → query unchanged.
 
+/// How long a topic listing waits for the other processes' writers on the rmw
+/// graph registry. A live writer answers the doorbell within a few 20 ms
+/// passes, so this bounds only a writer that does not answer; it covers one
+/// interval send (500 ms), which serves a writer whose doorbell could not open.
+const TOPIC_GATHER_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// One regime for the whole process: a listing that cannot reach the registry,
+/// or does not hear every writer, does so on every call while the cause
+/// lasts, and rosbag2 lists topics about ten times a second.
+static TOPIC_GATHER_FAILURES: std::sync::Mutex<
+    cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+> = std::sync::Mutex::new(
+    cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new(),
+);
+
+type TopicTypes = std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// The `(topic, types)` pairs of the other processes on the rmw graph
+/// registry, merged into `topics`. Every error and every `Incomplete` verdict
+/// still keeps what was heard, and reports through [`TOPIC_GATHER_FAILURES`].
+fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
+    use cerulion_core::transport::failure_regime_latch::{lock_regime_latch, RegimeDecision};
+    use cerulion_core::transport::rmw_graph_registry::GatherCompleteness;
+    let Some(writer) = &rt.graph_registry else {
+        return;
+    };
+    // `AssertUnwindSafe`: the gather owns every port it opens, and `topics` is
+    // only written after it returns.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.transport
+            .gather_rmw_graph(writer.writer_id(), TOPIC_GATHER_WINDOW)
+    }));
+    let failure = match outcome {
+        Ok(Ok(gather)) => {
+            for (topic, types) in gather.topics {
+                topics.entry(topic).or_default().extend(types);
+            }
+            match gather.completeness {
+                GatherCompleteness::Settled => None,
+                GatherCompleteness::Incomplete {
+                    live_writers,
+                    writers_heard,
+                } => Some(format!(
+                    "heard {writers_heard} of {live_writers} live writers in the window"
+                )),
+            }
+        }
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some("the gather panicked".to_string()),
+    };
+    let mut latch = lock_regime_latch(&TOPIC_GATHER_FAILURES);
+    let Some(error) = failure else {
+        if let Some(suppressed_count) = latch.on_success() {
+            tracing::info!(
+                service =
+                    cerulion_core::transport::rmw_graph_registry::RMW_GRAPH_REGISTRY_SERVICE_NAME,
+                suppressed_count,
+                "topic listing hears every other process again"
+            );
+        }
+        return;
+    };
+    match latch.on_failure() {
+        RegimeDecision::Loud => tracing::warn!(
+            service = cerulion_core::transport::rmw_graph_registry::RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            error = %error,
+            "topic listing may miss topics of other processes; it returns this \
+             process's topics and what it heard. Repeats log at debug"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            service = cerulion_core::transport::rmw_graph_registry::RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            error = %error,
+            total_failures = total,
+            suppressed,
+            "topic listing still may miss topics of other processes"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            service = cerulion_core::transport::rmw_graph_registry::RMW_GRAPH_REGISTRY_SERVICE_NAME,
+            error = %error,
+            suppressed,
+            "topic listing may miss topics of other processes (suppressed repeat)"
+        ),
+    }
+}
+
 /// # Safety
 /// rmw ABI contract.
 #[no_mangle]
@@ -750,19 +884,18 @@ pub unsafe extern "C" fn rmw_get_topic_names_and_types(
         let Ok(rt) = runtime::runtime() else {
             return RMW_RET_ERROR;
         };
-        let graph = rt.graph.read().unwrap_or_else(|e| e.into_inner());
-        let mut entries: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        // Endpoint maps: the type name is any record's `type_name` (all
-        // endpoints on a topic share it); a present topic always has >= 1
-        // record (the entry is dropped when the last leaves).
-        for (topic, records) in graph.publishers.iter().chain(graph.subscriptions.iter()) {
-            if let Some(first) = records.first() {
-                entries.insert(topic.clone(), first.type_name.clone());
+        let mut topics = TopicTypes::new();
+        {
+            let graph = rt.graph.read().unwrap_or_else(|e| e.into_inner());
+            for (topic, records) in graph.publishers.iter().chain(graph.subscriptions.iter()) {
+                topics
+                    .entry(topic.clone())
+                    .or_default()
+                    .extend(records.iter().map(|r| r.type_name.clone()));
             }
         }
-        let list: Vec<(String, String)> = entries.into_iter().collect();
-        fill_names_and_types(topic_names_and_types, allocator, &list)
+        merge_other_processes(rt, &mut topics);
+        fill_names_and_multi_types(topic_names_and_types, allocator, &topics)
     })
 }
 
@@ -1030,9 +1163,9 @@ pub unsafe extern "C" fn rmw_count_clients(
     )
 }
 
-// Per-node and per-topic endpoint queries: local-process registry view
-// (cross-process discovery is not implemented; it would ride Zenoh
-// liveliness).
+// Per-node and per-topic endpoint queries: local-process registry view. Only
+// `rmw_get_topic_names_and_types` reads other processes (through the rmw graph
+// registry, which carries `(topic, type_name)` pairs and no endpoint info).
 
 /// # Safety
 /// rmw ABI contract.

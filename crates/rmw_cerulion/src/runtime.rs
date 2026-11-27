@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+use cerulion_core::transport::rmw_graph_registry::RmwGraphWriter;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 
 /// A compact snapshot of an endpoint's QoS: what the caller REQUESTED,
@@ -194,6 +195,12 @@ pub struct Runtime {
     pub last_pump_ms: AtomicU64,
     /// Monotonic base for `last_pump_ms`.
     pub started: std::time::Instant,
+    /// This process's writer on the host-wide rmw topic graph registry: every
+    /// local publisher and subscription counts its `(topic, type_name)` pair
+    /// here, so `rmw_get_topic_names_and_types` in another process lists it.
+    /// `None` in a replayed process, which answers from its own endpoints
+    /// only. No port opens until the first endpoint.
+    pub graph_registry: Option<RmwGraphWriter>,
 }
 
 /// Raw pointer to a live `PublisherData`.
@@ -445,6 +452,8 @@ pub fn runtime() -> Result<&'static Runtime, String> {
             .as_deref(),
     )
     .map_err(|error| error.to_string())?;
+    let graph_registry =
+        crate::replay::cross_process_graph_allowed().then(|| transport.open_rmw_graph_writer());
     let rt = Runtime {
         topic_scope,
         local_exclusions: Mutex::new(BTreeMap::new()),
@@ -455,6 +464,7 @@ pub fn runtime() -> Result<&'static Runtime, String> {
         publishers: Mutex::new(Vec::new()),
         last_pump_ms: AtomicU64::new(0),
         started: std::time::Instant::now(),
+        graph_registry,
     };
     // Two threads racing rmw_init: first one wins; both get the same
     // singleton (TransportManager::init is itself OnceLock-backed).
