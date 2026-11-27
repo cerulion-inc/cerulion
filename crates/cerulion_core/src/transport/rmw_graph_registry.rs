@@ -819,9 +819,9 @@ struct WriterState {
     ports: Option<WriterPorts>,
     /// Frames sent so far, raised once per send when the send ends.
     frames_sent: u64,
-    /// When set, the pump sends only after a ring. Read and written under
-    /// the state lock, so no send that skipped this check is still running
-    /// once a setter returns. Only a test sets it.
+    /// When set, the pump sends only after a ring. The pump reads it under
+    /// the state lock, so once the setter returns no interval send is
+    /// running. Only a test sets it.
     timed_sends_held: bool,
     open_failures: FailureRegimeLatch,
     send_failures: FailureRegimeLatch,
