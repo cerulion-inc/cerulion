@@ -40,6 +40,9 @@
 //! placeholder values and reading the actual pair out of the assertion failure
 //! — never hand-computed. The fixture FILES were generated from the very writer
 //! sequences below (see [`assert_matches_fixture`]), never hand-edited.
+//! They were re-blessed for hash recipe 4: the move is the `hash_recipe` field
+//! of every schema descriptor (3 to 4) and the data-section and summary CRCs
+//! that cover it, no other byte.
 //!
 //! ## Re-blessing (both halves, in one commit)
 //!
@@ -295,7 +298,7 @@ fn the_two_topic_determinism_fixture_matches_its_pinned_crc_and_length() {
     // Also the fixture file's own guard — see the module docs, "Two pins".
     assert_eq!(
         identity(&bytes),
-        (0xD1D6_E1D1, 2325),
+        (0xF20C_DAC0, 2325),
         "the two-topic determinism fixture's bytes moved; if that was DELIBERATE, \
          re-bless this literal in the same commit and state the reason there"
     );
@@ -361,7 +364,7 @@ fn the_six_message_roundtrip_fixture_matches_its_pinned_crc_and_length() {
     // Also the fixture file's own guard — see the module docs, "Two pins".
     assert_eq!(
         identity(&bytes),
-        (0x7766_2528, 2975),
+        (0x5850_B6B3, 2975),
         "the six-message roundtrip fixture's bytes moved; if that was DELIBERATE, \
          re-bless this literal in the same commit and state the reason there"
     );
@@ -386,7 +389,7 @@ fn the_empty_topic_list_bag_matches_its_pinned_crc_and_length() {
     // Also the fixture file's own guard — see the module docs, "Two pins".
     assert_eq!(
         identity(&bytes),
-        (0x7F85_D2FA, 1252),
+        (0xF123_78B7, 1252),
         "the empty-topic-list bag's bytes moved; if that was DELIBERATE, \
          re-bless this literal in the same commit and state the reason there"
     );
