@@ -5178,6 +5178,36 @@ impl TransportManager {
         run_registry::gather_from_node_checked(&self.node, window)
     }
 
+    /// A writer that publishes this process's rmw `(topic, type_name)` pairs
+    /// on the `/__cerulion/rmw_graph` registry (see [`rmw_graph_registry`]).
+    /// No port opens until the first
+    /// [`add`](rmw_graph_registry::RmwGraphWriter::add) or
+    /// [`remove`](rmw_graph_registry::RmwGraphWriter::remove). The writer keeps
+    /// this manager alive and releases its ports before it.
+    pub fn open_rmw_graph_writer(&self) -> rmw_graph_registry::RmwGraphWriter {
+        rmw_graph_registry::RmwGraphWriter::new(self.arc_self())
+    }
+
+    /// Gather the rmw `(topic, type_name)` pairs of every other live writer on
+    /// THIS manager's namespace, waiting at most `window`. Pass this process's
+    /// own [`writer_id`](rmw_graph_registry::RmwGraphWriter::writer_id) as
+    /// `own_writer` so the gather does not wait for itself; its pairs are not
+    /// in the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError`] if the registry service or the gather subscriber
+    /// cannot be opened (for example, every reader slot is taken). An
+    /// `Incomplete` answer is not an error: read
+    /// [`RmwGraphGather::completeness`](rmw_graph_registry::RmwGraphGather::completeness).
+    pub fn gather_rmw_graph(
+        &self,
+        own_writer: Option<u128>,
+        window: std::time::Duration,
+    ) -> TransportResult<rmw_graph_registry::RmwGraphGather> {
+        rmw_graph_registry::gather_from_node(&self.node, own_writer, window)
+    }
+
     /// Create a publisher whose iceoryx2 slot size is derived from the
     /// schema `T: ShmMessage`.
     ///

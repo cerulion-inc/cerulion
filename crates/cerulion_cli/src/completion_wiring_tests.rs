@@ -789,6 +789,7 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion bag play::feed_index_budget",
         "cerulion bag play::rate",
         "cerulion bag play::start_offset",
+        "cerulion bag play::verifier_record_budget",
         "cerulion bag record::duration",
         "cerulion bag record::schema_wait_ms",
         "cerulion graph fires::for_secs",

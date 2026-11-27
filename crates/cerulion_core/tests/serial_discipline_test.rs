@@ -598,6 +598,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point; the condition under test is a listener whose OWNING PROCESS died without deregistering, which needs a second process to kill",
     ),
     (
+        "rmw_graph_registry_iox2_test.rs",
+        "subprocess_child_holds_a_graph_writer",
+        "child",
+        "self-re-exec entry point; the condition under test is a writer whose OWNING PROCESS died without dropping it, which needs a second process to kill",
+    ),
+    (
         "output_proxy_test.rs",
         "subprocess_child_holds_a_subscriber",
         "child",
