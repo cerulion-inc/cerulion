@@ -1167,7 +1167,7 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 12.** (A bag with no recorder attachment carries no
+`recorder.json` stamps 13.** (A bag with no recorder attachment carries no
 stamp at all and reads as the "absent" row above, not as a 12; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
@@ -1549,11 +1549,15 @@ holds no stop record.
 
 A format 13 recording records every single-frame take on a graph-wired input
 (`CerulionSubscriber::try_receive_one` and `try_receive_one_owned`) as a read:
-a `Served` record (popped 1) for the frame a take delivered, after its writer's
+a `Taken` record (popped 1) for the frame a take delivered, after its writer's
 annotation when the take opens a writer run, and a `NoFrame` record (popped 0)
 for a take that found its queue empty, both under the `Body` role. A take on a
 `block` input pays the credit word for every frame it removed, and a take that
 finds its queue empty clears what the word still counts, as a drain does.
+`Taken` is not `Served`: a take leaves the frames behind the one it delivered
+queued, a latest-value input included, where a `Served` read of a latest-value
+input drains its queue to the newest frame. So `--verify` counts a `block`
+slot one frame lower per take, and never as emptied by one.
 
 A `--verify` replay feeds each take the frame its recorded read took, by writer
 and sequence, and holds it to that read: a take the re-execution does not make

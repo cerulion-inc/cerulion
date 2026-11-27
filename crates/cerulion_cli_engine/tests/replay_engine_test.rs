@@ -51,8 +51,8 @@ use cerulion_core::trace_ring::{
     pack_read_outcome_meta, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
     TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
     READ_OUTCOME_NO_FRAME, READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, READ_OUTCOME_SERVED,
-    RECORD_TYPE_FIRE, RECORD_TYPE_NODE_STOP, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
-    STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+    READ_OUTCOME_TAKEN, RECORD_TYPE_FIRE, RECORD_TYPE_NODE_STOP, RECORD_TYPE_READ_OUTCOME,
+    RECORD_TYPE_STEP_BOUNDARY, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
 };
 use cerulion_core::wire::WireHeader;
 use indexmap::IndexMap;
@@ -22699,7 +22699,7 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
     write_bag_with_recorder_json(&rec, &stamped, pre_stamp_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 12
+    // This bag is recorded BY THIS BINARY, so it stamps 13
     // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
     // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
@@ -24979,13 +24979,13 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 12 on every
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 13 on every
 /// bag this binary writes (every gated consult, and every frame of each batch
 /// that fits its read stage's window, record, every complete checkpoint part
 /// of a stopped node carries the stopped flag, every read site names its
-/// writer at every checkpoint window head, and every stop is a NODE-STOP
-/// record), so every "corpus" bag elsewhere in
-/// this file is a format-**12** bag, a PRECONDITION that roles are
+/// writer at every checkpoint window head, every stop is a NODE-STOP
+/// record, and every single-frame take is a read record), so every "corpus" bag elsewhere in
+/// this file is a format-**13** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
 /// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 12, the node stops,
@@ -51095,10 +51095,10 @@ fn clv_assert_join_mismatch(outcome: &ReplayOutcome, label: &str) {
 ///    and single-writer producer annotations stripped): `--verify` reports
 ///    `BestEffort` (`below trace format 8`) and stands the producer topic down
 ///    with `join_mismatch` on `reader.state` rather than silently mis-steering.
-/// 2. Neutral `--resim all` (without `--verify`) on the intact format-12 bag:
+/// 2. Neutral `--resim all` (without `--verify`) on the intact format-13 bag:
 ///    uses read-log-steered shared-queue injection (`BestEffort`) and stands
 ///    the producer topic down with `join_mismatch` on `reader.state`.
-/// 3. Format-12 bag with a served frame removed from `producer/out`: `--verify`
+/// 3. Format-13 bag with a served frame removed from `producer/out`: `--verify`
 ///    refuses before any step runs with exit 2 naming
 ///    `read_identity_frame_missing`, node `reader`, input `state`, and the
 ///    missing sequence.
@@ -51145,7 +51145,7 @@ fn cross_rank_latest_value_evicted_pre_format_eight_bag_stands_down_with_join_mi
     }
     clv_assert_join_mismatch(&outcome_fmt7, "format-7 --verify");
 
-    // Arm 2: neutral `--resim all` (no `--verify`) on the intact format-12 bag
+    // Arm 2: neutral `--resim all` (no `--verify`) on the intact format-13 bag
     // also runs steered shared-queue injection and stands down with `join_mismatch`.
     let bag_fmt12 = dir.path().join("clv_fmt12_two_rank.mcap");
     ri_two_rank_bag_labelled(&live.rec, &bag_fmt12, clv_on_rank1, false);
@@ -51164,9 +51164,9 @@ fn cross_rank_latest_value_evicted_pre_format_eight_bag_stands_down_with_join_mi
         }
         other => panic!("expected BestEffort on neutral resim, got {other:?}"),
     }
-    clv_assert_join_mismatch(&outcome_neutral, "format-12 neutral resim");
+    clv_assert_join_mismatch(&outcome_neutral, "format-13 neutral resim");
 
-    // Arm 3: format-12 bag missing a frame served at step 7 (sequence 19) is
+    // Arm 3: format-13 bag missing a frame served at step 7 (sequence 19) is
     // refused before the first step with exit 2 (`read_identity_frame_missing`).
     let mut missing = live.rec.clone();
     let lost = missing.messages[CLV_PRODUCER_TOPIC].remove(19);
@@ -51264,7 +51264,7 @@ fn cross_rank_latest_value_eviction_verify_is_bit_identical_across_two_runs() {
 }
 
 /// Stripping `BatchFrame` records from `popped >= 2` reads on the cross-rank
-/// latest-value edge in a format-12 bag (while keeping the single-writer
+/// latest-value edge in a format-13 bag (while keeping the single-writer
 /// run-opening producer annotation) refuses `--verify` before the first step
 /// with exit 2 naming `read_identity_batch_unattributed`, node `reader`, and
 /// input `state`.
@@ -63925,13 +63925,13 @@ fn tk_replay(
 }
 
 /// The live run takes every frame the talker published, in order, and its
-/// format 13 read log records every take: `Served` (popped 1) for each frame
+/// format 13 read log records every take: `Taken` (popped 1) for each frame
 /// and `NoFrame` (popped 0) for each take that found the queue empty, all
 /// under the `Body` role.
 ///
 /// Hand oracle, per three steps: step 0 mod 3 takes one frame and finds one
 /// empty queue, step 1 takes two frames, step 2 finds two empty queues, so 30
-/// steps hold 30 `Served` and 30 `NoFrame` records.
+/// steps hold 30 `Taken` and 30 `NoFrame` records.
 #[test]
 #[serial]
 fn a_take_is_a_recorded_read_in_a_format_13_recording() {
@@ -63940,7 +63940,7 @@ fn a_take_is_a_recorded_read_in_a_format_13_recording() {
     let records = tk_take_records(&live.rec);
     let served: Vec<_> = records
         .iter()
-        .filter(|r| r.1 == READ_OUTCOME_SERVED)
+        .filter(|r| r.1 == READ_OUTCOME_TAKEN)
         .collect();
     let empty: Vec<_> = records
         .iter()
@@ -63963,8 +63963,8 @@ fn a_take_is_a_recorded_read_in_a_format_13_recording() {
             .map(|r| r.1)
             .collect::<Vec<_>>()
     };
-    assert_eq!(at_step(0), vec![READ_OUTCOME_SERVED, READ_OUTCOME_NONE]);
-    assert_eq!(at_step(1), vec![READ_OUTCOME_SERVED, READ_OUTCOME_SERVED]);
+    assert_eq!(at_step(0), vec![READ_OUTCOME_TAKEN, READ_OUTCOME_NONE]);
+    assert_eq!(at_step(1), vec![READ_OUTCOME_TAKEN, READ_OUTCOME_TAKEN]);
     assert_eq!(at_step(2), vec![READ_OUTCOME_NONE, READ_OUTCOME_NONE]);
 }
 
@@ -64108,4 +64108,176 @@ fn a_format_12_bag_replays_its_takes_unrecorded() {
         }
         other => panic!("a format 12 take-only stage is refused under --verify: {other:?}"),
     }
+}
+
+// ===========================================================================
+// Takes on a `block` input: `src` (5 ms) -> `taker`, whose `block` input of
+// depth 2 it reads only through one `CerulionSubscriber::try_receive_one` per
+// fire, one fire per 10 ms. A take removes one frame and leaves the frames
+// behind it queued, so the slot fills and holds `src`; a replay must count the
+// slot as the credit word did, one frame per take.
+// ===========================================================================
+
+/// The tag a block taker logs each take under.
+const TB_TAG: f64 = 8.0;
+/// The steps every block-take recording runs.
+const TB_STEPS: usize = 12;
+
+/// A hand-written consumer of one `block` input of depth 2 that takes one
+/// frame per fire and logs `(tag, x, wire sequence, 0)` through `ri_log`.
+/// `fifo` makes `inp` its FIFO data trigger, throttled to one fire per 10 ms;
+/// otherwise it is a `period_ms = 10` node and `inp` a latest-value input.
+struct BlockTakerEntry {
+    context: Option<cerulion_core::NodeContext>,
+    fifo: bool,
+}
+
+impl NodeEntry for BlockTakerEntry {
+    fn info(&self) -> cerulion_core::TransportResult<cerulion_core::NodeInfo> {
+        use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta};
+        let info = cerulion_core::NodeInfo::with_meta(
+            vec![InputMeta {
+                name: "inp".to_string(),
+                schema_hash: <Vector3 as cerulion_core::ShmMessage>::SCHEMA_HASH,
+                trigger: self.fifo,
+                depth: 2,
+                backpressure: BackpressurePolicy::Block,
+                expect_within_ms: None,
+                accumulate: false,
+                consume: if self.fifo {
+                    InputConsume::Fifo
+                } else {
+                    InputConsume::Latest
+                },
+            }],
+            vec![],
+        );
+        Ok(if self.fifo {
+            info.with_policy(cerulion_core::MacroPolicy::DataTrigger {
+                input_name: "inp".to_string(),
+            })
+            .with_throttle_ms(10)
+        } else {
+            info.with_policy(cerulion_core::MacroPolicy::Period { period_ms: 10 })
+        })
+    }
+
+    fn init(&mut self, context: cerulion_core::NodeContext) -> cerulion_core::TransportResult<()> {
+        self.context = Some(context);
+        Ok(())
+    }
+
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        let ctx = self.context.as_ref().expect("init ran");
+        let cerulion_core::AnySubscriber::Ipc(sub) = ctx.subscriber("inp").expect("inp is wired");
+        sub.try_receive_one(|m| {
+            let x = f64::from_le_bytes(m.payload()[0..8].try_into().unwrap());
+            ri_log(TB_TAG, x, f64::from(m.header().sequence), 0.0);
+        })?;
+        Ok(())
+    }
+}
+
+const TB_YAML: &str = "name: tbgraph\nprefix: tb\nnodes:\n\
+     \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: taker\n    type: block_taker\n    inputs:\n      - name: inp\n        source: src/out\n";
+
+fn tb_factories(fifo: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        (
+            "taker",
+            Box::new(BlockTakerEntry {
+                context: None,
+                fifo,
+            }),
+        ),
+    ])
+}
+
+/// The takes, by hand: the frame `x = n + 1`, wire sequence `n`, at step
+/// `2n`, for `n` 0 to 5.
+fn tb_oracle() -> Vec<RiRead> {
+    (0..6u32)
+        .map(|n| {
+            (
+                TB_TAG.to_bits(),
+                f64::from(n + 1).to_bits(),
+                f64::from(n).to_bits(),
+                0f64.to_bits(),
+            )
+        })
+        .collect()
+}
+
+/// Record the block-take graph and replay it under `--verify`, twice, and
+/// check both against the hand oracle at the reference run's 5 ms step:
+///
+/// * step 0: `src` sends `x` 1 (the slot counts 1) and the taker takes it (0);
+/// * steps 1 to 3: `src` sends 2, 3, 4, and the taker takes 2 at step 2, so
+///   the slot counts 1, then 1, then 2;
+/// * step 4: the slot is full, so `src` is held at its 20 ms deadline; the
+///   taker takes 3 (1);
+/// * from step 5 `src` fires one owed instant at each odd step, which fills
+///   the slot, and the taker takes one frame at each even step.
+///
+/// So `src` fires at steps 0, 1, 2, 3, 5, 7, 9, 11 (`x` 1 to 8) and the taker
+/// takes `x` 1 to 6. A slot that read each take as a drain to the newest
+/// frame would count 1 at step 4, and convict the held `src` there.
+fn tb_assert_replays(fifo: bool, label: &str) {
+    ri_take();
+    let rec = record_uniform_with_read_log(TB_YAML, || tb_factories(fifo), &[], TB_STEPS);
+    assert_eq!(ri_take(), tb_oracle(), "{label}: the live takes");
+    assert_eq!(
+        bh_xs(&rec, "/tb/src/out"),
+        (1..=8).map(f64::from).collect::<Vec<_>>(),
+        "{label}"
+    );
+    assert_eq!(
+        bh_fire_steps(&rec, "src"),
+        vec![0, 1, 2, 3, 5, 7, 9, 11],
+        "{label}: the slot holds src at every even step from 4"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("tb.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let replay = || {
+        let (outcome, reads) = ri_replay_stamped(
+            &bag,
+            || tb_factories(fifo),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            None,
+            bh_clean_stamp(&rec),
+            None,
+        );
+        (outcome.expect("the stamped fed replay runs"), reads)
+    };
+    let (outcome, reads) = replay();
+    ri_assert_fed(&outcome);
+    assert_eq!(reads, tb_oracle(), "{label}: every replayed take");
+    bh_assert_period_held_replays(&outcome, label);
+    let (again, reads_again) = replay();
+    assert_eq!(reads_again, reads, "{label}");
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "{label}: two replays of one bag are byte-identical"
+    );
+}
+
+/// A taker of a latest-value `block` input replays clean: each take is a
+/// `Taken` read that leaves the frames behind it counted on the slot.
+#[test]
+#[serial]
+fn takes_on_a_latest_value_block_input_replay_with_no_false_finding() {
+    tb_assert_replays(false, "a latest-value block input");
+}
+
+/// A taker of a FIFO `block` trigger input replays clean the same way.
+#[test]
+#[serial]
+fn takes_on_a_fifo_block_input_replay_with_no_false_finding() {
+    tb_assert_replays(true, "a FIFO block input");
 }

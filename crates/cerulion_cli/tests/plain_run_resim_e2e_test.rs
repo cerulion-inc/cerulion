@@ -3981,9 +3981,9 @@ fn a_one_rank_capture_whose_window_starts_after_the_first_reads_verifies_by_read
     );
     assert_eq!(
         recorder["trace_format"],
-        serde_json::json!(12),
-        "the capture stamps trace format 12, whose recorder names the writer at every \
-         checkpoint window: {recorder}"
+        serde_json::json!(13),
+        "the capture stamps trace format 13, whose recorder names the writer at every \
+         checkpoint window (format 11 on): {recorder}"
     );
     assert_eq!(
         wh.first.global_level & STEP_BOUNDARY_FLAG_RUNS_REOPENED,
