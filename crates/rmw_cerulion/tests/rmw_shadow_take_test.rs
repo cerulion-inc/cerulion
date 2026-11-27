@@ -1293,6 +1293,118 @@ fn a_panic_in_the_serve_report_of_the_regime_closing_take_closes_the_regime_firs
     }
 }
 
+/// The same panic inside the serve report on a PRIVATE COPY: the unwind
+/// takes the copy back (none outstanding) and returns its buffer to the pool,
+/// so nothing the caller never received stays tracked.
+#[test]
+#[serial]
+fn a_panic_in_the_loaned_serve_report_takes_the_private_copy_back() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtServeRep{suffix}"));
+        let (node, publisher, subscription) = setup_pair(ts, "ptserverep", suffix);
+        publish_point(
+            publisher,
+            &CPoint {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+        );
+        let fired_before = rmw_cerulion::test_seams::loaned_serve_report_panics_fired();
+        let (ret, taken, loaned, _) = {
+            let _seam = rmw_cerulion::test_seams::LoanedServeReportPanicGuard::arm();
+            take_loaned(subscription)
+        };
+        assert_eq!(
+            rmw_cerulion::test_seams::loaned_serve_report_panics_fired(),
+            fired_before + 1,
+            "the serve-report seam must have fired, otherwise this arm proves nothing"
+        );
+        assert_eq!(ret, ffi::RMW_RET_ERROR, "the panic surfaces as an error");
+        assert!(!taken, "and nothing is handed out");
+        assert!(loaned.is_null(), "the out-param is never written");
+        assert_eq!(
+            copies(subscription),
+            (0, 1, 1),
+            "the unwind takes the copy back and its buffer returns to the pool"
+        );
+        assert_eq!(outstanding(subscription), 0, "and no sample is held");
+        teardown(node, publisher, subscription);
+    }
+}
+
+/// The same panic on a small fixed type's take past its copy pool: with all
+/// four pooled copies held, the 5th take is a copy into fresh memory, and a
+/// panic in its serve report (which fires after the copy latch's report) must
+/// free that copy and leave it untracked, with the four pooled copies still
+/// held and nothing handed out.
+#[test]
+#[serial]
+fn a_panic_in_the_serve_report_of_an_unpooled_copy_frees_it() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtServeRepPool{suffix}"));
+        let (node, publisher, subscription) = setup_pair(ts, "ptservereppool", suffix);
+        for i in 0..5u32 {
+            publish_point(
+                publisher,
+                &CPoint {
+                    x: f64::from(i),
+                    y: 0.0,
+                    z: 0.0,
+                },
+            );
+        }
+        let mut held = Vec::new();
+        for i in 0..4 {
+            let (ret, taken, loaned, _) = take_loaned(subscription);
+            assert_eq!(ret, RMW_RET_OK, "pooled take {i}");
+            assert!(taken && !loaned.is_null());
+            held.push(loaned);
+        }
+        assert_eq!(
+            copies(subscription),
+            (4, 4, 0),
+            "the pool is fully loaned out"
+        );
+
+        let fired_before = rmw_cerulion::test_seams::loaned_serve_report_panics_fired();
+        let (ret, taken, loaned, _) = {
+            let _seam = rmw_cerulion::test_seams::LoanedServeReportPanicGuard::arm();
+            take_loaned(subscription)
+        };
+        assert_eq!(
+            rmw_cerulion::test_seams::loaned_serve_report_panics_fired(),
+            fired_before + 1,
+            "the serve-report seam must have fired on the unpooled copy"
+        );
+        assert_eq!(ret, ffi::RMW_RET_ERROR, "the panic surfaces as an error");
+        assert!(!taken && loaned.is_null(), "nothing is handed out");
+        let unpooled = sub_data(subscription)
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .copied_takes
+            .len();
+        assert_eq!(unpooled, 0, "the unwind must untrack and free the copy");
+        assert_eq!(
+            copies(subscription),
+            (4, 4, 0),
+            "the pooled copies are untouched"
+        );
+        assert_eq!(
+            sub_data(subscription).loan_copy_count(),
+            1,
+            "the copy was counted before the seam fired, as for any copy"
+        );
+        // The panic wedged the entity (its lock is poisoned): the destroy
+        // frees the four pooled copies with it.
+        assert_eq!(held.len(), 4);
+        teardown(node, publisher, subscription);
+    }
+}
+
 /// TWO `float32[]` members aim into the held sample, 4-aligned, and the
 /// return re-points both at `{NULL, 0, 0}`.
 #[test]
@@ -1497,44 +1609,77 @@ fn cpp_string_only_type_is_not_take_loanable_through_the_c_abi() {
     }
 }
 
-/// Control: a FIXED type's loaned take is unchanged — the SHM pointer
-/// itself, no shadow built, no shadow on the take.
+/// A small FIXED message (three doubles): its loaned take is a private copy.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct CPoint {
+    x: f64,
+    y: f64,
+    z: f64,
+}
+
+fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    let members = Box::leak(
+        vec![
+            c_member("x", 2, 0),
+            c_member("y", 2, 8),
+            c_member("z", 2, 16),
+        ]
+        .into_boxed_slice(),
+    );
+    let mm = Box::leak(Box::new(
+        ffi::rosidl_typesupport_introspection_c__MessageMembers {
+            message_namespace_: cstr("rmw_shadow__msg"),
+            message_name_: cstr(unique),
+            member_count_: 3,
+            size_of_: std::mem::size_of::<CPoint>(),
+            members_: members.as_ptr(),
+            ..Default::default()
+        },
+    ));
+    Box::leak(Box::new(ffi::rosidl_message_type_support_t {
+        typesupport_identifier: cstr("rosidl_typesupport_introspection_c"),
+        data: mm as *const _ as *const c_void,
+        ..Default::default()
+    }))
+}
+
+unsafe fn publish_point(publisher: *const ffi::rmw_publisher_t, msg: &CPoint) {
+    assert_eq!(
+        rmw_publish(
+            publisher,
+            msg as *const CPoint as *const c_void,
+            std::ptr::null_mut()
+        ),
+        RMW_RET_OK
+    );
+}
+
+/// The pooled private copies outstanding, with the copy pool's (built, free)
+/// buffer counts. Reads through a poisoned lock: the panic arm asserts on a
+/// wedged entity.
+unsafe fn copies(subscription: *const ffi::rmw_subscription_t) -> (usize, usize, usize) {
+    let inner = sub_data(subscription)
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    (
+        inner.pooled_copies.len(),
+        inner.copy_pool.built(),
+        inner.copy_pool.free_count(),
+    )
+}
+
+/// Control: a small FIXED type's loaned take never builds a shadow. It is a
+/// private copy from the subscription's copy pool: no shadow, no held
+/// sample, the published values; and the pooled buffer is reused, so a
+/// steady-state take + return allocates nothing on the Rust heap.
 #[test]
 #[serial]
-fn fixed_type_take_still_hands_out_the_shm_pointer_without_a_shadow() {
-    #[repr(C)]
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    struct CPoint {
-        x: f64,
-        y: f64,
-        z: f64,
-    }
+fn small_fixed_type_take_is_a_pooled_copy_without_a_shadow() {
     unsafe {
         let suffix = unique_suffix();
-        let members = Box::leak(
-            vec![
-                c_member("x", 2, 0),
-                c_member("y", 2, 8),
-                c_member("z", 2, 16),
-            ]
-            .into_boxed_slice(),
-        );
-        let mm = Box::leak(Box::new(
-            ffi::rosidl_typesupport_introspection_c__MessageMembers {
-                message_namespace_: cstr("rmw_shadow__msg"),
-                message_name_: cstr(&format!("Pt{suffix}")),
-                member_count_: 3,
-                size_of_: std::mem::size_of::<CPoint>(),
-                members_: members.as_ptr(),
-                ..Default::default()
-            },
-        ));
-        let ts: *const ffi::rosidl_message_type_support_t =
-            Box::leak(Box::new(ffi::rosidl_message_type_support_t {
-                typesupport_identifier: cstr("rosidl_typesupport_introspection_c"),
-                data: mm as *const _ as *const c_void,
-                ..Default::default()
-            }));
+        let ts = point_ts(&format!("Pt{suffix}"));
         let (node, publisher, subscription) = setup_pair(ts, "pt", suffix);
         assert!((*subscription).can_loan_messages);
         assert!(
@@ -1546,31 +1691,56 @@ fn fixed_type_take_still_hands_out_the_shm_pointer_without_a_shadow() {
             y: 2.0,
             z: 3.0,
         };
-        assert_eq!(
-            rmw_publish(
-                publisher,
-                &msg as *const _ as *const c_void,
-                std::ptr::null_mut()
-            ),
-            RMW_RET_OK
-        );
+        publish_point(publisher, &msg);
         let (ret, taken, p, _) = take_loaned(subscription);
         assert_eq!(ret, RMW_RET_OK);
         assert!(taken);
-        assert!(
-            !loan_has_shadow(subscription, p),
-            "a fixed type's take has no shadow"
+        assert_eq!(
+            outstanding(subscription),
+            0,
+            "a private copy holds no sample"
         );
+        assert_eq!(copies(subscription), (1, 1, 0), "one pooled copy out");
         assert_eq!(shadows_built_and_free(subscription), (0, 0));
-        let range = held_sample_range(subscription, p);
-        assert!(
-            range.contains(&(p as usize)),
-            "the loaned pointer IS the SHM payload"
-        );
         assert_eq!(*(p as *const CPoint), msg);
         assert_eq!(
             rmw_return_loaned_message_from_subscription(subscription, p),
             RMW_RET_OK
+        );
+        assert_eq!(copies(subscription), (0, 1, 1), "the buffer is recycled");
+
+        // Steady state: the SAME buffer serves the next take, and the take +
+        // return path allocates nothing on the Rust heap (both run on this
+        // thread, the one that opens the probe's window).
+        let next = CPoint {
+            x: -4.0,
+            y: 5.5,
+            z: 0.125,
+        };
+        publish_point(publisher, &next);
+        ALLOCATOR.enable();
+        let (ret, taken, p2, _) = take_loaned(subscription);
+        let served = if p2.is_null() {
+            None
+        } else {
+            Some(*(p2 as *const CPoint))
+        };
+        let ret_back = rmw_return_loaned_message_from_subscription(subscription, p2);
+        let (allocs, bytes) = ALLOCATOR.disable();
+        assert_eq!(ret, RMW_RET_OK);
+        assert!(taken);
+        assert_eq!(p2, p, "the recycled buffer is handed out again");
+        assert_eq!(served, Some(next), "the copy carries the second frame");
+        assert_eq!(ret_back, RMW_RET_OK);
+        assert_eq!(
+            copies(subscription),
+            (0, 1, 1),
+            "no second buffer was built"
+        );
+        assert_eq!(
+            (allocs, bytes),
+            (0, 0),
+            "a steady-state copy take + return must not allocate on the Rust heap"
         );
         teardown(node, publisher, subscription);
     }

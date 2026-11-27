@@ -385,7 +385,7 @@ This trial shows delivery, not latency. [Latency](#latency) has the benchmark, i
 <summary>Before you move your own stack: topic tools, loans, SROS2 and process replay</summary>
 
 - `cerulion topic list` shows the topics after you sign in. `ros2 topic list` and rqt do not.
-- Zero-copy needs the publisher to loan each message and the subscriber to take loaned ones. Jazzy lets a subscriber take loans only with `ROS_DISABLE_LOANED_MESSAGES=0`. Without loans, `rmw_cerulion` copies, and a loaned variable-size message can still copy some members, such as strings ([ROS 2 guide](https://docs.cerulion.com/cerulion/guides/bridge-ros2)).
+- Zero-copy needs the publisher to loan each message and the subscriber to take loaned ones. Jazzy lets a subscriber take loans only with `ROS_DISABLE_LOANED_MESSAGES=0`. Without loans, `rmw_cerulion` copies, and a loaned variable-size message can still copy some members, such as strings ([ROS 2 guide](https://docs.cerulion.com/cerulion/guides/bridge-ros2)). A loaned take of a fixed-size message of 4 KiB or less is a private copy, so a callback may change it.
 - SROS2 is not supported. `ROS_SECURITY_ENABLE=true` does not secure a Cerulion transport, so keep a stack that needs SROS2 on its current middleware.
 - `cerulion ros2 run` can also replay one recorded ROS 2 process against the deliveries it recorded. It is runtime-tested on Humble only; the Foxy, Jazzy and Lyrical builds compile the same code. It reproduces a run of the same binaries, parameters and distro, and only for a process that meets its conditions. A replayed process really sends on its recorded topics and services and still drives the devices it writes to, so read the limits and safety rules in [ROS 2 replay](docs/ros2_replay.md) first.
 

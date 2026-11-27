@@ -2160,11 +2160,11 @@ fn c_abi_destroy_node_unregisters_its_graph_guard() {
 // =====================================================================
 
 /// Loaned take round trip: publish via the publish-side loan, take via
-/// `rmw_take_loaned_message_with_info` — the pointer aims DIRECTLY into
-/// the SHM frame (past the WireHeader), field values byte-exact against
-/// the hand oracle, message_info exact against the wire header read back
-/// through that same pointer, return releases, and the queue is then
-/// empty. Also pins the unknown-pointer return arm.
+/// `rmw_take_loaned_message_with_info` (a 24-byte point, so the loan is a
+/// private copy), field values byte-exact against the hand oracle,
+/// message_info exact against the wire header of the SAME frame as a
+/// second subscription takes it serialized, return releases, and the queue
+/// is then empty. Also pins the unknown-pointer return arm.
 #[test]
 #[serial]
 fn c_abi_loaned_take_round_trip_and_return() {
@@ -2185,6 +2185,10 @@ fn c_abi_loaned_take_round_trip_and_return() {
             (*subscription).can_loan_messages,
             "fixed POD type must loan on the take side too"
         );
+        // Takes the same frame as the wire bytes, header included: the oracle
+        // for the loaned take's message_info.
+        let observer = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        assert!(!observer.is_null());
         let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
         assert!(!publisher.is_null());
 
@@ -2237,15 +2241,27 @@ fn c_abi_loaned_take_round_trip_and_return() {
                 z: 0.25
             }
         );
-        // message_info: source_timestamp is EXACTLY the wire timestamp —
-        // cross-checked against the WireHeader sitting 40 bytes before the
-        // loaned pointer in the SAME held frame.
-        let header_bytes = std::slice::from_raw_parts(
-            (out as *const u8).sub(cerulion_core::wire::WireHeader::SIZE),
-            cerulion_core::wire::WireHeader::SIZE,
+        // message_info: source_timestamp is EXACTLY the wire timestamp,
+        // cross-checked against the WireHeader of the same frame as the
+        // observer subscription takes it serialized.
+        let mut serialized: ffi::rmw_serialized_message_t = std::mem::zeroed();
+        serialized.allocator = malloc_allocator();
+        let mut observed = false;
+        assert_eq!(
+            rmw_take_serialized_message(
+                observer,
+                &mut serialized,
+                &mut observed,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
         );
+        assert!(observed, "the observer takes the same frame");
+        let header_bytes =
+            std::slice::from_raw_parts(serialized.buffer, cerulion_core::wire::WireHeader::SIZE);
         let header = cerulion_core::wire::WireHeader::read_from_buf(header_bytes)
-            .expect("wire header before the loaned payload");
+            .expect("wire header of the serialized frame");
+        fixture_deallocate(serialized.buffer as *mut c_void, std::ptr::null_mut());
         assert_eq!(info.source_timestamp, header.timestamp_ns as i64);
         #[cfg(cerulion_has_message_info_sequence_numbers)]
         assert_eq!(info.publication_sequence_number, 0, "first publish = seq 0");
@@ -2330,58 +2346,10 @@ fn c_abi_loaned_take_round_trip_and_return() {
         assert!(out3.is_null());
 
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, observer), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
-}
-
-/// True when `p` lies inside the payload of a shared-memory sample this
-/// subscription holds for a loaned take: the zero-copy oracle, which a copy
-/// on the heap cannot satisfy.
-///
-/// # Safety
-/// `subscription` must be a live subscription created by this implementation.
-unsafe fn inside_a_held_sample(
-    subscription: *const ffi::rmw_subscription_t,
-    p: *mut c_void,
-) -> bool {
-    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
-    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
-    inner.pending_takes.iter().any(|t| {
-        let payload = t.sample.payload();
-        let start = payload.as_ptr() as usize;
-        (start..start + payload.len()).contains(&(p as usize))
-    })
-}
-
-/// A `uint8[n]` message: FIXED, exactly `n` bytes.
-fn bytes_ts(unique: &str, n: usize) -> *const ffi::rosidl_message_type_support_t {
-    let mut data = member("data", ROS_TYPE_UINT8, 0);
-    data.is_array_ = true;
-    data.array_size_ = n;
-    data.is_upper_bound_ = false;
-    make_message_ts("rmw_e2e__msg", unique, n, vec![data])
-}
-
-/// Byte `i` of the `uint8[n]` frame published with `seed`.
-fn bytes_value(seed: u8, i: usize) -> u8 {
-    (i as u8).wrapping_mul(31).wrapping_add(seed)
-}
-
-/// Publish one `uint8[n]` frame carrying [`bytes_value`]`(seed, ..)`.
-///
-/// # Safety
-/// `publisher` must be a live publisher of a `bytes_ts(_, n)` type.
-unsafe fn publish_bytes(publisher: *const ffi::rmw_publisher_t, n: usize, seed: u8) {
-    let msg: Vec<u8> = (0..n).map(|i| bytes_value(seed, i)).collect();
-    assert_eq!(
-        rmw_publish(
-            publisher,
-            msg.as_ptr() as *const c_void,
-            std::ptr::null_mut()
-        ),
-        RMW_RET_OK
-    );
 }
 
 /// The smallest fixed message, in bytes, whose loaned take is the zero-copy
@@ -2671,89 +2639,73 @@ fn c_abi_loaned_verbs_unsupported_for_variable_types() {
     }
 }
 
-/// Destroy with an outstanding take loan: the subscription releases the
-/// held sample (no leak, no abort — warned in the log), and the topic
-/// stays healthy for a fresh subscription afterwards.
+/// Destroy with an outstanding take loan, in both fixed shapes (a private
+/// copy and, one byte past the copy limit, the shared-memory struct): the
+/// subscription frees the copy or releases the held sample (no leak, no
+/// abort; warned in the log), and the topic stays healthy for a fresh
+/// subscription afterwards.
 #[test]
 #[serial]
 fn c_abi_destroy_subscription_with_outstanding_loan_releases() {
-    unsafe {
-        let suffix = unique_suffix();
-        let type_name = format!("PtLD{suffix}");
-        let ts = point_ts(&type_name);
-        let (_, node, _opts) = setup_node(&format!("ldestroy_node_{suffix}"));
+    for n in [24, ZERO_COPY_BYTES] {
+        unsafe {
+            let suffix = unique_suffix();
+            let ts = bytes_ts(&format!("BtLD{n}x{suffix}"), n);
+            let (_, node, _opts) = setup_node(&format!("ldestroy_node_{n}_{suffix}"));
 
-        let topic = CString::new(format!("/rmw_e2e/ldestroy/{suffix}")).expect("topic");
-        let qos = default_qos();
-        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
-        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+            let topic = CString::new(format!("/rmw_e2e/ldestroy/{n}/{suffix}")).expect("topic");
+            let qos = default_qos();
+            let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+            let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
 
-        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
-        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+            let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+            let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
 
-        let msg = CPoint {
-            x: 5.0,
-            y: 6.0,
-            z: 7.0,
-        };
-        assert_eq!(
-            rmw_publish(
-                publisher,
-                &msg as *const _ as *const c_void,
-                std::ptr::null_mut()
-            ),
-            RMW_RET_OK
-        );
-        let mut taken = false;
-        let mut held: *mut c_void = std::ptr::null_mut();
-        assert_eq!(
-            rmw_take_loaned_message(subscription, &mut held, &mut taken, std::ptr::null_mut()),
-            RMW_RET_OK
-        );
-        assert!(taken);
+            publish_bytes(publisher, n, 5);
+            let mut taken = false;
+            let mut held: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                rmw_take_loaned_message(subscription, &mut held, &mut taken, std::ptr::null_mut()),
+                RMW_RET_OK
+            );
+            assert!(taken);
+            assert_eq!(
+                inside_a_held_sample(subscription, held),
+                n == ZERO_COPY_BYTES,
+                "uint8[{n}]: the loan's shape"
+            );
 
-        // Destroy WITH the loan outstanding: must succeed (the held sample
-        // is dropped with the subscription — borrow released, never leaked)
-        // and must not abort the process.
-        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+            // Destroy WITH the loan outstanding: must succeed (the copy is
+            // freed, or the held sample dropped with the subscription,
+            // borrow released, never leaked) and must not abort the process.
+            assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
 
-        // The topic is healthy afterwards: a fresh subscription attaches
-        // (the freed borrow/subscriber slots are reusable) and a fresh
-        // publish round-trips through the loaned take.
-        let sub2 = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
-        assert!(
-            !sub2.is_null(),
-            "fresh subscription after loan-holding destroy"
-        );
-        let msg2 = CPoint {
-            x: 9.0,
-            y: 0.0,
-            z: 0.0,
-        };
-        assert_eq!(
-            rmw_publish(
-                publisher,
-                &msg2 as *const _ as *const c_void,
-                std::ptr::null_mut()
-            ),
-            RMW_RET_OK
-        );
-        let mut t2 = false;
-        let mut p2: *mut c_void = std::ptr::null_mut();
-        assert_eq!(
-            rmw_take_loaned_message(sub2, &mut p2, &mut t2, std::ptr::null_mut()),
-            RMW_RET_OK
-        );
-        assert!(t2);
-        assert_eq!((*(p2 as *const CPoint)).x, 9.0);
-        assert_eq!(
-            rmw_return_loaned_message_from_subscription(sub2, p2),
-            RMW_RET_OK
-        );
+            // The topic is healthy afterwards: a fresh subscription attaches
+            // (the freed borrow/subscriber slots are reusable) and a fresh
+            // publish round-trips through the loaned take.
+            let sub2 = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+            assert!(
+                !sub2.is_null(),
+                "fresh subscription after loan-holding destroy"
+            );
+            publish_bytes(publisher, n, 9);
+            let mut t2 = false;
+            let mut p2: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                rmw_take_loaned_message(sub2, &mut p2, &mut t2, std::ptr::null_mut()),
+                RMW_RET_OK
+            );
+            assert!(t2);
+            assert_eq!(loaned_bytes(p2, n), &expected_bytes(9, n)[..]);
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(sub2, p2),
+                RMW_RET_OK
+            );
 
-        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
-        assert_eq!(rmw_destroy_subscription(node, sub2), RMW_RET_OK);
-        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+            assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+            assert_eq!(rmw_destroy_subscription(node, sub2), RMW_RET_OK);
+            assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+        }
     }
 }
 
@@ -2892,6 +2844,545 @@ fn c_abi_loaned_take_refuses_nonzero_offset_table_metadata() {
             RMW_RET_OK
         );
 
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+// =====================================================================
+// The fixed loaned take: a private copy up to the copy limit, shared memory above
+// =====================================================================
+
+/// The loaned takes this subscription holds as shared-memory samples.
+///
+/// # Safety
+/// `subscription` must be a live subscription created by this implementation.
+unsafe fn shared_memory_loans(subscription: *const ffi::rmw_subscription_t) -> usize {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.pending_takes.len()
+}
+
+/// The pooled private copies this subscription has handed out and not had
+/// back, with the copy pool's (built, free) buffer counts.
+///
+/// # Safety
+/// `subscription` must be a live subscription created by this implementation.
+unsafe fn private_copies(subscription: *const ffi::rmw_subscription_t) -> (usize, usize, usize) {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+    (
+        inner.pooled_copies.len(),
+        inner.copy_pool.built(),
+        inner.copy_pool.free_count(),
+    )
+}
+
+/// The copies this subscription has handed out into fresh memory, past its
+/// reserve or its copy pool, and not had back.
+///
+/// # Safety
+/// `subscription` must be a live subscription created by this implementation.
+unsafe fn unpooled_copies(subscription: *const ffi::rmw_subscription_t) -> usize {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.copied_takes.len()
+}
+
+/// True when `p` lies inside the payload of a shared-memory sample this
+/// subscription holds for a loaned take: the zero-copy oracle, which a copy
+/// on the heap cannot satisfy.
+///
+/// # Safety
+/// `subscription` must be a live subscription created by this implementation.
+unsafe fn inside_a_held_sample(
+    subscription: *const ffi::rmw_subscription_t,
+    p: *mut c_void,
+) -> bool {
+    let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+    let inner = data.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.pending_takes.iter().any(|t| {
+        let payload = t.sample.payload();
+        let start = payload.as_ptr() as usize;
+        (start..start + payload.len()).contains(&(p as usize))
+    })
+}
+
+/// The frame the small fixed copy scenario publishes.
+const COPY_PUBLISHED: CPoint = CPoint {
+    x: 7.0,
+    y: -8.5,
+    z: 0.25,
+};
+
+/// What that scenario observes, written out by hand: the copy as taken, the
+/// copy after the callback's write (`x *= 0.5`, `z = -1.0`), and the second
+/// subscription's view of the same frame, which the write must not reach.
+const COPY_OBSERVED: [CPoint; 3] = [
+    CPoint {
+        x: 7.0,
+        y: -8.5,
+        z: 0.25,
+    },
+    CPoint {
+        x: 3.5,
+        y: -8.5,
+        z: -1.0,
+    },
+    CPoint {
+        x: 7.0,
+        y: -8.5,
+        z: 0.25,
+    },
+];
+
+/// One run of the small fixed copy scenario on a fresh topic: two
+/// subscriptions take the same frame as loans; the first writes through its
+/// loan the way an rclcpp `std::shared_ptr<MsgT>` callback does
+/// (`msg->x *= 0.5`). Returns what was observed, for the hand oracle.
+///
+/// # Safety
+/// Drives the rmw C ABI; the caller holds the serial lock.
+unsafe fn small_fixed_copy_run(tag: &str) -> [CPoint; 3] {
+    let suffix = unique_suffix();
+    let ts = point_ts(&format!("PtCp{tag}{suffix}"));
+    let (_, node, _opts) = setup_node(&format!("lcopy_{tag}_node_{suffix}"));
+    let topic = CString::new(format!("/rmw_e2e/lcopy/{tag}/{suffix}")).expect("topic");
+    let qos = default_qos();
+    let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+    let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+    let writer_sub = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+    let other_sub = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+    assert!(!writer_sub.is_null() && !other_sub.is_null());
+    assert!((*writer_sub).can_loan_messages);
+    let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+    assert!(!publisher.is_null());
+    assert_eq!(
+        rmw_publish(
+            publisher,
+            &COPY_PUBLISHED as *const _ as *const c_void,
+            std::ptr::null_mut()
+        ),
+        RMW_RET_OK
+    );
+
+    let mut taken = false;
+    let mut p: *mut c_void = std::ptr::null_mut();
+    assert_eq!(
+        rmw_take_loaned_message(writer_sub, &mut p, &mut taken, std::ptr::null_mut()),
+        RMW_RET_OK
+    );
+    assert!(taken && !p.is_null());
+    // Checked BEFORE the write: a pointer into the subscriber's read-only
+    // mapping would fault the test process on the write below.
+    assert!(
+        !inside_a_held_sample(writer_sub, p),
+        "a small fixed loan must not point into the shared-memory sample"
+    );
+    assert_eq!(
+        shared_memory_loans(writer_sub),
+        0,
+        "a private copy holds no shared-memory sample"
+    );
+    assert_eq!(
+        private_copies(writer_sub),
+        (1, 1, 0),
+        "the loan is the one private copy the pool built"
+    );
+    assert_eq!(p as usize % 8, 0, "the copy must be 8-aligned");
+    let as_taken = *(p as *const CPoint);
+    let msg = &mut *(p as *mut CPoint);
+    msg.x *= 0.5;
+    msg.z = -1.0;
+    let after_write = *(p as *const CPoint);
+
+    // The second subscription takes the same frame by COPYING it out of the
+    // shared-memory sample after the write: the frame every other
+    // subscriber reads is what was published.
+    let mut other_view = CPoint::default();
+    let mut other_taken = false;
+    assert_eq!(
+        rmw_take(
+            other_sub,
+            &mut other_view as *mut _ as *mut c_void,
+            &mut other_taken,
+            std::ptr::null_mut()
+        ),
+        RMW_RET_OK
+    );
+    assert!(other_taken);
+
+    assert_eq!(
+        rmw_return_loaned_message_from_subscription(writer_sub, p),
+        RMW_RET_OK
+    );
+    assert_eq!(
+        private_copies(writer_sub),
+        (0, 1, 1),
+        "the returned copy's buffer is back in the pool"
+    );
+    assert_eq!(
+        rmw_return_loaned_message_from_subscription(writer_sub, p),
+        ffi::RMW_RET_INVALID_ARGUMENT,
+        "a second return of the same copy is an unknown loan"
+    );
+    assert_eq!(
+        private_copies(writer_sub),
+        (0, 1, 1),
+        "a refused second return touches nothing"
+    );
+    assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    assert_eq!(rmw_destroy_subscription(node, writer_sub), RMW_RET_OK);
+    assert_eq!(rmw_destroy_subscription(node, other_sub), RMW_RET_OK);
+    assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    [as_taken, after_write, other_view]
+}
+
+/// A loaned take of a small fixed type (a 24-byte point) hands out a private
+/// copy: not inside the shared-memory sample, carrying the published values,
+/// writable, and the write stays private (a second subscription on the same
+/// topic still reads what was published).
+#[test]
+#[serial]
+fn a_small_fixed_loaned_take_is_a_private_copy_the_callback_may_write() {
+    let observed = unsafe { small_fixed_copy_run("one") };
+    assert_eq!(observed, COPY_OBSERVED);
+}
+
+/// Determinism: two independent runs of the copy scenario observe the same
+/// bytes, each checked against the hand oracle and then bit for bit against
+/// each other.
+#[test]
+#[serial]
+fn two_runs_of_the_small_fixed_copy_take_match_the_hand_oracle() {
+    let first = unsafe { small_fixed_copy_run("ra") };
+    let second = unsafe { small_fixed_copy_run("rb") };
+    assert_eq!(first, COPY_OBSERVED, "run 1");
+    assert_eq!(second, COPY_OBSERVED, "run 2");
+    let bits = |run: &[CPoint; 3]| -> Vec<u64> {
+        run.iter()
+            .flat_map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])
+            .collect()
+    };
+    assert_eq!(bits(&first), bits(&second), "the two runs differ in a bit");
+}
+
+/// A `uint8[n]` message: FIXED, exactly `n` bytes.
+fn bytes_ts(unique: &str, n: usize) -> *const ffi::rosidl_message_type_support_t {
+    let mut data = member("data", ROS_TYPE_UINT8, 0);
+    data.is_array_ = true;
+    data.array_size_ = n;
+    data.is_upper_bound_ = false;
+    make_message_ts("rmw_e2e__msg", unique, n, vec![data])
+}
+
+/// Byte `i` of the `uint8[n]` frame published with `seed`.
+fn bytes_value(seed: u8, i: usize) -> u8 {
+    (i as u8).wrapping_mul(31).wrapping_add(seed)
+}
+
+/// Publish one `uint8[n]` frame carrying [`bytes_value`]`(seed, ..)`.
+///
+/// # Safety
+/// `publisher` must be a live publisher of a `bytes_ts(_, n)` type.
+unsafe fn publish_bytes(publisher: *const ffi::rmw_publisher_t, n: usize, seed: u8) {
+    let msg: Vec<u8> = (0..n).map(|i| bytes_value(seed, i)).collect();
+    assert_eq!(
+        rmw_publish(
+            publisher,
+            msg.as_ptr() as *const c_void,
+            std::ptr::null_mut()
+        ),
+        RMW_RET_OK
+    );
+}
+
+/// The largest fixed message, in bytes, whose loaned take is a private copy.
+const COPY_LIMIT_BYTES: usize = rmw_cerulion::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES;
+
+/// A small fixed take that serves nothing takes nothing from the copy pool:
+/// an empty queue, a frame refused by the framing gate (nonzero offset-table
+/// metadata), and a frame dropped on the schema-hash gate (a skewed publisher
+/// on the same topic). After six such takes in a row the pool has built no
+/// buffer; a clean frame then builds one, and its return gives it back.
+#[test]
+#[serial]
+fn a_small_fixed_take_that_serves_nothing_takes_nothing_from_the_pool() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtCr{suffix}"));
+        let skewed = point_ts(&format!("PtCrSkew{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("lcret_node_{suffix}"));
+        let topic = CString::new(format!("/rmw_e2e/lcret/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        let skewed_publisher = rmw_create_publisher(node, skewed, topic.as_ptr(), &qos, &pub_opts);
+        assert!(!subscription.is_null() && !publisher.is_null() && !skewed_publisher.is_null());
+        let take = || {
+            let mut taken = true;
+            let mut p: *mut c_void = std::ptr::null_mut();
+            let ret =
+                rmw_take_loaned_message(subscription, &mut p, &mut taken, std::ptr::null_mut());
+            (ret, taken, p)
+        };
+        let msg = CPoint {
+            x: 3.0,
+            y: 4.0,
+            z: 5.0,
+        };
+
+        // An empty queue.
+        assert_eq!(take(), (RMW_RET_OK, false, std::ptr::null_mut()));
+        assert_eq!(private_copies(subscription), (0, 0, 0), "empty queue");
+
+        // Five refused frames in a row: three with a nonzero offset-table
+        // count (bytes [16..20] of the WireHeader), two of a skewed type.
+        for i in 0..5u32 {
+            if i % 2 == 0 {
+                let crafted = serialize_point(&msg, ts);
+                let bytes = std::slice::from_raw_parts_mut(crafted.buffer, crafted.buffer_length);
+                bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+                assert_eq!(
+                    rmw_publish_serialized_message(publisher, &crafted, std::ptr::null_mut()),
+                    RMW_RET_OK
+                );
+            } else {
+                assert_eq!(
+                    rmw_publish(
+                        skewed_publisher,
+                        &msg as *const _ as *const c_void,
+                        std::ptr::null_mut()
+                    ),
+                    RMW_RET_OK
+                );
+            }
+            assert_eq!(
+                take(),
+                (RMW_RET_OK, false, std::ptr::null_mut()),
+                "refused frame {i}"
+            );
+            assert_eq!(private_copies(subscription), (0, 0, 0), "refused frame {i}");
+        }
+        assert_eq!(
+            decode_failure_count(subscription),
+            3,
+            "the framing refusals"
+        );
+
+        // A clean frame builds the pool's first buffer.
+        assert_eq!(
+            rmw_publish(
+                publisher,
+                &msg as *const _ as *const c_void,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK
+        );
+        let (ret, taken, p) = take();
+        assert_eq!((ret, taken), (RMW_RET_OK, true));
+        assert_eq!(*(p as *const CPoint), msg);
+        assert_eq!(
+            private_copies(subscription),
+            (1, 1, 0),
+            "served from the one buffer it built"
+        );
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, p),
+            RMW_RET_OK
+        );
+        assert_eq!(private_copies(subscription), (0, 1, 1));
+
+        assert_eq!(rmw_destroy_publisher(node, skewed_publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// The size boundary: a fixed message of EXACTLY the copy limit is served as
+/// a private copy, and one byte past it keeps the zero-copy loan: the
+/// pointer lies inside the held shared-memory sample.
+#[test]
+#[serial]
+fn a_fixed_type_at_the_copy_limit_copies_and_one_byte_past_it_stays_zero_copy() {
+    for (n, private_copy) in [(COPY_LIMIT_BYTES, true), (COPY_LIMIT_BYTES + 1, false)] {
+        unsafe {
+            let suffix = unique_suffix();
+            let ts = bytes_ts(&format!("Bytes{n}x{suffix}"), n);
+            let (_, node, _opts) = setup_node(&format!("lbytes_node_{n}_{suffix}"));
+            let topic = CString::new(format!("/rmw_e2e/lbytes/{n}/{suffix}")).expect("topic");
+            let qos = default_qos();
+            let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+            let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+            let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+            assert!(!subscription.is_null());
+            assert!(
+                (*subscription).can_loan_messages,
+                "uint8[{n}] is a fixed type and loans on take"
+            );
+            let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+            assert!(!publisher.is_null());
+            publish_bytes(publisher, n, 1);
+
+            let mut taken = false;
+            let mut p: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                rmw_take_loaned_message(subscription, &mut p, &mut taken, std::ptr::null_mut()),
+                RMW_RET_OK
+            );
+            assert!(taken && !p.is_null());
+            assert_eq!(
+                inside_a_held_sample(subscription, p),
+                !private_copy,
+                "uint8[{n}]: private copy expected = {private_copy}"
+            );
+            assert_eq!(
+                shared_memory_loans(subscription),
+                usize::from(!private_copy),
+                "uint8[{n}]: shared-memory samples held for the loan"
+            );
+            assert_eq!(
+                private_copies(subscription).0,
+                usize::from(private_copy),
+                "uint8[{n}]: private copies held for the loan"
+            );
+            let values = std::slice::from_raw_parts(p as *const u8, n);
+            for (i, v) in values.iter().enumerate() {
+                assert_eq!(*v, bytes_value(1, i), "uint8[{n}] byte {i}");
+            }
+            if private_copy {
+                let values = std::slice::from_raw_parts_mut(p as *mut u8, n);
+                values[0] = 0xA5;
+                values[n - 1] = 0x5A;
+                assert_eq!((values[0], values[n - 1]), (0xA5, 0x5A));
+            }
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                ffi::RMW_RET_INVALID_ARGUMENT
+            );
+            assert_eq!(shared_memory_loans(subscription), 0);
+            assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+            assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+            assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+        }
+    }
+}
+
+/// A small fixed type's pool holds the loan budget's 4 buffers: with 4
+/// pooled copies held, the 5th loaned take is served by a copy into fresh
+/// memory (RMW_RET_OK, the published values, tracked apart from the pool),
+/// never refused. Each copy released its sample when it was taken, so while
+/// all five are held the subscription's borrow budget is untouched: a copying
+/// `rmw_take` still serves the next frame. Returning the unpooled copy frees
+/// it, and the next loaned take is served from the pool again.
+#[test]
+#[serial]
+fn holding_every_pooled_copy_serves_the_next_take_unpooled_and_leaves_the_borrows_free() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtCb{suffix}"));
+        let (_, node, _opts) = setup_node(&format!("lcbudget_node_{suffix}"));
+        let topic = CString::new(format!("/rmw_e2e/lcbudget/{suffix}")).expect("topic");
+        let qos = default_qos();
+        let pub_opts: ffi::rmw_publisher_options_t = std::mem::zeroed();
+        let sub_opts: ffi::rmw_subscription_options_t = std::mem::zeroed();
+        let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
+        let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        for i in 0..7u32 {
+            let msg = CPoint {
+                x: f64::from(i),
+                y: 0.0,
+                z: 0.0,
+            };
+            assert_eq!(
+                rmw_publish(
+                    publisher,
+                    &msg as *const _ as *const c_void,
+                    std::ptr::null_mut()
+                ),
+                RMW_RET_OK
+            );
+        }
+        let mut held: Vec<*mut c_void> = Vec::new();
+        for i in 0..5u32 {
+            let mut t = false;
+            let mut p: *mut c_void = std::ptr::null_mut();
+            assert_eq!(
+                rmw_take_loaned_message(subscription, &mut p, &mut t, std::ptr::null_mut()),
+                RMW_RET_OK,
+                "copy {i} is served whatever the consumer holds"
+            );
+            assert!(t);
+            assert_eq!((*(p as *const CPoint)).x, f64::from(i), "copy {i}: FIFO");
+            held.push(p);
+        }
+        let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
+        assert_eq!(data.loan_refusal_count(), 0, "nothing was refused");
+        assert_eq!(
+            private_copies(subscription),
+            (4, 4, 0),
+            "four pooled copies out, the pool at its capacity"
+        );
+        assert_eq!(unpooled_copies(subscription), 1, "the 5th is unpooled");
+        assert_eq!(data.loan_copy_count(), 1, "and counted as a copy");
+        assert_eq!(shared_memory_loans(subscription), 0);
+
+        // The held copies hold no borrow: a copying take serves the next frame.
+        let mut plain = CPoint::default();
+        let mut plain_taken = false;
+        assert_eq!(
+            rmw_take(
+                subscription,
+                &mut plain as *mut _ as *mut c_void,
+                &mut plain_taken,
+                std::ptr::null_mut()
+            ),
+            RMW_RET_OK,
+            "the held copies must leave the borrow budget free"
+        );
+        assert!(plain_taken);
+        assert_eq!(plain.x, 5.0);
+
+        let unpooled = held.pop().expect("the unpooled copy");
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, unpooled),
+            RMW_RET_OK
+        );
+        assert_eq!(unpooled_copies(subscription), 0, "returning frees it");
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
+            RMW_RET_OK
+        );
+        assert_eq!(private_copies(subscription), (3, 4, 1));
+        let mut t = false;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            rmw_take_loaned_message(subscription, &mut p, &mut t, std::ptr::null_mut()),
+            RMW_RET_OK
+        );
+        assert!(t);
+        assert_eq!((*(p as *const CPoint)).x, 6.0);
+        assert_eq!(
+            private_copies(subscription),
+            (4, 4, 0),
+            "served from the pool again, nothing more built"
+        );
+        assert_eq!(unpooled_copies(subscription), 0);
+        held.push(p);
+        for p in held {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);

@@ -103,6 +103,7 @@ Runs unmodified, with evidence:
 - MoveIt 2 with zero source edits: the scheduled workflow above plans with OMPL and executes the trajectory through `joint_trajectory_controller` over `rmw_cerulion` (`examples/moveit_hero/`).
 - Parameters (they ride ordinary rmw services, `docs/internals/rmw.md` lines 537 to 538), services (18 exports, e2e in `docs/internals/rmw.md` line 1080), guard conditions and `rmw_wait`, TRANSIENT_LOCAL late-joiner delivery with a raised subscriber ceiling (`docs/internals/rmw.md` lines 436 to 439 and 1058 to 1065). Actions have no rmw-level API; they run as the topics and services beneath them, and the MoveGroup action is what the MoveIt hero exercises.
 - Zero-copy publish and take need the Jazzy opt-in `ROS_DISABLE_LOANED_MESSAGES=0` and the heap hook the `ros2` verbs preload (`libcerulion_heaphook.so`, shipped beside the rmw in the Linux packages) (`api/pubsub.rs` lines 2387 to 2388; `docs/internals/rmw.md` line 772); without them the rmw takes the copy path.
+- A loaned take of a fixed-size message of 4 KiB or less (`geometry_msgs/Twist`, `geometry_msgs/Vector3`) is a private copy, so an rclcpp callback that takes a `std::shared_ptr` to the message may write to it, and the write reaches no other subscriber; a larger fixed-size message keeps its zero-copy loan, and that loan, like the shared-memory members of a loaned variable-size message, is read-only: a write to it crashes the process (`crates/rmw_cerulion/tests/rmw_e2e_test.rs`, `a_small_fixed_loaned_take_is_a_private_copy_the_callback_may_write`).
 
 Known limits:
 

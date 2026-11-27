@@ -55,20 +55,19 @@ pub fn schema_hash_verdict(frame_hash: u64, expected_hash: u64) -> HashVerdict {
     }
 }
 
-/// The size rule for a FIXED (recursively plain) message's loaned take: at
-/// most this many bytes is the private-copy shape, more is the shared-memory
-/// shape ([`fixed_loan_shape`]).
+/// The largest FIXED (recursively plain) message, in bytes, whose loaned take
+/// is served as a private copy; a larger one keeps the shared-memory loan.
 ///
-/// A private copy is the struct in rmw-owned memory with its sample released
-/// at once, so a `std::shared_ptr<MsgT>` callback may write it; the
-/// shared-memory shape is the struct inside the held sample, read-only, so the
-/// take stays zero-copy. The rule for the value: a private copy may add at most
+/// The rule it pins ([`fixed_loan_shape`]): a fixed message of at most this
+/// many bytes is copied into rmw-owned memory and its sample released at
+/// once, so a `std::shared_ptr<MsgT>` callback may write it; a larger one is
+/// handed out as the struct inside the held sample, read-only, so its take
+/// stays zero-copy. The rule for its value: a private copy may add at most
 /// 10% to one hop at the smallest measured size, which gives 4 KiB. Every test
 /// derives its boundary types from it, so a new value changes nothing else.
 pub const RMW_FIXED_LOAN_COPY_MAX_BYTES: usize = 4 * 1024;
 
-/// The shape the size rule ([`fixed_loan_shape`]) gives a FIXED type's loaned
-/// take.
+/// What a FIXED type's loaned take hands out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixedLoanShape {
     /// A private copy of the struct in rmw-owned memory, writable; the sample

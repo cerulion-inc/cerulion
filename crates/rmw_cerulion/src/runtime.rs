@@ -914,20 +914,35 @@ pub struct SubscriptionInner {
     /// the subscription's borrow ceiling less one: a take past that is served
     /// by copy (`copied_takes`).
     pub pending_takes: Vec<PendingTake>,
-    /// Outstanding loaned takes served by COPY because the subscription
-    /// already held every zero-copy loan its borrow ceiling allows, keyed by
-    /// the pointer handed to the caller. Each entry owns private heap memory
+    /// Outstanding loaned takes served by COPY into fresh memory, keyed by the
+    /// pointer handed to the caller: because the subscription already held
+    /// every zero-copy loan its borrow ceiling allows, or (a small fixed type)
+    /// every buffer of its copy pool. Each entry owns private heap memory
     /// and holds NO iceoryx2 sample (the borrow it was received into was
     /// released before the take returned), so the reserve counts
     /// `pending_takes` alone. Returned through the same call as a loan;
     /// dropped (freed) at subscription destroy.
     pub copied_takes: Vec<CopiedTake>,
     /// Whether the served-by-copy regime is open: set by a take served by
-    /// copy, cleared by the first take served zero-copy with no copy
-    /// outstanding, which is the only take that reports to the copy latch's
-    /// success side. A zero-copy take while it is clear reads only this flag
+    /// copy into fresh memory, cleared by the first take served zero-copy (for
+    /// a small fixed type, from its pool) with no such copy outstanding, which
+    /// is the only take that reports to the copy latch's success side. A zero-copy take while it is clear reads only this flag
     /// of the copy bookkeeping.
     pub copy_regime_open: bool,
+    /// Outstanding loaned takes of a small FIXED type
+    /// (`take_gate::fixed_loan_shape` is `PrivateCopy`) served from
+    /// `copy_pool`, keyed by the pointer handed to the caller: the copy's own
+    /// address. Each entry owns one of the pool's buffers and holds NO
+    /// iceoryx2 sample (the sample was released before the take returned), so
+    /// it consumes no borrow. Returned through the same call as a loan, which
+    /// gives the buffer back to the pool; dropped (freed) at subscription
+    /// destroy. Reserved at create to the pool's capacity, the most entries it
+    /// can ever hold: a take that finds every buffer out is served by copy
+    /// into fresh memory instead (`copied_takes`).
+    pub pooled_copies: Vec<PooledCopy>,
+    /// The reused buffers a small fixed type's loaned take copies into, sized
+    /// to the loan budget. Capacity 0 for every other type.
+    pub copy_pool: FixedCopyPool,
     /// The recyclable shadow messages the forged take hands
     /// out, sized to the loan budget. Empty (nothing built) until the first
     /// forged take; never touched by a fixed type's take.
@@ -948,7 +963,9 @@ pub struct SubscriptionInner {
 /// One outstanding loaned take.
 ///
 /// `key` is what rclcpp holds and later returns: the SHM payload pointer
-/// for a fixed type, the shadow's address for a forged one. Declaration
+/// for a fixed type above the copy limit (`take_gate::fixed_loan_shape`),
+/// the shadow's address for a forged one. A smaller fixed type's take holds
+/// no sample and is tracked as a [`PooledCopy`] instead. Declaration
 /// order is the DROP order and it matters: the shadow un-forges (and its
 /// `fini` runs over empty sequences) before the sample's SHM borrow is
 /// released, so no destructor ever sees a shared-memory address.
@@ -961,7 +978,8 @@ pub struct PendingTake {
     pub sample: cerulion_core::transport::subscriber::OwnedInboundSample,
 }
 
-/// One loaned take served by COPY past the borrow ceiling's zero-copy loans.
+/// One loaned take served by COPY into fresh memory: past the borrow
+/// ceiling's zero-copy loans, or past a small fixed type's copy pool.
 ///
 /// Its key, what the caller holds and later returns, is the address of the
 /// copy's own memory, derived from the copy itself so the two cannot
@@ -1006,6 +1024,142 @@ pub(crate) enum TakeCopy {
     /// copying decode, so every member owns its storage and nothing aliases
     /// shared memory. Dropping it runs the typesupport's `fini`.
     Shadow(TakeShadow),
+}
+
+/// One loaned take of a small FIXED type, served from the subscription's
+/// [`FixedCopyPool`].
+///
+/// Its key, what the caller holds and later returns, is the address of the
+/// copy's own buffer, derived from the buffer so the two cannot disagree.
+/// Moving the entry (into the table, or as the table reorders) never moves
+/// the heap words the caller's pointer aims at.
+pub struct PooledCopy {
+    buffer: CopyBuffer,
+}
+
+impl PooledCopy {
+    /// Track `buffer`, which already holds the copied struct.
+    pub(crate) fn new(buffer: CopyBuffer) -> Self {
+        Self { buffer }
+    }
+
+    /// The pointer handed to the caller: the copy's address, mutable because
+    /// the memory is private to this take.
+    pub(crate) fn loaned_ptr(&mut self) -> *mut std::os::raw::c_void {
+        self.buffer.words.as_mut_ptr() as *mut std::os::raw::c_void
+    }
+
+    /// The return's key: the copy's address.
+    pub fn key(&self) -> usize {
+        self.buffer.words.as_ptr() as usize
+    }
+
+    /// The buffer, for [`FixedCopyPool::release`].
+    pub(crate) fn into_buffer(self) -> CopyBuffer {
+        self.buffer
+    }
+}
+
+/// One buffer of a [`FixedCopyPool`]: `fixed_size` rounded up to whole `u64`
+/// words, so the struct it holds is 8-aligned (`WireLayout::fixed_align` is
+/// at most 8). Only the pool builds one, so every buffer is the pool's size.
+pub struct CopyBuffer {
+    words: Vec<u64>,
+}
+
+impl CopyBuffer {
+    /// Copy `body` (a frame's fixed section) into the front of the buffer, in
+    /// native byte order, so the words hold the struct's bytes as laid out; the
+    /// rest of the word holding `body`'s last byte is zeroed, and words past it
+    /// keep their contents. A body longer than the buffer
+    /// panics (caught by `ffi_guard`) instead of being cut short.
+    pub(crate) fn fill(&mut self, body: &[u8]) {
+        assert!(
+            body.len() <= self.words.len() * std::mem::size_of::<u64>(),
+            "a frame body longer than the copy buffer"
+        );
+        // Whole words as `[u8; 8]` chunks, which the compiler turns into one
+        // bulk copy of all of them; a partial last word is copied on its own
+        // into a zeroed word.
+        let (whole, tail) = body.as_chunks::<8>();
+        for (word, chunk) in self.words.iter_mut().zip(whole) {
+            *word = u64::from_ne_bytes(*chunk);
+        }
+        if !tail.is_empty() {
+            let mut bytes = [0u8; 8];
+            bytes[..tail.len()].copy_from_slice(tail);
+            self.words[body.len() / 8] = u64::from_ne_bytes(bytes);
+        }
+    }
+}
+
+/// The per-subscription pool of buffers a small fixed type's loaned take
+/// copies into.
+///
+/// Sized to the loan budget. Buffers are built LAZILY (a subscription that
+/// never takes a loan builds none) and then RECYCLED, so a consumer holding at
+/// most `capacity` copies at once allocates nothing in steady state. A take
+/// that finds every buffer loaned out gets `None` and is served by copy into
+/// fresh memory instead (`SubscriptionInner::copied_takes`), so a consumer that
+/// keeps more messages keeps receiving.
+pub struct FixedCopyPool {
+    free: Vec<CopyBuffer>,
+    built: usize,
+    capacity: usize,
+    words: usize,
+}
+
+impl FixedCopyPool {
+    /// An empty pool that will build at most `capacity` buffers, each holding
+    /// a `fixed_size`-byte struct.
+    pub(crate) fn new(capacity: usize, fixed_size: usize) -> Self {
+        Self {
+            free: Vec::with_capacity(capacity),
+            built: 0,
+            capacity,
+            words: fixed_size.div_ceil(8).max(1),
+        }
+    }
+
+    /// Take a free buffer, or build one while under capacity; `None` when
+    /// every buffer the pool may build is loaned out.
+    pub(crate) fn acquire(&mut self) -> Option<CopyBuffer> {
+        if let Some(buffer) = self.free.pop() {
+            return Some(buffer);
+        }
+        if self.built >= self.capacity {
+            return None;
+        }
+        self.built += 1;
+        Some(CopyBuffer {
+            // hot-path-alloc-ok: built once per buffer, at most `capacity`
+            // times per subscription; every later take recycles it.
+            words: vec![0u64; self.words],
+        })
+    }
+
+    /// Return a buffer for the next take; its stale contents are overwritten
+    /// by the next copy (the whole struct), never read. Every buffer must come
+    /// back here: one dropped instead stays counted in [`Self::built`].
+    pub(crate) fn release(&mut self, buffer: CopyBuffer) {
+        self.free.push(buffer);
+    }
+
+    /// The most buffers this pool will ever build (the loan budget, or 0 for
+    /// a type whose loaned take is not a pooled copy).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Buffers built so far (never exceeds [`Self::capacity`]).
+    pub fn built(&self) -> usize {
+        self.built
+    }
+
+    /// Buffers currently idle in the pool.
+    pub fn free_count(&self) -> usize {
+        self.free.len()
+    }
 }
 
 /// One rmw-owned SHADOW message — the object a forged
@@ -1207,12 +1361,13 @@ pub struct SubscriptionData {
     /// regime.
     pub forge_fallbacks: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
     /// Loaned take: flood-suppressed loudness + an unconditional counter for
-    /// loaned takes SERVED BY COPY because the subscription already holds
-    /// every zero-copy loan its borrow ceiling allows
-    /// (`loan_refusal_latch::report_loan_copied`). Its own latch: the take
+    /// loaned takes SERVED BY COPY into fresh memory because the subscription
+    /// already holds every zero-copy loan its borrow ceiling allows, and the
+    /// counter alone, with no line, for a small fixed type's take past every
+    /// buffer of its copy pool (`loan_refusal_latch::report_loan_copied`). Its own latch: the take
     /// SUCCEEDED (a degrade, not a refusal), so it must not share the
     /// refusal regime, and it recovers on the first take served zero-copy
-    /// with no copy outstanding.
+    /// (for a small fixed type, from the pool) with no such copy outstanding.
     pub loan_copies: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
     /// Adopt-take (`--adopt-take`): `Some` iff the env gate
     /// was armed at CREATE, the heap-hook grant was constructible, AND the
@@ -1240,9 +1395,10 @@ impl SubscriptionData {
             .total_failures()
     }
 
-    /// Unconditional running total of loaned takes served by copy past the
-    /// zero-copy loans the borrow ceiling allows: independent of log level
-    /// and never reset by recovery (Principle #3). Reachable only from Rust,
+    /// Unconditional running total of loaned takes served by copy into fresh
+    /// memory, past the zero-copy loans the borrow ceiling allows or past a
+    /// small fixed type's copy pool: independent of log level and never reset
+    /// by recovery (Principle #3). Reachable only from Rust,
     /// like [`Self::loan_refusal_count`].
     pub fn loan_copy_count(&self) -> u64 {
         cerulion_core::transport::failure_regime_latch::lock_regime_latch(&self.loan_copies)
@@ -1383,5 +1539,86 @@ mod tests {
             segment.contains("never repairs"),
             "the message must state the no-repair rule: {segment}"
         );
+    }
+
+    /// The bytes a copy buffer holds, word by word in native order.
+    fn held_bytes(buffer: &super::CopyBuffer) -> Vec<u8> {
+        buffer.words.iter().flat_map(|w| w.to_ne_bytes()).collect()
+    }
+
+    /// `CopyBuffer::fill` holds the body's bytes in order and zeroes the last
+    /// word's bytes past it, over a buffer whose stale bytes are all 0xFF:
+    /// hand oracles for a one-byte body, one whole word, a word and one byte,
+    /// two words less one byte, a short body at the front of a longer buffer
+    /// (the words past it untouched), and an empty body (nothing written).
+    #[test]
+    fn a_copy_buffer_holds_the_body_and_zeroes_the_partial_word() {
+        let cases: &[(&[u8], usize, &[u8])] = &[
+            (&[0xAA], 1, &[0xAA, 0, 0, 0, 0, 0, 0, 0]),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], 1, &[1, 2, 3, 4, 5, 6, 7, 8]),
+            (
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+                2,
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                &[9, 8, 7, 6, 5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 7],
+                2,
+                &[9, 8, 7, 6, 5, 4, 3, 2, 1, 2, 3, 4, 5, 6, 7, 0],
+            ),
+            (
+                &[1, 2, 3],
+                3,
+                &[
+                    1, 2, 3, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                ],
+            ),
+            (&[], 1, &[0xFF; 8]),
+        ];
+        for &(body, words, want) in cases {
+            let mut buffer = super::CopyBuffer {
+                words: vec![u64::MAX; words],
+            };
+            buffer.fill(body);
+            assert_eq!(held_bytes(&buffer), want, "body of {} bytes", body.len());
+        }
+    }
+
+    /// A body of the largest size the copy limit admits, and one byte less (one
+    /// of the two ends in a partial word), is held byte for byte: the byte at
+    /// index `i` is `((i ^ (i >> 8)) * 31 + 7) mod 256`, which does not repeat
+    /// every 256 bytes, and the partial word's tail is zeroed.
+    #[test]
+    fn a_copy_buffer_holds_a_body_at_the_copy_limit_byte_for_byte() {
+        let limit = crate::take_gate::RMW_FIXED_LOAN_COPY_MAX_BYTES;
+        for n in [limit - 1, limit] {
+            let body: Vec<u8> = (0..n).map(|i| ((i ^ (i >> 8)) * 31 + 7) as u8).collect();
+            let mut buffer = super::CopyBuffer {
+                words: vec![u64::MAX; n.div_ceil(8)],
+            };
+            buffer.fill(&body);
+            let held = held_bytes(&buffer);
+            assert_eq!(held.len(), n.next_multiple_of(8), "n={n}");
+            for (i, b) in held.iter().take(n).enumerate() {
+                assert_eq!(
+                    usize::from(*b),
+                    ((i ^ (i >> 8)) * 31 + 7) % 256,
+                    "n={n} byte {i}"
+                );
+            }
+            assert!(
+                held[n..].iter().all(|b| *b == 0),
+                "n={n}: the partial word's tail is zeroed"
+            );
+        }
+    }
+
+    /// A body longer than the buffer panics instead of being cut short.
+    #[test]
+    #[should_panic(expected = "a frame body longer than the copy buffer")]
+    fn a_copy_buffer_refuses_a_longer_body() {
+        let mut buffer = super::CopyBuffer { words: vec![0; 1] };
+        buffer.fill(&[0; 9]);
     }
 }

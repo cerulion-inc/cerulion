@@ -13,7 +13,11 @@
 //! reserved borrow, copies the message into private memory, releases the
 //! borrow at once and hands out the copy. Both shapes are pinned: a FIXED type
 //! past the copy limit (the fixed section copied into aligned heap words) and
-//! a FORGED type (an unpooled shadow filled by the copying decode).
+//! a FORGED type (an unpooled shadow filled by the copying decode). A small
+//! FIXED type's take is always a private copy from a pool of four reused
+//! buffers and holds no borrow; a take that finds every pooled buffer loaned
+//! out is a copy into fresh memory, counted on the same latch with no line,
+//! its regime closed by a take served from the pool.
 //!
 //! The copies ride their own `FailureRegimeLatch` through
 //! `loan_refusal_latch`. Hand oracles, every predicate matching the LEVEL
@@ -147,6 +151,32 @@ fn point_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
             c_member("z", ROS_TYPE_DOUBLE, 16),
             pad,
         ],
+        None,
+        None,
+    )
+}
+
+/// FIXED and small, the shape of `geometry_msgs/Twist` (two vectors of three
+/// doubles, 48 bytes): its loan is a private copy from the subscription's
+/// copy pool.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct CTwist {
+    linear: [f64; 3],
+    angular: [f64; 3],
+}
+
+fn twist_ts(unique: &str) -> *const ffi::rosidl_message_type_support_t {
+    let mut linear = c_member("linear", ROS_TYPE_DOUBLE, 0);
+    linear.is_array_ = true;
+    linear.array_size_ = 3;
+    let mut angular = c_member("angular", ROS_TYPE_DOUBLE, 24);
+    angular.is_array_ = true;
+    angular.array_size_ = 3;
+    c_ts(
+        unique,
+        std::mem::size_of::<CTwist>(),
+        vec![linear, angular],
         None,
         None,
     )
@@ -972,6 +1002,217 @@ fn the_copy_regime_closes_and_opens_again_with_one_head_and_one_recovery_each() 
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
     }
+}
+
+/// The Twist-shaped messages published in order, written out by hand.
+const TWIST_ORACLE: [CTwist; 8] = [
+    CTwist {
+        linear: [0.5, -1.0, 2.0],
+        angular: [0.0, 0.0, 0.25],
+    },
+    CTwist {
+        linear: [1.5, -2.0, 4.0],
+        angular: [0.0, 0.0, 0.5],
+    },
+    CTwist {
+        linear: [2.5, -3.0, 6.0],
+        angular: [0.0, 0.0, 0.75],
+    },
+    CTwist {
+        linear: [3.5, -4.0, 8.0],
+        angular: [0.0, 0.0, 1.0],
+    },
+    CTwist {
+        linear: [4.5, -5.0, 10.0],
+        angular: [0.0, 0.0, 1.25],
+    },
+    CTwist {
+        linear: [5.5, -6.0, 12.0],
+        angular: [0.0, 0.0, 1.5],
+    },
+    CTwist {
+        linear: [6.5, -7.0, 14.0],
+        angular: [0.0, 0.0, 1.75],
+    },
+    CTwist {
+        linear: [7.5, -8.0, 16.0],
+        angular: [0.0, 0.0, 2.0],
+    },
+];
+
+/// The pooled private copies the subscription holds.
+unsafe fn pooled_copies_held(subscription: *const ffi::rmw_subscription_t) -> usize {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pooled_copies
+        .len()
+}
+
+/// Publish Twist `i` of the oracle and take it as a loan: served, taken, the
+/// struct exactly the oracle's, 8-aligned, never inside a held sample and
+/// never a borrow held. Returns the pointer.
+unsafe fn publish_and_take_twist(
+    publisher: *const ffi::rmw_publisher_t,
+    subscription: *const ffi::rmw_subscription_t,
+    i: usize,
+) -> *mut c_void {
+    assert_eq!(
+        rmw_publish(
+            publisher,
+            &TWIST_ORACLE[i] as *const _ as *const c_void,
+            std::ptr::null_mut()
+        ),
+        RMW_RET_OK
+    );
+    let (ret, taken, p) = take_loaned(subscription);
+    assert_eq!(
+        ret, RMW_RET_OK,
+        "twist {i} is served whatever the consumer holds"
+    );
+    assert!(taken && !p.is_null(), "twist {i} is taken");
+    assert_eq!(p as usize % 8, 0, "twist {i}'s loaned pointer is 8-aligned");
+    assert_eq!(*(p as *const CTwist), TWIST_ORACLE[i], "twist {i}");
+    assert!(
+        !inside_a_held_sample(subscription, p as *const u8),
+        "a small fixed take is a private copy (twist {i})"
+    );
+    assert_eq!(zero_copy_held(subscription), 0, "a copy holds no borrow");
+    p
+}
+
+/// A consumer that holds six Twist messages keeps receiving them all. The
+/// first four are pooled copies; the 5th and the 6th find every pooled buffer
+/// loaned out and are copies into fresh memory: counted (2), nothing refused
+/// and no borrow held. Every held copy still reads its published values after
+/// the later takes. With both unpooled copies and one pooled copy back, the
+/// next take is served from the pool and closes the regime; the take after it
+/// finds the pool full again and opens a second one, counted.
+#[test]
+#[serial]
+#[traced_test]
+fn six_held_twists_keep_receiving_past_the_copy_pool_and_recover() {
+    const HELD: usize = 6;
+    const POOL: usize = 4;
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = twist_ts(&format!("Tw{suffix}"));
+        let (node, publisher, subscription, _topic) = setup_pair(ts, "tw", suffix);
+        let mut held = Vec::new();
+        for i in 0..HELD {
+            held.push(publish_and_take_twist(publisher, subscription, i));
+            assert_eq!(pooled_copies_held(subscription), (i + 1).min(POOL));
+            assert_eq!(copies_held(subscription), (i + 1).saturating_sub(POOL));
+            assert_eq!(copy_regime_open(subscription), i >= POOL, "after twist {i}");
+        }
+        for (i, &p) in held.iter().enumerate() {
+            assert_eq!(
+                *(p as *const CTwist),
+                TWIST_ORACLE[i],
+                "held twist {i} is untouched by the later takes"
+            );
+        }
+        assert_eq!(copy_count(subscription), (HELD - POOL) as u64);
+        assert_eq!(refusal_count(subscription), 0, "nothing was refused");
+
+        // Both unpooled copies and the oldest pooled copy back: the next take
+        // is served from the pool and closes the regime.
+        for p in held.split_off(POOL) {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(copies_held(subscription), 0);
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
+            RMW_RET_OK
+        );
+        held.push(publish_and_take_twist(publisher, subscription, 6));
+        assert_eq!(pooled_copies_held(subscription), POOL);
+        assert!(!copy_regime_open(subscription), "the pooled take closes it");
+        held.push(publish_and_take_twist(publisher, subscription, 7));
+        assert_eq!(copies_held(subscription), 1, "the pool is full again");
+        assert_eq!(copy_count(subscription), (HELD - POOL + 1) as u64);
+
+        for p in held {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
+/// Whether `loaned` is one of the subscription's pooled copies.
+unsafe fn is_pooled(subscription: *const ffi::rmw_subscription_t, loaned: *mut c_void) -> bool {
+    let data = &*((*subscription).data as *const SubscriptionData);
+    data.inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pooled_copies
+        .iter()
+        .any(|c| c.key() == loaned as usize)
+}
+
+/// Run the six-deep Twist sequence on a fresh topic: six takes held, both
+/// unpooled copies and the oldest pooled copy returned, two takes more.
+/// Returns each take's struct and whether it was pooled, and the copy count.
+unsafe fn run_twist_sequence(tag: &str) -> (Vec<(CTwist, bool)>, u64) {
+    let suffix = unique_suffix();
+    let ts = twist_ts(&format!("TwD{tag}{suffix}"));
+    let (node, publisher, subscription, _topic) = setup_pair(ts, &format!("twd{tag}"), suffix);
+    let mut served = Vec::new();
+    let mut held = Vec::new();
+    for i in 0..8 {
+        if i == 6 {
+            for p in held.split_off(4) {
+                assert_eq!(
+                    rmw_return_loaned_message_from_subscription(subscription, p),
+                    RMW_RET_OK
+                );
+            }
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
+                RMW_RET_OK
+            );
+        }
+        let p = publish_and_take_twist(publisher, subscription, i);
+        served.push((*(p as *const CTwist), is_pooled(subscription, p)));
+        held.push(p);
+    }
+    let copies = copy_count(subscription);
+    for p in held {
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, p),
+            RMW_RET_OK
+        );
+    }
+    assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+    assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+    assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    (served, copies)
+}
+
+/// Determinism: two runs of the six-deep Twist sequence serve the same takes,
+/// each equal to the hand oracle (the published values, pooled for takes 0 to
+/// 3 and 6, unpooled for 4, 5 and 7) and then to each other, with the same
+/// copy count.
+#[test]
+#[serial]
+#[traced_test]
+fn the_same_twist_sequence_serves_the_same_takes_twice() {
+    const POOLED: [bool; 8] = [true, true, true, true, false, false, true, false];
+    let oracle: Vec<(CTwist, bool)> = TWIST_ORACLE.iter().copied().zip(POOLED).collect();
+    let first = unsafe { run_twist_sequence("a") };
+    let second = unsafe { run_twist_sequence("b") };
+    assert_eq!(first.0, oracle, "the first run against the hand oracle");
+    assert_eq!(first.1, 3, "three takes past the pool");
+    assert_eq!(first, second, "two runs serve the same takes");
 }
 
 /// Run the fixed sequence on a fresh topic: six takes held, a copy and a
