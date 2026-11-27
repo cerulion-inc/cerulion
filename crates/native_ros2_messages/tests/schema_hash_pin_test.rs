@@ -57,7 +57,7 @@ fn parsed_corpus() -> Vec<MessageSchema> {
         // Mirror build.rs's `sanitize_package_name` (`-` → `_`) so the
         // package string we hash over matches the generated constant for
         // any hyphenated package dir (all dirs use
-        // underscores, so this is a no-op — kept for fidelity).
+        // underscores, so this is a no-op, kept for fidelity).
         let package = pkg_dir
             .file_name()
             .unwrap()
