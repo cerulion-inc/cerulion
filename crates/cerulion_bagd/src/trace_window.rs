@@ -552,6 +552,16 @@ pub struct CompleteSteps {
 }
 
 impl TrimmedTrace {
+    /// Whether this trace begins at its run's own step 0: rank 0's first kept
+    /// boundary, the one `resolve_resume` reads, is step 0. A replay of such a
+    /// trace runs from the start and reads no checkpoint.
+    pub(crate) fn begins_at_step_zero(&self) -> bool {
+        self.per_rank
+            .get(&cerulion_core::trace_ring::AUTHORITATIVE_TRACE_RANK)
+            .and_then(|per| per.first_recorded_step)
+            == Some(0)
+    }
+
     /// Record what [`end_at_last_complete_step`] removed before this trace was
     /// trimmed, and which of the ranks it saw bounded keep no boundary here.
     pub(crate) fn record_end_cut(&mut self, cut: usize, steps_cut: usize, bounded_ranks: &[u32]) {
