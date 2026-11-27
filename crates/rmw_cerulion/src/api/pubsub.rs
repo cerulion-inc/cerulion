@@ -579,9 +579,120 @@ fn register_dynamic_egress(transport: &TransportManager, topic: &str, schema_has
     }
 }
 
+/// One regime for the whole process: the registry writer is process-wide, so a
+/// failure to list one endpoint is the same failure for the next.
+static GRAPH_REGISTRY_FAILURES: Mutex<FailureRegimeLatch> = Mutex::new(FailureRegimeLatch::new());
+
+/// Count a local endpoint's `(topic, type_name)` on the host-wide rmw topic
+/// graph registry, so `rmw_get_topic_names_and_types` in other processes lists
+/// it (see `cerulion_core::transport::rmw_graph_registry`).
+///
+/// Best-effort and panic-contained, like [`register_dynamic_egress`]: it runs on
+/// a handle that is already built and in the local graph, so neither a refused
+/// name nor a panic may fail the create. Shared-memory failures are kept and
+/// retried inside the writer and logged there; what reaches this latch is a
+/// refused name (empty, or over the frame bound) or a caught panic.
+fn list_on_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &str) {
+    let Some(writer) = &rt.graph_registry else {
+        return;
+    };
+    contain_panic(|| {
+        // `AssertUnwindSafe`: the writer recovers its own poisoned locks, and
+        // a panic after the count moved leaves a count that the matching
+        // destroy still removes.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.add(topic, type_name)
+        }));
+        let error = match outcome {
+            Ok(Ok(())) => {
+                report_graph_registry_success(topic);
+                return;
+            }
+            Ok(Err(error)) => error.to_string(),
+            Err(payload) => format!(
+                "graph registry add panicked: {}",
+                panic_message(payload.as_ref())
+            ),
+        };
+        report_graph_registry_failure(topic, &error);
+    });
+}
+
+/// Count one less local endpoint on `(topic, type_name)`; the inverse of
+/// [`list_on_graph_registry`]. A pair that was never counted (its add was
+/// refused) changes nothing, so a remove never reports a recovery.
+fn unlist_from_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &str) {
+    let Some(writer) = &rt.graph_registry else {
+        return;
+    };
+    contain_panic(|| {
+        // `AssertUnwindSafe`: see `list_on_graph_registry`.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            writer.remove(topic, type_name)
+        }));
+        if let Err(payload) = outcome {
+            report_graph_registry_failure(
+                topic,
+                &format!(
+                    "graph registry remove panicked: {}",
+                    panic_message(payload.as_ref())
+                ),
+            );
+        }
+    });
+}
+
+/// Run `work` and drop any panic out of it. For best-effort work whose report
+/// goes through the host's tracing subscriber, which may itself panic: the
+/// handle or answer the caller returns after it must still be returned.
+pub(crate) fn contain_panic(work: impl FnOnce()) {
+    // `AssertUnwindSafe`: `work` only logs and moves its own latch, which
+    // `lock_regime_latch` recovers from poison.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+}
+
+fn report_graph_registry_success(topic: &str) {
+    let recovered = lock_regime_latch(&GRAPH_REGISTRY_FAILURES).on_success();
+    if let Some(suppressed_count) = recovered {
+        tracing::info!(
+            topic = %topic,
+            suppressed_count,
+            "rmw graph registry: a new endpoint is listed for other processes after \
+             failures; the endpoints that failed stay unlisted"
+        );
+    }
+}
+
+fn report_graph_registry_failure(topic: &str, error: &str) {
+    let decision = lock_regime_latch(&GRAPH_REGISTRY_FAILURES).on_failure();
+    match decision {
+        RegimeDecision::Loud => tracing::warn!(
+            topic = %topic,
+            error = %error,
+            "rmw graph registry: an endpoint is not listed for other processes; \
+             ros2 topic list in another process does not show it. Local pub/sub is \
+             unaffected. Repeats log at debug"
+        ),
+        RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
+            topic = %topic,
+            error = %error,
+            total_failures = total,
+            suppressed,
+            "rmw graph registry: endpoints are still not listed for other processes"
+        ),
+        RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+            topic = %topic,
+            error = %error,
+            suppressed,
+            "rmw graph registry: an endpoint is not listed for other processes \
+             (suppressed repeat)"
+        ),
+    }
+}
+
 /// The human-readable text of a caught panic payload (`panic!("…")` carries a
 /// `&str` or a `String`; anything else is named as such rather than dropped).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
         .copied()
@@ -958,6 +1069,7 @@ pub unsafe extern "C" fn rmw_create_publisher(
             let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
             GraphRegistry::add_endpoint(&mut graph.publishers, &data_ref.topic, record);
         }
+        list_on_graph_registry(rt, &data_ref.topic, &data_ref.type_name);
         // Register for the rmw_wait event pump (TRANSIENT_LOCAL history
         // to late joiners on idle publishers).
         {
@@ -1049,8 +1161,11 @@ pub unsafe extern "C" fn rmw_destroy_publisher(
                 // channel docs and pinned by
                 // `rmw_canonical_names_test`; a removal primitive added to the
                 // channel must be wired here and update both.
-                let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
-                GraphRegistry::remove_endpoint(&mut graph.publishers, &data.topic, &data.gid);
+                {
+                    let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
+                    GraphRegistry::remove_endpoint(&mut graph.publishers, &data.topic, &data.gid);
+                }
+                unlist_from_graph_registry(rt, &data.topic, &data.type_name);
             }
             runtime::notify_graph_change();
             // Principle #3: the adopted/copied totals'
@@ -2801,6 +2916,8 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 &node_data.name,
             );
         }
+        let data_ref = &*((*ptr).data as *const SubscriptionData);
+        list_on_graph_registry(rt, &data_ref.topic, &data_ref.type_name);
         runtime::notify_graph_change();
         ptr
     })
@@ -2873,8 +2990,15 @@ pub unsafe extern "C" fn rmw_destroy_subscription(
                 crate::adopt_take::retire_stats(&adopt.stats);
             }
             if let Ok(rt) = runtime::runtime() {
-                let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
-                GraphRegistry::remove_endpoint(&mut graph.subscriptions, &data.topic, &data.gid);
+                {
+                    let mut graph = rt.graph.write().unwrap_or_else(|e| e.into_inner());
+                    GraphRegistry::remove_endpoint(
+                        &mut graph.subscriptions,
+                        &data.topic,
+                        &data.gid,
+                    );
+                }
+                unlist_from_graph_registry(rt, &data.topic, &data.type_name);
             }
             runtime::notify_graph_change();
         }

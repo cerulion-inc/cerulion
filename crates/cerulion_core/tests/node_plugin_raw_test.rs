@@ -875,3 +875,653 @@ fn host_sink_panic_keeps_native_minus_six_detail_without_latching() {
         node.shutdown().unwrap();
     }
 }
+
+#[test]
+fn raw_frame_second_commit_on_block_output_returns_named_error_and_preserves_depth() {
+    use cerulion_core::credit::CreditWord;
+    use cerulion_core::error::TransportError;
+    use cerulion_core::graph::node::AnyPublisher;
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+
+    type Text = native_ros2_messages::std_msgs::String;
+
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(777);
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "node_plugin_raw_block_dup".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        iceoryx_test_config(),
+    )
+    .unwrap();
+
+    let word_a = CreditWord::local(1);
+    let word_b = CreditWord::local(1);
+    let word_spill = CreditWord::local(2);
+
+    let mut pub_a = manager
+        .create_publisher("abi/raw/block/a", MaxSliceLen::try_new(64).unwrap(), 0)
+        .unwrap();
+    pub_a.register_block_outstanding_named_for_test(word_a.clone(), "consumer", "inp_a");
+    let mut pub_b = manager
+        .create_publisher("abi/raw/block/b", MaxSliceLen::try_new(64).unwrap(), 0)
+        .unwrap();
+    pub_b.register_block_outstanding_named_for_test(word_b.clone(), "consumer", "inp_b");
+    let pub_free = manager
+        .create_publisher("abi/raw/free", MaxSliceLen::try_new(64).unwrap(), 0)
+        .unwrap();
+    let mut pub_spill = manager
+        .create_publisher(
+            "abi/raw/block/spill",
+            MaxSliceLen::try_new(4096).unwrap(),
+            0,
+        )
+        .unwrap();
+    pub_spill.register_block_outstanding_named_for_test(
+        word_spill.clone(),
+        "spill_consumer",
+        "text_in",
+    );
+
+    let mut sub_a = manager.create_subscriber("abi/raw/block/a").unwrap();
+    let mut sub_b = manager.create_subscriber("abi/raw/block/b").unwrap();
+    let sub_free = manager.create_subscriber("abi/raw/free").unwrap();
+    let mut sub_spill = manager.create_subscriber("abi/raw/block/spill").unwrap();
+
+    let mut publishers = IndexMap::new();
+    publishers.insert("blk_a".into(), AnyPublisher::Ipc(pub_a));
+    publishers.insert("blk_b".into(), AnyPublisher::Ipc(pub_b));
+    publishers.insert("free_out".into(), AnyPublisher::Ipc(pub_free));
+    publishers.insert("spill_blk".into(), AnyPublisher::Ipc(pub_spill));
+
+    let env = Arc::new(HashMap::new());
+    let mut native = NodeContext::with_runtime_env(
+        publishers,
+        IndexMap::new(),
+        clock,
+        ShutdownSignal::new(),
+        env.clone(),
+    );
+    native.set_transport(manager.clone());
+    native.set_node_id_for_test("raw_producer");
+
+    let vec_layout = PluginWireLayout {
+        schema_hash: Vector3::SCHEMA_HASH,
+        fixed_size: 24,
+        variable_fields: 0,
+        alignment: 8,
+    };
+    let text_layout = PluginWireLayout {
+        schema_hash: Text::SCHEMA_HASH,
+        fixed_size: Text::WIRE_FIXED_SIZE as u32,
+        variable_fields: Text::VARIABLE_FIELD_COUNT as u32,
+        alignment: 8,
+    };
+    let specs = vec![
+        HostPortSpec {
+            name: "blk_a".into(),
+            direction: LeaseDirection::Write,
+            layout: vec_layout,
+            read_mode: 0,
+            accumulate_cap: None,
+        },
+        HostPortSpec {
+            name: "blk_b".into(),
+            direction: LeaseDirection::Write,
+            layout: vec_layout,
+            read_mode: 0,
+            accumulate_cap: None,
+        },
+        HostPortSpec {
+            name: "free_out".into(),
+            direction: LeaseDirection::Write,
+            layout: vec_layout,
+            read_mode: 0,
+            accumulate_cap: None,
+        },
+        HostPortSpec {
+            name: "spill_blk".into(),
+            direction: LeaseDirection::Write,
+            layout: text_layout,
+            read_mode: 0,
+            accumulate_cap: None,
+        },
+    ];
+    let context = ContextHandle {
+        value: register_context(HostContext::new(native, specs, env, 4).unwrap()).unwrap(),
+    };
+    // SAFETY (U05): process HOST_API and registered context outlive client and plugin.
+    let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+    let info = DylibNodeEntry::parse_info_json_labeled(
+        &format!(
+            r#"{{"inputs":[],"outputs":[{{"name":"blk_a","schema_hash":{vec},"max_slice_len_default":64}},{{"name":"blk_b","schema_hash":{vec},"max_slice_len_default":64}},{{"name":"free_out","schema_hash":{vec},"max_slice_len_default":64}},{{"name":"spill_blk","schema_hash":{text},"max_slice_len_default":4096}}],"policy":{{"period_ms":1}}}}"#,
+            vec = Vector3::SCHEMA_HASH,
+            text = Text::SCHEMA_HASH
+        ),
+        "raw block dup",
+    )
+    .unwrap();
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    let mut plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+
+    let write_vec3 = |bytes: &mut [u8], vals: [f64; 3]| {
+        let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
+        header.total_size = 64;
+        header.offset_table_offset = 64;
+        header.write_to_buf(bytes);
+        for (i, v) in vals.into_iter().enumerate() {
+            bytes[40 + i * 8..48 + i * 8].copy_from_slice(&v.to_le_bytes());
+        }
+    };
+
+    // Fire 1: one commit on blk_a, one commit on distinct block output blk_b,
+    // three commits on non-block free_out, plus refused 2nd and 3rd commits on blk_a.
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    {
+        let mut loan = plugin
+            .publisher_mut("blk_a")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        write_vec3(loan.bytes_mut(), [1.0, 2.0, 3.0]);
+        loan.commit().unwrap();
+    }
+    assert_eq!(word_a.outstanding(), 1);
+
+    // Distinct block output on the same node in the same fire succeeds.
+    {
+        let mut loan = plugin
+            .publisher_mut("blk_b")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        write_vec3(loan.bytes_mut(), [10.0, 20.0, 30.0]);
+        loan.commit().unwrap();
+    }
+    assert_eq!(word_b.outstanding(), 1);
+
+    // Non-block output on the same node commits multiple frames in one fire unchanged.
+    for k in 0..3 {
+        let mut loan = plugin
+            .publisher_mut("free_out")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        let base = (k as f64) + 100.0;
+        write_vec3(loan.bytes_mut(), [base, base + 1.0, base + 2.0]);
+        loan.commit().unwrap();
+    }
+
+    // Second and adversarial third commit on blk_a in the same fire fail with named error.
+    let expected_a_err = "node 'raw_producer' output 'blk_a' on topic 'abi/raw/block/a' already committed a frame in this fire; block consumer 'consumer.inp_a' allows at most one commit per output per fire";
+    for bad in [[9.0, 9.0, 9.0], [8.0, 8.0, 8.0]] {
+        let mut loan = plugin
+            .publisher_mut("blk_a")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        write_vec3(loan.bytes_mut(), bad);
+        let err = loan.commit().unwrap_err();
+        let TransportError::HostServiceFailed { reason } = err else {
+            panic!("expected HostServiceFailed, got {err:?}");
+        };
+        assert_eq!(reason, expected_a_err);
+        assert!(!client.has_failure());
+        assert_eq!(
+            with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+            0
+        );
+        assert_eq!(word_a.outstanding(), 1);
+    }
+
+    // Verify exact delivered frames: blk_a received only frame 1, blk_b received its frame,
+    // free_out received all 3 frames.
+    let view_a = sub_a
+        .view_raw_expecting(Vector3::SCHEMA_HASH)
+        .unwrap()
+        .expect("blk_a frame 1 delivered");
+    assert_eq!(view_a.header().sequence, 0);
+    assert_eq!(&view_a[40..48], &1.0f64.to_le_bytes());
+    assert_eq!(&view_a[48..56], &2.0f64.to_le_bytes());
+    assert_eq!(&view_a[56..64], &3.0f64.to_le_bytes());
+    drop(view_a);
+    assert!(sub_a
+        .view_raw_expecting(Vector3::SCHEMA_HASH)
+        .unwrap()
+        .is_none());
+    word_a.record_drained(1);
+
+    let view_b = sub_b
+        .view_raw_expecting(Vector3::SCHEMA_HASH)
+        .unwrap()
+        .expect("blk_b frame delivered");
+    assert_eq!(view_b.header().sequence, 0);
+    assert_eq!(&view_b[40..48], &10.0f64.to_le_bytes());
+    drop(view_b);
+    word_b.record_drained(1);
+
+    let mut free_frames = Vec::new();
+    let drained_free = sub_free
+        .try_receive(|msg| {
+            let x = f64::from_le_bytes(msg.payload()[0..8].try_into().unwrap());
+            free_frames.push((msg.header().sequence, x));
+        })
+        .unwrap();
+    assert_eq!(drained_free, 3);
+    assert_eq!(free_frames, vec![(0, 100.0), (1, 101.0), (2, 102.0)]);
+
+    // Fire 2: discarding a loan before committing once on blk_a in the same fire succeeds.
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    {
+        let discarded = plugin
+            .publisher_mut("blk_a")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        drop(discarded);
+    }
+    {
+        let mut loan = plugin
+            .publisher_mut("blk_a")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        write_vec3(loan.bytes_mut(), [4.0, 5.0, 6.0]);
+        loan.commit().unwrap();
+    }
+    assert_eq!(word_a.outstanding(), 1);
+    let view_a2 = sub_a
+        .view_raw_expecting(Vector3::SCHEMA_HASH)
+        .unwrap()
+        .expect("blk_a fire 2 frame delivered");
+    assert_eq!(view_a2.header().sequence, 1);
+    assert_eq!(&view_a2[40..48], &4.0f64.to_le_bytes());
+    assert_eq!(&view_a2[48..56], &5.0f64.to_le_bytes());
+    assert_eq!(&view_a2[56..64], &6.0f64.to_le_bytes());
+    drop(view_a2);
+    word_a.record_drained(1);
+
+    // Adaptive spill refusal path through RawFrameLoan::commit: warm up sizer
+    // with small frames across fires, then commit 1 small + 1 large spill in one fire.
+    let write_text_header = |bytes: &mut [u8], total_size: u32| {
+        let mut header = WireHeader::new(Text::SCHEMA_HASH, 0, 0);
+        header.total_size = total_size;
+        header.offset_table_offset = WireHeader::SIZE as u32;
+        header.offset_table_count = Text::VARIABLE_FIELD_COUNT as u32;
+        header.write_to_buf(bytes);
+    };
+    let warmup = cerulion_core::transport::adaptive_sizer::WINDOW_SIZE as u32;
+    for seq in 0..warmup {
+        with_context(context.value, HostContext::begin_fire).unwrap();
+        let mut loan = plugin
+            .publisher_mut("spill_blk")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Text>(), 48)
+            .unwrap();
+        write_text_header(loan.bytes_mut(), 48);
+        loan.commit().unwrap();
+        let view = sub_spill
+            .view_raw_expecting(Text::SCHEMA_HASH)
+            .unwrap()
+            .expect("spill warmup frame");
+        assert_eq!(view.header().sequence, seq);
+        drop(view);
+        word_spill.record_drained(1);
+    }
+
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    {
+        let mut first = plugin
+            .publisher_mut("spill_blk")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Text>(), 56)
+            .unwrap();
+        write_text_header(first.bytes_mut(), 56);
+        first.bytes_mut()[40..44].copy_from_slice(&8u32.to_le_bytes());
+        first.bytes_mut()[44..48].copy_from_slice(&8u32.to_le_bytes());
+        first.bytes_mut()[48..56].copy_from_slice(b"keep-one");
+        first.commit().unwrap();
+    }
+    assert_eq!(word_spill.outstanding(), 1);
+    {
+        let mut spill = plugin
+            .publisher_mut("spill_blk")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Text>(), 3040)
+            .unwrap();
+        let bytes = spill.bytes_mut();
+        bytes[40..44].copy_from_slice(&8u32.to_le_bytes());
+        bytes[44..48].copy_from_slice(&2992u32.to_le_bytes());
+        bytes[48..3040].fill(0x5a);
+        let err = spill.commit().unwrap_err();
+        let TransportError::HostServiceFailed { reason } = err else {
+            panic!("expected HostServiceFailed on duplicate spill, got {err:?}");
+        };
+        assert_eq!(
+            reason,
+            "node 'raw_producer' output 'spill_blk' on topic 'abi/raw/block/spill' already committed a frame in this fire; block consumer 'spill_consumer.text_in' allows at most one commit per output per fire"
+        );
+    }
+    assert!(!client.has_failure());
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.outstanding_leases())).unwrap(),
+        0
+    );
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.invariant_failures())).unwrap(),
+        0
+    );
+    assert_eq!(word_spill.outstanding(), 1);
+    let kept = sub_spill
+        .view_raw_expecting(Text::SCHEMA_HASH)
+        .unwrap()
+        .expect("first spill_blk frame preserved");
+    assert_eq!(kept.header().sequence, warmup);
+    assert_eq!(&kept[48..56], b"keep-one");
+    drop(kept);
+    assert!(sub_spill
+        .view_raw_expecting(Text::SCHEMA_HASH)
+        .unwrap()
+        .is_none());
+
+    drop(plugin);
+    drop(client);
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    remove_context(context.value).unwrap();
+}
+
+#[test]
+fn raw_frame_duplicate_block_commit_refusal_is_deterministic() {
+    use cerulion_core::credit::CreditWord;
+    use cerulion_core::error::TransportError;
+    use cerulion_core::graph::node::AnyPublisher;
+    use cerulion_core::graph::node_host_abi::{HostLeaseCounters, HostPortSpec};
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+
+    let run_once = || -> (String, Vec<u8>, u64, HostLeaseCounters) {
+        let clock = Arc::new(VirtualClock::new());
+        clock.set(1_234_567);
+        let manager = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "node_plugin_raw_block_det".into(),
+                clock: clock.clone(),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            iceoryx_test_config(),
+        )
+        .unwrap();
+        let word = CreditWord::local(1);
+        let mut publisher = manager
+            .create_publisher("abi/raw/block/det", MaxSliceLen::try_new(64).unwrap(), 0)
+            .unwrap();
+        publisher.register_block_outstanding_named_for_test(word.clone(), "sink", "in_vec");
+        let mut subscriber = manager.create_subscriber("abi/raw/block/det").unwrap();
+        let mut publishers = IndexMap::new();
+        publishers.insert("out".into(), AnyPublisher::Ipc(publisher));
+        let env = Arc::new(HashMap::new());
+        let mut native = NodeContext::with_runtime_env(
+            publishers,
+            IndexMap::new(),
+            clock,
+            ShutdownSignal::new(),
+            env.clone(),
+        );
+        native.set_transport(manager.clone());
+        native.set_node_id_for_test("det_producer");
+        let specs = vec![HostPortSpec {
+            name: "out".into(),
+            direction: LeaseDirection::Write,
+            layout: PluginWireLayout {
+                schema_hash: Vector3::SCHEMA_HASH,
+                fixed_size: 24,
+                variable_fields: 0,
+                alignment: 8,
+            },
+            read_mode: 0,
+            accumulate_cap: None,
+        }];
+        let context = ContextHandle {
+            value: register_context(HostContext::new(native, specs, env, 2).unwrap()).unwrap(),
+        };
+        // SAFETY (U05): process HOST_API and registered context outlive client and plugin.
+        let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+        let info = DylibNodeEntry::parse_info_json_labeled(
+            &format!(
+                r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":{},"max_slice_len_default":64}}],"policy":{{"period_ms":1}}}}"#,
+                Vector3::SCHEMA_HASH
+            ),
+            "raw block det",
+        )
+        .unwrap();
+        with_context(context.value, HostContext::begin_node_call).unwrap();
+        let mut plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+        with_context(context.value, HostContext::begin_fire).unwrap();
+
+        let write_vec3_header = |bytes: &mut [u8]| {
+            let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
+            header.total_size = 64;
+            header.offset_table_offset = 64;
+            header.write_to_buf(bytes);
+        };
+        let mut first = plugin
+            .publisher_mut("out")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        write_vec3_header(first.bytes_mut());
+        first.bytes_mut()[40..48].copy_from_slice(&1.5f64.to_le_bytes());
+        first.bytes_mut()[48..56].copy_from_slice(&(-2.5f64).to_le_bytes());
+        first.bytes_mut()[56..64].copy_from_slice(&3.5f64.to_le_bytes());
+        first.commit().unwrap();
+
+        let mut second = plugin
+            .publisher_mut("out")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        write_vec3_header(second.bytes_mut());
+        second.bytes_mut()[40..48].copy_from_slice(&99.0f64.to_le_bytes());
+        let TransportError::HostServiceFailed { reason } = second.commit().unwrap_err() else {
+            panic!("expected HostServiceFailed");
+        };
+
+        let frame = subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .expect("first frame delivered");
+        let delivered_bytes = frame[..].to_vec();
+        drop(frame);
+        let outstanding = word.outstanding();
+        let counters = with_context(context.value, |host| Ok(host.counters())).unwrap();
+        drop(plugin);
+        drop(client);
+        with_context(context.value, HostContext::end_node_call).unwrap();
+        remove_context(context.value).unwrap();
+        (reason, delivered_bytes, outstanding, counters)
+    };
+
+    let first = run_once();
+    let second = run_once();
+    assert_eq!(first, second);
+    // Independently check against hand-written oracle values.
+    assert_eq!(
+        first.0,
+        "node 'det_producer' output 'out' on topic 'abi/raw/block/det' already committed a frame in this fire; block consumer 'sink.in_vec' allows at most one commit per output per fire"
+    );
+    assert_eq!(first.1.len(), 64);
+    let hdr = WireHeader::read_from_buf(&first.1).unwrap();
+    assert_eq!(
+        (
+            hdr.schema_hash,
+            hdr.sequence,
+            hdr.timestamp_ns,
+            hdr.total_size
+        ),
+        (Vector3::SCHEMA_HASH, 0, 1_234_567, 64)
+    );
+    assert_eq!(&first.1[40..48], &1.5f64.to_le_bytes());
+    assert_eq!(&first.1[48..56], &(-2.5f64).to_le_bytes());
+    assert_eq!(&first.1[56..64], &3.5f64.to_le_bytes());
+    assert_eq!(first.2, 1);
+    assert_eq!(
+        first.3,
+        HostLeaseCounters {
+            committed: 1,
+            discarded: 0,
+            released: 0,
+            spills: 0,
+        }
+    );
+}
+
+#[test]
+fn raw_frame_block_output_commits_in_shutdown_call_after_last_tick_are_sent() {
+    use cerulion_core::credit::CreditWord;
+    use cerulion_core::error::TransportError;
+    use cerulion_core::graph::node::AnyPublisher;
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(4_200);
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "node_plugin_raw_block_shutdown".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 8,
+            network: None,
+        },
+        iceoryx_test_config(),
+    )
+    .unwrap();
+    let word = CreditWord::local(3);
+    let mut publisher = manager
+        .create_publisher(
+            "abi/raw/block/shutdown",
+            MaxSliceLen::try_new(64).unwrap(),
+            0,
+        )
+        .unwrap();
+    publisher.register_block_outstanding_named_for_test(word.clone(), "sink", "status_in");
+    let mut subscriber = manager.create_subscriber("abi/raw/block/shutdown").unwrap();
+    let mut publishers = IndexMap::new();
+    publishers.insert("status".into(), AnyPublisher::Ipc(publisher));
+    let env = Arc::new(HashMap::new());
+    let mut native = NodeContext::with_runtime_env(
+        publishers,
+        IndexMap::new(),
+        clock,
+        ShutdownSignal::new(),
+        env.clone(),
+    );
+    native.set_transport(manager.clone());
+    native.set_node_id_for_test("status_node");
+    let specs = vec![HostPortSpec {
+        name: "status".into(),
+        direction: LeaseDirection::Write,
+        layout: PluginWireLayout {
+            schema_hash: Vector3::SCHEMA_HASH,
+            fixed_size: 24,
+            variable_fields: 0,
+            alignment: 8,
+        },
+        read_mode: 0,
+        accumulate_cap: None,
+    }];
+    let context = ContextHandle {
+        value: register_context(HostContext::new(native, specs, env, 2).unwrap()).unwrap(),
+    };
+    // SAFETY (U05): process HOST_API and registered context outlive client and plugin.
+    let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+    let info = DylibNodeEntry::parse_info_json_labeled(
+        &format!(
+            r#"{{"inputs":[],"outputs":[{{"name":"status","schema_hash":{},"max_slice_len_default":64}}],"policy":{{"period_ms":1}}}}"#,
+            Vector3::SCHEMA_HASH
+        ),
+        "raw block shutdown",
+    )
+    .unwrap();
+    let commit = |plugin: &mut PluginContext, x: f64| -> Result<(), TransportError> {
+        let mut loan = plugin
+            .publisher_mut("status")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        let bytes = loan.bytes_mut();
+        let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
+        header.total_size = 64;
+        header.offset_table_offset = 64;
+        header.write_to_buf(bytes);
+        bytes[40..48].copy_from_slice(&x.to_le_bytes());
+        bytes[48..64].fill(0);
+        loan.commit()
+    };
+    // A raw view drains to the newest frame, so each check follows one commit.
+    let mut received = |sequence: u32, x: f64| {
+        let view = subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .expect("status frame delivered");
+        assert_eq!(view.header().sequence, sequence);
+        assert_eq!(&view[40..48], &x.to_le_bytes());
+        drop(view);
+        assert!(subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .is_none());
+    };
+
+    // Init call: no fire is open, so the per-fire limit does not apply.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    let mut plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+    with_context(context.value, HostContext::end_node_call).unwrap();
+
+    // Last tick: one commit inside the fire, as the tick path opens it.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    commit(&mut plugin, 1.0).unwrap();
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    received(0, 1.0);
+    word.record_drained(1);
+    assert_eq!(word.outstanding(), 0);
+
+    // Shutdown call after the last tick: no fire is open, so both final
+    // status frames are sent while the queue has room.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    commit(&mut plugin, 2.0).unwrap();
+    received(1, 2.0);
+    commit(&mut plugin, 3.0).unwrap();
+    received(2, 3.0);
+    assert!(!client.has_failure());
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    assert_eq!(word.outstanding(), 2);
+    word.record_drained(2);
+
+    // A later fire opens the window again and refuses its second commit.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    commit(&mut plugin, 4.0).unwrap();
+    let TransportError::HostServiceFailed { reason } = commit(&mut plugin, 5.0).unwrap_err() else {
+        panic!("expected HostServiceFailed on the second commit in a fire");
+    };
+    assert_eq!(
+        reason,
+        "node 'status_node' output 'status' on topic 'abi/raw/block/shutdown' already committed a frame in this fire; block consumer 'sink.status_in' allows at most one commit per output per fire"
+    );
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    assert_eq!(word.outstanding(), 1);
+    received(3, 4.0);
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.counters().committed)).unwrap(),
+        4
+    );
+
+    drop(plugin);
+    drop(client);
+    remove_context(context.value).unwrap();
+}

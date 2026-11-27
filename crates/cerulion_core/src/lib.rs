@@ -850,7 +850,23 @@ pub mod wire;
 /// Compiler-independent node table; legacy Rust boundaries require a rebuild.
 ///
 /// v33: host-side per-consumer `block` credit slots; the stable node table is unchanged.
-pub const CERULION_ABI_VERSION: u32 = 33;
+///
+/// v34: `DueShape::Pops` gains `peek: bool` inside existing tail padding so a
+/// replay read gate distinguishes recorded per-set `Sync` matcher peeks from
+/// drains; the stable node table is unchanged.
+///
+/// v35: a single-frame take (`CerulionSubscriber::try_receive_one` and its
+/// owned twin) on a graph-wired input is a recorded read (`trace_format` 13):
+/// it consults the replay read gate, stages its read record and pays the
+/// `block` credit word. `ReadOutcomeStage` gains `records_single_takes`, the
+/// rule a replay adopts from the bag's trace format,
+/// `OwnedInboundSample` gains `origin`, the writer stream key of a fed take,
+/// and `ReadOutcomeKind` gains `Taken` (9), the record a take stages.
+/// The take paths run inside a node library, so a library built against an
+/// earlier core reads the stage at stale offsets and takes without recording.
+///
+///   **OPERATOR COST: every node crate must be rebuilt against this core.**
+pub const CERULION_ABI_VERSION: u32 = 35;
 
 // Re-export commonly used types
 #[cfg(unix)]

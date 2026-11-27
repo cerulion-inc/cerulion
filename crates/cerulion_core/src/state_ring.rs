@@ -521,11 +521,62 @@ impl StateChunker {
         self.next_part
     }
 
+    /// Bytes currently held in the inline buffer of the record not yet emitted.
+    pub(crate) fn filled(&self) -> usize {
+        self.filled
+    }
+
+    /// Fallible counterpart to [`append`](Self::append): stops immediately and
+    /// returns `false` if `emit` refuses a full record, leaving `next_part`
+    /// equal to the exact count of records accepted.
+    pub(crate) fn try_append(
+        &mut self,
+        mut bytes: &[u8],
+        emit: &mut impl FnMut(&[u8; STATE_RECORD_SIZE as usize]) -> bool,
+    ) -> bool {
+        while !bytes.is_empty() {
+            if self.filled == STATE_RECORD_PAYLOAD
+                && !self.try_emit_buffered(RECORD_KIND_CHUNK_V2, emit)
+            {
+                return false;
+            }
+            let n = (STATE_RECORD_PAYLOAD - self.filled).min(bytes.len());
+            self.buf[self.filled..self.filled + n].copy_from_slice(&bytes[..n]);
+            self.filled += n;
+            bytes = &bytes[n..];
+        }
+        true
+    }
+
+    /// Fallible counterpart to [`finish`](Self::finish): returns `None` if
+    /// `emit` refuses the final record.
+    pub(crate) fn try_finish(
+        mut self,
+        emit: &mut impl FnMut(&[u8; STATE_RECORD_SIZE as usize]) -> bool,
+    ) -> Option<u32> {
+        if !self.try_emit_buffered(RECORD_KIND_FINAL_V2, emit) {
+            return None;
+        }
+        Some(self.next_part)
+    }
+
     fn emit_buffered(
         &mut self,
         kind: u32,
         emit: &mut impl FnMut(&[u8; STATE_RECORD_SIZE as usize]),
     ) {
+        let accepted = self.try_emit_buffered(kind, &mut |record| {
+            emit(record);
+            true
+        });
+        debug_assert!(accepted);
+    }
+
+    fn try_emit_buffered(
+        &mut self,
+        kind: u32,
+        emit: &mut impl FnMut(&[u8; STATE_RECORD_SIZE as usize]) -> bool,
+    ) -> bool {
         let header = StateRecordHeader {
             run_id: self.run_id,
             step: self.step,
@@ -536,9 +587,12 @@ impl StateChunker {
             rank: self.rank,
             format_version: STATE_RECORD_FORMAT_VERSION,
         };
-        emit(&encode_record(&header, &self.buf[..self.filled]));
+        if !emit(&encode_record(&header, &self.buf[..self.filled])) {
+            return false;
+        }
         self.next_part += 1;
         self.filled = 0;
+        true
     }
 }
 
@@ -1574,6 +1628,27 @@ impl StateRingProducer {
         }
     }
 
+    /// Open a non-blocking, budgeted [`TryStateRingSink`] for one node's state
+    /// at one anchor step.
+    ///
+    /// At most `budget_records` records are pushed for this anchor, including
+    /// the final record, and no push ever waits for the consumer.
+    pub fn try_sink(
+        &mut self,
+        step: u64,
+        node_idx: u32,
+        budget_records: u64,
+    ) -> TryStateRingSink<'_> {
+        let run_id = self.run_id;
+        let rank = self.rank;
+        TryStateRingSink {
+            chunker: StateChunker::new(run_id, step, node_idx, rank),
+            producer: self,
+            budget_records,
+            refused: false,
+        }
+    }
+
     /// Publish a SKIP record naming why this anchor (or this node's part of it) was
     /// voided.
     pub fn push_skip(&mut self, step: u64, node_idx: u32, cause: SkipCause, detail: &str) {
@@ -1639,9 +1714,31 @@ impl StateRingProducer {
         self.inner.push(record);
     }
 
+    /// Publish one pre-built record ONLY if it needs no wait: returns `true`
+    /// when the record was published and `false` when the backpressure ring has
+    /// no free slot.
+    ///
+    /// Enforces the same debug-build rank contract as [`push_record`](Self::push_record).
+    pub fn try_push_record(&mut self, record: &[u8; STATE_RECORD_SIZE as usize]) -> bool {
+        debug_assert!(
+            {
+                let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+                hb.copy_from_slice(&record[..STATE_RECORD_HEADER_SIZE]);
+                StateRecordHeader::from_bytes(&hb).rank == self.rank
+            },
+            "a record published on this producer must carry its own rank"
+        );
+        self.inner.try_push(record)
+    }
+
     /// The run every record from this producer carries.
     pub fn run_id(&self) -> u64 {
         self.run_id
+    }
+
+    /// Ring capacity in records.
+    pub fn capacity(&self) -> u64 {
+        self.inner.capacity()
     }
 
     /// Total records published so far.
@@ -1703,8 +1800,9 @@ impl StateRingProducer {
 ///
 /// # Which path this sink serves, and why it is UNBUDGETED
 ///
-/// The design has two sinks feeding ONE encoder and emitting IDENTICAL bytes, so
-/// which carrier a node took is invisible in the bag:
+/// The design has three sinks feeding ONE encoder and emitting IDENTICAL bytes, so
+/// which carrier a node took is invisible in the bag (the third, [`TryStateRingSink`],
+/// is the direct stream's, budgeted and never waiting, for a runtime that cannot fork):
 ///
 /// - the INLINE carrier's `BoundedSink` — a hard `CAPTURE_INLINE_BUDGET_BYTES`
 ///   capacity over a pre-allocated arena, shared across the boundary's nodes, which
@@ -1777,6 +1875,99 @@ impl crate::state::StateSink for StateRingSink<'_> {
     fn write(&mut self, bytes: &[u8]) -> Result<(), crate::state::SinkFull> {
         self.append(bytes);
         Ok(())
+    }
+}
+
+/// A non-blocking, record-budgeted capture sink over the state ring.
+///
+/// Serves the direct capture stream on an executor unit thread: every push uses
+/// [`StateRingProducer::try_push_record`] (never waiting on a slow or dead
+/// recorder), and every write is checked up front against the remaining record
+/// budget (always keeping one record for the final record).
+///
+/// Once a write exceeds the budget, a ring push returns `false`, or
+/// [`refuse`](crate::state::StateSink::refuse) is called, refusal latches:
+/// every later write and [`finish`](Self::finish) return
+/// [`SinkFull`](crate::state::SinkFull) without pushing another record.
+/// Dropping without [`finish`](Self::finish) leaves any already-pushed records
+/// as a truncated anchor that a subsequent SKIP record voids.
+#[derive(Debug)]
+#[must_use = "a sink that is never written to and never finished records nothing"]
+pub struct TryStateRingSink<'a> {
+    chunker: StateChunker,
+    producer: &'a mut StateRingProducer,
+    budget_records: u64,
+    refused: bool,
+}
+
+impl TryStateRingSink<'_> {
+    fn records_left(&self) -> u64 {
+        self.budget_records
+            .saturating_sub(u64::from(self.chunker.parts_emitted()))
+    }
+
+    /// Whether this sink has latched a refusal.
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// How many records this sink has actually pushed into the state ring.
+    pub fn records_emitted(&self) -> u64 {
+        u64::from(self.chunker.parts_emitted())
+    }
+
+    /// Emit the tail as the FINAL record non-blockingly and return the anchor's
+    /// total part count.
+    ///
+    /// Returns [`SinkFull`](crate::state::SinkFull) without pushing if the sink
+    /// already refused, has no budget left for the final record, or the ring
+    /// refuses the push.
+    pub fn finish(self) -> Result<u32, crate::state::SinkFull> {
+        if self.refused || self.records_left() == 0 {
+            return Err(crate::state::SinkFull);
+        }
+        let Self {
+            chunker, producer, ..
+        } = self;
+        chunker
+            .try_finish(&mut |record| producer.try_push_record(record))
+            .ok_or(crate::state::SinkFull)
+    }
+}
+
+impl crate::state::StateSink for TryStateRingSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), crate::state::SinkFull> {
+        if self.refused {
+            return Err(crate::state::SinkFull);
+        }
+        let total = (self.chunker.filled() as u64).saturating_add(bytes.len() as u64);
+        if parts_for_len(total) > self.records_left() {
+            self.refused = true;
+            return Err(crate::state::SinkFull);
+        }
+        let Self {
+            chunker, producer, ..
+        } = self;
+        if !chunker.try_append(bytes, &mut |record| producer.try_push_record(record)) {
+            self.refused = true;
+            return Err(crate::state::SinkFull);
+        }
+        Ok(())
+    }
+
+    fn remaining_hint(&self) -> Option<usize> {
+        if self.refused {
+            return Some(0);
+        }
+        let bytes = self
+            .records_left()
+            .saturating_mul(STATE_RECORD_PAYLOAD as u64)
+            .saturating_sub(self.chunker.filled() as u64);
+        Some(usize::try_from(bytes).unwrap_or(usize::MAX))
+    }
+
+    fn refuse(&mut self) {
+        self.refused = true;
     }
 }
 
@@ -3322,5 +3513,389 @@ mod naming_tests {
         // A run whose rank 0 is the hole is still discovered — rank 0 is not
         // special to the walk.
         assert_eq!(sweep(&[1, 2]).0, vec![1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod try_sink_tests {
+    use super::*;
+    use crate::state::{CerulionState, SinkFull, StateError, StateSink};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TAG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_tag(label: &str) -> String {
+        let n = TAG_SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("cer_trysink_{label}_{}_{n}", std::process::id())
+    }
+
+    fn patterned(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 37 + 11) % 251) as u8).collect()
+    }
+
+    fn drain_raw_records(
+        consumer: &mut StateRingConsumer,
+    ) -> Vec<[u8; STATE_RECORD_SIZE as usize]> {
+        const RS: usize = STATE_RECORD_SIZE as usize;
+        let (a, b) = consumer.drain_slices().expect("no lap");
+        let records: Vec<[u8; RS]> = a
+            .as_chunks::<RS>()
+            .0
+            .iter()
+            .chain(b.as_chunks::<RS>().0)
+            .copied()
+            .collect();
+        let count = records.len() as u64;
+        consumer.commit(count).expect("commit");
+        records
+    }
+
+    fn header_of(rec: &[u8; STATE_RECORD_SIZE as usize]) -> StateRecordHeader {
+        let mut hb = [0u8; STATE_RECORD_HEADER_SIZE];
+        hb.copy_from_slice(&rec[..STATE_RECORD_HEADER_SIZE]);
+        StateRecordHeader::from_bytes(&hb)
+    }
+
+    #[test]
+    fn try_state_ring_sink_streams_1000_bytes_into_three_exact_records_without_waiting() {
+        let tag = unique_tag("1000b");
+        let mut owner = StateRingOwner::create(&tag, 8, 2, 0xA1, &["n0", "n1", "n2", "n3"])
+            .expect("create ring");
+        let name = owner.name().to_string();
+        let mut producer = owner.producer().expect("single producer");
+        let input = patterned(1_000);
+
+        {
+            let mut sink = producer.try_sink(9, 3, 4);
+            for chunk in input.chunks(137) {
+                sink.write(chunk).expect("within budget");
+            }
+            assert!(!sink.refused());
+            let parts = sink.finish().expect("finish within budget");
+            assert_eq!(parts, 3);
+        }
+
+        assert_eq!(producer.pushed(), 3);
+        assert_eq!(producer.backpressure_waits(), 0);
+        assert_eq!(producer.capacity(), 8);
+
+        let mut consumer = StateRingConsumer::open(&name).expect("open consumer");
+        let raw = drain_raw_records(&mut consumer);
+        assert_eq!(raw.len(), 3);
+
+        let expected_parts: &[(u32, u32, u32)] = &[
+            (0, RECORD_KIND_CHUNK_V2, 472),
+            (1, RECORD_KIND_CHUNK_V2, 472),
+            (2, RECORD_KIND_FINAL_V2, 56),
+        ];
+        for (rec, &(part, kind, len)) in raw.iter().zip(expected_parts) {
+            let h = header_of(rec);
+            assert_eq!(h.run_id, 0xA1);
+            assert_eq!(h.step, 9);
+            assert_eq!(h.node_idx, 3);
+            assert_eq!(h.part, part);
+            assert_eq!(h.kind, kind);
+            assert_eq!(h.len, len);
+            assert_eq!(h.rank, 2);
+            assert_eq!(h.format_version, STATE_RECORD_FORMAT_VERSION);
+        }
+
+        let mut asm = StateAssembler::passthrough();
+        let mut events = Vec::new();
+        for rec in &raw {
+            if let Some(ev) = asm.feed(rec) {
+                events.push(ev);
+            }
+        }
+        events.extend(asm.finish());
+        assert_eq!(
+            events,
+            vec![StateAnchorEvent::Complete {
+                run_id: 0xA1,
+                step: 9,
+                node_idx: 3,
+                parts: 3,
+                bytes: input,
+            }]
+        );
+    }
+
+    #[test]
+    fn try_state_ring_sink_944_bytes_emit_exactly_two_records_and_zero_budget_refuses() {
+        let tag = unique_tag("944b");
+        let mut owner = StateRingOwner::create(&tag, 8, 1, 0xB2, &["n0"]).expect("create ring");
+        let name = owner.name().to_string();
+        let mut producer = owner.producer().expect("single producer");
+        let input = patterned(944);
+
+        // Exact 2-record boundary: 944 = 2 * 472, no trailing empty record.
+        {
+            let mut sink = producer.try_sink(4, 0, 2);
+            sink.write(&input).expect("exact fit");
+            assert_eq!(sink.remaining_hint(), Some(0));
+            assert_eq!(sink.finish(), Ok(2));
+        }
+        assert_eq!(producer.pushed(), 2);
+        assert_eq!(producer.backpressure_waits(), 0);
+
+        // Zero-byte anchor with a 1-record budget emits one empty FINAL record.
+        {
+            let sink = producer.try_sink(5, 0, 1);
+            assert_eq!(sink.finish(), Ok(1));
+        }
+        assert_eq!(producer.pushed(), 3);
+
+        // Zero-record budget refuses both write and finish with zero pushes.
+        {
+            let mut sink = producer.try_sink(6, 0, 0);
+            assert_eq!(sink.remaining_hint(), Some(0));
+            assert_eq!(sink.write(&[]), Err(SinkFull));
+            assert!(sink.refused());
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+        {
+            let sink = producer.try_sink(7, 0, 0);
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+        assert_eq!(producer.pushed(), 3);
+        assert_eq!(producer.backpressure_waits(), 0);
+
+        let mut consumer = StateRingConsumer::open(&name).expect("open");
+        let mut asm = StateAssembler::passthrough();
+        let mut events = Vec::new();
+        consumer.drain(&mut asm, &mut events).expect("drain");
+        events.extend(asm.finish());
+        assert_eq!(
+            events,
+            vec![
+                StateAnchorEvent::Complete {
+                    run_id: 0xB2,
+                    step: 4,
+                    node_idx: 0,
+                    parts: 2,
+                    bytes: input,
+                },
+                StateAnchorEvent::Complete {
+                    run_id: 0xB2,
+                    step: 5,
+                    node_idx: 0,
+                    parts: 1,
+                    bytes: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn try_state_ring_sink_budget_of_4_refuses_5_record_stream_and_latches() {
+        let tag = unique_tag("budget4");
+        let mut owner = StateRingOwner::create(&tag, 16, 0, 0xC3, &["n0"]).expect("create ring");
+        let name = owner.name().to_string();
+        let mut producer = owner.producer().expect("single producer");
+        let block = patterned(STATE_RECORD_PAYLOAD);
+
+        {
+            let mut sink = producer.try_sink(11, 0, 4);
+            for i in 0..4 {
+                sink.write(&block)
+                    .unwrap_or_else(|_| panic!("chunk {i} should fit in budget 4"));
+            }
+            assert!(!sink.refused());
+            assert_eq!(sink.records_emitted(), 3);
+            assert_eq!(sink.remaining_hint(), Some(0));
+
+            // 5th record exceeds the 4-record budget: refuses without pushing.
+            assert_eq!(sink.write(&block), Err(SinkFull));
+            assert!(sink.refused());
+            assert_eq!(sink.remaining_hint(), Some(0));
+            assert_eq!(sink.records_emitted(), 3);
+
+            // Latched: even a 1-byte write and finish are refused.
+            assert_eq!(sink.write(&[0x55]), Err(SinkFull));
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+
+        assert!(producer.pushed() <= 4);
+        assert_eq!(producer.pushed(), 3);
+        assert_eq!(producer.backpressure_waits(), 0);
+
+        let mut consumer = StateRingConsumer::open(&name).expect("open");
+        let mut asm = StateAssembler::passthrough();
+        let mut events = Vec::new();
+        consumer.drain(&mut asm, &mut events).expect("drain");
+        events.extend(asm.finish());
+        assert_eq!(
+            events,
+            vec![StateAnchorEvent::Torn {
+                run_id: 0xC3,
+                step: 11,
+                node_idx: 0,
+                cause: TornCause::Truncated { parts_seen: 3 },
+            }]
+        );
+    }
+
+    #[test]
+    fn try_state_ring_sink_refuses_when_ring_fills_inside_budget_without_waiting() {
+        let tag = unique_tag("ringfull");
+        let mut owner = StateRingOwner::create(&tag, 4, 0, 0xD4, &["n0"]).expect("create ring");
+        let mut producer = owner.producer().expect("single producer");
+
+        // Prefill 2 of the 4 ring slots so only 2 real slots remain.
+        let skip = encode_skip_record(0xD4, 1, 0, 0, SkipCause::Contended, "prefill");
+        assert!(producer.try_push_record(&skip));
+        assert!(producer.try_push_record(&skip));
+        assert_eq!(producer.free_records(), Some(2));
+
+        // Grant a budget larger than the ring's real room (10 > 2).
+        let block = patterned(STATE_RECORD_PAYLOAD);
+        {
+            let mut sink = producer.try_sink(2, 0, 10);
+            // First 472-byte write buffers without flushing (0 pushed).
+            assert_eq!(sink.write(&block), Ok(()));
+            // Second 472-byte write flushes part 0 (1 pushed, 1 free).
+            assert_eq!(sink.write(&block), Ok(()));
+            // Third 472-byte write flushes part 1 (2 pushed, 0 free).
+            assert_eq!(sink.write(&block), Ok(()));
+            assert_eq!(sink.records_emitted(), 2);
+            // Fourth 472-byte write attempts to flush part 2 into a full ring -> refuses without waiting.
+            assert_eq!(sink.write(&block), Err(SinkFull));
+            assert!(sink.refused());
+            assert_eq!(sink.records_emitted(), 2);
+            // Latched for later writes and finish.
+            assert_eq!(sink.write(&[1]), Err(SinkFull));
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+
+        // Also check finish() directly hitting a full ring with 0 free slots.
+        {
+            let mut sink = producer.try_sink(3, 0, 1);
+            assert_eq!(sink.write(&[0xAA, 0xBB]), Ok(()));
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+
+        assert_eq!(producer.pushed(), 4);
+        assert_eq!(producer.backpressure_waits(), 0);
+        assert_eq!(producer.backpressure_wait_timeouts(), 0);
+    }
+
+    #[test]
+    fn try_state_ring_sink_remaining_hint_and_hashmap_early_refusal_push_nothing() {
+        let tag = unique_tag("hint");
+        let mut owner = StateRingOwner::create(&tag, 8, 0, 0xE5, &["n0"]).expect("create ring");
+        let mut producer = owner.producer().expect("single producer");
+
+        // Hand-computed remaining_hint progression for a 2-record budget (944 bytes).
+        {
+            let mut sink = producer.try_sink(1, 0, 2);
+            assert_eq!(sink.remaining_hint(), Some(944));
+            sink.write(&[1u8; 100]).expect("100 bytes");
+            assert_eq!(sink.remaining_hint(), Some(844));
+            sink.write(&[2u8; 372]).expect("reaches 472 buffered");
+            assert_eq!(sink.remaining_hint(), Some(472));
+            assert_eq!(sink.records_emitted(), 0);
+            sink.write(&[3u8; 1])
+                .expect("flushes part 0, buffers 1 byte");
+            assert_eq!(sink.records_emitted(), 1);
+            assert_eq!(sink.remaining_hint(), Some(471));
+            sink.refuse();
+            assert!(sink.refused());
+            assert_eq!(sink.remaining_hint(), Some(0));
+            assert_eq!(sink.write(&[4u8]), Err(SinkFull));
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+        assert_eq!(producer.pushed(), 1);
+
+        // A HashMap with more entries than remaining_hint refuses early and pushes nothing.
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        for i in 0..500u32 {
+            map.insert(i, i.wrapping_mul(3));
+        }
+        let pushed_before = producer.pushed();
+        {
+            let mut sink = producer.try_sink(2, 0, 1);
+            assert_eq!(sink.remaining_hint(), Some(472));
+            let err = map
+                .cer_capture(&mut sink)
+                .expect_err("500-entry map exceeds 472-byte hint");
+            assert_eq!(err, StateError::SinkFull);
+            assert!(sink.refused());
+            assert_eq!(sink.records_emitted(), 0);
+            assert_eq!(sink.finish(), Err(SinkFull));
+        }
+        assert_eq!(producer.pushed(), pushed_before);
+        assert_eq!(producer.backpressure_waits(), 0);
+    }
+
+    #[test]
+    fn try_state_ring_sink_two_runs_emit_bit_identical_records_matching_oracle() {
+        let input = patterned(1_000);
+        // Hand-built oracle records from encode_record.
+        let oracle = vec![
+            encode_record(
+                &StateRecordHeader {
+                    run_id: 0xF6,
+                    step: 7,
+                    node_idx: 2,
+                    part: 0,
+                    kind: RECORD_KIND_CHUNK_V2,
+                    len: 472,
+                    rank: 3,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
+                },
+                &input[0..472],
+            ),
+            encode_record(
+                &StateRecordHeader {
+                    run_id: 0xF6,
+                    step: 7,
+                    node_idx: 2,
+                    part: 1,
+                    kind: RECORD_KIND_CHUNK_V2,
+                    len: 472,
+                    rank: 3,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
+                },
+                &input[472..944],
+            ),
+            encode_record(
+                &StateRecordHeader {
+                    run_id: 0xF6,
+                    step: 7,
+                    node_idx: 2,
+                    part: 2,
+                    kind: RECORD_KIND_FINAL_V2,
+                    len: 56,
+                    rank: 3,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
+                },
+                &input[944..1_000],
+            ),
+        ];
+
+        let run_once = |label: &str, chunk_size: usize| -> Vec<[u8; STATE_RECORD_SIZE as usize]> {
+            let tag = unique_tag(label);
+            let mut owner =
+                StateRingOwner::create(&tag, 8, 3, 0xF6, &["n0", "n1", "n2"]).expect("create ring");
+            let name = owner.name().to_string();
+            let mut producer = owner.producer().expect("single producer");
+            {
+                let mut sink = producer.try_sink(7, 2, 4);
+                for chunk in input.chunks(chunk_size) {
+                    sink.write(chunk).expect("write");
+                }
+                assert_eq!(sink.finish(), Ok(3));
+            }
+            assert_eq!(producer.backpressure_waits(), 0);
+            let mut consumer = StateRingConsumer::open(&name).expect("open");
+            drain_raw_records(&mut consumer)
+        };
+
+        let run_a = run_once("det_a", 13);
+        let run_b = run_once("det_b", 200);
+        assert_eq!(run_a, oracle);
+        assert_eq!(run_b, oracle);
+        assert_eq!(run_a, run_b);
     }
 }

@@ -116,7 +116,10 @@ pub use topology::{
     resolve_levels, CreditBar, CycleError, GraphTopology, Level, LevelGrowth, Levels,
     PacedTopicWarning, RefineInputs, TriggerEdges,
 };
-pub use validation::{validate_graph, validate_graph_with, ValidationOptions};
+pub use validation::{
+    check_sync_window_periods, validate_graph, validate_graph_with, SyncWindowKind,
+    SyncWindowPeriodWarning, ValidationOptions,
+};
 pub use waitset::{check_waitset_attachment_capacity, WAITSET_MAX_ATTACHMENTS};
 
 use crate::error::TransportResult;

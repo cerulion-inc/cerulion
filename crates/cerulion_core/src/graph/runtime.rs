@@ -304,6 +304,14 @@ pub struct CrossProcessWiring<'a> {
     /// the topics whose producer node this worker builds, because the
     /// worker's own topology holds only its subgraph's consumers.
     pub(crate) paced_topic_warnings: Option<&'a [super::topology::PacedTopicWarning]>,
+    /// The sync-window period warnings this build logs. `None` (every
+    /// single-process build): the build derives them from its own topology,
+    /// which is the whole graph. `Some(list)` (a multi-process worker): it logs
+    /// exactly `list`, the warnings its supervisor derived from the whole graph
+    /// for the Sync nodes this worker builds, because a worker's own topology
+    /// cannot resolve trigger producers in other process groups.
+    pub(crate) sync_window_period_warnings:
+        Option<&'a [super::validation::SyncWindowPeriodWarning]>,
 }
 
 impl<'a> CrossProcessWiring<'a> {
@@ -316,6 +324,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_consumed_topics: None,
             input_depth_floors: None,
             paced_topic_warnings: None,
+            sync_window_period_warnings: None,
         }
     }
 
@@ -334,6 +343,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_consumed_topics: None,
             input_depth_floors: None,
             paced_topic_warnings: None,
+            sync_window_period_warnings: None,
         }
     }
 
@@ -352,6 +362,7 @@ impl<'a> CrossProcessWiring<'a> {
             sibling_consumed_topics: None,
             input_depth_floors: None,
             paced_topic_warnings: None,
+            sync_window_period_warnings: None,
         }
     }
 
@@ -399,6 +410,19 @@ impl<'a> CrossProcessWiring<'a> {
         warnings: &'a [super::topology::PacedTopicWarning],
     ) -> Self {
         self.paced_topic_warnings = Some(warnings);
+        self
+    }
+
+    /// Log exactly `warnings` as this build's sync-window period warnings, in
+    /// place of the ones its own topology would give. Chained onto one of the
+    /// constructors above: a multi-process worker passes its plan's list (from
+    /// the supervisor's whole-graph check), and a replay pass passes an empty
+    /// slice so a replay logs none.
+    pub fn with_sync_window_period_warnings(
+        mut self,
+        warnings: &'a [super::validation::SyncWindowPeriodWarning],
+    ) -> Self {
+        self.sync_window_period_warnings = Some(warnings);
         self
     }
 
@@ -3420,6 +3444,18 @@ pub type AttachedForkCarrier = crate::graph::runtime::ForkCarrier;
 #[cfg(not(unix))]
 pub type AttachedForkCarrier = std::convert::Infallible;
 
+/// The direct capture stream's per-runtime state, alive only while this runtime is
+/// armed WITHOUT the fork carrier ([`GraphRuntime::attach_state_arm_no_fork`]).
+///
+/// Aliased for the same reason as [`AttachedForkCarrier`].
+#[cfg(unix)]
+pub type AttachedDirectCarrier = crate::state_carrier::DirectCarrier;
+
+/// Non-unix stub for [`AttachedDirectCarrier`], uninhabited: no anchor is taken
+/// there, so the slot can never be anything but `None`.
+#[cfg(not(unix))]
+pub type AttachedDirectCarrier = std::convert::Infallible;
+
 /// How many consecutive cadences a process will REMEMBER having
 /// skipped while its own capture child was still running.
 ///
@@ -3615,6 +3651,23 @@ impl crate::state_carrier::InlineCaptureTarget for NodeCaptureView<'_> {
         // specific encoding fault; the walk's overflow-versus-error split does not
         // depend on recognising `SinkFull` through this mapping, because it also
         // consults the sink's own `refused()` flag.
+        self.entry
+            .capture_state(sink)
+            .map_err(|e| crate::state::StateError::NodeCapture {
+                // hot-path-alloc-ok: cold: error-detail render on a state-capture failure arm
+                detail: e.to_string(),
+            })
+    }
+}
+
+#[cfg(unix)]
+impl crate::state_carrier::DirectCaptureTarget for NodeCaptureView<'_> {
+    fn capture_direct(
+        &self,
+        sink: &mut dyn crate::state::StateSink,
+    ) -> Result<(), crate::state::StateError> {
+        // Same mapping as the inline `capture`: the stream tells a budget refusal
+        // from an encoder error through the sink's own `refused()` flag.
         self.entry
             .capture_state(sink)
             .map_err(|e| crate::state::StateError::NodeCapture {
@@ -4684,7 +4737,8 @@ pub struct GraphRuntime {
     /// runtime carries no arena at all.
     capture_arena: Vec<u8>,
     /// The nodes the inline walk deferred, refilled every
-    /// anchor and reused across them (`walk_inline` CLEARS it).
+    /// anchor and reused across them (`walk_inline` CLEARS it). The set goes to the
+    /// fork carrier, or to the direct stream when `direct_carrier` is `Some`.
     capture_fork_set: Vec<(u32, CarrierForkReason)>,
     /// The fork carrier — the breadcrumb, the child setup and the
     /// reaper thread — or `None` (the default) while no recorder has armed this run.
@@ -4696,6 +4750,10 @@ pub struct GraphRuntime {
     /// `None` — "the bounded inline attempt does everything" stated in the type
     /// system rather than in a comment.
     fork_carrier: Option<AttachedForkCarrier>,
+    /// The direct capture stream, `Some` only while this runtime is armed without
+    /// fork. At most one of this slot and `fork_carrier` is `Some`: which one is
+    /// the carrier mode, so no separate mode flag can disagree with it.
+    direct_carrier: Option<AttachedDirectCarrier>,
     /// Principle #3 observable: how the last anchor's nodes split between the
     /// inline walk and the fork carrier — see [`Self::last_anchor_carriers`].
     last_anchor_carriers: Option<AnchorCarrierSplit>,
@@ -6386,6 +6444,22 @@ impl GraphRuntime {
             for warning in paced {
                 warning.log(config.identity());
             }
+            let derived_sync;
+            let sync_warnings: &[super::validation::SyncWindowPeriodWarning] =
+                match cross_process.sync_window_period_warnings {
+                    Some(planned) => planned,
+                    None => {
+                        derived_sync = super::validation::check_sync_window_periods(
+                            &config,
+                            &topology,
+                            &entry_infos,
+                        );
+                        &derived_sync
+                    }
+                };
+            for warning in sync_warnings {
+                warning.log();
+            }
         }
 
         // CHAIN FUSION, resolved once and logged once. The decision is the
@@ -7411,9 +7485,10 @@ impl GraphRuntime {
                 precreated_services.push(transport.precreate_topic_services(&flow.topic, cfg)?);
             }
         }
-        // topic → outstanding counters to register on that topic's publisher.
-        let mut pub_block_by_topic: HashMap<String, Vec<crate::credit::CreditWord>> =
-            HashMap::new();
+        // topic -> (outstanding counter, consumer node, consumer input) entries
+        // to register on that topic's publisher.
+        type PubBlockRegistration = (crate::credit::CreditWord, Arc<str>, Arc<str>);
+        let mut pub_block_by_topic: HashMap<String, Vec<PubBlockRegistration>> = HashMap::new();
         // (consumer node, input) → that consumer's outstanding counter.
         // `block`: consumer (node,input) → (outstanding mirror,
         // defer threshold, shared counters) — everything the consumer's
@@ -7647,7 +7722,11 @@ impl GraphRuntime {
                 pub_block_by_topic
                     .entry(flow.topic.clone())
                     .or_default()
-                    .push(outstanding.clone());
+                    .push((
+                        outstanding.clone(),
+                        Arc::from(edge.node_id.as_str()),
+                        Arc::from(edge.input.as_str()),
+                    ));
                 sub_block_by_input.insert(
                     (edge.node_id.clone(), edge.input.clone()),
                     (outstanding.clone(), threshold as u64, Arc::clone(&counters)),
@@ -7929,7 +8008,11 @@ impl GraphRuntime {
                 pub_block_by_topic
                     .entry(binding.topic.clone())
                     .or_default()
-                    .push(word.clone());
+                    .push((
+                        word.clone(),
+                        Arc::from(binding.consumer_node.as_str()),
+                        Arc::from(binding.consumer_input.as_str()),
+                    ));
                 // Each producer of the edge publishes through its own
                 // connection into the consumer's input (at most 16, so the
                 // count fits a `u32`). Only this half publishes, so only this
@@ -8305,8 +8388,12 @@ impl GraphRuntime {
                              history_size = 0."
                         );
                     }
-                    for ctr in counters {
-                        publisher.register_block_outstanding(ctr.clone());
+                    for (ctr, consumer_node, consumer_input) in counters {
+                        publisher.register_block_outstanding(
+                            ctr.clone(),
+                            Arc::clone(consumer_node),
+                            Arc::clone(consumer_input),
+                        );
                     }
                 }
                 // Wire this output's `promise_within_ms`
@@ -8737,14 +8824,14 @@ impl GraphRuntime {
                         role: stage_role,
                     },
                     read_stage.capacity(),
-                    if node_per_set_sync && node_trigger_names.contains(input.name.as_str()) {
-                        // A per-set `Sync` trigger input pops through the
-                        // matcher's own ops, which are NOT the two gated drain
-                        // bodies, so a gate here would be bypassed. Named
-                        // before the multi-publisher fact because it is the
-                        // harder one: a bypass admits a frame the recording did
-                        // not, where an ambiguous sequence only fails to pin
-                        // one.
+                    if node_per_set_sync
+                        && node_trigger_names.contains(input.name.as_str())
+                        && body_feed.is_none()
+                    {
+                        // An UNFED per-set `Sync` trigger input stays blocked
+                        // so unfed replays keep their existing best-effort path;
+                        // a FED stage gates its matcher ops through the private
+                        // feed.
                         Some(crate::read_outcome::GateBlocker::PerSetSyncEdge)
                     } else if annotated_edge && body_feed.is_none() {
                         // A FED stage is fed by (writer, sequence), so a
@@ -9308,7 +9395,9 @@ impl GraphRuntime {
                                      (`sync_unmatched_discard_count`), on a graph whose producers \
                                      are perfectly healthy. Not refused: an in-phase pair aligns \
                                      at any N. Fix if unintended: lower N below the window, or \
-                                     widen `sync_window_ms`"
+                                     raise `sync_window_ms` while keeping it strictly below the \
+                                     input period minus skew (at or above that bound, one drop \
+                                     can silently pair every later sample with the previous period)"
                                 );
                             }
                         }
@@ -10825,6 +10914,7 @@ impl GraphRuntime {
             capture_arena: Vec::new(),
             capture_fork_set: Vec::new(),
             fork_carrier: None,
+            direct_carrier: None,
             last_anchor_carriers: None,
             // Never poisoned at build (poison requires a participant + a boundary
             // timeout, both post-build).
@@ -11639,7 +11729,56 @@ impl GraphRuntime {
         // Installing here also means no WRITER exists after arm, which closes
         // the same deadlock in the other direction.
         crate::state_carrier::install_fork_panic_hook();
+        self.direct_carrier = None;
         self.start_fork_carrier();
+    }
+
+    /// ARM this runtime WITHOUT the fork carrier: the anchor's deferred set is
+    /// streamed on this runtime's own thread instead of by a `fork(2)` child.
+    ///
+    /// For an executor unit that shares its process with other units. A fork
+    /// copies only the forking thread, so a lock a sibling unit's thread holds at
+    /// that instant stays held in the child forever; this arm never forks. The
+    /// inline walk is unchanged, and each node it defers is encoded into the state
+    /// ring through [`crate::state_carrier::stream_deferred_direct`], whose pushes
+    /// never wait and whose record budget is the ring's free part at the boundary.
+    /// The cost is that a deferred node's encoder (a `#[cerulion(serde)]` field or a
+    /// hand-written `CerulionState`) runs on this thread, and nothing bounds its
+    /// time.
+    ///
+    /// Everything else is [`Self::attach_state_arm`]'s: the catch-up clamp, the
+    /// stored handle and the arena. A fork carrier a previous arm started is torn
+    /// down exactly as `Drop` tears it down, and the fork-exclusion tally is cleared,
+    /// since no capture child will read this process's memory. No panic hook is
+    /// installed and no reaper thread is started.
+    #[cfg(unix)]
+    // hot-path-alloc-ok-fn: cold: arms the Flashback capture plane ONCE at run start (the arena is
+    // allocated here so the anchor never allocates one)
+    pub fn attach_state_arm_no_fork(&mut self, arm: Arc<crate::state_arm::MappedStateArm>) {
+        self.scheduler.attach_catchup_arm(
+            Arc::clone(&arm) as Arc<dyn crate::scheduler::catchup_clamp::CatchupArm>
+        );
+        self.state_arm = Some(arm);
+        if self.capture_arena.is_empty() {
+            self.capture_arena = vec![0u8; crate::state::CAPTURE_INLINE_BUDGET_BYTES];
+        }
+        if let Some(mut carrier) = self.fork_carrier.take() {
+            // `stop` kills and reaps a child still in flight; the ring is ours again
+            // only after that, and the producer's local cursor may be stale by what
+            // the child wrote, so it is re-read before the first direct push.
+            carrier.reaper.stop();
+            crate::state_carrier::clear_fork_panic_breadcrumb();
+            if let Some(producer) = self.state_ring.as_mut() {
+                producer.resync_after_fork();
+            }
+        }
+        self.state_arm_fork_sweep = None;
+        self.direct_carrier = Some(crate::state_carrier::DirectCarrier::new());
+        tracing::info!(
+            graph = %self.config.identity(),
+            "state arm attached without fork: this executor unit captures its deferred \
+             node state on its own thread"
+        );
     }
 
     /// Bring up the fork carrier — the breadcrumb page, the
@@ -11828,6 +11967,18 @@ impl GraphRuntime {
         self.last_anchor_carriers
     }
 
+    /// Principle #3 observable: what the LAST anchor's direct stream did, or `None`
+    /// if this runtime is not armed without fork or has streamed no anchor yet.
+    ///
+    /// The direct stream's refusals reach the bag only as SKIP records, which a
+    /// reader cannot tell apart from a fork child's; this says how many deferred
+    /// nodes were streamed, refused by the ring budget, or failed, and whether their
+    /// encoders ran.
+    #[cfg(unix)]
+    pub fn last_anchor_direct(&self) -> Option<crate::state_carrier::DirectStreamStats> {
+        self.direct_carrier.as_ref().and_then(|c| c.last_stats())
+    }
+
     /// Principle #3 observable: whether a capture child of this process is
     /// still encoding.
     ///
@@ -11888,7 +12039,10 @@ impl GraphRuntime {
     ///
     /// A node the walk defers goes to the FORK carrier:
     /// the parent `fork(2)`s and the child streams that node's state into
-    /// the same ring, framed identically. A node neither carrier can capture
+    /// the same ring, framed identically. In a runtime armed without fork
+    /// ([`Self::attach_state_arm_no_fork`]) it goes to the direct stream instead,
+    /// which encodes it on this thread into the same ring, framed identically,
+    /// and never waits for room. A node no carrier can capture
     /// is reported through the ring's SKIP vocabulary rather than dropped, so a
     /// reader learns which nodes an anchor does not cover and why — never a short
     /// anchor presented as whole.
@@ -11990,7 +12144,15 @@ impl GraphRuntime {
         // This is the resync point AND the only place the ring may be touched
         // after a child has owned it. It runs FIRST so a child that finished between
         // cadences is fully accounted for before this cadence writes a byte.
-        self.reap_finished_children(producer, skip_report);
+        //
+        // A runtime armed without fork has no child, and it skips the graph-wide
+        // gate below too: the recorder selects one checkpoint per rank and accepts
+        // different steps across ranks, so a peer's capture child gives this unit
+        // no reason to skip.
+        let direct = self.direct_carrier.is_some();
+        if !direct {
+            self.reap_finished_children(producer, skip_report);
+        }
 
         // ---- One child at a time, GRAPH-WIDE. ----------------------------------
         //
@@ -12003,10 +12165,11 @@ impl GraphRuntime {
         //
         // Checked BEFORE the walk for the same reason: a boundary that is provably
         // going to be discarded must not pay the inline encoding either.
-        if self
-            .state_arm
-            .as_ref()
-            .is_some_and(|arm| arm.busy_workers() != 0)
+        if !direct
+            && self
+                .state_arm
+                .as_ref()
+                .is_some_and(|arm| arm.busy_workers() != 0)
         {
             // WHOSE child decides how the skip is recorded, not whether. If it is
             // OURS, the ring's producer role is the child's for its lifetime
@@ -12219,7 +12382,7 @@ impl GraphRuntime {
         // does and does not allocate).
         let shapes: Vec<Option<u64>> = views.iter().map(|v| v.entry.state_shape()).collect();
 
-        let mut header_failures: Vec<(u32, String)> = Vec::new();
+        let mut header_failures: Vec<(u32, SkipCause, &'static str)> = Vec::new();
         let stats = walk_inline(&views, arena, fork_set, |idx, payload| {
             let i = idx as usize;
             // Field access, never a destructure: the third element is a
@@ -12235,9 +12398,9 @@ impl GraphRuntime {
                 // itself.
                 header_failures.push((
                     node_idx,
+                    SkipCause::CaptureFailed,
                     "captured state but declares no `state_shape()`, so the anchor cannot be \
-                     framed"
-                        .to_string(),
+                     framed",
                 ));
                 return;
             };
@@ -12272,6 +12435,8 @@ impl GraphRuntime {
         // forever in the child's image by nobody, so the child takes each lock itself.
         let fork_targets: Vec<NodeForkTarget> = fork_set
             .iter()
+            // A runtime armed without fork streams the set itself, below.
+            .filter(|_| !direct)
             .filter_map(|(idx, _)| {
                 let i = *idx as usize;
                 // Field access, never a destructure: the third element is a
@@ -12300,6 +12465,36 @@ impl GraphRuntime {
             .map(|(idx, reason)| (guards[*idx as usize].0, *reason))
             .collect();
 
+        // ---- The direct stream, in a runtime armed without fork. ----------------
+        //
+        // It runs HERE, while the views and guards are alive: each encoder runs under
+        // `catch_unwind` inside the guard's scope, so a panic is caught before it can
+        // unwind through the `MutexGuard` and poison the node for every later tick.
+        // Its failures join `header_failures` and are pushed after the guards drop.
+        if let Some(carrier) = self.direct_carrier.as_mut() {
+            let deferred: Vec<crate::state_carrier::DirectDeferredNode<'_, NodeCaptureView<'_>>> =
+                fork_set
+                    .iter()
+                    .map(|&(idx, reason)| {
+                        let i = idx as usize;
+                        crate::state_carrier::DirectDeferredNode {
+                            node_idx: guards[i].0,
+                            reason,
+                            shape: shapes[i],
+                            framework: &framework[i],
+                            target: &views[i],
+                        }
+                    })
+                    .collect();
+            header_failures.extend(crate::state_carrier::stream_deferred_direct(
+                carrier,
+                producer,
+                step,
+                ANCHOR_RING_HEADROOM_RECORDS,
+                &deferred,
+            ));
+        }
+
         // Guards are dropped HERE, at the end of the walk and BEFORE `fork(2)`. A
         // guard held across the fork would be held forever in the child's image (a
         // fork child has one thread), so every one of the child's `try_lock`s would
@@ -12314,15 +12509,17 @@ impl GraphRuntime {
         // node thread at a step boundary, and a blocking push on a full ring waits
         // five seconds per record.
         let mut header_unpublished = 0u64;
-        for (node_idx, detail) in &header_failures {
-            if !producer.try_push_skip(step, *node_idx, SkipCause::CaptureFailed, detail) {
+        let mut first_unpublished = None;
+        for &(node_idx, cause, detail) in &header_failures {
+            if !producer.try_push_skip(step, node_idx, cause, detail) {
                 header_unpublished += 1;
+                first_unpublished.get_or_insert(cause);
             }
         }
-        if !header_failures.is_empty() {
+        if let Some(&(_, first_cause, _)) = header_failures.first() {
             skip_report.note(
                 step,
-                SkipCause::CaptureFailed,
+                first_unpublished.unwrap_or(first_cause),
                 header_unpublished,
                 header_failures.len() as u64,
             );
@@ -12331,7 +12528,7 @@ impl GraphRuntime {
         tracing::debug!(
             step,
             inline_nodes = stats.inline_nodes,
-            forked_nodes = stats.forked_nodes,
+            deferred_nodes = stats.deferred_nodes,
             gated_nodes = stats.gated_nodes,
             unwound_nodes = stats.unwound_nodes,
             bytes_used = stats.bytes_used,
@@ -12341,7 +12538,9 @@ impl GraphRuntime {
         self.last_anchor_carriers = Some(stats);
 
         // ---- The fork carrier: everything the arena could not hold. ------------
-        self.fork_deferred_nodes(step, producer, fork_targets, skip_report);
+        if !direct {
+            self.fork_deferred_nodes(step, producer, fork_targets, skip_report);
+        }
     }
 
     /// Act on every capture child the reaper thread has
@@ -18176,6 +18375,23 @@ impl GraphRuntime {
         }
     }
 
+    /// Adopt the RECORDING's single-take rule on every wired stage: is a take
+    /// through `CerulionSubscriber::try_receive_one` or its owned twin a
+    /// recorded read, which consults the replay read gate, stages its record
+    /// and pays the `block` credit word? A recorder at trace format 13 makes
+    /// it one, and a replay of such a bag keeps the stages' creation value; a
+    /// bag declared below format 13 recorded no take, and a replay of it must
+    /// take the same unrecorded path, or its read log, its read gate and its
+    /// credit words would each part from the recording's. Called once per
+    /// replay, before the first step, whether or not the read log verifier is
+    /// active; a recording run never calls it.
+    // hot-path-alloc-ok-fn: cold: once per replay, before the first step
+    pub fn set_read_log_records_single_takes(&self, recorded: bool) {
+        for (_node, stage) in &self.read_outcome_stages {
+            stage.adopt_single_take_records(recorded);
+        }
+    }
+
     /// Reopen the writer runs of every read-outcome stage whose owning node id
     /// `keep` accepts, in wiring order: the next annotated read of each read
     /// site of such a stage stages its writer's annotation again, whatever the
@@ -19050,12 +19266,39 @@ impl GraphRuntime {
     }
 
     /// Re-read the armed flag off the stages, the ONE writer of
-    /// `replay_read_armed`.
+    /// `replay_read_armed`, and mirror per-set `Sync` trigger arming onto the
+    /// scheduler's `sync_replay_refill` flag.
     fn refresh_replay_read_armed(&mut self) {
         self.replay_read_armed = self
             .replay_read_plans
             .iter()
             .any(|(_node, plan)| plan.is_armed());
+        for binding in &self.sync_input_bindings {
+            if !binding.per_set {
+                continue;
+            }
+            let node_id = binding.node_id.as_ref();
+            let trigger_armed = self
+                .sync_input_bindings
+                .iter()
+                .filter(|b| b.per_set && b.node_id.as_ref() == node_id)
+                .any(|b| {
+                    let Some(input_idx) = self
+                        .read_log_input_names
+                        .get(node_id)
+                        .and_then(|names| names.iter().position(|n| n == b.input_name.as_ref()))
+                    else {
+                        return false;
+                    };
+                    self.replay_read_plans.iter().any(|(_, plan)| {
+                        plan.is_armed()
+                            && plan.key().node == node_id
+                            && usize::from(plan.key().input_idx) == input_idx
+                    })
+                });
+            self.scheduler
+                .set_sync_replay_refill(node_id, trigger_armed);
+        }
     }
 
     /// Is any read gate armed (Principle #3; false on a virgin runtime).

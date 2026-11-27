@@ -921,6 +921,19 @@ pub(crate) fn subscription_loans_allowed() -> bool {
     !matches!(mode(), Mode::Replay(_))
 }
 
+/// Whether this process lists its endpoints on the host-wide rmw topic graph
+/// registry and reads the other processes' endpoints back from it. A replay
+/// does neither: its topic list comes from its own endpoints, as in the
+/// recorded run's process, so unrelated processes on the host never enter it.
+/// Recording keeps the live cross-process answer.
+pub(crate) fn cross_process_graph_allowed() -> bool {
+    cross_process_graph_allowed_in(mode())
+}
+
+fn cross_process_graph_allowed_in(mode: &Mode) -> bool {
+    !matches!(mode, Mode::Replay(_))
+}
+
 /// A serialized take bypasses the bridge, so the delivery log cannot record
 /// what it delivered: recording marks the log not replayable.
 pub(crate) fn report_serialized_take(topic: &str) {
@@ -2232,6 +2245,31 @@ mod tests {
             library_digest: "abc".into(),
             pid: 1,
         }
+    }
+
+    #[test]
+    fn only_a_replay_turns_the_cross_process_graph_off() {
+        let dir = std::env::temp_dir().join(format!("rdl-graph-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let recorder = Recorder::start(&dir).expect("a recorder starts in a fresh directory");
+        recorder.finish();
+        let log = std::fs::read_dir(&dir)
+            .expect("the recorder wrote its directory")
+            .map(|e| e.expect("a directory entry").path())
+            .find(|p| p.to_string_lossy().ends_with(LOG_SUFFIX))
+            .expect("the recorder wrote one log");
+        let player = Player::load(&log).expect("the log of this process replays");
+        let rows = [
+            ("off", Mode::Off, true),
+            ("record", Mode::Record(Box::new(recorder)), true),
+            ("replay", Mode::Replay(Box::new(player)), false),
+            ("refused", Mode::Refused("refused".into()), true),
+        ];
+        for (name, mode, allowed) in &rows {
+            assert_eq!(cross_process_graph_allowed_in(mode), *allowed, "{name}");
+        }
+        drop(rows);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

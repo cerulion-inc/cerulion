@@ -185,6 +185,8 @@ pub enum BlockSendHook {
 pub(crate) struct BlockCountSlot {
     word: crate::credit::CreditWord,
     pending: Option<crate::credit::PublishUndo>,
+    consumer_node: Arc<str>,
+    consumer_input: Arc<str>,
 }
 
 /// Why [`CerulionPublisher::send_counted`] sent nothing. Either arm has
@@ -873,16 +875,32 @@ impl CerulionPublisher {
         self.notify_on_publish_raw = true;
     }
 
-    /// `block`: register one consumer's outstanding counter. The
-    /// graph runtime calls this once per `block` consumer of this
+    /// `block`: register one consumer's outstanding counter and its `(node, input)`
+    /// identity. The graph runtime calls this once per `block` consumer of this
     /// publisher's topic; the topic's other consumers register none. The
     /// same word is shared into that consumer's [`CerulionSubscriber`]
     /// (drain decrement) and the producer's pre-fire check (fullness read).
-    pub(crate) fn register_block_outstanding(&mut self, counter: crate::credit::CreditWord) {
+    pub(crate) fn register_block_outstanding(
+        &mut self,
+        counter: crate::credit::CreditWord,
+        consumer_node: Arc<str>,
+        consumer_input: Arc<str>,
+    ) {
         self.block_outstanding.push(BlockCountSlot {
             word: counter,
             pending: None,
+            consumer_node,
+            consumer_input,
         });
+    }
+
+    /// First registered `block` consumer `(node_id, input_name)` on this
+    /// publisher's topic, or `None` when the topic has no `block` consumer.
+    #[inline]
+    pub(crate) fn block_consumer(&self) -> Option<(&str, &str)> {
+        self.block_outstanding
+            .first()
+            .map(|slot| (slot.consumer_node.as_ref(), slot.consumer_input.as_ref()))
     }
 
     /// Wire this output's `#[output(promise_within_ms = N)]`
@@ -1033,11 +1051,34 @@ impl CerulionPublisher {
     /// Test-only public wrapper over `Self::register_block_outstanding` so
     /// integration tests (separate crate) can register a `block` outstanding
     /// mirror on a `TestTransport`-minted publisher. Gated behind
-    /// `test-helpers` — NOT part of the production surface (production wires
+    /// `test-helpers`, not part of the production surface (production wires
     /// this from `GraphRuntime::build`).
+    // hot-path-alloc-ok-fn: test-only block consumer registration helper
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn register_block_outstanding_for_test(&mut self, counter: crate::credit::CreditWord) {
-        self.register_block_outstanding(counter);
+        self.register_block_outstanding(
+            counter,
+            Arc::from("<test_consumer>"),
+            Arc::from("<test_input>"),
+        );
+    }
+
+    /// Test-only public wrapper over `Self::register_block_outstanding` that
+    /// records a specific `(consumer_node, consumer_input)` name pair for
+    /// tests that assert the named refusal diagnostic.
+    // hot-path-alloc-ok-fn: test-only block consumer registration helper
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn register_block_outstanding_named_for_test(
+        &mut self,
+        counter: crate::credit::CreditWord,
+        consumer_node: &str,
+        consumer_input: &str,
+    ) {
+        self.register_block_outstanding(
+            counter,
+            Arc::from(consumer_node),
+            Arc::from(consumer_input),
+        );
     }
 
     /// Test-only: force the next `deliver_history` to treat `update_connections`

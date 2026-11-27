@@ -1637,6 +1637,134 @@ fn a_sample_gated_per_set_run_is_deterministic() {
         );
     }
 }
+/// `sample(31)` on BOTH trigger inputs under a 32 ms window: the shape a
+/// 30 ms producer pair gets when each input is decimated to every second frame.
+#[cerulion_node(sync_window_ms = 32)]
+#[derive(Default)]
+struct BothSampledPairFuse {
+    #[input(trigger, backpressure = sample(31))]
+    a: Vector3,
+    #[input(trigger, backpressure = sample(31))]
+    b: Vector3,
+    sets: Option<Sets>,
+}
+
+#[cerulion_node_impl]
+impl BothSampledPairFuse {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let pair = (self.a.x, self.b.x);
+        if let Some(sink) = &self.sets {
+            sink.lock().expect("sets sink poisoned").push(pair);
+        }
+        Ok(())
+    }
+}
+
+/// What one two-gate run observed.
+#[derive(Debug, PartialEq)]
+struct PhaseRun {
+    sets: Vec<(f64, f64)>,
+    sampled: (u64, u64),
+    unmatched: (u64, u64),
+    skips: (u64, u64),
+}
+
+/// Two 30 ms streams, B 5 ms after A, published in stamp order with one step
+/// after each frame (the live arrival order). `drop_a_60` leaves out A's 60 ms
+/// frame. The payload is the stamp in ms.
+fn run_two_gate_stimulus(prefix: &str, drop_a_60: bool) -> PhaseRun {
+    let sets: Sets = Arc::new(Mutex::new(Vec::new()));
+    let (config, factories) = sampled_graph(
+        prefix,
+        "both_sampled_pair_fuse",
+        Box::new(BothSampledPairFuseEntry::with_state(BothSampledPairFuse {
+            sets: Some(Arc::clone(&sets)),
+            ..Default::default()
+        })),
+    );
+    let clock = Arc::new(VirtualClock::new());
+    let mut runtime = GraphRuntime::build_for_test(config, factories, Arc::clone(&clock), 32)
+        .expect("build two-gate sync graph");
+    let mgr = runtime.test_transport().expect("test transport parked");
+    let mut pub_a = mgr
+        .create_publisher(TOPIC_A, MaxSliceLen::const_new(64), 0)
+        .expect("publisher on a");
+    let mut pub_b = mgr
+        .create_publisher(TOPIC_B, MaxSliceLen::const_new(64), 0)
+        .expect("publisher on b");
+    for tick in 0..8u64 {
+        let a_ms = tick * 30;
+        if !(drop_a_60 && a_ms == 60) {
+            publish_at(&mut pub_a, &clock, a_ms * MS, a_ms as f64);
+            runtime.step(Duration::from_millis(1));
+        }
+        let b_ms = a_ms + 5;
+        publish_at(&mut pub_b, &clock, b_ms * MS, b_ms as f64);
+        runtime.step(Duration::from_millis(1));
+    }
+    let handle = runtime.node_handle("fuse").expect("fuse handle");
+    PhaseRun {
+        sets: recorded(&sets),
+        sampled: (
+            handle.backpressure_sampled_count("a"),
+            handle.backpressure_sampled_count("b"),
+        ),
+        unmatched: (
+            handle.sync_unmatched_discard_count(TOPIC_A),
+            handle.sync_unmatched_discard_count(TOPIC_B),
+        ),
+        skips: (
+            handle.sync_closer_skip_count(TOPIC_A),
+            handle.sync_closer_skip_count(TOPIC_B),
+        ),
+    }
+}
+
+/// One dropped frame moves a `sample(N)` gate onto a different producer tick,
+/// and the Sync node then pairs frames one producer period apart with no count.
+///
+/// Hand-walked. Gate A admits 0, refuses 30 (30 < 31), and with 60 lost admits
+/// 90 (90 - 0 >= 31), then refuses 120, admits 150, refuses 180, admits 210.
+/// Gate B admits 5, refuses 35, admits 65, 125, 185 and refuses 95, 155, 215.
+/// So A sits on odd ticks and B on even ticks: every set after the drop is
+/// `(A_k, B_{k-1})`, 25 ms apart, inside the 32 ms window, and both the
+/// UNMATCHABLE and the PASSED-OVER counters stay at zero. The 60 ms admitted
+/// spacing never protected the pairing; the 30 ms producer period bounds it.
+///
+/// The discriminator is the same stimulus with A's 60 ms frame present: both
+/// gates stay on even ticks and every set is from one tick.
+#[test]
+#[serial]
+fn a_dropped_frame_moves_a_sample_gate_onto_the_previous_tick_silently() {
+    let shifted = run_two_gate_stimulus("pssph1", true);
+    assert_eq!(
+        shifted,
+        PhaseRun {
+            sets: vec![(0.0, 5.0), (90.0, 65.0), (150.0, 125.0), (210.0, 185.0)],
+            sampled: (3, 4),
+            unmatched: (0, 0),
+            skips: (0, 0),
+        },
+        "after A loses its 60 ms frame, gate A admits odd ticks and every set \
+         pairs A with B from the previous tick, with no counter moving"
+    );
+
+    let in_phase = run_two_gate_stimulus("pssph2", false);
+    assert_eq!(
+        in_phase,
+        PhaseRun {
+            sets: vec![(0.0, 5.0), (60.0, 65.0), (120.0, 125.0), (180.0, 185.0)],
+            sampled: (4, 4),
+            unmatched: (0, 0),
+            skips: (0, 0),
+        },
+        "with no drop both gates admit even ticks and every set is one tick"
+    );
+
+    let again = run_two_gate_stimulus("pssph3", true);
+    assert_eq!(again, shifted, "two runs of one stimulus are identical");
+}
+
 // ===========================================================================
 // PART 4 — `sample(N)` wider than the alignment window is LOUD
 // ===========================================================================
@@ -1704,11 +1832,13 @@ fn a_sample_gate_wider_than_the_sync_window_warns_once_and_still_builds() {
                 && l.contains("sample_interval_ms=80")
                 && l.contains("sync_window_ms=50")
                 && l.contains("input=a")
+                && l.contains("strictly below the input period minus skew")
+                && !l.contains("or widen `sync_window_ms`")
         });
         if !named {
             return Err(
-                "the warn must name BOTH windows and the input, or an operator \
-                 cannot tell which declaration to change"
+                "the warn must name BOTH windows, the input, and the period-minus-skew \
+                 ceiling instead of advising an unconditional widen"
                     .to_string(),
             );
         }

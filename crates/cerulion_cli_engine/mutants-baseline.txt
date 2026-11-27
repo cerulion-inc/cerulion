@@ -151,6 +151,35 @@
 #          the 22 are field deletions the tool generated in functions outside
 #          the list (InjectionWindow::cross_rank, caught, and
 #          prepare_pass_verification, listed below).
+#          Re-run over the change that makes the budget a setting
+#          (`--verifier-record-budget`) and scopes the read-log count to
+#          `--duration`: the budget each site reads (`verifier_record_budget`),
+#          the per-step fold bound kept apart from it (`per_step_fold_budget`),
+#          the schedule decline's sentence over the budget it carries
+#          (`VerifierDecline::reason`), the remedies, and in
+#          src/replay_inject.rs the admission plan that arms empty schedules
+#          for a topic read only past the cut (`plan_edge_admission_covered`,
+#          `plan_edge_admission_inner`), with `--in-diff` that change's diff of
+#          the two files, `--re`
+#          '\bverifier_record_budget\b|\bper_step_fold_budget\b|VerifierDecline::remedy|VerifierDecline::reason|\bplan_edge_admission_inner\b|\bplan_edge_admission_covered\b',
+#          `--exclude-re 'tests::' --cap-lints true --in-place --timeout 300`,
+#          in 3 shards, `-- --lib -- replay_engine:: replay_inject::`:
+#          18 mutants: 12 caught, 2 unviable, 4 missed. The unviable replace
+#          the two admission planners with a default `AdmissionPlan` does not
+#          have. The 4 missed are listed below.
+#          Re-run over the change that refuses a step past the per-step fold
+#          bound at the census and steers a topic read only past the cut
+#          empty: the refusal's sentence (`FoldRunOverrun::sentence`), the
+#          cause's token, sentence and remedy (`VerifierDecline::code`,
+#          `VerifierDecline::reason`, `VerifierDecline::remedy`), and in
+#          src/replay_inject.rs the injection plan that steers such a topic
+#          empty (`plan_topic_injection_covered`, `plan_topic_injection_inner`),
+#          with `--in-diff` that change's diff of the two files, `--re`
+#          'FoldRunOverrun::sentence|plan_topic_injection_covered|plan_topic_injection_inner|VerifierDecline::code|VerifierDecline::reason|VerifierDecline::remedy',
+#          `--exclude-re 'tests::' --cap-lints true --in-place --timeout 300`,
+#          `-- --lib -- replay_engine:: replay_inject::`: 12 mutants: 10
+#          caught, 2 unviable, 0 missed. The unviable replace the two injection
+#          planners with a default `TopicPlan` does not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
@@ -164,6 +193,16 @@ in prepare_pass_verification
   prepare_pass_verification (the label join, describe_label_reading and
   classify_label_reading) runs only for a topic in that empty set, so no
   output changes.
+
+replay_engine.rs: replace verifier_record_budget -> usize with 0 (and with 1)
+at the `cfg(not(any(test, feature = "test-seams")))` definition
+replay_engine.rs: replace per_step_fold_budget -> usize with 0 (and with 1)
+at the `cfg(not(any(test, feature = "test-seams")))` definition
+  Not compiled under test. These are the shipped-build twins of the two
+  functions; a test build compiles the test-seam definitions instead, whose
+  mutants are all caught. The shipped bodies read the configured budget
+  saturated to `usize::MAX` and the fixed per-step constant, the same values
+  the test-seam bodies return when no override is installed.
 
 # Fifth scope: the decisions a replay makes about checkpoint window heads.
 #
@@ -622,6 +661,37 @@ in prepare_pass_verification
 #          in `prepare_pass_verification` and `InjectionWindow::cross_rank`:
 #          the fourth scope lists the first as equivalent and catches the
 #          second with the lib tests, which this command does not run.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Scope: the pure decisions a replay and the recorder make about a recorded
+# single-frame take (`trace_format` 13). In src/replay_engine.rs: the trace
+# format stamp's single-take term (`stamp_trace_format`), the claims this
+# build's recorder makes (`RecorderClaims::of_this_recorder`,
+# `recorder_records_single_takes`) and the replay's rule
+# (`replay_records_single_takes`). The take paths themselves run on the live
+# receive path in cerulion_core, which the mutation rule does not cover; they
+# are pinned by the red-first vectors `transport::subscriber::tests::a_take_*`
+# and `a_fed_take_*` in cerulion_core and, in tests/replay_engine_test.rs, by
+# `a_take_is_a_recorded_read_in_a_format_13_recording`,
+# `a_verify_replay_beside_a_skipped_ros2_entry_feeds_every_take_by_identity`,
+# `a_candidate_that_drops_a_recorded_take_is_caught` and
+# `a_format_12_bag_replays_its_takes_unrecorded`.
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the file> \
+#            --re '\bstamp_trace_format\b|RecorderClaims::of_this_recorder|replay_records_single_takes|recorder_records_single_takes' \
+#            --exclude-re 'delete field' --timeout 600 \
+#            -- --lib -- replay_engine:: graph_cmd::
+#          (the unmutated baseline passed)
+# Result:  12 mutants: 11 caught, 1 unviable, 0 missed. The unviable one
+#          replaces `RecorderClaims::of_this_recorder` with a default the type
+#          does not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

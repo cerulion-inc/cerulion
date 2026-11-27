@@ -306,7 +306,11 @@ impl ReadKind {
     #[must_use]
     pub fn from_outcome(kind: ReadOutcomeKind) -> Option<Self> {
         match kind {
-            ReadOutcomeKind::Served => Some(Self::Served),
+            // A take names the one frame it consumed, exactly as a `Served`
+            // read does, so the planner admits and feeds it the same way;
+            // what the two leave queued behind them is the block hold
+            // verifier's question (`replay_rederive`), not the planner's.
+            ReadOutcomeKind::Served | ReadOutcomeKind::Taken => Some(Self::Served),
             ReadOutcomeKind::Held => Some(Self::Held),
             ReadOutcomeKind::NoFrame => Some(Self::NoFrame),
             ReadOutcomeKind::DrainedBatch => Some(Self::DrainedBatch),
@@ -1264,6 +1268,29 @@ impl StepGroup {
 /// See the module docs for the rules. Pure and total: every input shape yields
 /// either a schedule or a typed stand-down, and nothing is logged.
 pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> TopicPlan {
+    plan_topic_injection_inner(topic, local, false)
+}
+
+/// [`plan_topic_injection`] when a `--duration` bound truncated the read-log
+/// census before this topic's first recorded read, and the caller has already
+/// confirmed that the recording reads this topic at or after the bound.
+///
+/// Inside the window the recording read nothing on the topic, so a topic no
+/// edge covers is steered with an EMPTY schedule, which injects nothing, rather
+/// than stood down to the recorded-clock window, which would publish frames the
+/// window never read. Every other stand-down (a fold refusal, a fan-out
+/// conflict) is kept. The frames are not reported as unconsumed: the reads that
+/// account for them lie past the bound.
+#[must_use]
+pub fn plan_topic_injection_covered(topic: &TopicReplay, local: &LocalProducers) -> TopicPlan {
+    plan_topic_injection_inner(topic, local, true)
+}
+
+fn plan_topic_injection_inner(
+    topic: &TopicReplay,
+    local: &LocalProducers,
+    covered_outside_window: bool,
+) -> TopicPlan {
     let mut covered: Vec<EdgePlan> = Vec::new();
     let mut uncovered: Vec<EdgeId> = Vec::new();
 
@@ -1284,6 +1311,26 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
         }
     }
 
+    if covered.is_empty() && covered_outside_window {
+        let local_frames = topic
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| local.node_for(frame.producer.as_ref()).is_some())
+            .map(|(frame_index, frame)| DueFrame {
+                frame_index,
+                sequence: frame.sequence,
+            })
+            .collect();
+        return TopicPlan::Steered(InjectionSchedule {
+            topic: topic.topic.clone(),
+            per_step: Vec::new(),
+            uncovered,
+            unconsumed: Vec::new(),
+            local_frames,
+            depth_raises: Vec::new(),
+        });
+    }
     if covered.is_empty() {
         return TopicPlan::StandDown(StandDown {
             topic: topic.topic.clone(),
@@ -2591,6 +2638,24 @@ fn record_is_batch(body: &RecordedReadBody) -> bool {
 /// and nothing is logged.
 #[must_use]
 pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    plan_edge_admission_inner(topic, stages, false)
+}
+
+/// [`plan_edge_admission`] when a `--duration` bound truncated the read-log
+/// census before this topic's first recorded read, and the caller has already
+/// confirmed that the recording carries read-log records for this topic at or
+/// after the bound. Keeps every wiring and skew refusal intact while arming
+/// gateable stages with empty schedules instead of refusing `NoCoverage`.
+#[must_use]
+pub fn plan_edge_admission_covered(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    plan_edge_admission_inner(topic, stages, true)
+}
+
+fn plan_edge_admission_inner(
+    topic: &TopicAdmission,
+    stages: &StageTable,
+    covered_outside_window: bool,
+) -> AdmissionPlan {
     let refused = |reason: AdmissionRefusalReason| {
         AdmissionPlan::Refused(AdmissionRefusal {
             topic: topic.topic.clone(),
@@ -2795,6 +2860,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
                         // ACCEPTED frame and not what the read popped: the count
                         // is enforced and the identity is not.
                         (ReadKind::Decimated, n) => DueRead::decimated(n, *served_seq),
+                        (_, n) if sited.role == ReadSiteRole::Peek => DueRead::peek(n, *served_seq),
                         (_, n) => DueRead::pops(n, *served_seq),
                     }
                 }
@@ -2888,7 +2954,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
     if planned.is_empty() {
         return AdmissionPlan::NotGateable(ungateable);
     }
-    if !any_records {
+    if !any_records && !covered_outside_window {
         return refused(AdmissionRefusalReason::NoCoverage { keys: offered });
     }
     AdmissionPlan::Enforced {
@@ -5699,6 +5765,180 @@ mod tests {
         assert_eq!(
             drain.per_step.iter().map(|s| s.step).collect::<Vec<_>>(),
             vec![0, 1]
+        );
+    }
+
+    /// `plan_edge_admission_covered` arms empty schedules when `--duration`
+    /// excludes every read on a covered topic, while still refusing wiring and
+    /// stage-set skew errors.
+    #[test]
+    fn covered_outside_window_arms_empty_schedule_without_hiding_skew() {
+        let single = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let empty = one_edge(vec![]);
+        assert!(matches!(
+            plan_edge_admission(&empty, &single),
+            AdmissionPlan::Refused(AdmissionRefusal {
+                reason: AdmissionRefusalReason::NoCoverage { .. },
+                ..
+            })
+        ));
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission_covered(&empty, &single)
+        else {
+            panic!("covered outside window must arm empty schedules");
+        };
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].per_step.is_empty());
+
+        // Skew still refuses even when covered outside the window.
+        let skewed = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages(vec![
+            StageKey {
+                node: "relay".into(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            StageKey {
+                node: "relay".into(),
+                input_idx: 0,
+                role: ReadStageRole::Drain,
+            },
+        ]);
+        assert!(matches!(
+            plan_edge_admission_covered(&empty, &skewed),
+            AdmissionPlan::Refused(AdmissionRefusal {
+                reason: AdmissionRefusalReason::StageSetSkew { .. },
+                ..
+            })
+        ));
+    }
+
+    /// `plan_topic_injection_covered` steers a topic no edge covers with an
+    /// empty schedule (nothing due, nothing uncovered or unconsumed, the local
+    /// frames still named), and plans a covered topic exactly as
+    /// `plan_topic_injection` does.
+    #[test]
+    fn covered_outside_window_steers_an_uncovered_topic_empty() {
+        let mut stream = frames(&[10, 11, 12]);
+        stream[1].producer = Some(ResolvedProducer::Named("relay_label".to_string()));
+        let empty = topic(true, stream, vec![]);
+        assert!(matches!(
+            expect_stand_down(plan_no_local(&empty)).reason,
+            StandDownReason::NoCoverage { .. }
+        ));
+        let local = LocalProducers::from_pairs([("relay_label".to_string(), "relay".to_string())]);
+        let s = expect_steered(plan_topic_injection_covered(&empty, &local));
+        assert!(s.per_step.is_empty(), "nothing is due inside the window");
+        assert!(s.uncovered.is_empty() && s.unconsumed.is_empty() && s.depth_raises.is_empty());
+        assert_eq!(
+            s.local_frames,
+            vec![DueFrame {
+                frame_index: 1,
+                sequence: 11
+            }]
+        );
+
+        let read = topic(
+            false,
+            frames(&[10, 11]),
+            vec![edge(
+                edge_id("fusion", "lidar"),
+                ConsumeMode::EachFifo,
+                vec![served(4, 10, 1), served(5, 11, 1)],
+            )],
+        );
+        assert_eq!(
+            shape(&expect_steered(plan_topic_injection_covered(
+                &read,
+                &LocalProducers::none()
+            ))),
+            vec![(4, vec![10]), (5, vec![11])],
+            "a covered topic plans its reads as before"
+        );
+    }
+
+    /// On a single-stage (`Body`-only) per-set `Sync` input, `plan_edge_admission`
+    /// maps `ReadSiteRole::Drain` to `DueRead::pops`, `ReadSiteRole::Peek` to
+    /// `DueRead::peek`, and `HandOff` to `DueRead::served_without_pop`, sharing
+    /// the drain writer run across `Drain`, `Peek`, and `HandOff`. On a two-stage
+    /// input (`Body` + `Drain`), `ReadSiteRole::Peek` is still refused with
+    /// `RecordShape::PeekOnGatedStage`.
+    #[test]
+    fn plan_edge_admission_marks_peek_and_preserves_handoff_on_single_stage() {
+        let single = StageTable::new(
+            &inputs("sync_node", &["a"]),
+            &census("sync_node", 0, &[ReadStageRole::Body]),
+        );
+        let reads = vec![
+            on_site(ReadSiteRole::Drain, annotation_read(0xAA)),
+            sited(0, ReadSiteRole::Drain, ReadKind::DrainedBatch, Some(10), 1),
+            sited(0, ReadSiteRole::Peek, ReadKind::DrainedBatch, Some(11), 1),
+            on_site(
+                ReadSiteRole::Drain,
+                RecordedRead::read(0, ReadKind::DrainedBatch, Some(11), 0, true),
+            ),
+        ];
+        let topic = TopicAdmission {
+            topic: "/a".to_string(),
+            multi_publisher: false,
+            edges: vec![AdmissionEdge {
+                node_id: "sync_node".to_string(),
+                input: "a".to_string(),
+                mode: ConsumeMode::EachFifo,
+                reads,
+            }],
+        };
+        let AdmissionPlan::Enforced { stages: plans, .. } = plan_edge_admission(&topic, &single)
+        else {
+            panic!("single-stage Sync input with Peek plans cleanly");
+        };
+        assert_eq!(plans.len(), 1);
+        let step0 = &plans[0].per_step[0];
+        assert_eq!(
+            step0.due,
+            vec![
+                DueRead::pops(1, Some(10)),
+                DueRead::peek(1, Some(11)),
+                DueRead::served_without_pop(Some(11)),
+            ]
+        );
+        assert!(!step0.due[0].is_peek());
+        assert!(step0.due[1].is_peek());
+        assert!(!step0.due[2].is_peek());
+        // `writer_run_site(Peek) == writer_run_site(Drain) == 1`: all three
+        // records inherit the drain-site writer run `0xAA`.
+        assert_eq!(step0.identity[0].writer, Some(0xAA));
+        assert!(step0.identity[0].annotated);
+        assert_eq!(step0.identity[1].writer, Some(0xAA));
+        assert!(!step0.identity[1].annotated);
+        assert_eq!(step0.identity[2].writer, Some(0xAA));
+        assert_eq!(step0.identity[2].popped, 0);
+
+        // Adversarial: two-stage input still refuses Peek with PeekOnGatedStage.
+        let split = StageTable::new(
+            &inputs("sync_node", &["a"]),
+            &census("sync_node", 0, &[ReadStageRole::Body, ReadStageRole::Drain]),
+        );
+        let AdmissionPlan::Refused(refusal) = plan_edge_admission(&topic, &split) else {
+            panic!("two-stage input with Peek must be refused");
+        };
+        assert_eq!(
+            refusal.reason,
+            AdmissionRefusalReason::UnenforceableRecord {
+                key: StageKey {
+                    node: "sync_node".to_string(),
+                    input_idx: 0,
+                    role: ReadStageRole::Drain,
+                },
+                step: 0,
+                shape: RecordShape::PeekOnGatedStage,
+            }
         );
     }
 }

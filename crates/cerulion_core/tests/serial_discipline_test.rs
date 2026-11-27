@@ -211,6 +211,11 @@ const FENCE_INVENTORY: &[(&str, &str)] = &[
         "default-namespace ports moved across threads; also a flatness gate",
     ),
     (
+        "dangling_shm_state_iox2_test",
+        "installs the process singleton through `init_with_config`; every arm runs on an \
+         isolated prefix, and the singleton arm needs a process with nothing installed",
+    ),
+    (
         "deliver_history_failure_iox2_test",
         "default-namespace manager: history fault injection",
     ),
@@ -591,6 +596,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "subprocess_child_holds_a_subscriber",
         "child",
         "self-re-exec entry point; the condition under test is a listener whose OWNING PROCESS died without deregistering, which needs a second process to kill",
+    ),
+    (
+        "rmw_graph_registry_iox2_test.rs",
+        "subprocess_child_holds_a_graph_writer",
+        "child",
+        "self-re-exec entry point; the condition under test is a writer whose OWNING PROCESS died without dropping it, which needs a second process to kill",
     ),
     (
         "output_proxy_test.rs",

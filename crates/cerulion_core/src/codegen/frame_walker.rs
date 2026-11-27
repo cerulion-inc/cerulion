@@ -1924,6 +1924,7 @@ mod tests {
                 schema_name: "Vec3".into(),
                 package: Some("geometry_msgs".into()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         let (walker, warns) = FrameWalker::new(vec![vec3_schema(), pose]);
@@ -1963,6 +1964,7 @@ mod tests {
                 schema_name: "InnerVar".into(),
                 package: Some("test_msgs".into()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         let (walker, _) = FrameWalker::new(vec![inner, outer]);
@@ -2015,6 +2017,7 @@ mod tests {
                     schema_name: "SomeMsg".into(),
                     package: Some("test_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
@@ -2321,6 +2324,7 @@ mod tests {
                     schema_name: "Nothing".into(),
                     package: Some("test_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
@@ -2374,6 +2378,7 @@ mod tests {
                     schema_name: "Pt".into(),
                     package: Some("test_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
                 length: 4,
             },
@@ -3202,6 +3207,7 @@ mod tests {
                     schema_name: "Header".into(),
                     package: Some("std_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
@@ -3376,6 +3382,7 @@ mod tests {
                     schema_name: "NotInTheSet".into(),
                     package: Some("test_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
@@ -3484,6 +3491,7 @@ mod tests {
                     schema_name: "Header".into(),
                     package: Some("std_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
                 length: 2,
             },
@@ -3551,6 +3559,7 @@ mod tests {
                     schema_name: "Node".into(),
                     package: Some("test_msgs".into()),
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
@@ -3929,6 +3938,7 @@ mod tests {
                 schema_name: "InnerVar".into(),
                 package: Some("test_msgs".into()),
                 fixed: None,
+                target_hash: None,
             },
         ));
         let (walker, _) = FrameWalker::new(vec![inner, holder]);

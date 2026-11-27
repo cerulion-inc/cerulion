@@ -98,8 +98,8 @@ use cerulion_core::flashback::retention::RetentionCaps;
 use cerulion_core::flashback::switch::TriggerPosture;
 use cerulion_core::flashback::trigger::{CaptureRequest, TriggerPolicy};
 use cerulion_core::state_ring::{
-    encode_record, StateRecordHeader, StateRingOwner, RECORD_KIND_FINAL_V2,
-    STATE_RECORD_FORMAT_VERSION, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
+    encode_record, StateRecordHeader, StateRingOwner, StateRingProducer, RECORD_KIND_FINAL_V2,
+    STATE_RECORD_FORMAT_VERSION, STATE_RECORD_HEADER_SIZE, STATE_RECORD_PAYLOAD, STATE_RECORD_SIZE,
 };
 use cerulion_core::trace_ring::{
     TraceRingProducer, TraceRingRecord, RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE,
@@ -599,7 +599,7 @@ fn capture_inner_full(
     // ring per rank is what `process_groups` provisions. A hand stamped
     // manifest can assert the ring COUNT, and only real rings at real ranks can
     // assert what a recorder does with them.
-    let _extra_state_owners: Vec<StateRingOwner> = (0..extra_state_rings)
+    let mut _extra_state_owners: Vec<StateRingOwner> = (0..extra_state_rings)
         .map(|i| {
             let extra_tag = unique_ring_tag(&format!("st{tag}x{i}"));
             let rank = i as u32 + 1;
@@ -622,6 +622,13 @@ fn capture_inner_full(
     // in this process that can see the consumer's cursor without becoming a
     // second consumer.
     let mut state_producer = state_owner.producer().expect("the single state producer");
+    // One producer per extra ring, minted once for the same reason. A state
+    // record goes to the ring of the rank its own header names, so an arm can
+    // anchor every rank of a multi-rank run.
+    let mut extra_state_producers: Vec<StateRingProducer> = _extra_state_owners
+        .iter_mut()
+        .map(|o| o.producer().expect("the single extra state producer"))
+        .collect();
 
     // The TRACE ring — optional, because ring ABSENCE is one of the arms.
     let mut trace_owner = if with_trace_ring {
@@ -694,7 +701,18 @@ fn capture_inner_full(
         // then silently push nothing.
         let mut buf = [0u8; STATE_RECORD_SIZE as usize];
         buf.copy_from_slice(record);
-        state_producer.push_record(&buf);
+        let header = StateRecordHeader::from_bytes(
+            buf[..STATE_RECORD_HEADER_SIZE]
+                .try_into()
+                .expect("a record starts with its header"),
+        );
+        match header.rank {
+            0 => state_producer.push_record(&buf),
+            rank => extra_state_producers
+                .get_mut(rank as usize - 1)
+                .unwrap_or_else(|| panic!("no state ring at rank {rank}"))
+                .push_record(&buf),
+        }
     }
     for seq in 0..PRE_WINDOW_FRAMES {
         pub_.publish_raw(&build_frame(HASH, seq, 1_000 + u64::from(seq), b"pre"))
@@ -711,7 +729,9 @@ fn capture_inner_full(
     if !state.is_empty() {
         assert!(
             await_condition(DEADLINE, || {
-                state_producer.free_records() == Some(u64::from(RING_RECORDS))
+                std::iter::once(&state_producer)
+                    .chain(&extra_state_producers)
+                    .all(|p| p.free_records() == Some(u64::from(RING_RECORDS)))
             }),
             "the recorder must drain the state ring — nothing else in this process consumes it"
         );
@@ -2378,6 +2398,218 @@ fn a_capture_whose_recorder_json_is_not_json_reads_not_resimmable() {
              contract it cannot read before it re-executes anything"
         ),
         "{m}"
+    );
+    h.cleanup();
+}
+
+// ===========================================================================
+// A multi-rank capture that holds every rank's step 0 and its checkpoints
+// ===========================================================================
+
+/// A COMPLETE checkpoint of both nodes on `rank` at `step`, one final record
+/// each.
+fn checkpoint_on(rank: u32, step: u64) -> Vec<Vec<u8>> {
+    (0..NODES.len() as u32)
+        .map(|node_idx| {
+            let payload = vec![0xC0 + node_idx as u8; 24];
+            encode_record(
+                &StateRecordHeader {
+                    run_id: RUN,
+                    step,
+                    node_idx,
+                    part: 0,
+                    kind: RECORD_KIND_FINAL_V2,
+                    len: payload.len() as u32,
+                    rank,
+                    format_version: STATE_RECORD_FORMAT_VERSION,
+                },
+                &payload,
+            )
+            .to_vec()
+        })
+        .collect()
+}
+
+/// A free-run capture of two worker ranks, each with its own trace ring and its
+/// own state ring, each anchored at `anchor_step` for both nodes.
+fn two_rank_free_run_capture(tag: &str, trace: &[TraceRingRecord], anchor_step: u64) -> Harness {
+    let state: Vec<Vec<u8>> = checkpoint_on(0, anchor_step)
+        .into_iter()
+        .chain(checkpoint_on(1, anchor_step))
+        .collect();
+    capture_inner_full(
+        tag,
+        trace,
+        &state,
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        1,
+        false,
+        trace,
+        &[recorder_json(r#""free_run""#)],
+    )
+}
+
+/// The steps each rank's checkpoint was embedded at, off the manifest.
+fn embedded_steps_by_rank(m: &serde_json::Value) -> std::collections::BTreeMap<String, u64> {
+    m["anchor"]["per_rank"]
+        .as_object()
+        .unwrap_or_else(|| panic!("an embedded checkpoint names its ranks: {m}"))
+        .iter()
+        .map(|(rank, entry)| {
+            let step = entry["step"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("rank {rank} names its step: {entry}"));
+            (rank.clone(), step)
+        })
+        .collect()
+}
+
+/// A free-run capture of two worker ranks that still holds both ranks' step 0
+/// carries the WHOLE trace beside its checkpoints, and reads resimmable.
+///
+/// Both ranks anchored at step 0, the first anchor a run takes. Trimmed through
+/// those checkpoints, each rank's trace would begin at step 1, and a replay
+/// that begins mid run with several state rings is refused, since per-rank
+/// resume is not supported. The whole trace begins at step 0 on every rank, and
+/// a replay from step 0 reads no checkpoint at all, so the capture carries it.
+/// The checkpoints stay in the bag.
+///
+/// HAND ORACLE. Each ring is handed steps 0 to 3, three records a step. The end
+/// cut removes step 3 (no later boundary proves it complete), so each rank keeps
+/// steps 0 to 2: 9 records a rank, 18 in the bag.
+#[test]
+fn a_two_rank_free_run_capture_holding_step_zero_carries_its_whole_trace_and_reads_resimmable() {
+    let a = two_rank_free_run_capture("zeroanchored_a", &trace_from_step_zero(), 0);
+    let b = two_rank_free_run_capture("zeroanchored_b", &trace_from_step_zero(), 0);
+    assert_eq!(
+        a.state_ring_ranks,
+        vec![0, 1],
+        "PRECONDITION: two state rings on two real ranks"
+    );
+    let m = flashback_manifest(&a.bag);
+    assert_eq!(
+        m["anchor"]["embedded"],
+        serde_json::json!(true),
+        "the checkpoints stay in the bag: {m}"
+    );
+    assert_eq!(
+        embedded_steps_by_rank(&m),
+        std::collections::BTreeMap::from([("0".to_string(), 0), ("1".to_string(), 0)]),
+        "PRECONDITION: both ranks anchored at step 0: {m}"
+    );
+    assert_eq!(
+        first_steps_by_rank(&a.bag),
+        std::collections::BTreeMap::from([(0, 0), (1, 0)]),
+        "every rank's trace still begins at step 0"
+    );
+    assert_eq!(carried_records(&m), 18, "{m}");
+    assert_eq!(m["anchor"]["resimmable"], serde_json::json!(true), "{m}");
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a verdict states its reason");
+    assert!(
+        reason.contains("step 0"),
+        "the verdict names the window: {reason}"
+    );
+    assert_eq!(
+        trace_payloads(&a.bag),
+        trace_payloads(&b.bag),
+        "two captures of one stimulus carry one trace"
+    );
+    a.cleanup();
+    b.cleanup();
+}
+
+/// The same two-rank free-run shape whose window begins MID RUN keeps its trim
+/// and its refusal: with no step 0 to replay from, only a resume could use the
+/// checkpoints, and a resume of several state rings is refused.
+///
+/// HAND ORACLE. Both ranks anchored at `ANCHOR_STEP`, so each rank's trace
+/// begins at `ANCHOR_STEP + 1`.
+#[test]
+fn a_two_rank_free_run_capture_that_begins_mid_run_keeps_its_trim_and_reads_not_resimmable() {
+    let h = two_rank_free_run_capture("midanchored", &trace_across_the_anchor(), ANCHOR_STEP);
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        embedded_steps_by_rank(&m),
+        std::collections::BTreeMap::from([
+            ("0".to_string(), ANCHOR_STEP),
+            ("1".to_string(), ANCHOR_STEP)
+        ]),
+        "PRECONDITION: both ranks anchored at the anchor step: {m}"
+    );
+    assert_eq!(
+        first_steps_by_rank(&h.bag),
+        std::collections::BTreeMap::from([(0, ANCHOR_STEP + 1), (1, ANCHOR_STEP + 1)]),
+        "the trace is trimmed through each rank's checkpoint"
+    );
+    assert_eq!(m["anchor"]["resimmable"], serde_json::json!(false), "{m}");
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a refusal states its reason");
+    assert!(
+        reason.contains("state rings"),
+        "refused for the several state rings a resume cannot read: {reason}"
+    );
+    h.cleanup();
+}
+
+/// A whole retention that begins at step 0 on rank 0 but whose peer begins at
+/// step 5 is refused too (the ranks begin apart), so the capture keeps its trim
+/// and the trim's own refusal, rather than the whole trace or its sentence.
+///
+/// HAND ORACLE. Rank 0 is handed steps 0 to 3 and anchored at step 0; the peer
+/// is handed steps 5 to 8 and anchored at step 5. Trimmed, rank 0 begins at
+/// step 1 and the peer at step 6, and a resume of several state rings is
+/// refused.
+#[test]
+fn a_two_rank_capture_whose_whole_trace_begins_apart_keeps_its_trim_and_its_refusal() {
+    let rank0 = trace_from_step_zero();
+    let peer: Vec<TraceRingRecord> = (5..=8u64)
+        .flat_map(|step| [boundary(step), fire(step, 0), fire(step, 1)])
+        .collect();
+    let state: Vec<Vec<u8>> = checkpoint_on(0, 0)
+        .into_iter()
+        .chain(checkpoint_on(1, 5))
+        .collect();
+    let h = capture_inner_full(
+        "apartanchored",
+        &rank0,
+        &state,
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        1,
+        false,
+        &peer,
+        &[recorder_json(r#""free_run""#)],
+    );
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        embedded_steps_by_rank(&m),
+        std::collections::BTreeMap::from([("0".to_string(), 0), ("1".to_string(), 5)]),
+        "PRECONDITION: each rank anchored at its own first step: {m}"
+    );
+    assert_eq!(
+        first_steps_by_rank(&h.bag),
+        std::collections::BTreeMap::from([(0, 1), (1, 6)]),
+        "the trace stays trimmed through each rank's checkpoint"
+    );
+    assert_eq!(m["anchor"]["resimmable"], serde_json::json!(false), "{m}");
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a refusal states its reason");
+    assert!(
+        reason.contains("state rings"),
+        "the trimmed trace's own refusal: {reason}"
+    );
+    assert!(
+        !reason.contains("begins at step 5"),
+        "not the refusal of the whole trace it did not carry: {reason}"
     );
     h.cleanup();
 }

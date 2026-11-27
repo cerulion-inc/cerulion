@@ -319,6 +319,47 @@ fn stream_key(
     }
 }
 
+/// How one single-frame take is recorded, resolved before its first receive
+/// (`CerulionSubscriber::begin_take`) and spent at its exit
+/// (`CerulionSubscriber::finish_take`).
+#[derive(Debug, Clone, Copy)]
+struct TakeAccount {
+    /// The stage's single-take rule is on: the take stages its record, settles
+    /// its admission and pays the `block` credit word.
+    recorded: bool,
+    /// Read-outcome capture is armed.
+    capture: bool,
+    /// An empty take stages a `NoFrame` record.
+    consult_capture: bool,
+    /// The record carries its writer's producer annotation.
+    annotate: bool,
+    /// The replay read gate's admission and its ordinal in the step's plan.
+    granted: Option<(crate::read_outcome::DueRead, u32)>,
+}
+
+impl TakeAccount {
+    /// A take a replay of a bag below trace format 13 makes: what that
+    /// recorder's take did, which is nothing beyond the pop.
+    const UNRECORDED: Self = Self {
+        recorded: false,
+        capture: false,
+        consult_capture: false,
+        annotate: false,
+        granted: None,
+    };
+}
+
+/// How a single-frame take ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TakeEnd {
+    /// It delivered a frame.
+    Delivered,
+    /// Its last receive found the queue empty.
+    Emptied,
+    /// A receive failed.
+    Faulted,
+}
+
 /// The `(sequence, producer token)` of each frame one drain popped, in pop
 /// order, held to a length fixed when the read stage is installed.
 ///
@@ -680,6 +721,11 @@ pub struct OwnedInboundSample {
     /// middleware layer's take, which asks for the header one statement after the
     /// read entry returns, costs the one parse the entry already paid.
     header: Option<WireHeader>,
+    /// The key of the writer stream this frame belongs to, what
+    /// [`Self::origin`] returns: the origin port id's value, or on a take a
+    /// replay feed served, the recorded writer token, widened (see
+    /// `stream_key`).
+    origin: u128,
 }
 
 impl OwnedInboundSample {
@@ -689,7 +735,10 @@ impl OwnedInboundSample {
     /// The read path that hands this in has done both one line earlier, so parsing
     /// the same thirty-two bytes again here would be the second parse of a frame on
     /// a path whose rule is one.
-    fn with_header(sample: InboundSample, header: &WireHeader) -> Self {
+    ///
+    /// `origin` is the frame's writer stream key, which the take computed: a fed
+    /// frame leaves the replay feed's one port, so its own origin names no writer.
+    fn with_header(sample: InboundSample, header: &WireHeader, origin: u128) -> Self {
         let frame_len = header.total_size as usize;
         // The precondition, checked where it is cheap: `payload()` slices the loaned
         // slot to `frame_len`, so a `total_size` outside it would panic there
@@ -705,6 +754,7 @@ impl OwnedInboundSample {
             sample,
             frame_len,
             header: Some(*header),
+            origin,
         }
     }
 
@@ -731,10 +781,12 @@ impl OwnedInboundSample {
         // The one parse this constructor makes is kept, so `wire_header` reads it
         // back instead of parsing the same bytes on demand. A frame whose header
         // does not parse keeps `None` here and the whole slot as its length.
+        let origin = sample.origin().value();
         Self {
             sample,
             frame_len,
             header,
+            origin,
         }
     }
 
@@ -780,8 +832,13 @@ impl OwnedInboundSample {
     /// producer-token precedent, and the same caveat `producer_token` above
     /// carries. Returned as the raw `u128` so a caller (`cerulion_bagd`)
     /// needs no iceoryx2 type import.
+    ///
+    /// On a frame [`CerulionSubscriber::try_receive_one_owned`] took from a
+    /// replay feed, it is the writer token the recording names for that frame,
+    /// widened, as [`ReceivedMessage::origin`] is on a fed callback take: every
+    /// fed frame leaves the feed's one port, whose id names no writer.
     pub fn origin(&self) -> u128 {
-        self.sample.origin().value()
+        self.origin
     }
 }
 
@@ -1983,10 +2040,11 @@ impl CerulionSubscriber {
     /// the step's plan. The caller has already established that a gate is
     /// armed, so `Ungated` cannot come back.
     #[inline(never)]
-    fn gate_admission(
+    fn gate_admission_at(
         gate: &crate::read_outcome::ReadPlanStage,
+        empty_recorded: bool,
     ) -> Option<(crate::read_outcome::DueRead, u32)> {
-        match gate.admit_at() {
+        match gate.admit_at_site(empty_recorded) {
             (crate::read_outcome::GateAnswer::Exact(due), ordinal) => Some((due, ordinal)),
             // `Ungated` is unreachable from an armed gate; withholding on it
             // keeps the two answers that mean "pop nothing" on one arm rather
@@ -2006,6 +2064,122 @@ impl CerulionSubscriber {
     fn note_unrecorded_take(&self) {
         if let Some(plan) = self.replay_plan.as_deref() {
             plan.note_unrecorded_take();
+        }
+    }
+
+    /// Open one single-frame take ([`Self::try_receive_one_with`] and its owned
+    /// twin), before its first receive.
+    ///
+    /// On a stage that keeps the single-take rule off (a replay of a bag below
+    /// trace format 13) the take is unrecorded, as that recorder's was, and a
+    /// fed gate is told so. Otherwise the capture bits are read and the gate
+    /// is consulted as at an empty-recording site: `None` means the gate
+    /// withheld the take, nothing leaves the queue, and the `NoFrame` record
+    /// the recording's own empty take staged at this position is staged.
+    #[inline]
+    fn begin_take(&self) -> Option<TakeAccount> {
+        if self
+            .read_stage
+            .as_ref()
+            .is_some_and(|s| !s.records_single_takes())
+        {
+            self.note_unrecorded_take();
+            return Some(TakeAccount::UNRECORDED);
+        }
+        let consult_capture = self.consult_capture_armed();
+        let granted = match self.replay_gate() {
+            None => None,
+            Some(gate) => match Self::gate_admission_at(gate, true) {
+                Some(grant) => Some(grant),
+                None => {
+                    if consult_capture {
+                        self.stage_read_outcome(
+                            ReadOutcomeKind::NoFrame,
+                            None,
+                            0,
+                            ReadSiteRole::Body,
+                        );
+                    }
+                    return None;
+                }
+            },
+        };
+        Some(TakeAccount {
+            recorded: true,
+            capture: self.read_capture_armed(),
+            consult_capture,
+            annotate: self.capture_producer_token(),
+            granted,
+        })
+    }
+
+    /// The writer stream key of the frame a take delivers at removal `pos`
+    /// (from 1): on a take a replay feed served, the writer its recording
+    /// names, and the origin port's value everywhere else (`stream_key`).
+    #[inline]
+    fn take_origin(
+        &self,
+        take: &TakeAccount,
+        origin: UniquePublisherId,
+        seq: u32,
+        pos: u64,
+    ) -> u128 {
+        let fed = take
+            .granted
+            .and_then(|(_, ordinal)| self.replay_plan.as_deref()?.fed_frames(ordinal));
+        stream_key(origin, Some(seq), fed, pos.saturating_sub(1) as usize)
+    }
+
+    /// Close one single-frame take that [`Self::begin_take`] opened: pay the
+    /// `block` credit word for the `removals` it popped, stage its record and
+    /// settle its admission. `served` is the delivered frame's wire sequence
+    /// and origin, `None` when it delivered nothing.
+    ///
+    /// An unrecorded take does none of it. A take whose receive failed stages
+    /// nothing, the posture every drain site keeps for a transport fault, and
+    /// settles the nothing it delivered.
+    #[inline]
+    fn finish_take(
+        &self,
+        take: TakeAccount,
+        removals: u64,
+        served: Option<(u32, UniquePublisherId)>,
+        end: TakeEnd,
+    ) {
+        if !take.recorded {
+            return;
+        }
+        self.record_block_drained(removals, end == TakeEnd::Emptied);
+        match served {
+            Some((seq, origin)) if take.capture => {
+                if take.annotate {
+                    self.stage_read_outcome_with_producer(
+                        ReadOutcomeKind::Taken,
+                        Some(seq),
+                        1,
+                        producer_token(origin),
+                        ReadSiteRole::Body,
+                    );
+                } else {
+                    self.stage_read_outcome(
+                        ReadOutcomeKind::Taken,
+                        Some(seq),
+                        1,
+                        ReadSiteRole::Body,
+                    );
+                }
+            }
+            None if take.consult_capture && end == TakeEnd::Emptied => {
+                self.stage_read_outcome(ReadOutcomeKind::NoFrame, None, 0, ReadSiteRole::Body);
+            }
+            _ => {}
+        }
+        // Settled through the plan handle, not `replay_gate()`: a grant is
+        // proof the gate was armed at the consult (the `drain_samples` rule).
+        if let Some((due, _)) = take.granted {
+            if let Some(gate) = self.replay_plan.as_deref() {
+                gate.settle(due, u64::from(served.is_some()), served.map(|(seq, _)| seq));
+            }
         }
     }
 
@@ -3302,11 +3476,26 @@ impl CerulionSubscriber {
     /// is one message per call — the drain-everything `try_receive`
     /// would silently discard the rest of the queue).
     ///
-    /// DELIBERATELY outside the read-outcome log. This is the rmw
-    /// `take` / services read path — those reads are not recorded in graph
-    /// bags today, so the read log does not invent records for them (the
-    /// three graph entry points are `drain_to_latest_with_accounting`'s
-    /// callers and `drain_samples`).
+    /// On a graph-wired input the take is a recorded read like the graph's
+    /// other read paths (`trace_format` 13): it asks the replay read gate
+    /// first, stages one `Taken` record (popped 1, the `Body` role, with the
+    /// producer annotation of its writer run) for the frame it delivers or one
+    /// `NoFrame` record for an empty queue, and pays the `block` credit word
+    /// for every frame it removed. A take leaves the frames behind the one it
+    /// delivered queued on every input, a latest-value one included, so its
+    /// record is `Taken` and not the `Served` of a read that drains the queue
+    /// to its newest frame. A replay of a bag below format 13 takes the
+    /// unrecorded path that recorder took: no gate, no record, no credit, and a
+    /// replay fed by read identity reports the take as an unrecorded take
+    /// (`ReadOutcomeStage::records_single_takes`). On a subscriber the graph
+    /// did not wire, such as the rmw `take` and services paths, there is no
+    /// stage, gate or credit word, so none of that runs.
+    ///
+    /// When the gate withholds the take, nothing leaves the queue and the call
+    /// returns `Ok(false)`, as at an empty queue. The take is recorded,
+    /// settled and paid for before `callback` runs, so a take the callback
+    /// makes on this subscriber is recorded after it, and a callback that
+    /// panics leaves the frame it was handed accounted for.
     ///
     /// Returns `Ok(true)` iff a valid sample was delivered to the
     /// callback. Malformed frames are skipped with a warning and
@@ -3335,9 +3524,10 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one");
         }
-        // A replay that feeds this input privately cannot place frames for a
-        // read the log never recorded: say so on the gate, by stage.
-        self.note_unrecorded_take();
+        // Resolved before the first receive: a withheld take pops nothing.
+        let Some(take) = self.begin_take() else {
+            return Ok(false);
+        };
         // Malformed frames this call POPPED. They are queue removals, so each one
         // rode a notify; the listener policy keys on removals, and the exits that
         // return without delivering a frame still have to report them.
@@ -3346,6 +3536,7 @@ impl CerulionSubscriber {
             let received = match self.subscriber.receive() {
                 Ok(received) => received,
                 Err(e) => {
+                    self.finish_take(take, removals, None, TakeEnd::Faulted);
                     self.drain_listener_after_removals(removals, drain);
                     return Err(TransportError::Receive {
                         topic: self.topic.clone(),
@@ -3354,6 +3545,7 @@ impl CerulionSubscriber {
                 }
             };
             let Some(sample) = received else {
+                self.finish_take(take, removals, None, TakeEnd::Emptied);
                 self.drain_listener_after_removals(removals, drain);
                 return Ok(false);
             };
@@ -3389,15 +3581,22 @@ impl CerulionSubscriber {
                 continue;
             }
             let payload = &raw[WireHeader::SIZE..total_size];
-            callback(ReceivedMessage::from_publisher(
-                header,
-                payload,
-                sample.origin().value(),
-            ));
-            // Same serve point as `drain_samples` — one frame, really
-            // delivered.
+            let origin = self.take_origin(&take, sample.origin(), header.sequence, removals);
+            // The take is accounted for before user code runs: a take the
+            // callback makes on this subscriber is then recorded after this
+            // one, in the order the frames left the queue (a replay plans its
+            // admissions in record order), and a callback that panics leaves
+            // the record, the settle and the credit word paid for a frame
+            // that really left the queue.
             self.record_service_cursor_from(&header);
+            self.finish_take(
+                take,
+                removals,
+                Some((header.sequence, sample.origin())),
+                TakeEnd::Delivered,
+            );
             self.drain_listener_after_removals(removals, drain);
+            callback(ReceivedMessage::from_publisher(header, payload, origin));
             return Ok(true);
         }
     }
@@ -3434,8 +3633,9 @@ impl CerulionSubscriber {
     /// exactly this), so the bytes behind [`OwnedInboundSample::payload`] can
     /// never be overwritten by a later publish while the sample is held.
     ///
-    /// Like [`Self::try_receive_one`], DELIBERATELY outside the
-    /// read-outcome log (rmw takes are not recorded in graph bags today).
+    /// Recorded, gated and credited exactly as [`Self::try_receive_one`] is.
+    /// On a take a replay feed served, [`OwnedInboundSample::origin`] is the
+    /// recorded writer token, widened.
     #[must_use = "receive result must be checked"]
     pub fn try_receive_one_owned(&self) -> TransportResult<Option<OwnedInboundSample>> {
         self.try_receive_one_owned_with(ListenerDrain::AfterRemovals)
@@ -3454,7 +3654,10 @@ impl CerulionSubscriber {
         if self.unified_bound.is_some() {
             self.warn_unified_receive_misuse("try_receive_one_owned");
         }
-        self.note_unrecorded_take();
+        // Resolved before the first receive: a withheld take pops nothing.
+        let Some(take) = self.begin_take() else {
+            return Ok(None);
+        };
         // Malformed frames this call POPPED. They are queue removals, so each one
         // rode a notify; the listener policy keys on removals, and the exits that
         // return without delivering a frame still have to report them.
@@ -3463,6 +3666,7 @@ impl CerulionSubscriber {
             let received = match self.subscriber.receive() {
                 Ok(received) => received,
                 Err(e) => {
+                    self.finish_take(take, removals, None, TakeEnd::Faulted);
                     self.drain_listener_after_removals(removals, drain);
                     return Err(TransportError::Receive {
                         topic: self.topic.clone(),
@@ -3471,6 +3675,7 @@ impl CerulionSubscriber {
                 }
             };
             let Some(sample) = received else {
+                self.finish_take(take, removals, None, TakeEnd::Emptied);
                 self.drain_listener_after_removals(removals, drain);
                 return Ok(None);
             };
@@ -3502,11 +3707,20 @@ impl CerulionSubscriber {
                 );
                 continue;
             }
+            let origin = self.take_origin(&take, sample.origin(), header.sequence, removals);
             // Same serve point as the callback twin — one frame,
             // really delivered (ownership does not change what "served" means).
             self.record_service_cursor_from(&header);
+            self.finish_take(
+                take,
+                removals,
+                Some((header.sequence, sample.origin())),
+                TakeEnd::Delivered,
+            );
             self.drain_listener_after_removals(removals, drain);
-            return Ok(Some(OwnedInboundSample::with_header(sample, &header)));
+            return Ok(Some(OwnedInboundSample::with_header(
+                sample, &header, origin,
+            )));
         }
     }
 
@@ -3540,7 +3754,7 @@ impl CerulionSubscriber {
         self.batch_frames.borrow_mut().clear();
         let granted = match self.replay_gate() {
             None => None,
-            Some(gate) => match Self::gate_admission(gate) {
+            Some(gate) => match Self::gate_admission_at(gate, true) {
                 Some(grant) => Some(grant),
                 None => {
                     // The gate held the pop back: nothing left the queue, and
@@ -3580,10 +3794,8 @@ impl CerulionSubscriber {
         // `deliver_raw_frame` and not counted, matching the timestamps the
         // trigger path forwards); one `NoFrame` record (popped 0) per drain
         // that delivered nothing and faulted nowhere. Armed-only (`capture`
-        // and `consult_capture`, read above the gate consult).
-        // rmw `take` / services route through `try_receive_one`, which is
-        // DELIBERATELY out of the read log's scope (not recorded in graph
-        // bags today), see that method.
+        // and `consult_capture`, read above the gate consult). A single-frame
+        // take records through `begin_take` and `finish_take` instead.
         // On a `multi_publisher_topics` edge, ALSO track the
         // origin of the frame whose sequence this batch reports (the newest
         // DELIVERED one) — the record says which producer's frame the batch
@@ -4116,7 +4328,7 @@ impl CerulionSubscriber {
     /// unified trigger accounting (`popped` = frames consumed this drain,
     /// `latest_ts` = the surviving sample's wire timestamp, None on Empty/Err).
     fn drain_to_latest_with_accounting(&mut self) -> DrainOutcome {
-        self.drain_with_accounting_impl(false)
+        self.drain_with_accounting_impl(false, true)
     }
 
     /// Pop exactly ONE sample (FIFO head) with the same accounting-once pass
@@ -4128,7 +4340,14 @@ impl CerulionSubscriber {
     /// pop returns `Empty` (popped = 1, decimation counted); the next read
     /// pops the next frame.
     fn drain_one_with_accounting(&mut self) -> DrainOutcome {
-        self.drain_with_accounting_impl(true)
+        self.drain_with_accounting_impl(true, true)
+    }
+
+    /// Site-aware twin of [`Self::drain_one_with_accounting`]: forwards
+    /// `empty_recorded` to [`Self::gate_admission_at`] so post-fire per-set
+    /// `Sync` refill passes withhold silently on an empty partner queue.
+    fn drain_one_with_accounting_at(&mut self, empty_recorded: bool) -> DrainOutcome {
+        self.drain_with_accounting_impl(true, empty_recorded)
     }
 
     /// The single drain-and-account implementation behind BOTH consume modes
@@ -4146,10 +4365,14 @@ impl CerulionSubscriber {
     ///
     /// With no armed gate the answer is `Ungated` and the body below runs byte
     /// for byte as it does today.
-    fn drain_with_accounting_impl(&mut self, limit_one: bool) -> DrainOutcome {
+    fn drain_with_accounting_impl(
+        &mut self,
+        limit_one: bool,
+        empty_recorded: bool,
+    ) -> DrainOutcome {
         let granted = match self.replay_gate() {
             None => None,
-            Some(gate) => match Self::gate_admission(gate) {
+            Some(gate) => match Self::gate_admission_at(gate, empty_recorded) {
                 Some(grant) => Some(grant),
                 None => {
                     // No stale EVENT drain here either, for the reason the body
@@ -5201,6 +5424,26 @@ impl CerulionSubscriber {
     /// why `false` is the gate's PASS witness and therefore the one answer a
     /// lost error must never be able to fabricate.
     pub(crate) fn sync_next_arrived(&mut self) -> TransportResult<bool> {
+        // Under an armed replay read gate, the private feed queue stays empty
+        // until an admission fills it, so probing `has_samples()` would always
+        // answer `false`, while an already-parked `next_head` from an earlier
+        // partial tick would unconditionally answer `true` and let the matcher
+        // advance it when a partner's successor was recorded as a post-fire
+        // refill instead of a `Peek`. Decide from this stage's own recorded
+        // plan: a parked `next_head` is eligible to advance only when the entry
+        // at the cursor is its recorded `HandOff` (`ServedWithoutPop` with the
+        // staged frame's sequence), and an empty `next_head` asks whether the
+        // next spendable entry is a recorded `Peek`.
+        if let Some(gate) = self.replay_gate() {
+            let answer = match &self.next_head {
+                Some(staged) => gate.next_is_handoff(wire_sequence(staged.payload())),
+                None => gate.next_is_peek(),
+            };
+            return answer.map_err(|_| TransportError::Receive {
+                topic: self.topic.clone(),
+                reason: "replay read gate poisoned during sync_next_arrived".to_string(),
+            });
+        }
         if self.next_head.is_some() {
             return Ok(true);
         }
@@ -5307,7 +5550,7 @@ impl CerulionSubscriber {
         }
         // Pop EXACTLY one, in FIFO order, with the same accounting-once pass
         // every other read on this input runs.
-        let outcome = self.drain_one_with_accounting();
+        let outcome = self.drain_one_with_accounting_at(site == SyncAlignSite::Boundary);
         let forgiven = outcome.forgiven;
         match outcome.slot {
             FrozenSlot::Sample(sample) => {
@@ -5380,10 +5623,9 @@ impl CerulionSubscriber {
                 // consult rule (`consult_capture_armed`) AND under the pass's
                 // SITE: a BOUNDARY align pass runs on both sides, so its empty
                 // pop has a replayed twin, while a post-fire REFILL align pass
-                // runs only on the recording side (a planned Sync fire goes to
-                // `Scheduler::tick_replay_burst`, and
-                // `Scheduler::set_trigger_refill` refuses any non-`Data`
-                // policy, so no align pass follows it). The split is applied to
+                // stages no `NoFrame` on an empty queue (a fed replay withholds
+                // silently under `empty_recorded = false`, and an unfed replay
+                // runs no post-fire align pass). The split is applied to
                 // the empty-consult record only, the one trace format 7
                 // introduced; the `Decimated` record above predates it and this
                 // site gate does not reach it.
@@ -5482,6 +5724,9 @@ impl CerulionSubscriber {
                     );
                 }
             }
+            if let Some(gate) = self.replay_gate() {
+                gate.consume_handoff(wire_sequence(promoted.payload()));
+            }
             self.frozen = Some(FrozenSlot::Sample(promoted));
             // SLOT EXIT (the skipped head only): the promotion itself
             // moves a frame BETWEEN slots and changes nothing, so the net here
@@ -5492,7 +5737,7 @@ impl CerulionSubscriber {
         // Nothing staged (an `Advance` the gate reached without a `NeedStamp`,
         // or a `DiscardTie`): refill from the queue, with the ordinary
         // accounting-once pass and the ordinary read-log record.
-        let outcome = self.drain_one_with_accounting();
+        let outcome = self.drain_one_with_accounting_at(site == SyncAlignSite::Boundary);
         if self.read_capture_armed() {
             match &outcome.slot {
                 // Same rule as the boundary drain — an
@@ -5537,13 +5782,11 @@ impl CerulionSubscriber {
                 // split `drain_for_trigger` applies: a BOUNDARY align pass runs
                 // on both sides (`GraphRuntime::drain_level` runs it
                 // unconditionally), so its empty refill has a replayed twin,
-                // while a post-fire REFILL align pass runs only on the
-                // recording side. `Scheduler::set_trigger_refill` refuses any
-                // non-`Data` policy, so a planned Sync fire goes to
-                // `Scheduler::tick_replay_burst` with no align pass behind it
-                // and makes no consult here at all; a record staged at the
-                // refill site would hold a position the replayed log can never
-                // fill.
+                // while a post-fire REFILL align pass stages no `NoFrame` on an
+                // empty queue (a fed replay withholds silently under
+                // `empty_recorded = false`, and an unfed replay runs no
+                // post-fire align pass); a record staged at the refill site
+                // would hold a position an unfed replayed log could never fill.
                 FrozenSlot::Empty => {
                     if site == SyncAlignSite::Boundary && self.consult_capture_armed() {
                         self.stage_read_outcome(
@@ -5836,7 +6079,9 @@ impl CerulionSubscriber {
         // freeze.
         let outcome = match self.consume_mode {
             ConsumeMode::Latest => self.drain_to_latest_with_accounting(),
-            ConsumeMode::EachFifo => self.drain_one_with_accounting(),
+            ConsumeMode::EachFifo => self.drain_one_with_accounting_at(
+                !(self.per_set_sync_trigger && site == TriggerDrainSite::Refill),
+            ),
         };
         // The UNIFIED trigger-drain read outcome: a DrainedBatch
         // (served-seq = the surviving/newest frame, popped = the batch), a
@@ -8592,5 +8837,1067 @@ mod tests {
         assert!(plan.take_violations().is_empty(), "every admission settled");
         let (a, b) = (u128::from(FED_WRITER_A), u128::from(FED_WRITER_B));
         assert_eq!(seen, vec![(a, 10), (b, 100), (a, 11), (b, 101)]);
+    }
+
+    /// A gated, fed per-set `Sync` subscriber drives `FillBoundary`, `ProbeNext`,
+    /// `PeekNext`, `Advance`, `DiscardTie`, and post-fire `FillRefill` through
+    /// the read plan and private feed, settles each frame's sequence, and fails
+    /// closed when the gate is poisoned or a peek is fed the wrong sequence.
+    #[test]
+    fn gated_sync_peek_and_discard_consult_feed_and_settle_sequence() {
+        use crate::read_outcome::{
+            ConsultRule, DueRead, ReadPlanStage, ReadStageRole, ReplayReadViolationKind, StageKey,
+        };
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+
+        struct SyncFeedEntry {
+            seq: u32,
+            ts: u64,
+            ids: Vec<(u64, u32)>,
+        }
+
+        struct CountingSyncFeed {
+            port: std::sync::Mutex<crate::transport::publisher::CerulionPublisher>,
+            entries: std::collections::HashMap<u32, SyncFeedEntry>,
+            fills: std::sync::atomic::AtomicUsize,
+        }
+
+        impl std::fmt::Debug for CountingSyncFeed {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("CountingSyncFeed").finish_non_exhaustive()
+            }
+        }
+
+        impl crate::replay_feed::ReadFeed for CountingSyncFeed {
+            fn fill(
+                &self,
+                _key: &StageKey,
+                _step: u64,
+                ordinal: u32,
+            ) -> Result<(), crate::replay_feed::ReadFeedFault> {
+                self.fills.fetch_add(1, Ordering::Relaxed);
+                let entry = self.entries.get(&ordinal).expect("planned ordinal");
+                let mut header = crate::wire::WireHeader::new(0xC1289, entry.seq, entry.ts);
+                let total = crate::wire::WireHeader::SIZE + 8;
+                header.total_size = total as u32;
+                let mut buf = vec![0u8; total]; // hot-path-alloc-ok: test-only frame builder.
+                header.write_to_buf(&mut buf);
+                self.port
+                    .lock()
+                    .expect("feed port")
+                    .publish_raw(&buf)
+                    .map(|_| ())
+                    .map_err(|e| crate::replay_feed::ReadFeedFault {
+                        detail: e.to_string(),
+                    })
+            }
+
+            fn frames(&self, _key: &StageKey, _step: u64, ordinal: u32) -> Option<&[(u64, u32)]> {
+                self.entries.get(&ordinal).map(|e| e.ids.as_slice())
+            }
+        }
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "gated_sync_ops".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+
+        // Happy path: FillBoundary (seq 10, ts 1000) -> ProbeNext (true, peek)
+        // -> PeekNext (seq 11, ts 2000) -> Advance (promotes seq 11 without a
+        // feed call; HandOff at ordinal 2 is transparent) -> ProbeNext (false)
+        // -> DiscardTie (refills seq 12, ts 3000 from feed) -> trailing Refill
+        // with empty plan withholds silently without UnplannedConsult.
+        let topic = "gated_sync_happy";
+        let port = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        sub.mark_fifo_consume();
+        sub.mark_per_set_sync_trigger();
+
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            0,
+            SyncFeedEntry {
+                seq: 10,
+                ts: 1_000,
+                ids: vec![(FED_WRITER_A, 10)],
+            },
+        );
+        entries.insert(
+            1,
+            SyncFeedEntry {
+                seq: 11,
+                ts: 2_000,
+                ids: vec![(FED_WRITER_A, 11)],
+            },
+        );
+        entries.insert(
+            3,
+            SyncFeedEntry {
+                seq: 12,
+                ts: 3_000,
+                ids: vec![(FED_WRITER_A, 12)],
+            },
+        );
+        let feed = Arc::new(CountingSyncFeed {
+            port: std::sync::Mutex::new(port),
+            entries,
+            fills: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let now = Arc::new(AtomicU64::new(0));
+        let plan = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sync".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::clone(&now),
+        ));
+        assert!(plan.install_feed(Arc::clone(&feed) as Arc<dyn crate::replay_feed::ReadFeed>));
+        plan.arm(ConsultRule::Recorded).expect("arm");
+        plan.install_step(
+            0,
+            &[
+                DueRead::pops(1, Some(10)),
+                DueRead::peek(1, Some(11)),
+                DueRead::served_without_pop(Some(11)),
+                DueRead::pops(1, Some(12)),
+            ],
+        )
+        .expect("install");
+        sub.set_replay_read_plan(Arc::clone(&plan));
+
+        // 1. FillBoundary pops seq 10 via feed.
+        let (popped, ts) = sub.snapshot_latest_for_trigger();
+        assert_eq!((popped, ts), (1, Some(1_000)));
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 1);
+
+        // 2. ProbeNext sees the recorded Peek (ordinal 1) without calling feed.
+        assert!(sub.sync_next_arrived().expect("probe"));
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 1);
+
+        // 3. PeekNext feeds and pops seq 11 into next_head.
+        assert_eq!(
+            sub.sync_peek_next_stamp(SyncAlignSite::Boundary)
+                .expect("peek"),
+            Some(2_000)
+        );
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 2);
+
+        // 4. Advance promotes next_head (seq 11) with NO feed call.
+        assert_eq!(
+            sub.sync_discard_head(SyncAlignSite::Boundary)
+                .expect("advance"),
+            Some(2_000)
+        );
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 2);
+
+        // 5. ProbeNext skips HandOff (ordinal 2), sees Drain (ordinal 3) -> false.
+        assert!(!sub.sync_next_arrived().expect("probe"));
+
+        // 6. DiscardTie (next_head is None) refills seq 12 from feed.
+        assert_eq!(
+            sub.sync_discard_head(SyncAlignSite::Boundary)
+                .expect("discard_tie"),
+            Some(3_000)
+        );
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 3);
+
+        // 7. After head is consumed (simulate fire by clearing frozen), a
+        // post-fire FillRefill against an exhausted plan withholds silently
+        // with zero UnplannedConsult violations.
+        sub.frozen = None;
+        let (refill_popped, refill_ts, _) =
+            sub.drain_for_trigger_observed(TriggerDrainSite::Refill);
+        assert_eq!((refill_popped, refill_ts), (0, None));
+        assert_eq!(feed.fills.load(Ordering::Relaxed), 3);
+        plan.sweep(0);
+        assert!(
+            plan.take_violations().is_empty(),
+            "happy path settles cleanly with zero violations"
+        );
+
+        // Adversarial 1: feeding the wrong sequence for a Peek mints
+        // SequenceMismatch at settle.
+        let topic_bad = "gated_sync_bad_peek";
+        let port_bad = mgr
+            .create_publisher(topic_bad, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub_bad = mgr.create_subscriber(topic_bad).expect("subscriber");
+        sub_bad.mark_fifo_consume();
+        sub_bad.mark_per_set_sync_trigger();
+        let mut bad_entries = std::collections::HashMap::new();
+        bad_entries.insert(
+            0,
+            SyncFeedEntry {
+                seq: 20,
+                ts: 1_000,
+                ids: vec![(FED_WRITER_A, 20)],
+            },
+        );
+        // Feed publishes seq 99 where the plan expects peek seq 21.
+        bad_entries.insert(
+            1,
+            SyncFeedEntry {
+                seq: 99,
+                ts: 2_000,
+                ids: vec![(FED_WRITER_A, 99)],
+            },
+        );
+        let feed_bad = Arc::new(CountingSyncFeed {
+            port: std::sync::Mutex::new(port_bad),
+            entries: bad_entries,
+            fills: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let plan_bad = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sync".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        assert!(
+            plan_bad.install_feed(Arc::clone(&feed_bad) as Arc<dyn crate::replay_feed::ReadFeed>)
+        );
+        plan_bad.arm(ConsultRule::Recorded).expect("arm");
+        plan_bad
+            .install_step(0, &[DueRead::pops(1, Some(20)), DueRead::peek(1, Some(21))])
+            .expect("install");
+        sub_bad.set_replay_read_plan(Arc::clone(&plan_bad));
+        assert_eq!(sub_bad.snapshot_latest_for_trigger(), (1, Some(1_000)));
+        assert!(sub_bad.sync_next_arrived().expect("probe"));
+        assert_eq!(
+            sub_bad
+                .sync_peek_next_stamp(SyncAlignSite::Boundary)
+                .expect("peek"),
+            Some(2_000)
+        );
+        let violations = plan_bad.take_violations();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(
+            violations[0].kind,
+            ReplayReadViolationKind::SequenceMismatch {
+                expected: Some(21),
+                observed: Some(99),
+            }
+        );
+
+        // Adversarial 2: a poisoned gate causes sync_next_arrived to fail
+        // closed with TransportError::Receive.
+        sub_bad.next_head = None;
+        plan_bad.poison_for_test();
+        let err = sub_bad
+            .sync_next_arrived()
+            .expect_err("poisoned gate fails closed");
+        assert!(
+            matches!(err, TransportError::Receive { .. }),
+            "expected TransportError::Receive, got {err:?}"
+        );
+
+        // Parked-peek regression: when a partial Sync tick leaves a frame
+        // parked in `next_head` across a step boundary, `sync_next_arrived`
+        // answers `false` when the new step has no matching `HandOff` at cursor
+        // (empty plan, a later `Peek`, or a `HandOff` for another sequence),
+        // answers `true` when the cursor holds a matching `HandOff`, consumes
+        // that `HandOff` on `sync_discard_head`, and fails closed when the gate
+        // is poisoned while `next_head` is populated.
+        let topic_parked = "gated_sync_parked_peek";
+        let port_parked = mgr
+            .create_publisher(topic_parked, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("feed port");
+        let mut sub_p = mgr.create_subscriber(topic_parked).expect("subscriber");
+        sub_p.mark_fifo_consume();
+        sub_p.mark_per_set_sync_trigger();
+        let mut parked_entries = std::collections::HashMap::new();
+        parked_entries.insert(
+            0,
+            SyncFeedEntry {
+                seq: 30,
+                ts: 10_000,
+                ids: vec![(FED_WRITER_A, 30)],
+            },
+        );
+        parked_entries.insert(
+            1,
+            SyncFeedEntry {
+                seq: 31,
+                ts: 35_000,
+                ids: vec![(FED_WRITER_A, 31)],
+            },
+        );
+        let feed_parked = Arc::new(CountingSyncFeed {
+            port: std::sync::Mutex::new(port_parked),
+            entries: parked_entries,
+            fills: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let now_p = Arc::new(AtomicU64::new(0));
+        let plan_p = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sync".to_string(),
+                input_idx: 1,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::clone(&now_p),
+        ));
+        assert!(
+            plan_p.install_feed(Arc::clone(&feed_parked) as Arc<dyn crate::replay_feed::ReadFeed>)
+        );
+        plan_p.arm(ConsultRule::Recorded).expect("arm");
+        plan_p
+            .install_step(0, &[DueRead::pops(1, Some(30)), DueRead::peek(1, Some(31))])
+            .expect("install step 0");
+        sub_p.set_replay_read_plan(Arc::clone(&plan_p));
+
+        // Step 0: fill head (seq 30) and park peek (seq 31) without advancing.
+        assert_eq!(sub_p.snapshot_latest_for_trigger(), (1, Some(10_000)));
+        assert!(sub_p.sync_next_arrived().expect("probe step 0"));
+        assert_eq!(
+            sub_p
+                .sync_peek_next_stamp(SyncAlignSite::Boundary)
+                .expect("peek step 0"),
+            Some(35_000)
+        );
+        plan_p.sweep(0);
+
+        // Step 1 (empty plan, partner had a refill so live did not advance):
+        // parked next_head answers false so matcher keeps the current pair.
+        now_p.store(1, Ordering::Release);
+        plan_p.install_step(1, &[]).expect("install step 1");
+        assert!(!sub_p.sync_next_arrived().expect("probe empty step 1"));
+
+        // Step 2 (a later Peek at cursor, no HandOff for seq 31): still false
+        // while seq 31 is parked; does not skip ahead to the later Peek.
+        now_p.store(2, Ordering::Release);
+        plan_p
+            .install_step(2, &[DueRead::peek(1, Some(32))])
+            .expect("install step 2");
+        assert!(!sub_p.sync_next_arrived().expect("probe peek step 2"));
+
+        // Step 3 (HandOff for a different seq 99): still false.
+        now_p.store(3, Ordering::Release);
+        plan_p
+            .install_step(3, &[DueRead::served_without_pop(Some(99))])
+            .expect("install step 3");
+        assert!(!sub_p.sync_next_arrived().expect("probe wrong handoff"));
+
+        // Step 4 (matching HandOff(31) at cursor): answers true, and
+        // sync_discard_head promotes seq 31 while consuming HandOff(31).
+        now_p.store(4, Ordering::Release);
+        plan_p
+            .install_step(
+                4,
+                &[
+                    DueRead::served_without_pop(Some(31)),
+                    DueRead::pops(1, Some(32)),
+                ],
+            )
+            .expect("install step 4");
+        assert!(sub_p.sync_next_arrived().expect("probe matching handoff"));
+        assert_eq!(
+            sub_p
+                .sync_discard_head(SyncAlignSite::Boundary)
+                .expect("advance parked"),
+            Some(35_000)
+        );
+        assert!(
+            !sub_p.sync_next_arrived().expect("probe after advance"),
+            "after promoting seq 31 and consuming HandOff(31), Drain(32) answers false"
+        );
+
+        // Step 5 (poisoned gate while next_head is Some): fails closed.
+        sub_p.next_head = sub_p.frozen.take().and_then(|slot| match slot {
+            FrozenSlot::Sample(s) => Some(s),
+            _ => None,
+        });
+        assert!(sub_p.next_head.is_some());
+        plan_p.poison_for_test();
+        let err = sub_p
+            .sync_next_arrived()
+            .expect_err("poisoned gate with parked next_head fails closed");
+        assert!(
+            matches!(err, TransportError::Receive { .. }),
+            "expected TransportError::Receive, got {err:?}"
+        );
+    }
+
+    // =======================================================================
+    // Single-frame takes (`try_receive_one`, `try_receive_one_owned`) are
+    // recorded, gated and credited reads from trace format 13.
+    // =======================================================================
+
+    /// A test transport and an ARMED body read stage for `topic`.
+    fn take_transport(
+        topic: &str,
+    ) -> (
+        Arc<crate::transport::TransportManager>,
+        Arc<ReadOutcomeStage>,
+    ) {
+        use crate::read_outcome::ReadStageRole;
+        use crate::transport::{TransportConfig, TransportManager};
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: topic.into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 16,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let stage = Arc::new(ReadOutcomeStage::new(
+            0,
+            ReadStageRole::Body,
+            hand_wired_drain_sizing(),
+        ));
+        stage.arm();
+        (mgr, stage)
+    }
+
+    /// A publisher and a subscriber on `topic`, the subscriber carrying an
+    /// ARMED body read stage.
+    fn take_fixture(
+        topic: &str,
+    ) -> (
+        Arc<crate::transport::TransportManager>,
+        crate::transport::publisher::CerulionPublisher,
+        CerulionSubscriber,
+        Arc<ReadOutcomeStage>,
+    ) {
+        let (mgr, stage) = take_transport(topic);
+        let publisher = mgr
+            .create_publisher(
+                topic,
+                crate::wire::MaxSliceLen::try_new(1024).expect("len"),
+                0,
+            )
+            .expect("publisher");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        (mgr, publisher, sub, stage)
+    }
+
+    /// A subscriber on `topic` with an ARMED body read stage and a replay read
+    /// gate armed under the counted rule with `due` installed for step 0, fed
+    /// by a [`OnePortFeed`] over `reads` whose port is the topic's only
+    /// publisher. The feed is returned too, so a test can queue a frame
+    /// through its port by hand.
+    #[allow(clippy::type_complexity)]
+    fn fed_take_fixture(
+        topic: &str,
+        due: &[crate::read_outcome::DueRead],
+        reads: Vec<Vec<(u64, u32)>>,
+    ) -> (
+        Arc<crate::transport::TransportManager>,
+        Arc<OnePortFeed>,
+        CerulionSubscriber,
+        Arc<crate::read_outcome::ReadPlanStage>,
+        Arc<ReadOutcomeStage>,
+    ) {
+        use crate::read_outcome::{ConsultRule, ReadPlanStage, ReadStageRole, StageKey};
+        let (mgr, stage) = take_transport(topic);
+        let port = mgr
+            .create_publisher(
+                topic,
+                crate::wire::MaxSliceLen::try_new(1024).expect("len"),
+                0,
+            )
+            .expect("feed port");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        let feed = Arc::new(OnePortFeed {
+            port: std::sync::Mutex::new(port),
+            reads,
+        });
+        let plan = Arc::new(ReadPlanStage::new(
+            StageKey {
+                node: "sink".to_string(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            8,
+            None,
+            Arc::new(AtomicU64::new(0)),
+        ));
+        assert!(plan.install_feed(Arc::clone(&feed) as Arc<dyn crate::replay_feed::ReadFeed>));
+        plan.arm(ConsultRule::Counted)
+            .expect("a stage with no blocker arms");
+        plan.install_step(0, due).expect("step 0 installs");
+        sub.set_replay_read_plan(Arc::clone(&plan));
+        (mgr, feed, sub, plan, stage)
+    }
+
+    /// `stage`'s staged records expanded by run count, in staging order, as
+    /// `(kind, served_seq, popped, token, role)`.
+    fn take_records(
+        stage: &ReadOutcomeStage,
+    ) -> Vec<(ReadOutcomeKind, u64, u32, Option<u64>, ReadSiteRole)> {
+        let mut out = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        stage.drain_into(|r| {
+            for _ in 0..r.run_count {
+                out.push((r.kind, r.served_seq, r.popped, r.token, r.role));
+            }
+            true
+        });
+        out
+    }
+
+    /// `plan`'s divergences as `(step, kind)`.
+    fn take_violations(
+        plan: &crate::read_outcome::ReadPlanStage,
+    ) -> Vec<(u64, crate::read_outcome::ReplayReadViolationKind)> {
+        plan.take_violations()
+            .into_iter()
+            .map(|v| (v.step, v.kind))
+            .collect()
+    }
+
+    /// A take is a recorded read: one `Taken` record (popped 1, the `Body`
+    /// role) for each frame it delivers, through both twins, and one `NoFrame`
+    /// record (popped 0) for each take that finds the queue empty. A malformed
+    /// frame the take skips is not the frame it names.
+    ///
+    /// Hand oracle: frames 0 and 1 are queued, then a 3-byte frame and frame 5.
+    /// The takes are callback, owned, callback, callback, owned: they see 0, 1,
+    /// 5 (past the malformed one), nothing, nothing, so the records are
+    /// `Taken 0`, `Taken 1`, `Taken 5`, then two `NoFrame` records. Every
+    /// record reads `popped` 1 or 0, never the 2 frames the third take removed.
+    ///
+    /// What breaks it: a take that records nothing (the trace format 12
+    /// recorder, or a mutant that drops `finish_take`), a take that stages the
+    /// removal count as `popped`, or one that stages under the `Drain` role.
+    #[test]
+    fn a_take_records_each_frame_it_delivers_and_each_empty_queue() {
+        use crate::read_outcome::STAGE_NO_FRAME;
+        let (_mgr, mut publisher, sub, stage) = take_fixture("take_records_reads");
+        for seq in [0, 1] {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+        }
+        publisher.publish_raw(&[1, 2, 3]).expect("publish");
+        publisher
+            .publish_raw(&batch_frame_bytes(5))
+            .expect("publish");
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        assert!(sub
+            .try_receive_one(|m| seen.push(m.header().sequence))
+            .expect("take"));
+        let owned = sub.try_receive_one_owned().expect("owned take");
+        seen.push(owned.and_then(|o| o.wire_header()).expect("frame").sequence);
+        assert!(sub
+            .try_receive_one(|m| seen.push(m.header().sequence))
+            .expect("take"));
+        assert!(!sub.try_receive_one(|_| {}).expect("empty take"));
+        assert!(sub
+            .try_receive_one_owned()
+            .expect("empty owned take")
+            .is_none());
+        assert_eq!(seen, vec![0, 1, 5]);
+        let body = ReadSiteRole::Body;
+        assert_eq!(
+            take_records(&stage),
+            vec![
+                (ReadOutcomeKind::Taken, 0, 1, None, body),
+                (ReadOutcomeKind::Taken, 1, 1, None, body),
+                (ReadOutcomeKind::Taken, 5, 1, None, body),
+                (ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body),
+                (ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body),
+            ]
+        );
+    }
+
+    /// On an edge that carries writers, the take's record is preceded by its
+    /// writer's annotation, once per writer run.
+    ///
+    /// Hand oracle: two frames of one publisher, taken one at a time, stage
+    /// `Producer` (the publisher's token), `Taken 3`, `Taken 4`: the second
+    /// read continues the run the first opened.
+    #[test]
+    fn a_take_on_an_annotated_edge_names_its_writer_once_per_run() {
+        let (_mgr, mut publisher, mut sub, stage) = take_fixture("take_annotates_writer");
+        sub.mark_multi_publisher_edge();
+        let token = crate::wire::fnv1a_hash(&publisher.publisher_id().to_le_bytes());
+        for seq in [3, 4] {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+        }
+        assert!(sub.try_receive_one(|_| {}).expect("take"));
+        assert!(sub.try_receive_one_owned().expect("owned take").is_some());
+        let records = take_records(&stage);
+        let body = ReadSiteRole::Body;
+        assert_eq!(records.len(), 3, "{records:?}");
+        assert_eq!(
+            (records[0].0, records[0].3, records[0].4),
+            (ReadOutcomeKind::Producer, Some(token), body)
+        );
+        assert_eq!(
+            &records[1..],
+            &[
+                (ReadOutcomeKind::Taken, 3, 1, None, body),
+                (ReadOutcomeKind::Taken, 4, 1, None, body),
+            ]
+        );
+    }
+
+    /// A take pays the `block` credit word for every frame it removed, and a
+    /// take that finds the queue empty clears what the word still counts.
+    ///
+    /// Hand oracle, depth 4: three frames are published and counted (3). A
+    /// take removes one (2). One more count with no frame behind it leaves the
+    /// word one above the queue (3); a take and an owned take remove the two
+    /// queued frames (2, then 1), and the empty take that follows zeroes the
+    /// word (0).
+    ///
+    /// CONTROL: on a stage that adopted the single-take rule off, a replay of
+    /// a bag below trace format 13, the same takes pay nothing, as that
+    /// recorder's takes did: 3, 3, 4, 4, 4, 4.
+    #[test]
+    fn a_take_pays_the_block_credit_word_for_what_it_removed() {
+        let run = |topic: &str, recorded: bool| -> Vec<u64> {
+            let (_mgr, mut publisher, mut sub, stage) = take_fixture(topic);
+            stage.adopt_single_take_records(recorded);
+            let word = crate::credit::CreditWord::local(4);
+            sub.register_block_probe_for_test(
+                word.clone(),
+                4,
+                Arc::new(BackpressureCounters::new()),
+                Arc::from("inp"),
+                16,
+            );
+            for seq in 0..3 {
+                publisher
+                    .publish_raw(&batch_frame_bytes(seq))
+                    .expect("publish");
+                word.record_published();
+            }
+            let mut seen = vec![word.outstanding()]; // hot-path-alloc-ok: test-only collector.
+            assert!(sub.try_receive_one(|_| {}).expect("take"));
+            seen.push(word.outstanding());
+            word.record_published();
+            seen.push(word.outstanding());
+            assert!(sub.try_receive_one(|_| {}).expect("take"));
+            seen.push(word.outstanding());
+            assert!(sub.try_receive_one_owned().expect("owned").is_some());
+            seen.push(word.outstanding());
+            assert!(!sub.try_receive_one(|_| {}).expect("empty take"));
+            seen.push(word.outstanding());
+            seen
+        };
+        assert_eq!(run("take_pays_credit", true), vec![3, 2, 3, 2, 1, 0]);
+        assert_eq!(
+            run("take_pays_no_credit_below_13", false),
+            vec![3, 3, 4, 4, 4, 4]
+        );
+    }
+
+    /// A take on a stage below trace format 13 is the unrecorded take that
+    /// recorder made: it stages no record, pops live without asking the gate,
+    /// and a fed gate mints `UnrecordedTake` for it.
+    ///
+    /// Hand oracle: the gate holds one admission, writer A's sequence 9, which
+    /// would publish frame 9; frame 2 is queued by hand. The take pops frame 2
+    /// under the port's own origin, a second take finds the queue empty (the
+    /// feed was never asked for 9), the stage holds nothing, and the gate
+    /// holds one `UnrecordedTake` per take at step 0.
+    #[test]
+    fn a_take_below_format_13_is_unrecorded_and_reported_on_a_fed_stage() {
+        use crate::read_outcome::{DueRead, ReplayReadViolationKind};
+        let (_mgr, feed, sub, plan, stage) = fed_take_fixture(
+            "take_below_13",
+            &[DueRead::pops(1, Some(9))],
+            vec![vec![(FED_WRITER_A, 9)]],
+        );
+        stage.adopt_single_take_records(false);
+        let port_id = {
+            let mut port = feed.port.lock().expect("feed port");
+            port.publish_raw(&batch_frame_bytes(2)).expect("publish");
+            port.publisher_id()
+        };
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        assert!(sub
+            .try_receive_one(|m| seen.push((m.origin(), m.header().sequence)))
+            .expect("take"));
+        assert!(
+            sub.try_receive_one_owned().expect("owned take").is_none(),
+            "nothing asked the feed for frame 9"
+        );
+        assert_eq!(seen, vec![(port_id, 2)]);
+        assert!(
+            take_records(&stage).is_empty(),
+            "a take below format 13 stages nothing"
+        );
+        assert_eq!(
+            take_violations(&plan),
+            vec![
+                (0, ReplayReadViolationKind::UnrecordedTake),
+                (0, ReplayReadViolationKind::UnrecordedTake),
+            ]
+        );
+    }
+
+    /// A fed take is admitted by the gate, served the frame its recording
+    /// names under that frame's recorded writer, recorded and settled clean,
+    /// through both twins, and two runs give one answer.
+    ///
+    /// Hand oracle: admissions A's 10 then B's 100. The callback take sees
+    /// `(A, 10)` and the owned take `(B, 100)`, each with the eight zero bytes
+    /// the feed's frame carries; the stage holds `Taken 10` then `Taken
+    /// 100`; no divergence. A third take, past the plan, is withheld, returns
+    /// nothing and is one unplanned consult.
+    #[test]
+    fn a_fed_take_serves_its_recorded_frame_under_its_recorded_writer() {
+        use crate::read_outcome::DueRead;
+        let run = |topic: &str| {
+            let (_mgr, _feed, sub, plan, stage) = fed_take_fixture(
+                topic,
+                &[DueRead::pops(1, Some(10)), DueRead::pops(1, Some(100))],
+                vec![vec![(FED_WRITER_A, 10)], vec![(FED_WRITER_B, 100)]],
+            );
+            let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+            assert!(sub
+                .try_receive_one(|m| {
+                    seen.push((m.origin(), m.header().sequence, m.payload().to_vec()));
+                })
+                .expect("fed take"));
+            let owned = sub
+                .try_receive_one_owned()
+                .expect("fed owned take")
+                .expect("a fed frame");
+            let header = owned.wire_header().expect("header");
+            seen.push((
+                owned.origin(),
+                header.sequence,
+                owned.payload()[crate::wire::WireHeader::SIZE..].to_vec(),
+            ));
+            assert!(
+                !sub.try_receive_one(|_| {}).expect("a take past the plan"),
+                "a take past the plan is withheld"
+            );
+            let body = ReadSiteRole::Body;
+            assert_eq!(
+                &take_records(&stage)[..2],
+                &[
+                    (ReadOutcomeKind::Taken, 10, 1, None, body),
+                    (ReadOutcomeKind::Taken, 100, 1, None, body),
+                ]
+            );
+            assert!(take_violations(&plan).is_empty(), "every admission settled");
+            assert_eq!(plan.unplanned_consults(), 1);
+            seen
+        };
+        let expected = vec![
+            (u128::from(FED_WRITER_A), 10, vec![0u8; 8]),
+            (u128::from(FED_WRITER_B), 100, vec![0u8; 8]),
+        ];
+        let first = run("fed_take_one");
+        assert_eq!(first, expected);
+        assert_eq!(run("fed_take_two"), first, "two runs, one answer");
+    }
+
+    /// The gate's answers bind a take: a recorded empty read withholds it and
+    /// leaves the queue as it is, a different frame at the head is a sequence
+    /// mismatch, and a recorded frame the queue never gets is a shortfall.
+    ///
+    /// Hand oracle, three admissions: nothing; A's 7; A's 8, which the feed
+    /// does not publish. Frame 3 is queued by hand before the first take.
+    /// * take 1 is withheld: `false`, `NoFrame` staged, frame 3 stays queued;
+    /// * take 2 fills 7 behind 3 and pops 3: `Taken 3` and
+    ///   `SequenceMismatch { 7, 3 }`;
+    /// * take 3 pops 7 where 8 was due: `Taken 7` and `SequenceMismatch { 8,
+    ///   7 }`;
+    /// * a fourth gate, fresh, admits A's 9 and its feed publishes nothing:
+    ///   the take finds the queue empty, `NoFrame` staged, and the gate mints
+    ///   `PoppedShortfall { 1, 0 }` and `SequenceMismatch { 9, none }`.
+    #[test]
+    fn a_take_is_bound_by_the_gate_answer() {
+        use crate::read_outcome::{DueRead, ReplayReadViolationKind as V, STAGE_NO_FRAME};
+        let body = ReadSiteRole::Body;
+        let (_mgr, feed, sub, plan, stage) = fed_take_fixture(
+            "take_gate_binds",
+            &[
+                DueRead::nothing(),
+                DueRead::pops(1, Some(7)),
+                DueRead::pops(1, Some(8)),
+            ],
+            vec![vec![], vec![(FED_WRITER_A, 7)], vec![]],
+        );
+        feed.port
+            .lock()
+            .expect("feed port")
+            .publish_raw(&batch_frame_bytes(3))
+            .expect("publish");
+        let mut seen = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        assert!(!sub
+            .try_receive_one(|m| seen.push(m.header().sequence))
+            .expect("withheld take"));
+        assert!(sub
+            .try_receive_one(|m| seen.push(m.header().sequence))
+            .expect("take"));
+        let owned = sub.try_receive_one_owned().expect("owned take");
+        seen.push(owned.and_then(|o| o.wire_header()).expect("frame").sequence);
+        assert_eq!(seen, vec![3, 7]);
+        assert_eq!(
+            take_records(&stage),
+            vec![
+                (ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body),
+                (ReadOutcomeKind::Taken, 3, 1, None, body),
+                (ReadOutcomeKind::Taken, 7, 1, None, body),
+            ]
+        );
+        assert_eq!(
+            take_violations(&plan),
+            vec![
+                (
+                    0,
+                    V::SequenceMismatch {
+                        expected: Some(7),
+                        observed: Some(3)
+                    }
+                ),
+                (
+                    0,
+                    V::SequenceMismatch {
+                        expected: Some(8),
+                        observed: Some(7)
+                    }
+                ),
+            ]
+        );
+
+        let (_mgr, _feed, sub, plan, stage) = fed_take_fixture(
+            "take_gate_short",
+            &[DueRead::pops(1, Some(9))],
+            vec![vec![]],
+        );
+        assert!(sub
+            .try_receive_one_owned()
+            .expect("an empty take")
+            .is_none());
+        assert_eq!(
+            take_records(&stage),
+            vec![(ReadOutcomeKind::NoFrame, STAGE_NO_FRAME, 0, None, body)]
+        );
+        assert_eq!(
+            take_violations(&plan),
+            vec![
+                (
+                    0,
+                    V::PoppedShortfall {
+                        expected: 1,
+                        admitted: 0
+                    }
+                ),
+                (
+                    0,
+                    V::SequenceMismatch {
+                        expected: Some(9),
+                        observed: None
+                    }
+                ),
+            ]
+        );
+    }
+
+    /// A take whose receive fails returns the error, stages no record, and
+    /// settles its admission with nothing delivered.
+    ///
+    /// Hand oracle: the subscriber's borrow budget is `n`; the gate admits one
+    /// fed frame per take, sequences `0..=n`. Each of the first `n` owned
+    /// takes is held, so each stages `Taken i` and settles clean. Take `n + 1`
+    /// fails at iceoryx2's receive (`ExceedsMaxBorrows`): an `Err`, no record,
+    /// and the gate mints `PoppedShortfall { 1, 0 }` and `SequenceMismatch {
+    /// n, none }` for it.
+    #[test]
+    fn a_take_whose_receive_fails_stages_nothing_and_settles_nothing_delivered() {
+        use crate::read_outcome::{DueRead, ReplayReadViolationKind as V};
+        let probe = take_transport("take_fault_probe").0;
+        let budget = probe
+            .create_subscriber("take_fault_probe")
+            .expect("subscriber")
+            .max_borrowed_samples() as u32;
+        let due: Vec<DueRead> = (0..=budget).map(|s| DueRead::pops(1, Some(s))).collect();
+        let reads: Vec<Vec<(u64, u32)>> = (0..=budget).map(|s| vec![(FED_WRITER_A, s)]).collect();
+        let (_mgr, _feed, sub, plan, stage) = fed_take_fixture("take_fault", &due, reads);
+        let mut held = Vec::new(); // hot-path-alloc-ok: test-only collector.
+        for _ in 0..budget {
+            held.push(
+                sub.try_receive_one_owned()
+                    .expect("a take within the borrow budget")
+                    .expect("a fed frame"),
+            );
+        }
+        let err = sub
+            .try_receive_one(|_| {})
+            .expect_err("a take past the borrow budget fails at receive");
+        assert!(matches!(err, TransportError::Receive { .. }), "{err:?}");
+        let body = ReadSiteRole::Body;
+        let expected: Vec<_> = (0..budget)
+            .map(|s| (ReadOutcomeKind::Taken, u64::from(s), 1, None, body))
+            .collect();
+        assert_eq!(take_records(&stage), expected);
+        assert_eq!(
+            take_violations(&plan),
+            vec![
+                (
+                    0,
+                    V::PoppedShortfall {
+                        expected: 1,
+                        admitted: 0
+                    }
+                ),
+                (
+                    0,
+                    V::SequenceMismatch {
+                        expected: Some(budget),
+                        observed: None
+                    }
+                ),
+            ]
+        );
+        drop(held);
+    }
+
+    /// A take records its read before the callback runs, so a take the
+    /// callback makes on the same subscriber is recorded after it, in the
+    /// order the frames left the queue. A replay plans its admissions in
+    /// record order, so the other order would feed each callback the other
+    /// frame.
+    ///
+    /// Hand oracle: frames 0 and 1 are queued. The outer take delivers 0 and
+    /// its callback's inner take delivers 1, so the records are `Taken 0`
+    /// then `Taken 1`.
+    #[test]
+    fn a_take_made_inside_a_take_callback_is_recorded_after_it() {
+        let (_mgr, mut publisher, sub, stage) = take_fixture("take_nested_order");
+        for seq in [0, 1] {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+        }
+        let seen = std::cell::RefCell::new(Vec::new()); // hot-path-alloc-ok: test-only collector.
+        assert!(sub
+            .try_receive_one(|outer| {
+                seen.borrow_mut().push(outer.header().sequence);
+                assert!(sub
+                    .try_receive_one(|inner| seen.borrow_mut().push(inner.header().sequence))
+                    .expect("inner take"));
+            })
+            .expect("outer take"));
+        assert_eq!(seen.into_inner(), vec![0, 1]);
+        let body = ReadSiteRole::Body;
+        assert_eq!(
+            take_records(&stage),
+            vec![
+                (ReadOutcomeKind::Taken, 0, 1, None, body),
+                (ReadOutcomeKind::Taken, 1, 1, None, body),
+            ]
+        );
+    }
+
+    /// A take whose callback panics has already recorded its read and paid
+    /// the `block` credit word for the frame it removed: the frame left the
+    /// queue, so the record and the word say so whatever the callback did.
+    ///
+    /// Hand oracle, depth 4: two frames are published and counted (2). The
+    /// take removes frame 0 and its callback panics: the stage holds `Taken
+    /// 0` and the word counts 1, the one frame still queued.
+    #[test]
+    fn a_take_whose_callback_panics_has_recorded_and_paid_for_its_frame() {
+        let (_mgr, mut publisher, mut sub, stage) = take_fixture("take_callback_panics");
+        let word = crate::credit::CreditWord::local(4);
+        sub.register_block_probe_for_test(
+            word.clone(),
+            4,
+            Arc::new(BackpressureCounters::new()),
+            Arc::from("inp"),
+            16,
+        );
+        for seq in [0, 1] {
+            publisher
+                .publish_raw(&batch_frame_bytes(seq))
+                .expect("publish");
+            word.record_published();
+        }
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sub.try_receive_one(|_| panic!("the callback panics"))
+        }));
+        assert!(unwound.is_err(), "the callback's panic unwinds the take");
+        assert_eq!(
+            take_records(&stage),
+            vec![(ReadOutcomeKind::Taken, 0, 1, None, ReadSiteRole::Body)]
+        );
+        assert_eq!(word.outstanding(), 1);
+    }
+
+    /// On a fed replay a take settles its admission before its callback runs:
+    /// a take the callback makes is admitted the next recorded read and fed
+    /// its frame, and a callback that panics leaves its admission settled.
+    ///
+    /// Hand oracle: admissions A's 7 then A's 8. The outer take is fed 7 and
+    /// its callback's inner take is fed 8; the stage holds `Taken 7` then
+    /// `Taken 8` and no divergence. On a second gate admitting A's 9 alone, a
+    /// take whose callback panics holds `Taken 9`, no divergence, and the take
+    /// after it is past the plan: withheld, one unplanned consult.
+    #[test]
+    fn a_fed_take_settles_before_its_callback_runs() {
+        use crate::read_outcome::DueRead;
+        let body = ReadSiteRole::Body;
+        let (_mgr, _feed, sub, plan, stage) = fed_take_fixture(
+            "fed_take_nested",
+            &[DueRead::pops(1, Some(7)), DueRead::pops(1, Some(8))],
+            vec![vec![(FED_WRITER_A, 7)], vec![(FED_WRITER_A, 8)]],
+        );
+        let seen = std::cell::RefCell::new(Vec::new()); // hot-path-alloc-ok: test-only collector.
+        assert!(sub
+            .try_receive_one(|outer| {
+                seen.borrow_mut().push(outer.header().sequence);
+                assert!(sub
+                    .try_receive_one(|inner| seen.borrow_mut().push(inner.header().sequence))
+                    .expect("inner take"));
+            })
+            .expect("outer take"));
+        assert_eq!(seen.into_inner(), vec![7, 8]);
+        assert_eq!(
+            take_records(&stage),
+            vec![
+                (ReadOutcomeKind::Taken, 7, 1, None, body),
+                (ReadOutcomeKind::Taken, 8, 1, None, body),
+            ]
+        );
+        assert!(take_violations(&plan).is_empty(), "every admission settled");
+        assert_eq!(plan.unplanned_consults(), 0);
+
+        let (_mgr, _feed, sub, plan, stage) = fed_take_fixture(
+            "fed_take_panics",
+            &[DueRead::pops(1, Some(9))],
+            vec![vec![(FED_WRITER_A, 9)]],
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sub.try_receive_one(|_| panic!("the callback panics"))
+        }));
+        assert!(unwound.is_err(), "the callback's panic unwinds the take");
+        assert_eq!(
+            take_records(&stage),
+            vec![(ReadOutcomeKind::Taken, 9, 1, None, body)]
+        );
+        assert!(take_violations(&plan).is_empty(), "the admission settled");
+        assert!(!sub.try_receive_one(|_| {}).expect("a take past the plan"));
+        assert_eq!(plan.unplanned_consults(), 1);
     }
 }

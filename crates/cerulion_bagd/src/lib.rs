@@ -17414,79 +17414,105 @@ impl Recorder {
         // read ONCE and used by both the verdict and the manifest, so the two
         // cannot disagree about the same run.
         let drain = trace_drain::snapshot(&self.trace_drain_state);
+        let worker_ranks = worker_manifest_ranks(&self.ring_identities);
+        let rank_counts = rank_node_counts(&self.ring_identities);
+        let held_frames = held_frames_by_writer(&batches, &first_origins);
+        let trace_ring_coverage = TraceRingCoverage {
+            declared: self.cfg.rings.len(),
+            // DISJOINT by construction: a ring that never opened is in
+            // `rings_unavailable` and never reached the drain, and one the
+            // drain lost is in `rings_retired` and never was unavailable.
+            // A LAP is in neither: the drain re-attaches, and what that
+            // costs is the HOLE the judge is handed below.
+            unreadable: self.rings_unavailable.len() + drain.rings_retired.len(),
+        };
+        // ONE judge for every trace this capture could carry, so the trace it
+        // carries and the verdict it states are about the same records.
+        let judge = |trace: &crate::trace_window::TrimmedTrace| {
+            judge_capture_resimmable(
+                trace,
+                &anchor_report,
+                &anchor_facts,
+                rings_seen,
+                &attachments,
+                // The node map is KNOWN iff exactly one WORKER trace ring supplied
+                // it. Computed beside `trim_node_ids`, from the SAME filtered
+                // vector, so the two cannot drift: the pairing is what stops an
+                // empty node list being read as "no node executed", and relaxing the
+                // count without moving `trim_node_ids` in lockstep would turn a
+                // conservative refusal into a VACUOUS acceptance.
+                //
+                // **The departure ring is excluded from BOTH.** Before that,
+                // a ONE-worker-group multi-process run (rank 0 plus the departure
+                // ring) reported `AmbiguousNodeMap` for a ring that by construction
+                // names no node, conservative in the safe direction, and tolerable
+                // while only a `--record` run held rings. With every multi-process
+                // run holding them it would be the DEFAULT verdict on the smallest
+                // deployment there is.
+                required_nodes_known,
+                // The worker roster `run_replay`'s gate 5 checks for
+                // contiguity, built by the rule that gate uses, see
+                // `worker_manifest_ranks`.
+                &worker_ranks,
+                // The SAME walk `run_replay`'s gate makes over the SAME records, in
+                // the SAME order, against the rank tables this capture is about to
+                // attach, see `rank_node_counts`.
+                cerulion_core::trace_ring::first_trace_record_refusal(
+                    trace.records.iter(),
+                    &rank_counts,
+                ),
+                // The hole this capture CARRIES, if any. Chosen
+                // through the SAME `TraceGap::spans` predicate the judge re-asks
+                // over the same bounds, so the recorder is selecting WHICH hole
+                // rather than deciding the rule: the rule stays in one place, in
+                // the crate the replayer also reads.
+                //
+                // The BOUNDS are capture-wide, over every record this capture
+                // carries whatever ring it came from, see `gap_spanning_carried`
+                // for why that is the correct judge and a per-ring one is not.
+                drain
+                    .gap_spanning_carried(&trace.records)
+                    .filter(|_| !trace.records.is_empty()),
+                // What this recorder was DECLARED versus what
+                // it has a reader for.
+                trace_ring_coverage,
+                // The rank holes, through the SAME method the warn calls, so the
+                // sentence a capture stores and the sentence the operator was
+                // warned with name the same ranks by construction rather than by
+                // two copies of one rule agreeing. See `Self::state_rank_holes`,
+                // which also states why it recomputes, and the read above for why
+                // the call cannot sit here.
+                &state_rank_holes,
+                // …and whether the walk that fills it ran at all, read at the same
+                // place and for the same borrow reason.
+                state_rank_space_walked,
+                // Every frame the kept reads consumed, against the frames this
+                // capture writes.
+                cerulion_core::flashback::resim::first_frame_gap(&trace.named_frames, &held_frames),
+            )
+        };
+        let trimmed_verdict = judge(&trimmed);
+        // A checkpoint must not cost a capture the start it already holds. A
+        // trace trimmed through its checkpoints is resumed from them, and a
+        // replay refuses some resumes (several state rings: per-rank resume is
+        // not supported). When it refuses this one, and the WHOLE retention
+        // still begins at step 0 on every rank, the replay can run from the
+        // start instead, reading no checkpoint at all: the capture carries the
+        // whole trace, keeps its checkpoints, and states that verdict. Asked of
+        // the same judge, so a whole trace the replay would refuse too leaves
+        // the trim and its own refusal in place.
+        let whole_from_step_zero = match (&anchor_report, &trimmed_verdict) {
+            (flashback_plane::AnchorReport::Embedded { .. }, Err(_)) => {
+                let whole = plane.select_trace_untrimmed(&trace_snapshot, &trim_node_ids);
+                (whole.begins_at_step_zero() && judge(&whole).is_ok()).then_some(whole)
+            }
+            _ => None,
+        };
+        let (trimmed, resim) = match whole_from_step_zero {
+            Some(whole) => (whole, Ok(())),
+            None => (trimmed, trimmed_verdict),
+        };
         let trace_records = trimmed.records.len();
-        let resim = judge_capture_resimmable(
-            &trimmed,
-            &anchor_report,
-            &anchor_facts,
-            rings_seen,
-            &attachments,
-            // The node map is KNOWN iff exactly one WORKER trace ring supplied
-            // it. Computed beside `trim_node_ids`, from the SAME filtered
-            // vector, so the two cannot drift — the pairing is what stops an
-            // empty node list being read as "no node executed", and relaxing the
-            // count without moving `trim_node_ids` in lockstep would turn a
-            // conservative refusal into a VACUOUS acceptance.
-            //
-            // **The departure ring is excluded from BOTH.** Before that,
-            // a ONE-worker-group multi-process run (rank 0 plus the departure
-            // ring) reported `AmbiguousNodeMap` for a ring that by construction
-            // names no node — conservative in the safe direction, and tolerable
-            // while only a `--record` run held rings. With every multi-process
-            // run holding them it would be the DEFAULT verdict on the smallest
-            // deployment there is.
-            required_nodes_known,
-            // The worker roster `run_replay`'s gate 5 checks for
-            // contiguity, built by the rule that gate uses — see
-            // `worker_manifest_ranks`.
-            &worker_manifest_ranks(&self.ring_identities),
-            // The SAME walk `run_replay`'s gate makes over the SAME records, in
-            // the SAME order, against the rank tables this capture is about to
-            // attach — see `rank_node_counts`.
-            cerulion_core::trace_ring::first_trace_record_refusal(
-                trimmed.records.iter(),
-                &rank_node_counts(&self.ring_identities),
-            ),
-            // The hole this capture CARRIES, if any. Chosen
-            // through the SAME `TraceGap::spans` predicate the judge re-asks
-            // over the same bounds, so the recorder is selecting WHICH hole
-            // rather than deciding the rule — the rule stays in one place, in
-            // the crate the replayer also reads.
-            //
-            // The BOUNDS are capture-wide, over every record this capture
-            // carries whatever ring it came from — see `gap_spanning_carried`
-            // for why that is the correct judge and a per-ring one is not.
-            drain
-                .gap_spanning_carried(&trimmed.records)
-                .filter(|_| trace_records > 0),
-            // What this recorder was DECLARED versus what
-            // it has a reader for.
-            TraceRingCoverage {
-                declared: self.cfg.rings.len(),
-                // DISJOINT by construction: a ring that never opened is in
-                // `rings_unavailable` and never reached the drain, and one the
-                // drain lost is in `rings_retired` and never was unavailable.
-                // A LAP is in neither — the drain re-attaches, and what that
-                // costs is the HOLE above.
-                unreadable: self.rings_unavailable.len() + drain.rings_retired.len(),
-            },
-            // The rank holes, through the SAME method the warn calls, so the
-            // sentence a capture stores and the sentence the operator was
-            // warned with name the same ranks by construction rather than by
-            // two copies of one rule agreeing. See `Self::state_rank_holes`,
-            // which also states why it recomputes, and the read above for why
-            // the call cannot sit here.
-            &state_rank_holes,
-            // …and whether the walk that fills it ran at all, read at the same
-            // place and for the same borrow reason.
-            state_rank_space_walked,
-            // Every frame the kept reads consumed, against the frames this
-            // capture writes.
-            cerulion_core::flashback::resim::first_frame_gap(
-                &trimmed.named_frames,
-                &held_frames_by_writer(&batches, &first_origins),
-            ),
-        );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //
         // `trace_records_carried` is a literal `0` here, and for good reason:
@@ -17549,6 +17575,9 @@ impl Recorder {
                 anchor: anchor_report,
                 handoff,
                 resim: &resim,
+                // Off the trace this capture CARRIES, which is what a replay
+                // starts from.
+                resim_from_start: trimmed.begins_at_step_zero(),
                 // `target(S-1)`, recovered from the boundary
                 // record the trim discards — the value resim's own scoping
                 // comment says it cannot compute.

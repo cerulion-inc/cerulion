@@ -568,6 +568,35 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   refuses as before. Oracle tests: the `marker_teardown`, `egress_scope` and
   `mirror_origin` unit tests, which inject the teardown through the open seam
   and pin one open for `Never`.
+- Rmw graph registry (`transport/rmw_graph_registry.rs`, `/__cerulion/rmw_graph` and the
+  doorbell `/__cerulion/rmw_graph/event`): a process that lists its rmw endpoints holds
+  one `RmwGraphWriter` (`TransportManager::open_rmw_graph_writer`). It is a handle that
+  keeps the manager alive, not a manager field, so the pinned manager layout does not
+  move. `add`/`remove` count endpoints per `(topic, type_name)`; the publisher opens on
+  the first call, and a failed open keeps the counts and runs again on the next call.
+  The writer id is the publisher id, and a gather drops a frame whose writer id is not
+  its sender's publisher id. A change sends the snapshot (one generation, one or more
+  parts); the pump sends again on a doorbell ring or every 500 ms. One send carries at
+  most `send_budget(listed publishers)` parts (an even share of half a reader queue, so
+  a queue holds two sends of every writer) from a cursor that moves on by every part
+  sent, so a snapshot larger than the 128-frame queue still lands whole within
+  `parts.div_ceil(budget)` sends. A test that counts the sends one ring causes holds the
+  interval sends with `hold_timed_sends_for_test` (`test-helpers`), because an interval
+  send that ends just before a ring is answered adds a second send to the count.
+  `gather_rmw_graph(own_writer, window)` waits only for
+  the listed publishers whose owner node is not `Dead` when the gather starts, minus
+  `own_writer` (`required_writers`); it reads the node list once and never reaps, and
+  reads the publisher list on each pass, so a writer that leaves the list mid-gather
+  stops being required. No required writer: `Settled` at once, no ring. A gather rings at
+  most once per drain pass (`next_pass`): again as soon as a pass brings a frame of a writer
+  that is not whole yet, with 1 ms between passes, else once every 20 ms; so a snapshot of many sends is
+  paced by the writer's answers, not by 20 ms per send. `RmwGraphGatherWindow` ends a
+  gather that has not settled after `idle` with no progress or at `limit` in all
+  (`time_left`); `fixed(d)` sets both to `d`. Static config and frame v1 are
+  fixed for the two service names; a change takes new names. The consumer is
+  `rmw_cerulion`: one writer per process
+  (`Runtime::graph_registry`, none in a replay) and one gather per
+  `rmw_get_topic_names_and_types` (`docs/internals/rmw.md`).
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
@@ -678,6 +707,19 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   version in the middle of the name (`isolated_root_evidence_test`). Crashed runs also
   leave stale `*.event` sockets under `/tmp/iceoryx2/` (not `/dev/shm`); sweep both
   locations.
+- On macOS and FreeBSD a state file on that segment that names absent shared memory, or
+  an empty one (a process stopped between writing the file and creating the segment),
+  made the released `open_or_create` retry open ("does not exist") and create ("already
+  exists") forever, so every node creation in the namespace spun at full CPU. The
+  workspace builds against a fork revision that bounds the retry by the builder timeout:
+  node creation now fails after the config's `creation_timeout` (1 s by default) with
+  `UnableToGenerateUniqueNodeId`. Every `TransportManager` constructor returns that as
+  `TransportError::NodeCreation`, whose message names `cerulion clean`; the singleton
+  stays unset, so a later call tries again. The fork does not remove the stale file.
+  `cerulion clean` removes it when no node is registered in the namespace and the file
+  is provably unused: its named creator is gone, or, for an empty file, it is older
+  than `EMPTY_STATE_FILE_MIN_AGE` (24 h), so a fresh empty file blocks the namespace
+  until then (`dangling_shm_state_iox2_test`).
 - Binding a listener's datagram socket moves the PROCESS umask, and 0.10 leaks it. iceoryx2's
   `UnixDatagramSocket::bind` sets a process global umask of `!permission` for the bind and
   restores it on scope exit; concurrent binds each save what the other installed, so the

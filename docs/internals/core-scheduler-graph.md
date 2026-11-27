@@ -217,7 +217,22 @@ naming here because they are easy to get wrong:
   failed gate probe must resolve to PRESENT, or a probe failure would vouch for scarcity on
   an unverified input and destroy arrived complete sets. Death is evaluated BEFORE descent,
   so a provably unmatchable frame is classified UNMATCHABLE (something is wrong) rather than
-  PASSED-OVER (the feature working).
+  PASSED-OVER (the feature working). The matcher intentionally preserves latency over
+  retrospective optimality, so a window at or above `input_period - skew` (or `unbounded_sync`
+  on periodic inputs) can silently phase-lock onto `(A_{k+1}, B_k)` after one drop while both
+  counters stay zero; `graph::validation::check_sync_window_periods` is the single pure checker
+  shared by `GraphRuntime::build_with_scheduler` (structured `tracing::warn!`) and
+  `cerulion_cli_engine::graph_cmd` (`cerulion graph validate` advisory warning and the
+  multi-process supervisor) to flag `sync_window_ms >= slowest_period_ms` or `unbounded_sync`
+  when every trigger input resolves to a declared period, without refusing any graph. A
+  `sample(N)` gate never lifts the resolved period: each gate keeps its own last admitted
+  stamp, so a drop (or a different first frame) moves one gate onto other producer ticks and
+  admitted frames from different ticks sit one producer period minus skew apart. On split
+  multi-process runs the full-graph `PlanningOnly` build skips logging, the supervisor computes
+  the warnings over the whole graph and stamps each Sync node's findings onto its owning
+  worker's `WorkerPlan::sync_window_period_warnings`, and that worker passes them through
+  `CrossProcessWiring::with_sync_window_period_warnings` so each split Sync node warns once
+  (never zero, never twice).
 - **Sync can match on CAPTURE time.** By default a head's stamp is the frame's WIRE stamp
   (publish time). A node whose `NodeInfo` carries capture-stamp locations
   (`NodeInfo::with_sync_capture_stamps`) aligns on each message's `header.stamp` instead,
@@ -514,6 +529,35 @@ this section is the opt-out's machinery.)
   build mode; owner drop unlinks but a prior consumer still drains.
 - The scheduler → trace-ring hook records fires for the out-of-process recorder;
   recording-ON steady state stays zero-alloc (`trace_ring_hook_zero_alloc_test`).
+
+## Checkpoint carriers (anchor boundary)
+
+- `GraphRuntime::take_anchor` runs at a due step boundary: the bounded inline walk
+  (`state_carrier::walk_inline`, a 64 KiB arena, `INLINE_SAFE` nodes only) and then
+  one carrier for the nodes it defers. Which carrier runs is which of the two runtime
+  slots is `Some`, never a separate flag.
+- `attach_state_arm` starts the FORK carrier: one `fork(2)` child encodes the deferred
+  set, and a peer's child in flight (`busy_workers() != 0`) skips the whole cadence as
+  `StillEncoding`.
+- `attach_state_arm_no_fork` is for an executor unit that shares its process with
+  other units, where a fork would copy one thread and leave a sibling's lock held in
+  the child. It starts no child, reaper or panic hook, skips the `busy_workers()` gate
+  (the recorder picks one checkpoint per rank), and streams the deferred set on the
+  unit thread through `state_carrier::stream_deferred_direct`, inside the node guards'
+  scope so a caught encoder panic cannot poison a node mutex. Its pushes never wait:
+  one record budget per boundary is the ring's free part less one record per deferred
+  node and `ANCHOR_RING_HEADROOM_RECORDS`, so each refusal SKIP still lands and voids
+  a truncated stream. A node refused at a budget is not entered again until the
+  budget grows. Observable: `last_anchor_direct()`. The cost: a deferred node's
+  user-written encoder (serde field, hand `CerulionState`) runs on the unit thread,
+  unbounded in time (`state_anchor_direct_iox2_test`).
+- The caller: `graph_run_worker` arms a unit whose plan shares its process
+  (`plan_shares_its_process`, the stamped `WorkerPlan::host`, the same predicate
+  that picks its detached transport) through
+  `state_arm_attach::attach_state_capture_no_fork_from`, as `PlaneRole::HostedUnit`
+  (kill switch and knobs apply, the fork-memory gate does not). A single-unit
+  worker keeps the fork carrier. Proof over the real binary:
+  `crates/cerulion_cli/tests/flashback_split_units_e2e_test.rs`.
 
 ## Clock model
 

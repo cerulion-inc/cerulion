@@ -1583,6 +1583,7 @@ unsafe fn base_field_type_cpp(
                 schema_name: nname.to_string(),
                 package: Some(cpp_package(ns).to_string()),
                 fixed: None,
+                target_hash: None,
             }
         }
         other => {

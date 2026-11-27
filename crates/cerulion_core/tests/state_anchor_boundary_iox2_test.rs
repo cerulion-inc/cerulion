@@ -549,11 +549,11 @@ fn a_lock_carrying_node_is_deferred_while_its_plain_sibling_still_anchors() {
         .last_anchor_carriers()
         .expect("the boundary at step 4 took an anchor");
     assert_eq!(split.inline_nodes, 1, "`counter` is inline-eligible");
-    assert_eq!(split.forked_nodes, 1, "`guarded` is not");
+    assert_eq!(split.deferred_nodes, 1, "`guarded` is not");
     assert_eq!(
         split.gated_nodes, 1,
         "and it was gated BEFORE its encoder ran — an overflow would report \
-         forked_nodes without gated_nodes"
+         deferred_nodes without gated_nodes"
     );
 
     // The inline half's own part is in the ring immediately, because the inline

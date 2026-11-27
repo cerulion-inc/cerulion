@@ -689,6 +689,12 @@ struct ScheduledNode {
     /// trailing refill (see [`Scheduler::set_replay_trailing_refills`])? Set
     /// by `take_planned_fire` from the plan, read by `tick_replay_burst`.
     replay_trailing_refill: bool,
+    /// Should [`Scheduler::tick_replay_burst`] drive per-set `Sync` refill
+    /// alignment between and after fires (with `mark_sync_heads_emitted` after
+    /// each fire)? Armed by `GraphRuntime` only when a per-set `Sync` node's
+    /// trigger stage is armed under a replay read plan, and cleared on disarm
+    /// so unfed replays keep their existing burst path untouched.
+    sync_replay_refill: bool,
     /// Refills whose empty answer the REPLAY READ GATE caused, a queued frame
     /// the recording had not read yet. Split out from
     /// [`Self::replay_refill_shortfalls`] rather than folded into it because
@@ -2680,6 +2686,7 @@ impl Scheduler {
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
             replay_trailing_refill: false,
+            sync_replay_refill: false,
             replay_enforced_empty_refills: 0,
             // No pauses until a replay engine installs some.
             replay_pauses: NodeReplayPauses::default(),
@@ -6523,6 +6530,14 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Enable or disable per-set `Sync` refill alignment inside
+    /// [`Self::tick_replay_burst`] for `node_id`.
+    pub(crate) fn set_sync_replay_refill(&mut self, node_id: &str, enabled: bool) {
+        if let Some(node) = self.nodes.get_mut(node_id) {
+            node.sync_replay_refill = enabled;
+        }
+    }
+
     /// Run ONE alignment pass over a Sync node's heads, driving the
     /// matcher's verdicts against transport.
     ///
@@ -7257,9 +7272,12 @@ impl Scheduler {
                 set_max_ns = hi,
                 window_ns,
                 "sync discarded an UNMATCHABLE frame: a partner ran past it by more than \
-                 the window. Widen `sync_window_ms`, fix a stalled or skewed producer, or \
-                 raise the fast input's `depth` above the fast:slow rate ratio (below it, \
-                 `drop_oldest` evicts the frames the matcher needed before it sees them)"
+                 the window. Fix a stalled or skewed producer, or raise the fast input's \
+                 `depth` above the fast:slow rate ratio (below it, `drop_oldest` evicts \
+                 the frames the matcher needed before it sees them). If you raise \
+                 `sync_window_ms`, keep it strictly below `input_period - skew`: a window \
+                 at or above that bound can silently pair every subsequent sample with \
+                 the previous period after one drop"
             ),
             RegimeDecision::StillFailing { total, suppressed } => tracing::warn!(
                 node_id = %id,
@@ -8262,10 +8280,13 @@ impl Scheduler {
         // clones two `Arc`s (`Arc<str>` + `Arc<dyn Fn>`) — two refcount bumps, mirroring
         // `tick_data_burst`'s live twin — and this fn runs only under a REPLAY plan.
         let refill = node.trigger_refill.clone();
+        let sync_refill = node.sync_replay_refill && node.sync_ops.is_some();
         let mut fire_time = first_fire_ns;
         for i in 0..fire_count {
             if i > 0 {
-                if let Some(r) = refill.as_ref() {
+                if sync_refill {
+                    let _ = Self::align_node_sync_heads(id, node, SyncAlignSite::Refill);
+                } else if let Some(r) = refill.as_ref() {
                     let outcome = (r.drain)();
                     // The POP COUNT first, exactly as the live burst reads it,
                     // and the cause only where a zero pop leaves something to
@@ -8307,6 +8328,9 @@ impl Scheduler {
                 }
             }
             Self::fire_node_into(id, node, fire_time, global_level, step, sink);
+            if sync_refill {
+                Self::mark_sync_heads_emitted(node);
+            }
             // The INTRA-STEP seam. Placed after the fire and its
             // bookkeeping, and BEFORE the `disabled` break, so a slot the
             // recording holds after the burst's LAST fire is still delivered —
@@ -8320,6 +8344,13 @@ impl Scheduler {
             if node.disabled {
                 break;
             }
+        }
+        if sync_refill && !node.disabled {
+            // Drain any trailing post-fire head fill recorded in this step
+            // (e.g. a faster partner filling a head after a tied fire, or a
+            // held/capped Sync set). Empty partner queues withhold silently
+            // under `empty_recorded = false`.
+            let _ = Self::align_node_sync_heads(id, node, SyncAlignSite::Refill);
         }
         // The recorded burst ended on a TRAILING REFILL: the live burst's
         // refill popped one more frame after its last fire and the cap froze it
@@ -12651,6 +12682,205 @@ mod align_driver_tests {
             msg.contains("DECLARATION POSITION"),
             "the refusal must name WHY order matters; got: {msg}"
         );
+    }
+
+    /// A planned per-set `Sync` burst with `sync_replay_refill` enabled marks
+    /// each fire's heads emitted, aligns between Fire 0 and Fire 1, and runs
+    /// one trailing refill align after the last fire; a disabled/panicked node
+    /// skips the trailing refill, and an unarmed node (`sync_replay_refill ==
+    /// false`) runs no refill passes at all.
+    #[test]
+    fn replay_burst_with_sync_replay_refill_aligns_between_and_after_fires() {
+        // Happy path: 2-fire planned burst with a trailing partner frame (a has
+        // 3 frames, b has 2). Boundary fills (a0, b0), Fire 0 fires and emits
+        // heads, Refill fills (a1, b1), Fire 1 fires and emits heads, trailing
+        // Refill fills a2 while b is empty.
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut inputs = IndexMap::new();
+        inputs.insert(
+            "a".to_string(),
+            FakeInput::with(&[1_000_000, 2_000_000, 3_000_000]),
+        );
+        inputs.insert("b".to_string(), FakeInput::with(&[1_000_000, 2_000_000]));
+        let transport = Arc::new(Mutex::new(FakeTransport {
+            inputs,
+            fail_head_ops_for: None,
+            fail_all_head_ops: false,
+            fail_only_kinds: Vec::new(),
+            ops_run: 0,
+            descent_ops: 0,
+        }));
+
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let ev_cb = Arc::clone(&events);
+        scheduler
+            .add_node(NodeConfig {
+                id: "fuse".to_string(),
+                policy: TriggerPolicy::Sync {
+                    inputs: vec!["a".to_string(), "b".to_string()],
+                    window: Some(Duration::from_millis(50)),
+                },
+                callback: Box::new(move || {
+                    ev_cb.lock().expect("events").push("fire".to_string());
+                }),
+            })
+            .expect("add sync node");
+        let ops_t = Arc::clone(&transport);
+        let ev_ops = Arc::clone(&events);
+        scheduler
+            .set_sync_ops(
+                "fuse",
+                &["a".to_string(), "b".to_string()],
+                move |input, op| {
+                    if matches!(op, SyncHeadOp::FillRefill) {
+                        ev_ops
+                            .lock()
+                            .expect("events")
+                            .push(format!("refill:{input}"));
+                    }
+                    ops_t.lock().expect("transport").run(input, op)
+                },
+            )
+            .expect("install sync ops");
+
+        scheduler.set_sync_replay_refill("fuse", true);
+        scheduler
+            .set_replay_fire_plan(
+                0,
+                &[ReplayFire {
+                    node_id: "fuse",
+                    first_fire_ns: 1_000_000,
+                    fire_count: 2,
+                    interval_ns: 0,
+                }],
+            )
+            .expect("install plan");
+        let _ = scheduler.align_sync_heads("fuse", SyncAlignSite::Boundary);
+        scheduler.step_ms(1);
+
+        assert_eq!(
+            *events.lock().expect("events"),
+            vec!["fire", "refill:a", "refill:b", "fire", "refill:a", "refill:b",],
+            "sync_replay_refill must align between Fire 0 and Fire 1 and once after Fire 1"
+        );
+        // Trailing refill popped a2 while b had nothing left.
+        let t = transport.lock().expect("transport");
+        assert!(
+            t.inputs["a"].queue.is_empty(),
+            "a2 consumed by trailing refill"
+        );
+        assert!(t.inputs["b"].queue.is_empty(), "b drained cleanly");
+        drop(t);
+
+        // Edge: disabled node (fatal stop on Fire 0) breaks out and skips both
+        // Fire 1 and the trailing refill.
+        let stop_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut p_inputs = IndexMap::new();
+        p_inputs.insert("a".to_string(), FakeInput::with(&[1_000_000, 2_000_000]));
+        p_inputs.insert("b".to_string(), FakeInput::with(&[1_000_000, 2_000_000]));
+        let p_transport = Arc::new(Mutex::new(FakeTransport {
+            inputs: p_inputs,
+            fail_head_ops_for: None,
+            fail_all_head_ops: false,
+            fail_only_kinds: Vec::new(),
+            ops_run: 0,
+            descent_ops: 0,
+        }));
+        let mut p_sched = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let stop_flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let stop_flag_cb = Arc::clone(&stop_flag);
+        let pev_cb = Arc::clone(&stop_events);
+        p_sched
+            .add_node(NodeConfig {
+                id: "fuse".to_string(),
+                policy: TriggerPolicy::Sync {
+                    inputs: vec!["a".to_string(), "b".to_string()],
+                    window: Some(Duration::from_millis(50)),
+                },
+                callback: Box::new(move || {
+                    pev_cb
+                        .lock()
+                        .expect("events")
+                        .push("fatal_fire".to_string());
+                    stop_flag_cb.store(NodeStopCause::FatalError.code(), Ordering::Release);
+                }),
+            })
+            .expect("add sync node");
+        p_sched
+            .set_node_stop_signal("fuse", stop_flag)
+            .expect("set stop signal");
+        let pops_t = Arc::clone(&p_transport);
+        let pev_ops = Arc::clone(&stop_events);
+        p_sched
+            .set_sync_ops(
+                "fuse",
+                &["a".to_string(), "b".to_string()],
+                move |input, op| {
+                    if matches!(op, SyncHeadOp::FillRefill) {
+                        pev_ops
+                            .lock()
+                            .expect("events")
+                            .push(format!("refill:{input}"));
+                    }
+                    pops_t.lock().expect("transport").run(input, op)
+                },
+            )
+            .expect("install sync ops");
+        p_sched.set_sync_replay_refill("fuse", true);
+        p_sched
+            .set_replay_fire_plan(
+                0,
+                &[ReplayFire {
+                    node_id: "fuse",
+                    first_fire_ns: 1_000_000,
+                    fire_count: 2,
+                    interval_ns: 0,
+                }],
+            )
+            .expect("install plan");
+        let _ = p_sched.align_sync_heads("fuse", SyncAlignSite::Boundary);
+        p_sched.step_ms(1);
+
+        assert_eq!(
+            *stop_events.lock().expect("events"),
+            vec!["fatal_fire"],
+            "a disabled node must skip both subsequent fires and the trailing refill"
+        );
+        // Control: unarmed node (sync_replay_refill = false) performs zero refills.
+        let mut c_sched = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let c_refills = Arc::new(AtomicU64::new(0));
+        c_sched
+            .add_node(NodeConfig {
+                id: "fuse".to_string(),
+                policy: TriggerPolicy::Sync {
+                    inputs: vec!["a".to_string(), "b".to_string()],
+                    window: Some(Duration::from_millis(50)),
+                },
+                callback: Box::new(|| {}),
+            })
+            .expect("add sync node");
+        let c_refills_ops = Arc::clone(&c_refills);
+        c_sched
+            .set_sync_ops("fuse", &["a".to_string(), "b".to_string()], move |_, op| {
+                if matches!(op, SyncHeadOp::FillRefill) {
+                    c_refills_ops.fetch_add(1, Ordering::Relaxed);
+                }
+                SyncOpAnswer::Nothing
+            })
+            .expect("install sync ops");
+        c_sched
+            .set_replay_fire_plan(
+                0,
+                &[ReplayFire {
+                    node_id: "fuse",
+                    first_fire_ns: 1_000_000,
+                    fire_count: 2,
+                    interval_ns: 0,
+                }],
+            )
+            .expect("install plan");
+        c_sched.step_ms(1);
+        assert_eq!(c_refills.load(Ordering::Relaxed), 0);
     }
 
     /// A failure regime where every descent operation is refused.
