@@ -175,11 +175,21 @@ pub const RECORD_TYPE_NODE_STOP: u32 = 7;
 /// `cerulion_cli_engine::replay_engine` is this one.
 pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = 12;
 
+/// The lowest `trace_format` whose read log records every single-frame take
+/// (`CerulionSubscriber::try_receive_one` and its owned twin) on a graph-wired
+/// input: a `Served` record (popped 1) or a `NoFrame` record at an empty
+/// queue, under the `Body` read-site role, and the `block` credit word pays
+/// for each frame a take removed
+/// (`read_outcome::ReadOutcomeStage::records_single_takes`). The one place the
+/// number is written: the replay's constant of the same name in
+/// `cerulion_cli_engine::replay_engine` is this one.
+pub const SINGLE_TAKE_MIN_TRACE_FORMAT: u32 = 13;
+
 /// The highest `trace_format` this build reads. The replay's read gate of the
 /// same name in `cerulion_cli_engine::replay_engine` is this constant, and its
 /// doc names what each format adds. The capture judge words an unknown stop
 /// cause against it ([`TraceRecordFault::detail`]), as the replay does.
-pub const SUPPORTED_TRACE_FORMAT: u32 = NODE_STOPS_MIN_TRACE_FORMAT;
+pub const SUPPORTED_TRACE_FORMAT: u32 = SINGLE_TAKE_MIN_TRACE_FORMAT;
 
 /// Read-outcome kind: a fresh frame was served to the read (the low-16
 /// half of the kind-6 `global_level` packing). The wire constants are

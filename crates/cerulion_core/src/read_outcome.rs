@@ -1532,6 +1532,17 @@ pub struct ReadOutcomeStage {
     /// recorded partner and fill rim slots the recording left free. Read by
     /// the subscriber before each multi-frame read, one `Acquire` load.
     records_batch_frames: AtomicBool,
+    /// Is a single-frame take (`CerulionSubscriber::try_receive_one` and its
+    /// owned twin) a recorded read? `true` at creation, the shape every trace
+    /// format 13 recorder writes: the take consults the replay read gate,
+    /// stages a `Served` record (popped 1) or a `NoFrame` record at an empty
+    /// queue under the `Body` role, and pays the `block` credit word for what it
+    /// popped. A REPLAY adopts the recording's own rule through
+    /// [`Self::adopt_single_take_records`]: below format 13 a take recorded
+    /// nothing and paid no credit, so a replay of such a bag takes the same
+    /// unrecorded path, and a fed replay reports it as an unrecorded take. Read
+    /// by the subscriber at the top of each take, one `Acquire` load.
+    records_single_takes: AtomicBool,
     /// Does `record_with_producer` stage the annotation before EVERY read,
     /// rather than only when the writer differs from the one the read's site
     /// last annotated? `false` at creation, the writer-run rule. The runtime
@@ -1564,6 +1575,7 @@ impl ReadOutcomeStage {
             armed: AtomicBool::new(false),
             records_every_consult: AtomicBool::new(true),
             records_batch_frames: AtomicBool::new(true),
+            records_single_takes: AtomicBool::new(true),
             annotates_every_read: false,
             pending: AtomicU32::new(0),
             inner: Mutex::new(StageInner::default()),
@@ -1752,6 +1764,28 @@ impl ReadOutcomeStage {
     #[inline]
     pub fn records_batch_frames(&self) -> bool {
         self.records_batch_frames.load(Ordering::Acquire)
+    }
+
+    /// Adopt the RECORDING's single-take rule: is a take through
+    /// `CerulionSubscriber::try_receive_one` or its owned twin a recorded read?
+    /// Called once per stage, before step 0, from
+    /// `GraphRuntime::set_read_log_records_single_takes` with the answer the
+    /// bag's `trace_format` gives; a recording run never calls it and keeps the
+    /// creation value `true`.
+    pub(crate) fn adopt_single_take_records(&self, recorded: bool) {
+        self.records_single_takes.store(recorded, Ordering::Release);
+    }
+
+    /// Whether a take through `CerulionSubscriber::try_receive_one` or its
+    /// owned twin is a recorded read on this stage.
+    ///
+    /// `true` at creation, the shape every trace format 13 recorder writes. A
+    /// replay adopts the recording's own answer before step 0, through
+    /// `GraphRuntime::set_read_log_records_single_takes` over every wired
+    /// stage; a recording run never moves it.
+    #[inline]
+    pub fn records_single_takes(&self) -> bool {
+        self.records_single_takes.load(Ordering::Acquire)
     }
 
     /// Stage one read outcome. `served_seq` is the served frame's wire
@@ -2511,10 +2545,11 @@ pub enum ReplayReadViolationKind {
         /// The admission's position in the step's installed plan, from 0.
         ordinal: u32,
     },
-    /// A read on a FED stage took a frame through a path the read log does not
-    /// record (`CerulionSubscriber::try_receive_one` and its owned twin, the
-    /// rmw `take` path). Such a read has no recorded identity, so its frames
-    /// cannot be fed and the replay cannot reproduce it.
+    /// A read on a FED stage took a frame through a path the recording did not
+    /// record: `CerulionSubscriber::try_receive_one` or its owned twin in a bag
+    /// below trace format 13, whose recorder staged no record for a take. Such
+    /// a read has no recorded identity, so its frames cannot be fed and the
+    /// replay cannot reproduce it.
     UnrecordedTake,
 }
 
@@ -3487,6 +3522,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             armed,
             records_every_consult,
             records_batch_frames,
+            records_single_takes,
             annotates_every_read,
             pending,
             inner

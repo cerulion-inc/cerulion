@@ -142,10 +142,13 @@
 //!   still covers is indistinguishable from a counted drain. A released slot
 //!   ([`CreditShared::release_slot`]) counts nothing, so its drains report no
 //!   clip.
-//! - **Pops that record no drain.** `CerulionSubscriber::try_receive_one`,
-//!   `try_receive_one_owned` and `spin_view_until_seq` take from the queue
-//!   without touching the word, so a `block` input read through them leaves
-//!   the word ABOVE the queue.
+//! - **Pops that record no drain.** `CerulionSubscriber::spin_view_until_seq`
+//!   takes from the queue without touching the word, and so do
+//!   `try_receive_one` and `try_receive_one_owned` in a replay of a bag below
+//!   trace format 13, whose recorder's takes paid nothing, so a `block` input
+//!   read through them leaves the word ABOVE the queue. From format 13 a take
+//!   pays the word for every frame it removed, and a take that finds its
+//!   queue empty records the empty drain.
 //! - **A send that returns `Ok` without reaching this consumer's queue**, such
 //!   as one to a consumer whose port connected after the send updated its
 //!   connections: the frame stays counted and no drain ever pays for it.
