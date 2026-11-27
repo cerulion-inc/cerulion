@@ -25,7 +25,9 @@
 //!
 //! The positive control on the log is the supervisor's "capture plane ARMED for
 //! this deployment" line, so an empty capture of stderr cannot pass the negative
-//! one (no "flashback checkpoints are OFF" line).
+//! ones: no process logs that it takes no checkpoints ("flashback checkpoints
+//! are OFF", the kill switch's "Flashback is OFF for this run", or a rank's own
+//! "Flashback STATE capture is OFF").
 //!
 //! A mid-run capture of this run is not resimmed here: a mid-run free-run
 //! recording of several worker ranks is refused, since per-rank resume is not
@@ -50,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use cerulion_core::flashback::FLASHBACK_CADENCE_MS_ENV;
+use cerulion_core::flashback::{FLASHBACK_CADENCE_MS_ENV, FLASHBACK_ENV};
 use serial_test::serial;
 
 mod mp_support;
@@ -165,6 +167,9 @@ fn a_process_that_hosts_several_units_takes_a_checkpoint_in_every_unit() {
         &[
             ("CERULION_HOME", &home_str),
             ("CERULION_FLASHBACK_DIR", &flashbacks_str),
+            // SET, never inherited: a developer's `CERULION_FLASHBACK=off` would
+            // turn every arm of this file into a refusal.
+            (FLASHBACK_ENV, "on"),
             (FLASHBACK_CADENCE_MS_ENV, ANCHOR_CADENCE_MS),
             (
                 "RUST_LOG",
@@ -204,6 +209,7 @@ fn a_process_that_hosts_several_units_takes_a_checkpoint_in_every_unit() {
     let flash_status = flash
         .wait_bounded(CAPTURE_COMPLETES)
         .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
+    flash.finish().assert_clean();
     assert!(
         flash_status.success(),
         "`cerulion flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\n\
@@ -244,10 +250,18 @@ fn a_process_that_hosts_several_units_takes_a_checkpoint_in_every_unit() {
         "POSITIVE CONTROL: the supervisor must arm the plane for a split deployment; \
          log:\n{log}"
     );
-    assert!(
-        !log.contains("flashback checkpoints are OFF"),
-        "a split deployment must not switch its checkpoints off; log:\n{log}"
-    );
+    // Every sentence that says a process takes no checkpoints.
+    for off in [
+        "flashback checkpoints are OFF",
+        "Flashback is OFF for this run",
+        "Flashback STATE capture is OFF",
+    ] {
+        assert!(
+            !log.contains(off),
+            "no process of a split deployment may turn its checkpoints off ({off:?}); \
+             log:\n{log}"
+        );
+    }
     assert_eq!(
         log.matches("state arm attached without fork").count(),
         2,
