@@ -64125,8 +64125,8 @@ const TB_STEPS: usize = 12;
 
 /// A hand-written consumer of one `block` input of depth 2 that takes one
 /// frame per fire and logs `(tag, x, wire sequence, 0)` through `ri_log`.
-/// `fifo` makes `inp` its FIFO data trigger, throttled to one fire per 10 ms;
-/// otherwise it is a `period_ms = 10` node and `inp` a latest-value input.
+/// `inp` is its data trigger, throttled to one fire per 10 ms; `fifo` makes it
+/// a FIFO input, otherwise it is a latest-value one (`consume: latest`).
 struct BlockTakerEntry {
     context: Option<cerulion_core::NodeContext>,
     fifo: bool,
@@ -64139,7 +64139,7 @@ impl NodeEntry for BlockTakerEntry {
             vec![InputMeta {
                 name: "inp".to_string(),
                 schema_hash: <Vector3 as cerulion_core::ShmMessage>::SCHEMA_HASH,
-                trigger: self.fifo,
+                trigger: true,
                 depth: 2,
                 backpressure: BackpressurePolicy::Block,
                 expect_within_ms: None,
@@ -64152,14 +64152,11 @@ impl NodeEntry for BlockTakerEntry {
             }],
             vec![],
         );
-        Ok(if self.fifo {
-            info.with_policy(cerulion_core::MacroPolicy::DataTrigger {
+        Ok(info
+            .with_policy(cerulion_core::MacroPolicy::DataTrigger {
                 input_name: "inp".to_string(),
             })
-            .with_throttle_ms(10)
-        } else {
-            info.with_policy(cerulion_core::MacroPolicy::Period { period_ms: 10 })
-        })
+            .with_throttle_ms(10))
     }
 
     fn init(&mut self, context: cerulion_core::NodeContext) -> cerulion_core::TransportResult<()> {
