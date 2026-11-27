@@ -522,7 +522,7 @@ fn a_deferred_node_is_captured_by_the_fork_child_with_its_own_bytes() {
         .last_anchor_carriers()
         .expect("the boundary at step 4 took an anchor");
     assert_eq!(split.inline_nodes, 1);
-    assert_eq!(split.forked_nodes, 1);
+    assert_eq!(split.deferred_nodes, 1);
 
     wait_for_reap(&mut h.runtime);
 
@@ -814,7 +814,7 @@ fn a_node_whose_encoder_refuses_in_the_child_is_never_published_as_a_complete_an
         .last_anchor_carriers()
         .expect("the boundary at step 4 took an anchor");
     assert_eq!(
-        split.forked_nodes, 1,
+        split.deferred_nodes, 1,
         "the hand-written node must reach the FORK carrier, or this drives nothing"
     );
     wait_for_reap(&mut h.runtime);
@@ -1264,7 +1264,7 @@ fn a_forked_anchor_states_the_same_stop_bytes() {
         .last_anchor_carriers()
         .expect("the boundary at step 4 took an anchor");
     assert_eq!(split.inline_nodes, 1);
-    assert_eq!(split.forked_nodes, 1);
+    assert_eq!(split.deferred_nodes, 1);
 
     wait_for_reap(&mut h.runtime);
 

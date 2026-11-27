@@ -8,7 +8,9 @@
 # rmw_cerulion in this distro's container (both directions, the three #[ignore]'d tests in
 # rclpy_xproc_test.rs run with --ignored against the freshly staged .so), with a wrong-payload
 # self-test that must red and a staged-vs-built digest check, so a green lane proves a real rclpy
-# peer talks to native Cerulion on this distro. On the rows in RCLCPP_PAIR_DISTROS (harvest.sh) it then runs the
+# peer talks to native Cerulion on this distro. On the rows in SCHEMA_HASH_CAPTURE_DISTROS (harvest.sh,
+# Jazzy) it then runs the schema hash capture in the same file: one stock rclpy publisher per pinned
+# type, a MEASURED line per wire hash, each equal to the generated constant. On the rows in RCLCPP_PAIR_DISTROS (harvest.sh) it then runs the
 # stock demo_nodes_cpp and demo_nodes_py talker and listener over rmw_cerulion in three pairs
 # (rclcpp to rclcpp, rclcpp to rclpy, rclpy to rclcpp). The emulated aarch64 leg sets
 # RMW_GATE_SKIP_SERIAL_SUITE=1 to defer the in-process serial suite (the x86_64 lanes always run
@@ -330,6 +332,62 @@ case "$expect" in
         grep -q -F "$GATE_WRONG_SENTINEL" "$splain" || { echo "GATE FAIL: $distro rclpy exchange SELF-TEST(2a): the injected literal ($GATE_WRONG_SENTINEL) never appears in the exchange's failure output; the RED is not a proven payload mismatch"; echo "-- output tail:"; tail -n 40 "$splain"; exit 1; }
         echo "GATE SELF-TEST PASS (2a): $distro wrong payload ($GATE_WRONG_SENTINEL) crossed the exchange and the oracle REJECTED it ($s_fail failed; the literal is in the collected values)"
         rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+        # ===================================================================
+        # SCHEMA HASH CAPTURE: one stock rclpy publisher per pinned type over
+        # rmw_cerulion, a native subscriber per topic reading
+        # WireHeader::schema_hash off the first frame. The test prints one
+        # `MEASURED <package>/<Name> 0x<hash>` line per type BEFORE it asserts
+        # wire == the generated SCHEMA_HASH, and the lines are printed again
+        # below (and into the job summary) on a red run too: they are the
+        # source for LIVE_RMW_MEASURED_HASHES in
+        # crates/native_ros2_messages/tests/schema_hash_pin_test.rs, never
+        # schema_hash(). ros-base ships none of the four extra message
+        # packages, so they are installed here.
+        # -------------------------------------------------------------------
+        if schema_hash_capture_runs "$distro"; then
+            for pkg in vision-msgs control-msgs grid-map-msgs object-recognition-msgs; do
+                if [ ! -d "/opt/ros/$distro/share/${pkg//-/_}" ]; then
+                    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "ros-$distro-$pkg" >/dev/null 2>&1 \
+                        || { echo "GATE FAIL: $distro schema hash capture - could not install ros-$distro-$pkg"; exit 1; }
+                fi
+            done
+            CAPTURE_TEST=schema_hash_capture_rclpy_publishers_to_native_subscribers
+            CAPTURE_TYPES_EXPECTED=8   # == CAPTURE_TYPES in rclpy_xproc_test.rs: the seven pinned wire hashes + the geometry_msgs/Pose control
+            rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+            clog="/tmp/rmw_rclpy_${distro}_${CAPTURE_TEST}.log"
+            echo "== rmw schema hash capture on $distro: $CAPTURE_TEST (fresh process, --ignored) =="
+            timeout --kill-after=30 "$RCLPY_TIMEOUT" \
+                env RMW_IMPLEMENTATION=rmw_cerulion \
+                    AMENT_PREFIX_PATH="$PREFIX:$AMENT_PREFIX_PATH" \
+                    LD_LIBRARY_PATH="$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+                cargo test --locked -p rmw_cerulion --release --test rclpy_xproc_test -- \
+                    --ignored --test-threads=1 --exact "$CAPTURE_TEST" --show-output 2>&1 | tee "$clog"
+            rc_cap=${PIPESTATUS[0]}
+            rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
+            rclpy_timed_out "$rc_cap" "$distro" "schema hash capture" "$RCLPY_TIMEOUT" && exit 1
+            cplain="${clog}.plain"; strip_ansi "$clog" > "$cplain"
+            echo "== MEASURED schema hashes on $distro (stock rclpy publishers over rmw_cerulion, read off the wire) =="
+            measured_hashes "$cplain"
+            if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+                { echo "### Schema hashes measured on $distro"; echo; echo '```'; measured_hashes "$cplain"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
+            if crashed "$cplain"; then
+                echo "GATE FAIL: $distro schema hash capture crashed or its test target did not compile (rc=$rc_cap)"; exit 1
+            fi
+            csum="$(grep -E '^test result: ' "$cplain" | tail -n 1)"
+            [ -n "$csum" ] || { echo "GATE FAIL: $distro schema hash capture printed NO 'test result:' summary (rc=$rc_cap)"; tail -n 40 "$cplain"; exit 1; }
+            cpassed=$(printf '%s\n' "$csum" | awk '{print $4}'); cfailed=$(printf '%s\n' "$csum" | awk '{print $6}')
+            case "$cpassed" in ''|*[!0-9]*) echo "GATE FAIL: $distro schema hash capture - unparseable passed count: $csum"; exit 1 ;; esac
+            case "$cfailed" in ''|*[!0-9]*) echo "GATE FAIL: $distro schema hash capture - unparseable failed count: $csum"; exit 1 ;; esac
+            if [ "$rc_cap" -ne 0 ] || [ "$cfailed" -ne 0 ] || [ "$cpassed" -ne 1 ]; then
+                echo "GATE FAIL: $distro schema hash capture rc=$rc_cap: $csum"; exit 1
+            fi
+            grep -qE "^test ${CAPTURE_TEST} \.\.\. ok$" "$cplain" || { echo "GATE FAIL: $distro schema hash capture passed but its own '^test ${CAPTURE_TEST} ... ok' line is absent (rule 37)"; exit 1; }
+            measured_hashes_judge "$cplain" "$CAPTURE_TYPES_EXPECTED" "$distro schema hash capture" || exit 1
+            echo "GATE PASS (schema hash capture): $distro measured $CAPTURE_TYPES_EXPECTED schema hashes off the wire, each equal to the generated SCHEMA_HASH"
+        else
+            echo "== schema hash capture SKIPPED on $distro: it runs on [$SCHEMA_HASH_CAPTURE_DISTROS] =="
+        fi
         # ===================================================================
         # RCLCPP TALKER AND LISTENER: the stock demo_nodes_cpp and demo_nodes_py
         # nodes over rmw_cerulion, three pairs: rclcpp to rclcpp, rclcpp to rclpy

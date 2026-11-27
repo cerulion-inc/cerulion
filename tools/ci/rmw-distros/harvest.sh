@@ -265,3 +265,43 @@ rclcpp_pair_judge() {
     echo "PAIR OK: $label - heard $n distinct messages, every one published ($(printf '%s\n' "$heard" | head -n1) to $(printf '%s\n' "$heard" | tail -n1))"
     return 0
 }
+
+# --- schema hash capture -------------------------------------------------------------
+# The rows that run the capture (rclpy_xproc_test.rs
+# schema_hash_capture_rclpy_publishers_to_native_subscribers): Jazzy only, the distro the wire
+# hashes pinned in crates/native_ros2_messages/tests/schema_hash_pin_test.rs were captured on.
+# Pinned here, beside its predicate, so gate_selftest.sh proves the list.
+SCHEMA_HASH_CAPTURE_DISTROS="jazzy"
+
+# schema_hash_capture_runs <distro>: exit 0 when <distro> is one of SCHEMA_HASH_CAPTURE_DISTROS.
+schema_hash_capture_runs() {
+    case " $SCHEMA_HASH_CAPTURE_DISTROS " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
+# measured_hashes <plain log>: the capture's `MEASURED <package>/<Name> 0x<16 hex>` lines, in log
+# order. A line of any other shape is not a measurement and is left out.
+measured_hashes() {
+    grep -E '^MEASURED [a-z0-9_]+/[A-Za-z0-9_]+ 0x[0-9a-f]{16}$' "$1"
+}
+
+# measured_hashes_judge <plain log> <expected types> <label>: exit 0 when the log carries exactly
+# <expected types> MEASURED lines, one per distinct type, and no `NOT MEASURED` line; else print
+# the named reason and return 1.
+measured_hashes_judge() {
+    local plain="$1" want="$2" label="$3" lines n distinct
+    if grep -qE '^NOT MEASURED ' "$plain"; then
+        echo "GATE FAIL: $label - a type got no frame: $(grep -m1 -E '^NOT MEASURED ' "$plain")"
+        return 1
+    fi
+    lines="$(measured_hashes "$plain")"
+    n=$(printf '%s\n' "$lines" | grep -c .)
+    distinct=$(printf '%s\n' "$lines" | awk 'NF { print $2 }' | sort -u | grep -c .)
+    if [ "$n" -ne "$want" ] || [ "$distinct" -ne "$want" ]; then
+        echo "GATE FAIL: $label - $n MEASURED line(s) over $distinct distinct type(s), expected $want of each"
+        return 1
+    fi
+    return 0
+}
