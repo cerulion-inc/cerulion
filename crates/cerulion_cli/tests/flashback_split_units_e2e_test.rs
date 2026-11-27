@@ -21,7 +21,10 @@
 //! * the run log has two "state arm attached without fork" lines (the two units
 //!   of `p0`) and three "checkpoint state ring created" lines (one per rank);
 //! * the capture's `anchor.per_rank` has exactly the keys `0`, `1` and `2`, each
-//!   with `nodes == 1` and `complete == 1`, and `anchor.missing_ranks` is empty.
+//!   with `nodes == 1` and `complete == 1`, and `anchor.missing_ranks` is empty;
+//! * the run is younger than the 30 s back window, so the capture holds every
+//!   rank's step 0 and reads `resimmable: true`, and `cerulion bag play --resim
+//!   all` re-executes it from the start with exit 0.
 //!
 //! The positive control on the log is the supervisor's "capture plane ARMED for
 //! this deployment" line, so an empty capture of stderr cannot pass the negative
@@ -29,7 +32,7 @@
 //! are OFF", the kill switch's "Flashback is OFF for this run", or a rank's own
 //! "Flashback STATE capture is OFF").
 //!
-//! A mid-run capture of this run is not resimmed here: a mid-run free-run
+//! A capture whose window begins mid run is not taken here: a mid-run free-run
 //! recording of several worker ranks is refused, since per-rank resume is not
 //! supported.
 //!
@@ -64,6 +67,7 @@ const READY_DEADLINE: Duration = Duration::from_secs(90);
 /// write, so its ceiling is generous by a wide margin.
 const CAPTURE_COMPLETES: Duration = Duration::from_secs(240);
 const EXIT_DEADLINE: Duration = Duration::from_secs(90);
+const RESIM_COMPLETES: Duration = Duration::from_secs(240);
 
 /// The run anchors every 2 s, so the 15 s post window holds several checkpoints
 /// of every rank.
@@ -310,5 +314,50 @@ fn a_process_that_hosts_several_units_takes_a_checkpoint_in_every_unit() {
         anchor["missing_ranks"],
         serde_json::json!([]),
         "no rank may be missing from the checkpoint: {manifest}"
+    );
+    // The run is younger than the 30 s back window, so the capture still holds
+    // every rank's step 0 and replays from the start, beside its checkpoints.
+    assert_eq!(
+        anchor["resimmable"],
+        serde_json::json!(true),
+        "a capture whose window reaches step 0 on every rank replays from the start: \
+         {manifest}"
+    );
+    let reason = anchor["resimmable_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a verdict states its reason: {manifest}"));
+    assert!(
+        reason.contains("step 0"),
+        "the verdict names the window: {reason}"
+    );
+
+    // ------------------------------------------------- the verdict, replayed
+    // The replay the verdict predicts: from the start, reading no checkpoint.
+    let resim_stderr = root.join("resim.stderr");
+    let mut resim = ChildGuard::single_process(
+        Command::new(env!("CARGO_BIN_EXE_cerulion"))
+            .args(["bag", "play"])
+            .arg(&captures[0])
+            .args(["--resim", "all"])
+            .current_dir(root)
+            .env_remove("CARGO_TARGET_DIR")
+            .env("CERULION_NETWORK", "off")
+            .env("CERULION_HOME", &home)
+            .stdout(Stdio::from(
+                std::fs::File::create(root.join("resim.stdout")).unwrap(),
+            ))
+            .stderr(Stdio::from(std::fs::File::create(&resim_stderr).unwrap()))
+            .spawn()
+            .expect("spawn cerulion bag play --resim"),
+    );
+    let resim_status = resim
+        .wait_bounded(RESIM_COMPLETES)
+        .unwrap_or_else(|| panic!("`cerulion bag play --resim` never returned"));
+    resim.finish().assert_clean();
+    assert_eq!(
+        resim_status.code(),
+        Some(0),
+        "`cerulion bag play --resim all` re-executes the capture from the start\nstderr:\n{}",
+        read_file(&resim_stderr)
     );
 }
