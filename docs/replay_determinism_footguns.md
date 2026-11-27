@@ -319,9 +319,11 @@ the slot, the two releases with no record do not apply. `#[cerulion_node]`
 sets that metadata, a `--raw-ffi` node may set it by hand, and a Python node
 cannot. Current builds also refuse a second commit per output per fire on a
 `block` topic at the host commit site, naming the node, output, topic and
-`block` consumer without sending the frame; without that metadata, a count
-past the depth is still no release, so older recordings written before the
-commit-site refusal remain valid. A step excused only by holds is a
+`block` consumer without sending the frame. The verifier still reads a count
+past the depth without that metadata as no release, since an older recording
+can hold one. Re-executing such a recording refuses the second commit, as a
+live run of the current build does, so `--verify` reports the missing frame as
+a divergence on that topic; record the run again with the current build. A step excused only by holds is a
 divergence, and the finding says why, if every slot that excused it shows a
 release with no record before its consumer next reads it.
 
