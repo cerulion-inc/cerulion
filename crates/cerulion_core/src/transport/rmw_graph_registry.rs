@@ -34,13 +34,18 @@
 //! The writers a gather must hear are the publishers that iceoryx2 lists on
 //! the registry service, minus the publishers whose owner node is `Dead`, minus
 //! the caller's own writer ([`required_writers`]). The gather reads the node
-//! list once, when the gather starts, and never removes a node, so a writer
-//! whose node dies during the gather stays required. With no required writer
-//! it returns [`GatherCompleteness::Settled`] at once, without a subscriber or
-//! a ring.
-//! Otherwise it returns `Settled` as soon as each required writer delivered a
-//! complete generation, or [`GatherCompleteness::Incomplete`] when the window
-//! ends first. The entries of an `Incomplete` gather are still real.
+//! list once, when it starts, and never removes a node. It reads the publisher
+//! list again on each pass. So a writer whose node dies during the gather
+//! stays required while its publisher is listed, a writer that joins during
+//! the gather becomes required, and a writer whose publisher leaves the list
+//! during the gather (it dropped its writer, or another process removed its
+//! stale ports) stops being required and its entries leave the result.
+//! With no required writer it returns [`GatherCompleteness::Settled`] at once,
+//! without a subscriber or a ring.
+//! Otherwise it returns `Settled` as soon as each writer required at the
+//! current pass delivered a complete generation, or
+//! [`GatherCompleteness::Incomplete`] when the window ends first. The entries
+//! of an `Incomplete` gather are still real.
 //!
 //! # Wire contract (frame v1)
 //!

@@ -684,6 +684,47 @@ fn a_silent_peer_makes_the_gather_incomplete_and_keeps_what_was_heard() {
     );
 }
 
+/// The required writers are read again on every pass: a peer that leaves
+/// the publisher list during a gather stops being required, so the gather
+/// settles without it and without waiting out its window.
+#[test]
+#[serial]
+fn a_peer_that_leaves_during_a_gather_stops_being_required() {
+    let root = IsolatedRoot::mint("rg_s");
+    let tm = manager("leave_w", &root.config());
+    let reader = manager("leave_r", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    writer.add("/stays", "pkg/msg/Stays").expect("pair");
+
+    const HELD: Duration = Duration::from_millis(300);
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let config = root.config();
+    let peer = std::thread::spawn(move || {
+        let node = raw_node(&config);
+        let service = raw_registry(&node);
+        let silent = service.publisher_builder().create().expect("raw publisher");
+        ready_tx.send(()).expect("signal ready");
+        std::thread::sleep(HELD);
+        drop(silent);
+    });
+    ready_rx.recv().expect("the silent peer is listed");
+
+    let start = Instant::now();
+    let got = gather(&reader, None, SETTLE_WINDOW);
+    let elapsed = start.elapsed();
+    peer.join().expect("peer thread");
+
+    assert_eq!(got, settled(&[("/stays", &["pkg/msg/Stays"])]));
+    assert!(
+        elapsed >= HELD - Duration::from_millis(100),
+        "the listed silent peer was required until it left (elapsed {elapsed:?})"
+    );
+    assert!(
+        elapsed < SETTLE_WINDOW - Duration::from_secs(2),
+        "the gather settled once the peer left (elapsed {elapsed:?})"
+    );
+}
+
 /// The child half of the killed-writer arm: a writer with one pair on the
 /// parent's root, held until the parent kills this process.
 #[test]

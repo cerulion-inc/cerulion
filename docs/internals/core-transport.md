@@ -582,8 +582,9 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   sent, so a snapshot larger than the 128-frame queue still lands whole within
   `parts.div_ceil(budget)` sends. `gather_rmw_graph(own_writer, window)` waits only for
   the listed publishers whose owner node is not `Dead` when the gather starts, minus
-  `own_writer` (`required_writers`); it reads the node list and never reaps. No
-  required writer: `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
+  `own_writer` (`required_writers`); it reads the node list once and never reaps, and
+  reads the publisher list on each pass, so a writer that leaves the list mid-gather
+  stops being required. No required writer: `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
   names; a change takes new names.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
