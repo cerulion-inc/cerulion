@@ -783,15 +783,19 @@ unsafe fn fill_from_endpoint_map(
 // identity — `runtime::ros_topic_to_cerulion`), so every names-and-types
 // query serves them VERBATIM: a name round-trips create → query unchanged.
 
-/// The longest a topic listing waits for the other processes' writers on the
-/// rmw graph registry. The gather rings again as soon as a ring brings new
-/// parts, so a live writer is heard as fast as it answers; this bounds a
+/// How long a topic listing waits for the other processes' writers on the
+/// rmw graph registry. The gather rings again as soon as a ring brings a
+/// frame of a writer that is not whole, so a live writer is heard as fast as it answers. `idle` bounds a
 /// writer that does not answer, and covers one interval send (500 ms), which
-/// serves a writer whose doorbell could not open. A writer whose snapshot
-/// needs more sends than fit in the window is cut: the listing returns its
-/// heard pairs and the `Incomplete` warning names the writers it did not hear
-/// whole.
-const TOPIC_GATHER_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+/// serves a writer whose doorbell could not open. While such frames arrive the
+/// gather goes on, so a large snapshot is heard whole, up to `limit`; a
+/// writer cut there leaves its heard pairs in the listing and the
+/// `Incomplete` warning counts it.
+const TOPIC_GATHER_WINDOW: cerulion_core::transport::rmw_graph_registry::RmwGraphGatherWindow =
+    cerulion_core::transport::rmw_graph_registry::RmwGraphGatherWindow {
+        idle: std::time::Duration::from_millis(600),
+        limit: std::time::Duration::from_secs(3),
+    };
 
 /// One regime for the whole process: a listing that cannot reach the registry,
 /// or does not hear every writer, does so on every call while the cause
@@ -831,8 +835,7 @@ fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
                     live_writers,
                     writers_heard,
                 } => Some(format!(
-                    "heard {writers_heard} of {live_writers} live writers whole in {} ms",
-                    TOPIC_GATHER_WINDOW.as_millis()
+                    "heard {writers_heard} of {live_writers} live writers whole"
                 )),
             }
         }

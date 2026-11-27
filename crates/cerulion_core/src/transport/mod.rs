@@ -5189,7 +5189,8 @@ impl TransportManager {
     }
 
     /// Gather the rmw `(topic, type_name)` pairs of every other live writer on
-    /// THIS manager's namespace, waiting at most `window`. Pass this process's
+    /// THIS manager's namespace, for at most `window` (its `idle` bound with
+    /// no new part, its `limit` in all). Pass this process's
     /// own [`writer_id`](rmw_graph_registry::RmwGraphWriter::writer_id) as
     /// `own_writer` so the gather does not wait for itself; its pairs are not
     /// in the answer.
@@ -5203,7 +5204,7 @@ impl TransportManager {
     pub fn gather_rmw_graph(
         &self,
         own_writer: Option<u128>,
-        window: std::time::Duration,
+        window: rmw_graph_registry::RmwGraphGatherWindow,
     ) -> TransportResult<rmw_graph_registry::RmwGraphGather> {
         rmw_graph_registry::gather_from_node(&self.node, own_writer, window)
     }

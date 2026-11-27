@@ -1248,11 +1248,13 @@ with rmw-specific additions:
   `api/pubsub.rs`): panic-contained, never a failed create or destroy, one process-wide
   `FailureRegimeLatch` for a refused name (empty, or over 256 bytes) or a caught panic.
   `rmw_get_topic_names_and_types` collects EVERY record's type from the local graph, drops
-  the read lock, gathers the other writers (`gather_rmw_graph(own writer id, 600 ms)`,
-  inside `catch_unwind`), and fills `types[i]` with every type of a topic, sorted
-  (`fill_names_and_multi_types`). The window is a bound, not a wait: a writer whose
-  snapshot needs more sends than the gather can ring in 600 ms is cut, and its heard pairs
-  are returned with the `Incomplete` warning. Every report runs inside `contain_panic`, so
+  the read lock, gathers the other writers (`gather_rmw_graph`, own writer id, idle
+  600 ms, limit 3 s, inside `catch_unwind`), and fills `types[i]` with every type of a
+  topic, sorted (`fill_names_and_multi_types`). Both bounds end only a gather that has not
+  settled: `idle` passes with no progress (no frame of a writer that is not whole yet, as
+  with a writer that does not answer), `limit` ends one
+  whose writers still send; a writer cut there leaves its heard pairs, with the
+  `Incomplete` warning. Every report runs inside `contain_panic`, so
   a panicking host subscriber fails no create, destroy or listing. A gather error or an
   `Incomplete` verdict still returns the local and heard pairs with `RMW_RET_OK`, through
   one process-wide latch, never a line

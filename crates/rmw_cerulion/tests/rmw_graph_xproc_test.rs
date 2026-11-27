@@ -35,8 +35,8 @@ use cerulion_core::testing::{
 };
 use cerulion_core::transport::dead_node_sweep::sweep_node_config;
 use cerulion_core::transport::rmw_graph_registry::{
-    GatherCompleteness, RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS,
-    RMW_GRAPH_QUEUE_DEPTH, RMW_GRAPH_REGISTRY_SERVICE_NAME,
+    GatherCompleteness, RmwGraphGatherWindow, RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS,
+    RMW_GRAPH_MAX_WRITERS, RMW_GRAPH_QUEUE_DEPTH, RMW_GRAPH_REGISTRY_SERVICE_NAME,
 };
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
@@ -405,7 +405,7 @@ impl ChildState {
                 let own = rt.graph_registry.as_ref().and_then(|w| w.writer_id());
                 let gather = rt
                     .transport
-                    .gather_rmw_graph(own, GATHER_WINDOW)
+                    .gather_rmw_graph(own, RmwGraphGatherWindow::fixed(GATHER_WINDOW))
                     .expect("gather");
                 let verdict = match gather.completeness {
                     GatherCompleteness::Settled => "settled".to_string(),
