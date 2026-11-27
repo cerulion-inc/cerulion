@@ -973,10 +973,15 @@ fn a_panicking_host_subscriber_fails_no_create_destroy_or_listing() {
         talker.ask(&format!("list {p}")),
         format!("{p}/remote=rmw_gx/msg/Remote;{p}/short=rmw_gx/msg/Short")
     );
-    // Each of the six reports panicked: per latch a failure, a suppressed
-    // repeat and a recovery.
+    // Every report the host subscriber saw panicked, and every call above
+    // still answered. Per latch there is a failure, a suppressed repeat and a
+    // recovery, but the suppressed repeat is a `debug!` and `cerulion_core`
+    // builds `tracing` with `release_max_level_info`: a release build never
+    // emits it. So the count is three per latch in a debug build and two in a
+    // release build (a failure and a recovery).
     let log = lister.exit_without_destroying();
-    assert_eq!(count(&log, HOST_PANIC), 6, "{log:#?}");
+    let reports_per_latch = if cfg!(debug_assertions) { 3 } else { 2 };
+    assert_eq!(count(&log, HOST_PANIC), 2 * reports_per_latch, "{log:#?}");
 }
 
 #[test]

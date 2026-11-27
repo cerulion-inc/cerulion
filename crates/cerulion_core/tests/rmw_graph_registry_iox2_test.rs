@@ -372,21 +372,20 @@ fn a_send_carries_its_share_of_half_a_queue_when_two_writers_are_listed() {
     );
 }
 
-/// The window of the big-snapshot tests, far wider than the topic listing's
-/// (600 ms idle, 3 s limit, set in `rmw_cerulion`): a host busy with other
-/// builds can starve 64 pump threads for seconds, and these tests pin that a
-/// writer that keeps answering is heard whole, not how fast a loaded host
-/// answers.
+/// The window of the big-snapshot tests: a bound that only a hang reaches.
+/// These tests pin that a writer that keeps answering is heard whole, which
+/// does not depend on how fast a loaded host schedules 64 pump threads, so no
+/// outcome here may hinge on a clock. How fast a gather rings again is pinned
+/// by the pure `next_pass` unit test in `rmw_graph_registry.rs`. The writers'
+/// own interval sends are held, so every send comes from a ring.
 const BIG_SNAPSHOT_WINDOW: RmwGraphGatherWindow = RmwGraphGatherWindow {
-    idle: Duration::from_secs(10),
-    limit: Duration::from_secs(40),
+    idle: Duration::from_secs(600),
+    limit: Duration::from_secs(600),
 };
 
 /// With sixteen writers listed, one send carries 4 parts, so the 129-part
-/// snapshot needs 33 sends, one per ring. A gather that rang once per 20 ms
-/// pass would need at least 32 pauses, 640 ms, past the topic listing's idle
-/// bound. A gather that rings again as soon as a writer that is not whole
-/// answers hears it whole.
+/// snapshot needs 33 sends, one per ring. The gather rings again as each send
+/// arrives and hears every writer whole.
 #[test]
 #[serial]
 fn a_snapshot_that_needs_33_sends_settles_whole() {
@@ -395,6 +394,7 @@ fn a_snapshot_that_needs_33_sends_settles_whole() {
     let reader = manager("pace_r", &root.config());
     let writer = tm.open_rmw_graph_writer();
     let pairs = add_a_129_part_snapshot(&writer);
+    writer.hold_timed_sends_for_test(true);
     let others: Vec<(Arc<TransportManager>, RmwGraphWriter)> = (0..15)
         .map(|i| {
             let other = manager(&format!("pace_{i:02}"), &root.config());
@@ -402,6 +402,7 @@ fn a_snapshot_that_needs_33_sends_settles_whole() {
             other_writer
                 .add(&format!("/pace/{i:02}"), "pkg/msg/Pace")
                 .expect("pair");
+            other_writer.hold_timed_sends_for_test(true);
             (other, other_writer)
         })
         .collect();
@@ -411,16 +412,10 @@ fn a_snapshot_that_needs_33_sends_settles_whole() {
         "precondition: 4 parts a send"
     );
 
-    let started = Instant::now();
     let got = reader
         .gather_rmw_graph(None, BIG_SNAPSHOT_WINDOW)
         .expect("gather");
-    let took = started.elapsed();
-    assert_eq!(
-        got.completeness,
-        GatherCompleteness::Settled,
-        "the gather took {took:?}"
-    );
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
     assert_eq!(got.topics.len(), 387 + 15);
     for (topic, type_name) in &pairs {
         assert_eq!(
@@ -437,9 +432,8 @@ fn a_snapshot_that_needs_33_sends_settles_whole() {
 }
 
 /// The widest legal graph: 64 writers listed, so one send carries 1 part and
-/// the 129-part snapshot needs 129 sends, one per ring. A gather that rings
-/// once per 20 ms needs 2.6 s for that; one that rings again on every answer
-/// lists every topic of every live writer.
+/// the 129-part snapshot needs 129 sends, one per ring. The gather lists every
+/// topic of every live writer.
 #[test]
 #[serial]
 fn a_snapshot_that_needs_129_sends_lists_every_topic_of_64_writers() {
@@ -448,6 +442,7 @@ fn a_snapshot_that_needs_129_sends_lists_every_topic_of_64_writers() {
     let reader = manager("wide_r", &root.config());
     let writer = tm.open_rmw_graph_writer();
     let pairs = add_a_129_part_snapshot(&writer);
+    writer.hold_timed_sends_for_test(true);
     let others: Vec<(Arc<TransportManager>, RmwGraphWriter)> = (0..RMW_GRAPH_MAX_WRITERS - 1)
         .map(|i| {
             let other = manager(&format!("wide_{i:02}"), &root.config());
@@ -455,6 +450,7 @@ fn a_snapshot_that_needs_129_sends_lists_every_topic_of_64_writers() {
             other_writer
                 .add(&format!("/wide/{i:02}"), "pkg/msg/Wide")
                 .expect("pair");
+            other_writer.hold_timed_sends_for_test(true);
             (other, other_writer)
         })
         .collect();
@@ -464,16 +460,10 @@ fn a_snapshot_that_needs_129_sends_lists_every_topic_of_64_writers() {
         "precondition: 1 part a send"
     );
 
-    let started = Instant::now();
     let got = reader
         .gather_rmw_graph(None, BIG_SNAPSHOT_WINDOW)
         .expect("gather");
-    let took = started.elapsed();
-    assert_eq!(
-        got.completeness,
-        GatherCompleteness::Settled,
-        "the gather took {took:?}"
-    );
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
     assert_eq!(got.topics.len(), 387 + 63);
     for (topic, type_name) in &pairs {
         assert_eq!(
@@ -487,10 +477,6 @@ fn a_snapshot_that_needs_129_sends_lists_every_topic_of_64_writers() {
             Some(&BTreeSet::from(["pkg/msg/Wide".to_string()]))
         );
     }
-    assert!(
-        took < BIG_SNAPSHOT_WINDOW.limit,
-        "the gather ran to its limit ({took:?})"
-    );
 }
 
 /// A raw notifier on the doorbell the writers created.
