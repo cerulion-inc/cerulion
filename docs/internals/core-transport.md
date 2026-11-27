@@ -568,6 +568,27 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   refuses as before. Oracle tests: the `marker_teardown`, `egress_scope` and
   `mirror_origin` unit tests, which inject the teardown through the open seam
   and pin one open for `Never`.
+- Rmw graph registry (`transport/rmw_graph_registry.rs`, `/__cerulion/rmw_graph` and the
+  doorbell `/__cerulion/rmw_graph/event`): a process that lists its rmw endpoints holds
+  one `RmwGraphWriter` (`TransportManager::open_rmw_graph_writer`). It is a handle that
+  keeps the manager alive, not a manager field, so the pinned manager layout does not
+  move. `add`/`remove` count endpoints per `(topic, type_name)`; the publisher opens on
+  the first call, and a failed open keeps the counts and runs again on the next call.
+  The writer id is the publisher id, and a gather drops a frame whose writer id is not
+  its sender's publisher id. A change sends the snapshot (one generation, one or more
+  parts); the pump sends again on a doorbell ring or every 500 ms. One send carries at
+  most `send_budget(listed publishers)` parts (an even share of half a reader queue, so
+  a queue holds two sends of every writer) from a cursor that moves on by every part
+  sent, so a snapshot larger than the 128-frame queue still lands whole within
+  `parts.div_ceil(budget)` sends. A test that counts the sends one ring causes holds the
+  interval sends with `hold_timed_sends_for_test` (`test-helpers`), because an interval
+  send that ends just before a ring is answered adds a second send to the count.
+  `gather_rmw_graph(own_writer, window)` waits only for
+  the listed publishers whose owner node is not `Dead` when the gather starts, minus
+  `own_writer` (`required_writers`); it reads the node list once and never reaps, and
+  reads the publisher list on each pass, so a writer that leaves the list mid-gather
+  stops being required. No required writer: `Settled` at once, no ring. Static config and frame v1 are fixed for the two service
+  names; a change takes new names.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
