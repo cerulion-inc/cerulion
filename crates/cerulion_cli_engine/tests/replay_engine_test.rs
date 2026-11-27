@@ -38159,6 +38159,11 @@ fn a_duration_cut_before_a_cross_rank_topics_first_read_steers_it_empty() {
             "the empty window schedule claims no coverage hole: {note:?}"
         );
     }
+    assert!(
+        outcome.injection_anomalies.is_empty(),
+        "an empty schedule leaves nothing unspent inside the window: {:?}",
+        outcome.injection_anomalies
+    );
 }
 
 /// **Every budget refusal and stand-down arm reads the configured budget and
