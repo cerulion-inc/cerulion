@@ -334,6 +334,8 @@ fn help_lists_the_whole_re_execution_surface() {
         "--report",
         "--tolerance",
         "--record-out",
+        "--feed-index-budget",
+        "--verifier-record-budget",
         "--rate",
         "--duration",
         "--start-offset",
@@ -543,6 +545,22 @@ fn illegal_flag_combinations_are_refused_by_name_and_never_as_a_violation() {
                 "t.yaml",
             ],
             "--tolerance",
+        ),
+        (
+            &["bag", "play", "x.mcap", "--verifier-record-budget", "100"],
+            "--verifier-record-budget",
+        ),
+        (
+            &[
+                "bag",
+                "play",
+                "x.mcap",
+                "--resim",
+                "all",
+                "--verifier-record-budget",
+                "0",
+            ],
+            "--verifier-record-budget",
         ),
     ];
     for (argv, flag) in cases {

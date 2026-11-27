@@ -123,6 +123,8 @@ pub struct ResimOptions {
     pub record_out_path: Option<PathBuf>,
     /// `--feed-index-budget BYTES` (requires `--verify`).
     pub feed_index_budget: Option<u64>,
+    /// `--verifier-record-budget COUNT` (legal in both resim modes).
+    pub verifier_record_budget: Option<u64>,
 }
 
 /// Which nodes re-execute.
@@ -189,6 +191,8 @@ pub struct PlayFlags {
     pub record_out: Option<PathBuf>,
     /// `--feed-index-budget BYTES`: resim + `--verify` only.
     pub feed_index_budget: Option<u64>,
+    /// `--verifier-record-budget COUNT`: resim only, in EITHER mode.
+    pub verifier_record_budget: Option<u64>,
 }
 
 /// What a legal `bag play` invocation resolved to.
@@ -285,6 +289,10 @@ const RESIM_ONLY: &[(&str, &str)] = &[
         "--feed-index-budget",
         "plain playback feeds no reads, so it builds no feed index to budget",
     ),
+    (
+        "--verifier-record-budget",
+        "plain playback builds no verifier read log, frame index or schedule to budget",
+    ),
 ];
 
 /// Resolve a `bag play` invocation, refusing every illegal flag combination
@@ -322,6 +330,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         allow_param_change,
         record_out,
         feed_index_budget,
+        verifier_record_budget,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
     // before anything else: a bound nobody can act on is a usage error, not a
@@ -331,7 +340,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 7] = [
+        let present: [bool; 8] = [
             verify,
             report.is_some(),
             tolerance.is_some(),
@@ -339,6 +348,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             allow_param_change,
             record_out.is_some(),
             feed_index_budget.is_some(),
+            verifier_record_budget.is_some(),
         ];
         if let Some((flag, why)) = RESIM_ONLY
             .iter()
@@ -407,6 +417,14 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         );
     }
 
+    if verifier_record_budget == Some(0) {
+        return Err(
+            "`--verifier-record-budget 0` leaves no room for any read, frame or schedule record: \
+             pass a positive record count, or omit the flag to use the default."
+                .to_string(),
+        );
+    }
+
     // `--record-out` shapes what the run PRODUCES, so it is legal in both modes.
     // One file cannot be both the verdict and the bag: refuse the collision by
     // name rather than let the second writer clobber the first.
@@ -431,6 +449,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             allow_param_change,
             record_out_path: record_out,
             feed_index_budget,
+            verifier_record_budget,
         },
     })
 }
@@ -1032,10 +1051,12 @@ fn engine_options(o: ResimOptions, verify: bool) -> replay_cmd::ReplayOptions {
         allow_param_change,
         record_out_path,
         feed_index_budget,
+        verifier_record_budget,
     } = o;
     replay_cmd::ReplayOptions {
         duration_bound_ns,
         feed_index_budget,
+        verifier_record_budget,
         report_path,
         tolerance_path,
         strict_state,
@@ -1373,6 +1394,7 @@ mod tests {
                     allow_param_change: true,
                     record_out_path: None,
                     feed_index_budget: None,
+                    verifier_record_budget: None,
                 },
             }
         );
@@ -1639,7 +1661,7 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 7] = [
+        let cases: [(&str, PlayFlags); 8] = [
             (
                 "--record-out",
                 PlayFlags {
@@ -1686,6 +1708,13 @@ mod tests {
                 "--feed-index-budget",
                 PlayFlags {
                     feed_index_budget: Some(1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "--verifier-record-budget",
+                PlayFlags {
+                    verifier_record_budget: Some(1),
                     ..Default::default()
                 },
             ),
@@ -1760,6 +1789,59 @@ mod tests {
             panic!("a verifying resim: {mode:?}");
         };
         assert_eq!(options.feed_index_budget, Some(4096));
+    }
+
+    /// `--verifier-record-budget 0` and `--verifier-record-budget` without
+    /// `--resim` are refused with exact usage-error messages; positive counts
+    /// (including `u64::MAX`) are legal in both neutral and verifying resim
+    /// modes and reach `ResimOptions`.
+    #[test]
+    fn resim_verifier_budget_zero_and_non_resim_refused() {
+        let non_resim = resolve_play_mode(PlayFlags {
+            verifier_record_budget: Some(500_000),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            non_resim,
+            "`--verifier-record-budget` needs `--resim` \u{2014} plain playback builds no \
+             verifier read log, frame index or schedule to budget. To RE-EXECUTE the bag's graph \
+             against your current build, run `cerulion bag play <bag> --resim all` (add \
+             `--verify` to byte-compare it against the recording)."
+        );
+
+        for verify in [false, true] {
+            let zero = resolve_play_mode(PlayFlags {
+                verifier_record_budget: Some(0),
+                verify,
+                ..resim("all")
+            })
+            .unwrap_err();
+            assert_eq!(
+                zero,
+                "`--verifier-record-budget 0` leaves no room for any read, frame or schedule \
+                 record: pass a positive record count, or omit the flag to use the default."
+            );
+
+            for count in [1, 3_000_000, u64::MAX] {
+                let mode = resolve_play_mode(PlayFlags {
+                    verifier_record_budget: Some(count),
+                    verify,
+                    ..resim("all")
+                })
+                .expect("positive verifier record budget resolves in both resim modes");
+                let PlayMode::Resim {
+                    verify: got_verify,
+                    options,
+                    ..
+                } = mode
+                else {
+                    panic!("expected resim mode: {mode:?}");
+                };
+                assert_eq!(got_verify, verify);
+                assert_eq!(options.verifier_record_budget, Some(count));
+            }
+        }
     }
 
     #[test]
@@ -2391,10 +2473,12 @@ mod tests {
                 allow_param_change: true,
                 record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
                 feed_index_budget: Some(4096),
+                verifier_record_budget: Some(500_000),
             },
             true,
         );
         assert_eq!(got.feed_index_budget, Some(4096));
+        assert_eq!(got.verifier_record_budget, Some(500_000));
         assert_eq!(
             got.purpose,
             crate::replay_engine::ReplayPurpose::Verify,
@@ -2435,6 +2519,8 @@ mod tests {
         assert!(!none.strict_state);
         assert!(!none.allow_param_change);
         assert!(none.record_out_path.is_none());
+        assert!(none.feed_index_budget.is_none());
+        assert!(none.verifier_record_budget.is_none());
     }
 
     #[test]

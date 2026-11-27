@@ -77,7 +77,7 @@ claim** about whether the result matches the recording (divergence is the
 product, not a failure), so a completed re-execution always exits **0**.
 
 The line between the two flag classes: a flag that shapes what EXECUTES
-(`--duration`, `--strict-state`, `--allow-param-change`) or PRODUCES (`--record-out`) works in both
+(`--duration`, `--strict-state`, `--allow-param-change`, `--verifier-record-budget`) or PRODUCES (`--record-out`) works in both
 modes; a flag that shapes the VERDICT (`--report`, `--tolerance`) needs `--verify`, and so
 does `--feed-index-budget`, which bounds the frame index only a verifying run builds.
 
@@ -147,7 +147,7 @@ it. On a `multi_publisher_topics` topic a driver shares with other nodes, the
 other writers' frames are compared and the driver's are not, when the replay
 attributes every recorded frame of the topic to its writer, which needs a bag
 that labels each frame with its writer, a wire header on every frame, and at
-most 200000 recorded frames, the verifier's record budget, on the
+most `--verifier-record-budget` recorded frames (3000000 by default), on the
 `multi_publisher_topics` topics one process or executor unit writes. Each
 writer is then compared in the process or executor unit that runs it, so a
 topic whose writers run in several of them is compared over every frame of
@@ -182,9 +182,9 @@ A `multi_publisher_topics` topic whose writers run in several processes or
 executor units is compared in every one of them that runs a writer of the
 topic other than a driver. When the replay attributes every recorded frame of
 the topic to its writer, which needs a bag that labels each frame with its
-writer, a wire header on every frame, and at most 200000 recorded frames, the
-verifier's record budget, on the `multi_publisher_topics` topics one process
-or executor unit writes, each writer is compared in the process or executor
+writer, a wire header on every frame, and at most `--verifier-record-budget`
+recorded frames (3000000 by default) on the `multi_publisher_topics` topics one
+process or executor unit writes, each writer is compared in the process or executor
 unit that runs it, and a byte mismatch names it (below). The frames a process
 or executor unit then feeds from the bag to its nodes that read the topic, the
 recorded frames of the writers that run elsewhere, are left out of the
@@ -483,6 +483,7 @@ cerulion bag play <BAG> --resim all [--verify] [-u|--duration D] [--strict-state
                                     [--allow-param-change] [--record-out PATH]
                                     [--report PATH] [--tolerance PATH]
                                     [--feed-index-budget BYTES]
+                                    [--verifier-record-budget COUNT]
 ```
 
 The two lines are the two modes, and their flags do **not** mix: every illegal
@@ -503,6 +504,7 @@ combination is refused by name with the reason, never silently ignored.
 | `--report PATH` | resim + `--verify` | Persist the machine-readable verdict JSON. Needs `--verify`: its `passed` / `violations` fields ARE the verdict a bare `--resim` declines to make. Beside the verdict it carries the per-rank REPORT-ONLY arrays, none of which move the exit code: `rank_execution` (one entry per pass: steps executed, first/last step, and whether the `--duration` bound is what stopped it; the per-rank breakdown `ticks_replayed` sums away), `injection_anomalies` (a bag-fed topic whose injected stream differed from the recording's: a sequence the plan did not name, a schedule that over-named the stream, or recorded frames a steered schedule left unaccounted for), and `replay_input_shortfalls` (a node whose trace-driven burst asked for the next recorded frame and got nothing, so it fired on its held head). Read all three before attributing a byte mismatch to the candidate: each says the replay's INPUT differed first. A `byte-mismatch` violation's `class` keeps `index`, `first_diff_byte_offset`, `recorded_len` and `replayed_len` and adds `difference`, one object with the keys `kind` (`field`, `header`, `schema_hash`, `layout` or `undecoded`), `path`, `recorded`, `replayed`, `field_byte`, `field_char`, `byte_offset`, `region` (`fixed_section_padding`, `offset_table`, `field_framing`, `unused_variable_bytes` or `trailing_bytes`), `reason` (`recorded_frame_too_short`, `replayed_frame_too_short`, `unknown_schema_hash`, `recorded_frame_undecodable` or `replayed_frame_undecodable`, the last two whichever decoder refused the frame) and `more`. `more` is an integer, 0 where nothing else is counted (always on `schema_hash`, `layout` and `undecoded`); any other key the kind does not use is `null`. `path` is the field's path for `field`, the wire-header field for `header` and `schema_hash`, and the framed field for `layout` in `field_framing`. `recorded` and `replayed` are a JSON number or boolean where the value is one; a string value is the string itself, without quotes; anything else (`.nan`, a byte such as `0x4c`, a window of a long string) is the line's text. On `field`, `field_byte` is the byte `<k>` inside the field that the line names (`byte <k> of its opaque bytes`, `byte <k> of its bytes`, or `past the NUL at field byte <k>`, where `recorded` and `replayed` then carry the same text), and `field_char` is the `<d>` of `from char <d>`. `first_diff_byte_offset` is the first differing byte in byte order, so it can sit in another field than `path`, which follows declaration order. |
 | `--tolerance PATH` | resim + `--verify` | Relax the byte-comparison per field. Needs `--verify`: there is no comparison to relax without it. |
 | `--feed-index-budget BYTES` | resim + `--verify` | The bytes a fed replay's index of recorded frames is charged (default 1073741824, 1 GiB): 40 for each frame the replayed reads consume, the index's key and slot for it, and 40 for each producer label of the topics they consume, which the build reads to tell a topic's writers apart. The index holds only the frames the replayed reads consume, up to `--duration` when it is given; a replay that needs more is refused with exit 2 (`read_identity_feed_index_budget`), naming the bytes it needs, the budget and this flag. Needs `--verify`: only a verifying resim feeds reads by recorded identity (see "Read identity" below). |
+| `--verifier-record-budget COUNT` | resim | The records a replay of a free-run recording holds in memory for each rank, one count for three structures separately (default 3000000; 3000000 reads take about 1 GiB): the rank's read log (a folded record of N reads counts N), the recorded frames with a wire header on the topics the rank consumes, and each pass's recorded schedule. A rank over it, where the replay feeds or gates its reads, is refused before step 1 with exit 2 over its reads or frames, naming the count, the budget and this flag; any other rank, and any pass over its schedule, runs with its re-derivation verdict stood down. `--duration` limits the read-log count to the steps inside the window. `0` is refused with exit 2. Legal with or without `--verify`. A lockstep recording is never refused or stood down by it (see "Read identity budget" below). |
 
 Why the playback flags are refused under `--resim`: `--rate` has no wall pace to
 multiply (a resim runs on the recording's own gating clock), `--loop` would not
@@ -1313,14 +1315,33 @@ the bytes the reads need, the frame identities and labels they are charged for,
 the budget and the flag.
 
 A replay of a free-run recording also holds in memory, for each rank (one
-process or executor unit of the recording), the rank's reads, a folded record
-of N identical reads counting N, and the recorded frames with a wire header on
-the topics the rank consumes, up to the verifier's budget of 200000 of each.
-Both cover the whole recording, whatever `--duration` bounds. A lockstep
-recording replays on its one gating clock and plans no read from the bag, so
-neither budget limits its replay; the 200000 recorded frames that attributing
-a `multi_publisher_topics` topic's frames to their writers needs, above, apply
-to it as to any replay. A free-run rank over a budget is refused only where
+process or executor unit of the recording), three things, each bounded
+separately by one count, `--verifier-record-budget <COUNT>` (default 3000000):
+
+- the rank's read log, the reads of the rank, a folded record of N identical
+  reads counting N;
+- the recorded frames with a wire header on the topics the rank consumes, the
+  frame index, which also bounds the walk that attributes the frames of a
+  `multi_publisher_topics` topic to their writers (above);
+- each pass's recorded schedule, the fires plus the reads it accumulates step
+  by step.
+
+`--duration` limits the read-log count to the steps inside its window, and the
+schedule accumulates only the steps the replay runs. The frame index still
+covers the whole recording, so `--duration` does not help over a frame-index
+refusal. The verifier holds about 330 bytes for each read at its peak, so 3000000
+reads take about 1 GiB, the same size as the `--feed-index-budget` default,
+and the frame index and the schedule's fires take memory on top of that; raise `--verifier-record-budget` on a host with more memory. `0` is a
+usage error (exit 2), and the flag without `--resim` is one too. It is legal
+with or without `--verify`. A separate bound of 200000 reads inside one step,
+a guard against a corrupt recorded run count, is not tunable, and raising the
+flag never raises it: a step over it is never expanded, and the rank's read log
+is declined as `verifier_declined_read_log_fold_run`, refused or stood down
+like a rank over the budget, with a re-record as the remedy. A lockstep recording replays on its one gating clock,
+plans no read from the bag and takes no census, so this budget does not limit
+its replay; the frames that attributing a `multi_publisher_topics` topic's
+frames to their writers needs, above, are bounded by the same flag and apply to
+it as to any replay. A free-run rank over the budget is refused only where
 the replay feeds or gates its recorded reads:
 
 - A `--verify` of a recording at `trace_format` 8 or later feeds every read,
@@ -1338,8 +1359,9 @@ the replay feeds or gates its recorded reads:
 Neither refuses a rank over the frames when the recording holds no read of
 that rank. A rank that is not refused runs, and a warning names the count and
 the budget. Its re-derivation verdict stands down with a note that names the
-cause (`verifier_declined_read_log_budget` or
-`verifier_declined_frame_index_budget`) and the count, and where it injects
+cause (`verifier_declined_read_log_budget`,
+`verifier_declined_frame_index_budget` or, always a stand-down,
+`verifier_declined_schedule_budget`) and the count, and where it injects
 recorded topics, they fall back to the recorded-clock injection window, so the
 frame comparison on the topics it produces is declined, neither passed nor
 failed (`declined_frame_comparisons`). The read-log verifier still compares
@@ -1350,9 +1372,19 @@ A refusal names how many reads or frames the rank holds and the budget. A read
 refusal also names the step of the first read past the budget and that step's
 time into the rank's recording, counted from the rank's first step in the bag,
 so on a bag that begins mid-run it is time into the bag, not into the run. The
-remedy it names is a shorter recording: the longest that fits is about the
-budget divided by the rank's reads per second, or by the frames per second on
-the topics it consumes, whichever is reached first.
+remedy it prints for the read log is: "This replay holds each rank's read log
+in memory up to this budget; raise it with `--verifier-record-budget <COUNT>`,
+bound the replay with `--duration`, or replay a shorter recording of this
+graph." For the frame index it is: "This replay holds the frames each rank
+consumes in memory up to this budget; raise it with `--verifier-record-budget
+<COUNT>` or replay a shorter recording of this graph." For the schedule it is:
+"This replay holds each pass's recorded schedule in memory up to this budget;
+raise it with `--verifier-record-budget <COUNT>`, bound the replay with
+`--duration`, or replay a shorter recording of this graph."
+
+The read-log budget lasts the budget divided by the rank's reads per second:
+one input read at 240 Hz lasts about 3.5 hours at 3000000, and 16 inputs at
+240 Hz about 13 minutes.
 
 What cannot be fed is refused by name before the first step (exit 2), with the
 node, the input, the writer and the sequence:
@@ -1702,4 +1734,4 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 | **With discovery OFF** (which is `cerulion bag record` always, and any recorder run under `CERULION_RECORD_DISCOVERY=off`), a topic that appears mid-recording is neither recorded NOR named | `bag record` sets `discover_live = false` (it owns its own selection policy), and that flag short-circuits discovery entirely, so nothing is watching for the topic and there is nothing to write into `untapped` either. The bag records `enumerated: false`, which is the accurate form of "nobody looked", but it cannot name what it did not look for | Nothing widens a window that is not open. Re-run the capture with the producer already live, or use `graph run --record` (where discovery is on) if you need the recorder to pick up producers that register after it arms. `--discovery-settle-ms` is **inert** here: the hold is released immediately when discovery is off |
 | A non-finalized bag cannot be played | The zero-copy frame walk needs the summary footer | None: only a finalized bag is playable |
 | A type NEITHER this machine NOR the bag defines still renders nothing | Nothing anywhere knows it: the bag can only carry what its recording machine could resolve | Re-record from a workspace that holds the `.msg` files |
-| A replay of a free-run recording holds each rank's reads and the recorded frames it consumes in memory, up to 200000 of each, so over either a rank whose recorded reads it feeds or gates is refused (exit 2) before its first step, and any other rank runs with its re-derivation verdict stood down. A lockstep recording is not limited | The replay plans those reads from the whole recording before the first step, so it holds both whole; `--duration` shortens neither. A lockstep replay plans no read from the bag | Replay a shorter recording. The refusal names the count, the budget and, for the reads, the step and time at which the rank ran past it; the longest recording that fits is about the budget divided by the rank's reads, or consumed frames, per second. Which ranks a replay feeds or gates is under "Read identity" above |
+| A replay of a free-run recording holds each rank's reads, the recorded frames it consumes and each pass's recorded schedule in memory, up to `--verifier-record-budget` records of each (default 3000000), so over the read log or the frames a rank whose recorded reads it feeds or gates is refused (exit 2) before its first step, and any other rank runs with its re-derivation verdict stood down. A lockstep recording is not limited | The replay plans those reads from the recording before the first step. `--duration` limits the read-log count to the steps inside its window, but the frame index still covers the whole recording | Raise `--verifier-record-budget <COUNT>` (about 330 bytes of memory for each read), bound the replay with `--duration`, or replay a shorter recording. The refusal names the count, the budget and, for the reads, the step and time at which the rank ran past it. Which ranks a replay feeds or gates is under "Read identity" above |
