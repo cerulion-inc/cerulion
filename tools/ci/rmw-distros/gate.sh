@@ -5,7 +5,7 @@
 # against the distro's real headers (generated bindings, never the vendored fallback), must export
 # no symbol the distro's headers do not declare, and (on the x86_64 lanes) its serial test suite
 # must pass. After the build, a `build` row also runs a REAL rclpy cross-process exchange over
-# rmw_cerulion in this distro's container (both directions, the three #[ignore]'d tests in
+# rmw_cerulion in this distro's container (both directions plus a cross-process topic listing, the four #[ignore]'d tests in
 # rclpy_xproc_test.rs run with --ignored against the freshly staged .so), with a wrong-payload
 # self-test that must red and a staged-vs-built digest check, so a green lane proves a real rclpy
 # peer talks to native Cerulion on this distro. On the rows in SCHEMA_HASH_CAPTURE_DISTROS (harvest.sh,
@@ -180,7 +180,7 @@ case "$expect" in
         # rclpy CROSS-PROCESS EXCHANGE (item: distro-lane rclpy step).
         # A REAL python3 rclpy process talks to in-process native Cerulion over
         # rmw_cerulion in BOTH directions, inside this distro's
-        # ros:<distro>-ros-base container. Reuses the three #[ignore]'d tests in
+        # ros:<distro>-ros-base container. Reuses the four #[ignore]'d tests in
         # crates/rmw_cerulion/tests/rclpy_xproc_test.rs (run with --ignored).
         # Runs after the build and symbol audit; on the x86_64 lanes the serial
         # suite has also run green first, and on the emulated leg the freshly built
@@ -189,7 +189,7 @@ case "$expect" in
         # PR check without blocking anything.
         # -------------------------------------------------------------------
         RCLPY_TIMEOUT="${RCLPY_TIMEOUT:-600}"      # hard wall for one exchange run (s)
-        EXCHANGES_EXPECTED=3                        # both directions: A (1) + B twist+string (2); == the 3 #[ignore]'d exchange tests run with --ignored (NOT the #[test] count, which includes the non-ignored seam unit arm)
+        EXCHANGES_EXPECTED=4                        # both directions: A (1) + B twist+string (2), plus the two-process topic listing (1); == the 4 #[ignore]'d exchange tests run with --ignored (NOT the #[test] count, which includes the non-ignored seam unit arm)
         PREFIX="${RCLPY_PREFIX:-/tmp/rmw_prefix_${distro}}"
         so_built="target/release/librmw_cerulion.so"
         so_staged="$PREFIX/lib/librmw_cerulion.so"
@@ -246,7 +246,8 @@ case "$expect" in
         for xt in \
             direction_a_rclpy_string_talker_to_native_subscriber \
             direction_b_native_twist_publisher_to_rclpy_listener \
-            direction_b_native_string_publisher_to_rclpy_listener; do
+            direction_b_native_string_publisher_to_rclpy_listener \
+            rclpy_processes_list_each_others_topics; do
             rm -rf /tmp/iceoryx2 /dev/shm/iox2_* 2>/dev/null || true
             xlog="/tmp/rmw_rclpy_${distro}_${xt}.log"
             echo "== rmw rclpy cross-process exchange on $distro: $xt (fresh process, --ignored) =="
@@ -288,9 +289,9 @@ case "$expect" in
         # means every named exchange passed; assert the count equals the pin so a
         # future edit that shortens the name list cannot quietly pass fewer.
         [ "$exchanges_ok" -eq "$EXCHANGES_EXPECTED" ] || { echo "GATE FAIL: $distro ran $exchanges_ok/$EXCHANGES_EXPECTED fresh-process rclpy exchanges (rule 37)"; exit 1; }
-        echo "EXCHANGE IDENTITIES PINNED ($distro): direction_a (rclpy->native) and direction_b twist + string (native->rclpy) each passed by name in its own fresh process"
-        echo "GATE PASS (rclpy exchange): $distro ran $exchanges_ok/$EXCHANGES_EXPECTED cross-process rclpy exchanges over rmw_cerulion, each in a FRESH process (both directions)"
-        echo "GATE TABLE | distro=$distro | judged=rclpy_xproc | exchanges=$exchanges_ok/$EXCHANGES_EXPECTED | directions=A(rclpy_talker->native),B(native->rclpy:twist,string) | procs=fresh-per-test | staged_so=$dig_built | rc=0"
+        echo "EXCHANGE IDENTITIES PINNED ($distro): direction_a (rclpy->native), direction_b twist + string (native->rclpy) and the two-process topic listing each passed by name in its own fresh process"
+        echo "GATE PASS (rclpy exchange): $distro ran $exchanges_ok/$EXCHANGES_EXPECTED cross-process rclpy exchanges over rmw_cerulion, each in a FRESH process (both directions plus the topic listing)"
+        echo "GATE TABLE | distro=$distro | judged=rclpy_xproc | exchanges=$exchanges_ok/$EXCHANGES_EXPECTED | directions=A(rclpy_talker->native),B(native->rclpy:twist,string),graph(rclpy<->rclpy:topic_list) | procs=fresh-per-test | staged_so=$dig_built | rc=0"
 
         # (Arm 2a) NEGATIVE self-test: inject a WRONG payload through the harness
         # seam and PROVE the exchange oracle rejects it - otherwise the positive

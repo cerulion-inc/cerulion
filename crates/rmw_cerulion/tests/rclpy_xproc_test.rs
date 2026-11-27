@@ -38,6 +38,13 @@
 //!   sequence it joined on), and EXPLICITLY that the rmw-written frame's
 //!   `WireHeader::schema_hash` equals the native generated
 //!   `std_msgs::String::SCHEMA_HASH`.
+//! - **Graph listing**: TWO SUBPROCESS rclpy processes, one publishing a
+//!   `std_msgs/String` topic and one subscribing to a `geometry_msgs/Twist`
+//!   topic, each list the topics of the host through
+//!   `node.get_topic_names_and_types()`. Each must print the same hand-written
+//!   line naming both topics with their exact ROS types: the listing of a
+//!   topic another process owns, which `rmw_get_topic_names_and_types` merges
+//!   from the shared-memory rmw graph registry.
 //! - **Schema hash capture**: a SUBPROCESS rclpy publisher per pinned type
 //!   (`CAPTURE_TYPES`) → one native subscriber per topic reads
 //!   `WireHeader::schema_hash` off the first frame, prints a
@@ -85,7 +92,8 @@
 //! # the rmw distro lanes do in tools/ci/rmw-distros/gate.sh):
 //! for t in direction_a_rclpy_string_talker_to_native_subscriber \
 //!          direction_b_native_twist_publisher_to_rclpy_listener \
-//!          direction_b_native_string_publisher_to_rclpy_listener; do
+//!          direction_b_native_string_publisher_to_rclpy_listener \
+//!          rclpy_processes_list_each_others_topics; do
 //!   rm -rf /tmp/iceoryx2 /dev/shm/iox2_*           # fresh iox state per test
 //!   cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --exact "$t" --nocapture
 //! done
@@ -211,7 +219,7 @@ export AMENT_PREFIX_PATH=\"$PREFIX:$AMENT_PREFIX_PATH\"\n  \
 export LD_LIBRARY_PATH=\"$PREFIX/lib:$LD_LIBRARY_PATH\"\n  \
 export RMW_IMPLEMENTATION=rmw_cerulion\n  \
 # each direction in its own process, iox state cleaned before each:\n  \
-for t in direction_a_rclpy_string_talker_to_native_subscriber direction_b_native_twist_publisher_to_rclpy_listener direction_b_native_string_publisher_to_rclpy_listener; do\n  \
+for t in direction_a_rclpy_string_talker_to_native_subscriber direction_b_native_twist_publisher_to_rclpy_listener direction_b_native_string_publisher_to_rclpy_listener rclpy_processes_list_each_others_topics; do\n  \
   rm -rf /tmp/iceoryx2 /dev/shm/iox2_*; cargo test -p rmw_cerulion --test rclpy_xproc_test -- --ignored --test-threads=1 --exact \"$t\" --nocapture\n  \
 done\n\
 (the same steps as ensure_rmw_cerulion in benches/latency/ros2/run_bench.sh)";
@@ -479,6 +487,48 @@ node.destroy_node()
 rclpy.shutdown()
 "#;
 
+/// One process of the graph-listing arm. It creates ONE endpoint (`__MAKE__`),
+/// then lists the host's topics under `__PREFIX__/` until the listing equals
+/// `__WANT__`, prints it as `LISTED <line>` and keeps spinning (so its own
+/// endpoint stays alive for the peer) until the parent kills it. A listing
+/// that never reaches `__WANT__` prints the last one seen, so a failure shows
+/// what the registry returned.
+const GRAPH_LISTER_PY: &str = r#"
+import time, rclpy
+from std_msgs.msg import String
+from geometry_msgs.msg import Twist
+
+PREFIX = "__PREFIX__/"
+WANT = "__WANT__"
+
+def listing(node):
+    rows = []
+    for name, types in node.get_topic_names_and_types():
+        if name.startswith(PREFIX):
+            rows.append("%s=%s" % (name, ",".join(sorted(types))))
+    return ";".join(sorted(rows))
+
+rclpy.init()
+node = rclpy.create_node("__NODE__")
+__MAKE__
+print("READY", flush=True)
+deadline = time.time() + __TIMEOUT__
+last = ""
+reported = False
+while rclpy.ok() and time.time() < deadline:
+    rclpy.spin_once(node, timeout_sec=0.25)
+    if reported:
+        continue
+    last = listing(node)
+    if last == WANT:
+        print("LISTED " + last, flush=True)
+        reported = True
+if not reported:
+    print("LISTED " + last, flush=True)
+node.destroy_node()
+rclpy.shutdown()
+"#;
+
 fn render(template: &str, node: &str, topic: &str) -> String {
     template
         .replace("__N__", &N.to_string())
@@ -739,6 +789,69 @@ fn direction_a_rclpy_string_talker_to_native_subscriber() {
     }
 
     // The talker keeps publishing; PyChild::Drop SIGKILLs + reaps it.
+}
+
+// ===========================================================================
+// Graph listing: two rclpy processes list each other's topics.
+//
+// Child P publishes `std_msgs/String` on `<prefix>/pub`; child S subscribes to
+// `geometry_msgs/Twist` on `<prefix>/sub`. Each then lists the host's topics
+// under the per-run prefix. The oracle is one hand-written line, the same for
+// both: a listing that omitted the peer's topic, or reported the wrong type,
+// differs from it. The prefix filter drops `/parameter_events` and `/rosout`.
+// ===========================================================================
+
+#[test]
+#[ignore = "distro-lane exchange: run by tools/ci/rmw-distros/gate.sh inside ros:<distro>-ros-base with a staged librmw_cerulion.so (--ignored); a plain cargo test skips it. Graph listing: two rclpy processes list each other's topics"]
+#[serial]
+fn rclpy_processes_list_each_others_topics() {
+    precondition_or_panic();
+
+    let prefix = format!("/xproc_graph_{}", std::process::id());
+    let want = format!("{prefix}/pub=std_msgs/msg/String;{prefix}/sub=geometry_msgs/msg/Twist");
+    let script = |node: &str, make: &str| {
+        render(GRAPH_LISTER_PY, node, "")
+            .replace("__PREFIX__", &prefix)
+            .replace("__WANT__", &want)
+            .replace("__MAKE__", make)
+    };
+    let publisher_make = format!("pub = node.create_publisher(String, \"{prefix}/pub\", 10)");
+    let subscriber_make =
+        format!("sub = node.create_subscription(Twist, \"{prefix}/sub\", lambda m: None, 10)");
+
+    // P first and READY, so its topic is live before S starts listing.
+    let mut publisher = PyChild::spawn(&script("graph_pub", &publisher_make), "graph-publisher");
+    if !publisher.wait_for("READY", Instant::now() + Duration::from_secs(30)) {
+        let stderr = publisher.kill_and_stderr();
+        panic!("rclpy publisher never printed READY.\nstderr:\n{stderr}");
+    }
+    let mut subscriber = PyChild::spawn(&script("graph_sub", &subscriber_make), "graph-subscriber");
+    if !subscriber.wait_for("READY", Instant::now() + Duration::from_secs(30)) {
+        let stderr = subscriber.kill_and_stderr();
+        panic!("rclpy subscriber never printed READY.\nstderr:\n{stderr}");
+    }
+
+    let want_line = format!("LISTED {want}");
+    for (who, child) in [
+        ("publisher", &mut publisher),
+        ("subscriber", &mut subscriber),
+    ] {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let got = loop {
+            match child.next_line(deadline) {
+                Some(l) if l.starts_with("LISTED ") => break Some(l),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        if got.as_deref() != Some(want_line.as_str()) {
+            let stderr = child.kill_and_stderr();
+            panic!(
+                "the rclpy {who} must list exactly {want_line:?} (its own topic and the \
+                 other process's, with exact ROS types), got {got:?}.\nstderr:\n{stderr}"
+            );
+        }
+    }
 }
 
 // ===========================================================================
