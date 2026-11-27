@@ -1264,6 +1264,29 @@ impl StepGroup {
 /// See the module docs for the rules. Pure and total: every input shape yields
 /// either a schedule or a typed stand-down, and nothing is logged.
 pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> TopicPlan {
+    plan_topic_injection_inner(topic, local, false)
+}
+
+/// [`plan_topic_injection`] when a `--duration` bound truncated the read-log
+/// census before this topic's first recorded read, and the caller has already
+/// confirmed that the recording reads this topic at or after the bound.
+///
+/// Inside the window the recording read nothing on the topic, so a topic no
+/// edge covers is steered with an EMPTY schedule, which injects nothing, rather
+/// than stood down to the recorded-clock window, which would publish frames the
+/// window never read. Every other stand-down (a fold refusal, a fan-out
+/// conflict) is kept. The frames are not reported as unconsumed: the reads that
+/// account for them lie past the bound.
+#[must_use]
+pub fn plan_topic_injection_covered(topic: &TopicReplay, local: &LocalProducers) -> TopicPlan {
+    plan_topic_injection_inner(topic, local, true)
+}
+
+fn plan_topic_injection_inner(
+    topic: &TopicReplay,
+    local: &LocalProducers,
+    covered_outside_window: bool,
+) -> TopicPlan {
     let mut covered: Vec<EdgePlan> = Vec::new();
     let mut uncovered: Vec<EdgeId> = Vec::new();
 
@@ -1284,6 +1307,26 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
         }
     }
 
+    if covered.is_empty() && covered_outside_window {
+        let local_frames = topic
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| local.node_for(frame.producer.as_ref()).is_some())
+            .map(|(frame_index, frame)| DueFrame {
+                frame_index,
+                sequence: frame.sequence,
+            })
+            .collect();
+        return TopicPlan::Steered(InjectionSchedule {
+            topic: topic.topic.clone(),
+            per_step: Vec::new(),
+            uncovered,
+            unconsumed: Vec::new(),
+            local_frames,
+            depth_raises: Vec::new(),
+        });
+    }
     if covered.is_empty() {
         return TopicPlan::StandDown(StandDown {
             topic: topic.topic.clone(),
@@ -5769,5 +5812,49 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// `plan_topic_injection_covered` steers a topic no edge covers with an
+    /// empty schedule (nothing due, nothing uncovered or unconsumed, the local
+    /// frames still named), and plans a covered topic exactly as
+    /// `plan_topic_injection` does.
+    #[test]
+    fn covered_outside_window_steers_an_uncovered_topic_empty() {
+        let mut stream = frames(&[10, 11, 12]);
+        stream[1].producer = Some(ResolvedProducer::Named("relay_label".to_string()));
+        let empty = topic(true, stream, vec![]);
+        assert!(matches!(
+            expect_stand_down(plan_no_local(&empty)).reason,
+            StandDownReason::NoCoverage { .. }
+        ));
+        let local = LocalProducers::from_pairs([("relay_label".to_string(), "relay".to_string())]);
+        let s = expect_steered(plan_topic_injection_covered(&empty, &local));
+        assert!(s.per_step.is_empty(), "nothing is due inside the window");
+        assert!(s.uncovered.is_empty() && s.unconsumed.is_empty() && s.depth_raises.is_empty());
+        assert_eq!(
+            s.local_frames,
+            vec![DueFrame {
+                frame_index: 1,
+                sequence: 11
+            }]
+        );
+
+        let read = topic(
+            false,
+            frames(&[10, 11]),
+            vec![edge(
+                edge_id("fusion", "lidar"),
+                ConsumeMode::EachFifo,
+                vec![served(4, 10, 1), served(5, 11, 1)],
+            )],
+        );
+        assert_eq!(
+            shape(&expect_steered(plan_topic_injection_covered(
+                &read,
+                &LocalProducers::none()
+            ))),
+            vec![(4, vec![10]), (5, vec![11])],
+            "a covered topic plans its reads as before"
+        );
     }
 }

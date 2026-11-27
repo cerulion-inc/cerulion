@@ -37971,6 +37971,196 @@ fn a_duration_cut_before_a_topics_first_read_arms_its_gate_empty() {
     );
 }
 
+/// **A `--duration` cut before every read does not hide a frame index over its
+/// budget: the gated rank is still refused before its first step.**
+///
+/// The never-failing bag with every read record before step 6 removed, cut at
+/// `6 * DELTA_MS` (steps 0 to 5), leaves the read-log census empty while the
+/// sink still reads the counter's topic from step 6 on, so the topic keeps its
+/// read gate. Under a frame-index budget of 11 the 12 recorded counter frames
+/// do not fit, and a gate the replay cannot build refuses with exit 2, exactly
+/// as the same replay without `--duration` does. Standing down instead would
+/// run the sink ungated.
+#[test]
+#[serial]
+fn a_duration_cut_before_every_read_still_refuses_a_frame_index_over_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rec = ls_never_failing_reference();
+    rec.trace
+        .retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step < 6));
+    let bag = dir.path().join("ls_reads_from_step_6_frames_over.mcap");
+    write_ls_free_run_bag(&rec, &bag);
+
+    let _frames = replay_engine::override_frame_index_record_budget(LS_FRAMES as usize - 1);
+    for duration in [Some(6 * DELTA_MS * 1_000_000), None] {
+        let (res, _) = ri_replay_with_verifier_budget(
+            &bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Resim,
+            duration,
+            None,
+            None,
+            None,
+        );
+        let err = res.expect_err("a gate over a frame index past its budget is refused");
+        assert_eq!(err.exit_code(), 2, "{duration:?}: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[read_log_budget_declined]")
+                && msg.contains("(verifier_declined_frame_index_budget)")
+                && msg.contains(
+                    "it consumes 12 recorded frames, more than the verifier's budget of 11 \
+                     frames per rank"
+                ),
+            "{duration:?}: {msg}"
+        );
+    }
+}
+
+/// **A corrupt fold run count is refused at the census, whatever the
+/// whole-recording budget.**
+///
+/// The never-failing bag's first read record at step 5 is rewritten to a run
+/// of 200,001 reads, one past the per-step fold bound of 200,000, and the
+/// replay runs under a whole-recording budget of `u64::MAX`. The census
+/// refuses the record at step 5 before it expands it: a `--verify` replay
+/// refuses with exit 2 under `read_identity_unplanned`, and a gated resim
+/// under `read_log_budget_declined`, each naming the 200,001 reads, the step
+/// and the per-step budget, and a re-record as the remedy.
+#[test]
+#[serial]
+fn a_corrupt_fold_run_count_is_refused_at_the_census_under_any_record_budget() {
+    let mut rec = ls_never_failing_reference();
+    let target = rec
+        .trace
+        .iter_mut()
+        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 5)
+        .expect("the sink reads at step 5");
+    assert_ne!(
+        cerulion_core::trace_ring::unpack_read_outcome_meta_full(target.global_level).1,
+        cerulion_core::read_outcome::ReadOutcomeKind::Producer.wire(),
+        "PREMISE: a read, not a producer annotation, so its aux carries a run count"
+    );
+    let popped = unpack_read_outcome_popped(target.duration_ns);
+    target.duration_ns = cerulion_core::trace_ring::pack_read_outcome_aux_run(popped, 200_001);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ls_corrupt_fold_run.mcap");
+    write_ls_free_run_bag(&rec, &bag);
+
+    const CAUSE: &str = "(verifier_declined_read_log_fold_run): it declares 200001 reads at \
+                         step 5, more than the verifier's per-step budget of 200000 reads, so a \
+                         folded record's run count is corrupt or hand-edited; re-record the bag \
+                         with this binary";
+    let (fed, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(u64::MAX),
+        None,
+        None,
+    );
+    let err = fed.expect_err("a corrupt run count is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "this recording's read log cannot be enforced [read_identity_unplanned]: rank 0's \
+             read log was declined {CAUSE}"
+        )
+    );
+
+    let (gated, _) = ri_replay_with_verifier_budget(
+        &bag,
+        ls_never_failing_factories,
+        replay_engine::ReplayPurpose::Resim,
+        None,
+        Some(u64::MAX),
+        None,
+        None,
+    );
+    let err = gated.expect_err("a corrupt run count is refused on the gated resim too");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("[read_log_budget_declined]") && msg.contains(CAUSE),
+        "{msg}"
+    );
+}
+
+/// **A `--duration` cut before a cross-rank topic's first recorded read steers
+/// the topic with an empty schedule instead of falling back to the recorded
+/// clock.**
+///
+/// On the two-rank `sy` bag with every read record before step 12 removed, a
+/// cut at rank 1's step 12 leaves the consumer's read-log census empty while
+/// the recording still reads both cross-rank topics from step 12 on. Inside
+/// the window the consumer read nothing, so the replay injects nothing there:
+/// both topics are steered (an `injection_coverage` note each, nothing uncovered or
+/// unconsumed) and neither stands down as `no_read_log_coverage`. The
+/// recorded-clock fallback would publish rank 0's frames against rank 1's
+/// skewed targets, the whole stream at rank 1's first step.
+#[test]
+#[serial]
+fn a_duration_cut_before_a_cross_rank_topics_first_read_steers_it_empty() {
+    const CUT: u64 = 12;
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sync_reads_from_step_12.mcap");
+    write_sy_bag(rec, &bag, |r| {
+        r.trace
+            .retain(|t| !(t.record_type == RECORD_TYPE_READ_OUTCOME && t.step < CUT));
+        for topic in [SY_A_TOPIC, SY_B_TOPIC] {
+            assert!(
+                !r.messages[topic].is_empty(),
+                "PREMISE: {topic} has recorded frames to inject"
+            );
+        }
+        assert!(
+            r.trace
+                .iter()
+                .any(|t| t.record_type == RECORD_TYPE_READ_OUTCOME && t.step >= CUT),
+            "PREMISE: the consumer still reads from step {CUT} on"
+        );
+    });
+
+    // Rank 1's timeline sits `SY_SKEW_NS` after rank 0's, and `--duration`
+    // runs from the earliest rank's first boundary, so this cut ends rank 1's
+    // window at step `CUT` and spans all of rank 0's.
+    let outcome = replay(
+        &bag,
+        sy_bounded_factories,
+        Some(SY_SKEW_NS + duration_for_steps(CUT)),
+        None,
+    )
+    .expect("the bounded replay runs");
+    assert!(
+        outcome
+            .injection_stand_downs
+            .iter()
+            .all(|s| s.code != "no_read_log_coverage"),
+        "no cross-rank topic may fall back to the recorded clock: {:?}",
+        outcome.injection_stand_downs
+    );
+    let steered: std::collections::BTreeSet<&str> = outcome
+        .injection_coverage
+        .iter()
+        .map(|c| c.topic.as_str())
+        .collect();
+    assert_eq!(
+        steered,
+        [SY_A_TOPIC, SY_B_TOPIC].into_iter().collect(),
+        "both cross-rank topics are steered"
+    );
+    for note in &outcome.injection_coverage {
+        assert!(
+            note.uncovered_edges.is_empty() && note.unconsumed_frames == 0,
+            "the empty window schedule claims no coverage hole: {note:?}"
+        );
+    }
+}
+
 /// **Every budget refusal and stand-down arm reads the configured budget and
 /// names it, the count, the step (where applicable), and the
 /// `--verifier-record-budget` remedy.**

@@ -11221,10 +11221,11 @@ fn fifo_trailing_refills(
 pub const DEFAULT_VERIFIER_RECORD_BUDGET: u64 = 3_000_000;
 
 /// Per-step hostile-run expansion ceiling for the per-edge read-log verifier
-/// ([`pull_step_outcomes`] and the replayed half of the per-edge compare).
-/// Kept independent of `--verifier-record-budget` so raising the
-/// whole-recording budget never lets a corrupt single-step fold count allocate
-/// millions of records per step.
+/// ([`pull_step_outcomes`] and the replayed half of the per-edge compare), and
+/// for each step of the read-log census ([`collect_rank_read_log`]), which
+/// refuses a step past it before expanding it. Kept independent of
+/// `--verifier-record-budget` so raising the whole-recording budget never lets
+/// a corrupt single-step fold count allocate millions of records per step.
 const REPLAY_PER_STEP_FOLD_BUDGET: usize = 200_000;
 
 /// WHICH of the verifier's three whole-recording record budgets a call site is
@@ -11243,12 +11244,13 @@ const REPLAY_PER_STEP_FOLD_BUDGET: usize = 200_000;
 /// * the schedule: the fires and reads one pass accumulates for the
 ///   re-derivation verdict, checked step by step inside the pass loop.
 ///
-/// Two separate per-step sites stay capped at [`REPLAY_PER_STEP_FOLD_BUDGET`]
-/// (a bound against a hostile run count that does not grow with the recording,
+/// Three per-step sites stay capped at [`REPLAY_PER_STEP_FOLD_BUDGET`] (a
+/// bound against a hostile run count that does not grow with the recording,
 /// [`expand_run`]): the per-step pull of the per-edge verifier, which counts
-/// one step's expansion, and its replayed half, which counts one edge's within
-/// one step. Raising `--verifier-record-budget` never raises that per-step
-/// bound.
+/// one step's expansion, its replayed half, which counts one edge's within one
+/// step, and each step of the census, which declines a step past the bound as
+/// [`VerifierDecline::ReadLogFoldRun`] before it expands any of it. Raising
+/// `--verifier-record-budget` never raises that per-step bound.
 ///
 /// A LOCKSTEP pass plans no read from the recording
 /// ([`PassVerification::inert`]): it takes no census, builds no frame index of
@@ -11364,6 +11366,8 @@ fn verifier_record_budget(site: BudgetSite, configured: u64) -> usize {
 /// The per-step hostile-run fold bound for the per-edge read-log verifier.
 /// A test seam lowering the read-log budget can lower this ceiling for fast
 /// hostile-run tests, but it never rises above [`REPLAY_PER_STEP_FOLD_BUDGET`].
+/// The census reads the constant itself, so a lowered seam leaves its
+/// per-step check where a shipped build has it.
 #[cfg(any(test, feature = "test-seams"))]
 fn per_step_fold_budget() -> usize {
     VERIFIER_BUDGET_OVERRIDES
@@ -11601,7 +11605,10 @@ impl BudgetTally {
 /// `step_end`, then walks the rank's step boundaries once, so
 /// [`VerifierDecline::ReadLogBudget`] carries every read the rank holds inside
 /// the window, the step of the first read past the budget and that step's time.
-/// Whether the caller then refuses or stands down is the pass's gating. A
+/// Whether the caller then refuses or stands down is the pass's gating. A step
+/// whose reads pass [`REPLAY_PER_STEP_FOLD_BUDGET`] is declined at once as
+/// [`VerifierDecline::ReadLogFoldRun`], before any of it is expanded, whatever
+/// the whole-recording budget. A
 /// record whose node or `input_idx` the manifest cannot resolve is skipped
 /// rather than given an invented name, and is not counted against the budget;
 /// a census within the budget that skipped one is declined as
@@ -11654,6 +11661,9 @@ fn collect_rank_read_log(
     let budget = verifier_record_budget(BudgetSite::ReadLog, configured_budget);
     let mut out: Vec<CollectedRead> = Vec::new();
     let mut tally = BudgetTally::default();
+    // `(step, reads)` of the step the walk is in, against the per-step fold
+    // bound.
+    let mut step_reads: (u64, u64) = (0, 0);
     // Read records this rank's own tables cannot place.
     let mut unresolvable: usize = 0;
     while let Some(r) = cursor.consume_next()? {
@@ -11693,6 +11703,22 @@ fn collect_rank_read_log(
         // annotation carries a TOKEN in its aux, never a count, so it expands
         // once (its pair's count rides the READ half).
         let runs = recorded_run_occurrences(kind, r.duration_ns);
+        // The per-step pull's bound, checked here before anything is expanded:
+        // `budget` may be as large as the user sets it, so without this a
+        // corrupt run count would size an allocation up to that budget.
+        if step_reads.0 != r.step {
+            step_reads = (r.step, 0);
+        }
+        step_reads.1 = step_reads.1.saturating_add(u64::from(runs));
+        if step_reads.1 > REPLAY_PER_STEP_FOLD_BUDGET as u64 {
+            return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogFoldRun(
+                FoldRunOverrun {
+                    step: r.step,
+                    reads: step_reads.1,
+                    budget: REPLAY_PER_STEP_FOLD_BUDGET as u64,
+                },
+            )));
+        }
         if !tally.add(r.step, runs, budget) {
             // Over budget the census reports NOTHING rather than a truncated
             // census that would read as a complete one: what it held is
@@ -12976,6 +13002,31 @@ impl ReadLogOverrun {
     }
 }
 
+/// How far one step of a rank's read log ran past the per-step fold bound:
+/// what a [`VerifierDecline::ReadLogFoldRun`] refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FoldRunOverrun {
+    /// The step whose reads went past the bound.
+    step: u64,
+    /// The reads that step declares up to and including the record that went
+    /// past the bound, a folded record counted by its run.
+    reads: u64,
+    /// The per-step bound, [`REPLAY_PER_STEP_FOLD_BUDGET`].
+    budget: u64,
+}
+
+impl FoldRunOverrun {
+    /// The cause's sentence: the reads, the step and the per-step budget.
+    fn sentence(self) -> String {
+        format!(
+            "it declares {} reads at step {}, more than the verifier's per-step budget of {} \
+             reads, so a folded record's run count is corrupt or hand-edited; re-record the bag \
+             with this binary",
+            self.reads, self.step, self.budget
+        )
+    }
+}
+
 /// A step's place in its rank's recording, on the rank's own clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunOutTime {
@@ -13032,7 +13083,7 @@ fn seconds_text(ns: u64) -> String {
 
 /// WHY one free-run pass declined the two additive gates.
 ///
-/// SIX causes, five of them found at PREPARE time (before the step loop) and
+/// SEVEN causes, six of them found at PREPARE time (before the step loop) and
 /// one mid-loop. They are kept apart because their remedies differ and the
 /// report has to be able to say which one fired.
 ///
@@ -13042,7 +13093,7 @@ fn seconds_text(ns: u64) -> String {
 /// would have steered. `ScheduleBudget` fires mid-loop, by which point the
 /// steering plan is already built and driving the injectors — the injection half
 /// is NOT degraded, and claiming it was would be a false report — so it rides
-/// [`RederivationNote::code`] instead. Between them every one of the six
+/// [`RederivationNote::code`] instead. Between them every one of the seven
 /// reaches a durable artifact, `ScheduleBudget`'s
 /// included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13053,6 +13104,11 @@ enum VerifierDecline {
     /// This rank's recorded read log is larger than the record budget,
     /// carrying the count the census took past it.
     ReadLogBudget(ReadLogOverrun),
+    /// One step of this rank's read log declares more reads than the per-step
+    /// fold bound ([`REPLAY_PER_STEP_FOLD_BUDGET`]), which no well-formed
+    /// recording reaches: a corrupt run count. Its own cause because its remedy
+    /// is a re-record, never a larger `--verifier-record-budget`.
+    ReadLogFoldRun(FoldRunOverrun),
     /// This rank consumes more recorded frames than the record budget,
     /// carrying the count the frame index took past it.
     FrameIndexBudget(FrameIndexOverrun),
@@ -13106,6 +13162,7 @@ impl VerifierDecline {
         match self {
             Self::InputTables => "verifier_declined_input_tables",
             Self::ReadLogBudget(_) => "verifier_declined_read_log_budget",
+            Self::ReadLogFoldRun(_) => "verifier_declined_read_log_fold_run",
             Self::FrameIndexBudget(_) => "verifier_declined_frame_index_budget",
             Self::ScheduleBudget(_) => "verifier_declined_schedule_budget",
             Self::ReadLogUnplaceable => "verifier_declined_read_log_unplaceable",
@@ -13123,6 +13180,7 @@ impl VerifierDecline {
             // constant, so the sentence stays true of the run that produced it.
             // In a shipped build the two are the same value.
             Self::ReadLogBudget(overrun) => overrun.sentence(),
+            Self::ReadLogFoldRun(overrun) => overrun.sentence(),
             Self::FrameIndexBudget(overrun) => overrun.sentence(),
             Self::ScheduleBudget(budget) => {
                 format!(
@@ -13180,7 +13238,10 @@ impl VerifierDecline {
                  raise it with `--verifier-record-budget <COUNT>`, bound the replay with \
                  `--duration`, or replay a shorter recording of this graph",
             ),
-            Self::InputTables | Self::ReadLogUnplaceable | Self::StagingRegime => None,
+            Self::InputTables
+            | Self::ReadLogFoldRun(_)
+            | Self::ReadLogUnplaceable
+            | Self::StagingRegime => None,
         }
     }
 }
@@ -14660,31 +14721,29 @@ fn rank_step_targets(
 }
 
 /// Does `rank`'s recorded kind-6 stream hold at least one read record for any
-/// edge in `edges` at `step >= from_step`?
+/// `(node, input)` edge in `edges` at `step >= from_step`?
 ///
 /// Called ONLY when `--duration` truncated the read-log census at `from_step`
-/// and `plan_edge_admission` saw zero reads for a topic inside `[0, from_step)`.
-/// Distinguishes a topic whose consumer did not read before the `--duration`
-/// cut from a recording that has no read-log coverage for that topic. Only a
-/// READ kind ([`replay_inject::ReadKind::from_outcome`]) counts: the annotation
-/// kinds and batch frames never reach a stage's schedule, so they never make
+/// and a planner (the admission gate's or the injection's) saw zero reads for a
+/// topic inside `[0, from_step)`. Distinguishes a topic whose consumer did not
+/// read before the `--duration` cut from a recording that has no read-log
+/// coverage for that topic. Only a READ kind
+/// ([`replay_inject::ReadKind::from_outcome`]) counts: the annotation kinds and
+/// batch frames never reach a stage's schedule, so they never make
 /// [`replay_inject::plan_edge_admission`] see a record either.
-fn rank_has_read_for_edges_from(
+fn rank_has_read_for_edges_from<'a>(
     trace: &RecordedTrace,
     rank: u32,
     rank_tables: &[Vec<Arc<str>>],
     recorded_inputs: &BTreeMap<String, Vec<String>>,
     width: KindFieldWidth,
-    edges: &[replay_inject::AdmissionEdge],
+    edges: impl IntoIterator<Item = (&'a str, &'a str)>,
     from_step: u64,
 ) -> Result<bool, ReplayError> {
     let Some(table) = rank_tables.get(rank as usize) else {
         return Ok(false);
     };
-    let wanted: BTreeSet<(&str, &str)> = edges
-        .iter()
-        .map(|e| (e.node_id.as_str(), e.input.as_str()))
-        .collect();
+    let wanted: BTreeSet<(&str, &str)> = edges.into_iter().collect();
     if wanted.is_empty() {
         return Ok(false);
     }
@@ -14748,7 +14807,10 @@ fn plan_topic_admission_in_window(
             rank_tables,
             recorded_inputs,
             width,
-            &planned.edges,
+            planned
+                .edges
+                .iter()
+                .map(|e| (e.node_id.as_str(), e.input.as_str())),
             end,
         )? {
             return Ok(replay_inject::plan_edge_admission_covered(planned, stages));
@@ -15446,6 +15508,15 @@ fn prepare_pass_verification(
         }
     };
 
+    // A census that `--duration` left empty is not a rank with nothing to
+    // gate when the rank reads past the bound: every gate decision below,
+    // the frame-index refusal included, reads this rather than the empty
+    // census.
+    let has_later_reads = !enforce_topics.is_empty()
+        && reads.is_empty()
+        && step_end.is_some()
+        && rank_has_read_records(trace, plan.rank())?;
+
     // ── the rank's consuming edges, by topic ─────────────────────────────
     let consumed = rank_consumed_edges(plan);
     let mut consumed_topics: BTreeSet<String> = BTreeSet::new();
@@ -15470,7 +15541,7 @@ fn prepare_pass_verification(
                  window; `declines` says what that costs this rank's topics"
             );
             let cause = VerifierDecline::FrameIndexBudget(overrun);
-            if !reads.is_empty() {
+            if !reads.is_empty() || has_later_reads {
                 if let Some(refusal) =
                     enforcement_blocked_by_decline(enforce_topics, cause, &cause.reason())
                 {
@@ -15850,7 +15921,29 @@ fn prepare_pass_verification(
             frames,
             edges,
         };
-        let topic_plan = replay_inject::plan_topic_injection(&replay, &local_producers);
+        let mut topic_plan = replay_inject::plan_topic_injection(&replay, &local_producers);
+        // A `--duration` cut before the topic's first read leaves no edge to
+        // steer from. When the rank reads the topic past the cut, the window
+        // read nothing, so the topic is steered empty rather than stood down to
+        // the recorded-clock window, which would inject frames early.
+        if let (Some(end), replay_inject::TopicPlan::StandDown(sd)) = (step_end, &topic_plan) {
+            if matches!(sd.reason, replay_inject::StandDownReason::NoCoverage { .. })
+                && rank_has_read_for_edges_from(
+                    trace,
+                    plan.rank(),
+                    rank_tables,
+                    &recorded_inputs,
+                    kind_width,
+                    consumed
+                        .iter()
+                        .filter(|(t, _, _)| t == topic)
+                        .map(|(_, node, input)| (node.as_str(), input.as_str())),
+                    end,
+                )?
+            {
+                topic_plan = replay_inject::plan_topic_injection_covered(&replay, &local_producers);
+            }
+        }
         // Steered or not, the injector re-publishes these frames by their
         // index, so it can count a driver's apart.
         let copies = DriverCopies::of(&replay.frames, &driver_labels);
@@ -16104,10 +16197,6 @@ fn prepare_pass_verification(
     // enforce and nothing to refuse. It is NOT `not_applicable`, which claims
     // no such edge exists: the edge exists and nothing gated it, which is what
     // the warn below and `ReadLogEnforcement::NotEnforced` state.
-    let has_later_reads = !enforce_topics.is_empty()
-        && reads.is_empty()
-        && step_end.is_some()
-        && rank_has_read_records(trace, plan.rank())?;
     if !enforce_topics.is_empty() && reads.is_empty() && !has_later_reads {
         tracing::warn!(
             rank = plan.rank(),
@@ -44628,18 +44717,24 @@ mod verifier_budget_overrun_tests {
         for cause in [
             VerifierDecline::InputTables,
             VerifierDecline::ReadLogBudget(read_log),
+            VerifierDecline::ReadLogFoldRun(FoldRunOverrun {
+                step: 2,
+                reads: 300_000,
+                budget: 200_000,
+            }),
             VerifierDecline::FrameIndexBudget(frames),
             VerifierDecline::ScheduleBudget(25),
             VerifierDecline::ReadLogUnplaceable,
             VerifierDecline::StagingRegime,
         ] {
-            // Exhaustive, so a seventh cause does not compile until it is
+            // Exhaustive, so an eighth cause does not compile until it is
             // given its remedy here.
             let (remedy, ends_with) = match cause {
                 VerifierDecline::ReadLogBudget(_) => (Some(READ_LOG), READ_LOG),
                 VerifierDecline::FrameIndexBudget(_) => (Some(FRAMES), FRAMES),
                 VerifierDecline::ScheduleBudget(_) => (Some(SCHEDULE), SCHEDULE),
                 VerifierDecline::InputTables
+                | VerifierDecline::ReadLogFoldRun(_)
                 | VerifierDecline::ReadLogUnplaceable
                 | VerifierDecline::StagingRegime => (None, RE_RECORD),
             };
@@ -44988,20 +45083,15 @@ mod verifier_budget_overrun_tests {
             "sink".to_string(),
             vec!["in0".to_string(), "in1".to_string()],
         )]);
-        let edge = |input: &str| replay_inject::AdmissionEdge {
-            node_id: "sink".to_string(),
-            input: input.to_string(),
-            mode: replay_inject::ConsumeMode::Latest,
-            reads: Vec::new(),
-        };
-        let probe = |rank: u32, edges: &[replay_inject::AdmissionEdge], from_step: u64| {
+        let edge = |input: &'static str| ("sink", input);
+        let probe = |rank: u32, edges: &[(&str, &str)], from_step: u64| {
             rank_has_read_for_edges_from(
                 &trace,
                 rank,
                 &rank_tables,
                 &recorded_inputs,
                 KindFieldWidth::Narrow,
-                edges,
+                edges.iter().copied(),
                 from_step,
             )
             .expect("the walk succeeds")
@@ -45019,6 +45109,136 @@ mod verifier_budget_overrun_tests {
         assert!(!probe(0, &[edge("in1")], 0), "no record names `in1`");
         assert!(!probe(0, &[], 0), "no edge is never covered");
         assert!(!probe(1, &[edge("in0")], 0), "rank 1 has no table");
+    }
+
+    /// Run the census of rank 0 over a one-node bag whose reads are `records`
+    /// (`(step, run count)`, one `Served` record each, one boundary per step),
+    /// bounded by `step_end`, under a whole-recording budget of `u64::MAX`.
+    /// `Ok(n)` is a census holding `n` reads; `Err` is the decline.
+    fn fold_run_census(
+        records: &[(u64, u32)],
+        step_end: Option<u64>,
+    ) -> Result<usize, VerifierDecline> {
+        use cerulion_bag::{BagWriter, BagWriterConfig};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bag = dir.path().join("fold_run.mcap");
+        let mut writer = BagWriter::create(&bag, BagWriterConfig::default(), &[]).expect("writer");
+        let meta = cerulion_core::trace_ring::pack_read_outcome_meta(
+            0,
+            READ_OUTCOME_SERVED,
+            ReadSiteRole::Body,
+        );
+        let last_step = records.iter().map(|&(step, _)| step).max().unwrap_or(0);
+        writer
+            .write_chunk(|c| {
+                let mut seq = 0u32;
+                for step in 0..=last_step {
+                    let t = 1_000_000_000 + step * 5_000_000;
+                    let boundary = TraceRingRecord {
+                        step,
+                        fire_time_ns: t,
+                        duration_ns: 0,
+                        node_idx: 0,
+                        global_level: 0,
+                        record_type: RECORD_TYPE_STEP_BOUNDARY,
+                        reserved: 0,
+                    };
+                    c.write_scheduler_trace(seq, t, t, &boundary)?;
+                    seq += 1;
+                    for &(_, run) in records.iter().filter(|&&(s, _)| s == step) {
+                        let rec = TraceRingRecord {
+                            step,
+                            fire_time_ns: u64::from(seq),
+                            duration_ns: cerulion_core::trace_ring::pack_read_outcome_aux_run(
+                                1, run,
+                            ),
+                            node_idx: 0,
+                            global_level: meta,
+                            record_type: RECORD_TYPE_READ_OUTCOME,
+                            reserved: 0,
+                        };
+                        c.write_scheduler_trace(seq, t, t, &rec)?;
+                        seq += 1;
+                    }
+                }
+                Ok(())
+            })
+            .expect("chunk");
+        writer.finalize().expect("finalize");
+
+        let trace = RecordedTrace::new(Arc::new(BagReader::open(&bag).expect("open")));
+        let rank_tables = vec![vec![Arc::<str>::from("sink")]];
+        let recorded_inputs = BTreeMap::from([("sink".to_string(), vec!["in0".to_string()])]);
+        match collect_rank_read_log(
+            &trace,
+            0,
+            &rank_tables,
+            &recorded_inputs,
+            KindFieldWidth::Narrow,
+            step_end,
+            u64::MAX,
+        )
+        .expect("the walk succeeds")
+        {
+            ReadLogCensus::Collected(reads) => Ok(reads.len()),
+            ReadLogCensus::Declined(cause) => Err(cause),
+        }
+    }
+
+    /// A corrupt fold run count is refused by the census before it is
+    /// expanded, however high the whole-recording budget is: the census holds
+    /// at most [`REPLAY_PER_STEP_FOLD_BUDGET`] reads of one step, the bound the
+    /// per-step pull holds. Exactly 200,000 reads in one step fit; 200,001 in
+    /// one record, or in two records of one step, are declined at that step;
+    /// two steps of 150,000 each fit because the bound is per step; a run of
+    /// `u32::MAX` is declined without being expanded; and a corrupt run past
+    /// `--duration` is never read.
+    #[test]
+    fn the_census_refuses_a_step_past_the_per_step_fold_bound_before_expanding_it() {
+        let over = |step: u64, reads: u64| {
+            Err(VerifierDecline::ReadLogFoldRun(FoldRunOverrun {
+                step,
+                reads,
+                budget: 200_000,
+            }))
+        };
+        assert_eq!(fold_run_census(&[(0, 200_000)], None), Ok(200_000));
+        assert_eq!(
+            fold_run_census(&[(0, 1), (1, 200_001)], None),
+            over(1, 200_001)
+        );
+        assert_eq!(
+            fold_run_census(&[(0, 150_000), (0, 50_001)], None),
+            over(0, 200_001)
+        );
+        assert_eq!(
+            fold_run_census(&[(0, 150_000), (1, 150_000)], None),
+            Ok(300_000)
+        );
+        assert_eq!(
+            fold_run_census(&[(2, u32::MAX)], None),
+            over(2, u64::from(u32::MAX))
+        );
+        assert_eq!(fold_run_census(&[(0, 1), (5, u32::MAX)], Some(5)), Ok(1));
+
+        let cause = VerifierDecline::ReadLogFoldRun(FoldRunOverrun {
+            step: 2,
+            reads: 300_000,
+            budget: 200_000,
+        });
+        assert_eq!(cause.code(), "verifier_declined_read_log_fold_run");
+        assert_eq!(
+            cause.reason(),
+            "it declares 300000 reads at step 2, more than the verifier's per-step budget of \
+             200000 reads, so a folded record's run count is corrupt or hand-edited; re-record \
+             the bag with this binary"
+        );
+        assert_eq!(
+            cause.remedy(),
+            None,
+            "a larger budget does not cure a corrupt count"
+        );
     }
 }
 
