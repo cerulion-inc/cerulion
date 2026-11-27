@@ -2014,6 +2014,7 @@ unsafe fn base_field_type(
                 schema_name: nname.to_string(),
                 package: Some(ns.split("__").next().unwrap_or(ns).to_string()),
                 fixed: None,
+                target_hash: None,
             }
         }
         other @ (ros_type::LONG_DOUBLE | ros_type::WCHAR | ros_type::WSTRING) => {

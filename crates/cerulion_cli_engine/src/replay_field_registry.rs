@@ -1672,6 +1672,7 @@ mod tests {
                         schema_name: "Filler3".to_string(),
                         package: None,
                         fixed: None,
+                        target_hash: None,
                     },
                 ));
             }
@@ -1762,6 +1763,7 @@ mod tests {
                         schema_name: "Filler3".to_string(),
                         package: None,
                         fixed: None,
+                        target_hash: None,
                     },
                 ));
             }
@@ -2086,6 +2088,7 @@ mod tests {
                 schema_name: "BBox".into(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         det.add_field(FieldDef::new("score", FieldType::F64));
@@ -2097,6 +2100,7 @@ mod tests {
                     schema_name: "Detection2D".into(),
                     package: None,
                     fixed: None,
+                    target_hash: None,
                 }),
             },
         ));
