@@ -5,8 +5,9 @@
 # does not state, the verifier budget's pure decision functions, the
 # decisions a replay makes about checkpoint window heads, those it makes about
 # a recorded node stop, how a replay judges and re-executes a FIFO node that a
-# `block` input in its own rank holds, and how it judges a `period_ms` or Sync
-# node that such an input holds.
+# `block` input in its own rank holds, how it judges a `period_ms` or Sync node
+# that such an input holds, and the refusal a replay gives a recording from a
+# newer Cerulion.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -613,6 +614,53 @@ at the `cfg(not(any(test, feature = "test-seams")))` definition
 #          2 unviable, none missed. The unviable replace
 #          `PendingExcuse::voided` and `FifoCarry::voided_at` with
 #          `Some(Default::default())`, a default `VoidedExcuse` does not have.
+
+# Ninth scope: the refusal a replay gives a recording from a newer Cerulion.
+#
+# Scope: the pure functions in src/replay_cmd.rs behind that refusal: which
+# refusal the `recorder.json` contract gate gives (`newer_recording_refusal`),
+# the recorder version a refusal may print (`NewerRecorderVersion::newer_than`,
+# its `Display`, and `release_number`, which reads a version's leading
+# `MAJOR.MINOR.PATCH`), the ` (<version>)` it renders after "a newer
+# Cerulion" (`RecordedBy`'s `Display`) and the ASCII-only printing of bag
+# text in the `recorder.json` refusals (`PrintableAscii`'s `Display`, and
+# `printable_ids` in src/replay_engine.rs, which prints the driver stamp's node
+# ids through it). The rest of the two files reads the bag, which the mutation
+# rule does not cover; the gate that calls the picker is pinned by
+# tests/replay_gates_test.rs.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_cmd.rs \
+#            --re 'NewerRecorderVersion|release_number|PrintableAscii|RecordedBy|newer_recording_refusal' \
+#            --exclude-re 'tests::' --cap-lints true --in-place \
+#            --timeout 600 -- --lib -- replay_cmd::
+#          (the unmutated baseline passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  20 mutants: 18 caught, 2 unviable, 0 missed. Caught: `newer_than`
+#          replaced with None, the `&&` and `||` of its token rule swapped,
+#          the `&&` that joins the token rule and the release comparison
+#          replaced with `||`, the comparison's match arm deleted and its `>`
+#          replaced with `==`, `<` and `>=`; `release_number` replaced with
+#          None, `Some([0; 3])` and `Some([1; 3])`; the three `Display` bodies
+#          replaced with `Ok(())`; the picker replaced with None and its `>`
+#          replaced with `==`, `<` and `>=`. Each fails a test in
+#          replay_cmd::tests. The 2 unviable replace `newer_than` and the
+#          picker with `Some(Default::default())`: `NewerRecorderVersion` and
+#          `ReplayError` have no default.
+#          (The first run of this scope, over the version token alone before
+#          it compared releases, gave 11 mutants: 9 caught, 2 unviable.)
+#          Re-run once the printer was renamed `PrintableAscii` and printed
+#          the other `recorder.json` refusals' bag text: with
+#          `--re 'PrintableAscii'` and the command above, 1 mutant, 1 caught
+#          (its `Display` replaced with `Ok(())`); and over
+#          src/replay_engine.rs with `--re 'printable_ids'` and the test
+#          command `-- --test replay_gates_test`, 4 mutants, 2 caught (its
+#          body replaced with `String::new()` and with "xyzzy"). The other 2
+#          are field deletions the tool generates outside the `--re` list,
+#          in `prepare_pass_verification` and `InjectionWindow::cross_rank`:
+#          the fourth scope lists the first as equivalent and catches the
+#          second with the lib tests, which this command does not run.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

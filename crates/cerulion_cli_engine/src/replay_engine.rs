@@ -118,7 +118,8 @@ use crate::replay_inject;
 use crate::replay_rederive;
 
 use crate::replay_cmd::{
-    ReplayError, TraceManifest, DEPARTURE_RING_RANK, TRACE_MANIFEST_PREFIX, TRACE_MANIFEST_SUFFIX,
+    PrintableAscii, ReplayError, TraceManifest, DEPARTURE_RING_RANK, TRACE_MANIFEST_PREFIX,
+    TRACE_MANIFEST_SUFFIX,
 };
 use crate::replay_field_registry::FrameDecoder;
 use crate::tolerance::MetricKind;
@@ -1755,11 +1756,12 @@ pub struct RecorderInfo {
     /// consult wrote a kind-6 record, an empty drain's `NoFrame` included". A
     /// binary REFUSES a
     /// bag whose `trace_format` EXCEEDS the version it supports
-    /// ([`SUPPORTED_TRACE_FORMAT`]) with a plain "recorded by a newer Cerulion
-    /// — upgrade to replay" message (rather than silently mis-decoding a future
-    /// bit-layout). `#[serde(default)]` makes an absent field decode to v1 (full
-    /// back-compat), matching the recorder.json "unknown extra fields ignored"
-    /// forward-compat contract.
+    /// ([`SUPPORTED_TRACE_FORMAT`]) with exit 2 and a message that says a newer
+    /// Cerulion recorded the bag, names both formats and says to upgrade
+    /// (`replay_cmd::ReplayError::TraceFormatTooNew`), rather than silently
+    /// mis-decoding a future bit-layout. `#[serde(default)]` makes an absent
+    /// field decode to v1 (full back-compat), matching the recorder.json
+    /// "unknown extra fields ignored" forward-compat contract.
     #[serde(default = "trace_format_v1")]
     pub trace_format: u32,
     /// The COORDINATION contract the recording was taken under.
@@ -1840,6 +1842,15 @@ impl RecordedDriverStamp {
     }
 }
 
+/// Node ids from the bag, comma-separated, each printed through
+/// [`PrintableAscii`] so a refusal never carries their raw bytes.
+fn printable_ids(ids: &[&str]) -> String {
+    ids.iter()
+        .map(|id| PrintableAscii(id).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A recording's driver flags, checked against the graph the bag embeds: one
 /// flag for every native node of that graph and for nothing else.
 ///
@@ -1873,10 +1884,11 @@ impl DriverStamp {
                 return Err(ReplayError::BagInvalidAttachment {
                     name: crate::replay_cmd::RECORDER_ATTACHMENT.to_string(),
                     reason: format!(
-                        "`node_external` is {value}, which is not a map of node ids to true or \
+                        "`node_external` is {}, which is not a map of node ids to true or \
                          false. It is the key a replay judges external (driver) nodes by, so an \
                          unreadable value is refused rather than guessed. Re-record the bag, or \
-                         repair the attachment"
+                         repair the attachment",
+                        PrintableAscii(&value)
                     ),
                 })
             }
@@ -1893,7 +1905,7 @@ impl DriverStamp {
                 detail: format!(
                     "recorder.json's `node_external` names node(s) the embedded graph does not \
                      run: {}",
-                    extra.join(", ")
+                    printable_ids(&extra)
                 ),
             });
         }
@@ -1907,7 +1919,7 @@ impl DriverStamp {
                 detail: format!(
                     "recorder.json's `node_external` does not name node(s) the embedded graph \
                      runs: {}",
-                    missing.join(", ")
+                    printable_ids(&missing)
                 ),
             });
         }
@@ -2638,10 +2650,10 @@ pub fn replay_stages_batch_frames(
 /// trace; format-2 bags, which carry no kind 6, stay fully replayable); bumped
 /// to 4 by free-run recording support (a bag may be stamped `coordination: free_run`, whose
 /// per-rank boundary streams do not share a timeline). A bag stamped with a
-/// `trace_format` GREATER than this is refused up front (exit 2) with a plain
-/// "upgrade to replay" message — which is exactly how an OLDER binary refuses a
-/// format-3 bag (its own SUPPORTED is 2, and its record-type gate also refuses
-/// kind 6 as reserved).
+/// `trace_format` GREATER than this that clears the gates before the
+/// `recorder.json` one is refused there (exit 2) as
+/// `replay_cmd::ReplayError::TraceFormatTooNew`, which says a newer Cerulion
+/// recorded it and to upgrade Cerulion to replay it.
 ///
 /// Bumped to 5 by read-site roles (a kind-6 record's `global_level` word carries
 /// the READ-SITE ROLE in bits 14..16 — see

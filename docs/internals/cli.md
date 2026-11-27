@@ -289,10 +289,11 @@ Rules that must not drift:
   `driver_frames_uncompared` (`DriverInputsReport::leaves_driver_frames_out`). The driver set
   comes from the recording: `recorder.json`'s `node_external` (each native node's flag, from
   the LOADED `info()` through `replay_engine::is_external_policy`, the predicate the
-  candidate set `external_node_ids` uses too) is read at gate 6b as contract key 3
-  (`RecordedDriverStamp`; unreadable refuses `BagInvalidAttachment` after the version gate)
-  and admitted against the embedded graph's native nodes (`DriverStamp::admit`, the type's
-  only constructor; a node too many or too few refuses `RecordingInconsistent`).
+  candidate set `external_node_ids` uses too) is read at gate 2b, right after the
+  completeness check, as contract key 3 (`RecordedDriverStamp`), and admitted at 6b, once
+  the graph is parsed, against the embedded graph's native nodes (`DriverStamp::admit`,
+  the type's only constructor; an unreadable stamp refuses `BagInvalidAttachment` there,
+  and a node too many or too few refuses `RecordingInconsistent`).
   `resolve_driver_set` (pure) then classifies from the stamp and refuses
   `ReplayError::DriverSetDrift` (exit 2, every node in id order, both directions) when the
   candidate set differs, after `NodeLoad` and the resume refusals, under `--verify` and the
@@ -1180,6 +1181,7 @@ hand-oracle unit tests in `replay_value_diff/tests.rs`.
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib); a resim on its private namespace delivers nothing to a live input or an egress tap on the shared one (including external-input data-trigger isolation in both `--verify` and neutral modes) and opens no node on the shared namespace; two resims on two different slots write identical reports and `--record-out` bags carrying no slot data; and two resims in a row reuse the slot the first resim claimed, remove a leftover segment planted on it and leave one namespace's files (lockable resim slots are also swept by `ipc_cleanup::sweep_resim_slots` from `clean`, `doctor`, and exit hygiene) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib`, `test_node_macro_data_trigger_cdylib` |
+| `tests/replay_newer_recording_cli_test.rs` | `bag play --resim all --verify` over the real binary on a bag whose `recorder.json` stamps a `trace_format` one past the highest this build reads: exit 2 and one `Error:` line, written out by hand, that says a newer Cerulion recorded the bag, names its `cerulion_version` stamp (a release above this build's), both formats and this build's version, and says to upgrade, with no corrupt-bag or re-record text. The bag is refused before any node library loads, so the file also runs on macOS | no | none |
 | `tests/node_fatal_e2e_test.rs` | A node returning `NodeError::Fatal` on a temp workspace, `--single-process`: exact delivered frames, ONE fatal log line, `graph run` exit 3 (record and plain arms), `bag play --resim all --verify` exit 0 on the recording; a recorded `Logic` error keeps the node firing (a second failure is logged), exit 0 and the same two frames | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/node_fatal_mp_e2e_test.rs` | The same workspace on the multi-process default (Linux only, iceoryx2 2034 waiver on macOS): two workers, ONE fatal line, the worker's and the supervisor's `Error:` lines, exit 3, not degraded, no orphan; a `Logic` error keeps the node firing (a second failure is logged) and exits 0 | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/verifier_budget_cli_e2e_test.rs` | `--verifier-record-budget` over the real binary: a free-run bag with 200016 reads verifies under the default, is refused at `--verifier-record-budget 200000`, and is admitted with `--duration 1.0`; the usage errors (`0`, no `--resim`) and `--help` | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |

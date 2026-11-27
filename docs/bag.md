@@ -1167,6 +1167,21 @@ The variable is an execution-mode switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 
+**A bag from a newer Cerulion is refused with the upgrade remedy.** A resim
+refuses (exit 2) a bag stamped with a `trace_format` above the highest this
+build reads, and a bag whose `coordination` stamp this build does not know at
+a format it reads, before it reads the bag's graph or any trace record. The
+message says a newer Cerulion recorded the bag, adds
+the bag's `cerulion_version` in parentheses when it is a plain version token
+(ASCII letters, digits, `.`, `-` and `+`, at most 64 bytes) whose
+`MAJOR.MINOR.PATCH` is above this build's, names the format
+or the stamp and this Cerulion's version, and ends
+`Upgrade Cerulion to replay it.` The recording is sound, and an upgraded
+Cerulion replays it. On 2.1.0 or an earlier release the same refusal names the
+newer scheduler-trace format, or the unknown `coordination` stamp, and then
+calls the recording corrupt or hand-edited and says to re-record it. That
+recording is sound too: upgrade Cerulion to replay it.
+
 
 **A stamp never under-claims, which means every bag this build writes with a
 `recorder.json` stamps 13.** (A bag with no recorder attachment carries no
@@ -1493,8 +1508,8 @@ did before format 10. A reader below 10 reads past the flag and would judge a
 node stopped before the checkpoint as one that owed fires, so the stamp moves
 and that reader refuses the bag. A later section version can define more flag
 bits, which this build reads past; a change to what they mean for a resim
-comes with a new `trace_format`, which this build refuses with "upgrade to
-replay it".
+comes with a new `trace_format`, which this build refuses with "Upgrade
+Cerulion to replay it."
 
 ### Window heads (`trace_format` 11)
 
@@ -1552,16 +1567,16 @@ compared, because a resim never gives a driver its device. A stop the resim
 makes in a short rank's tolerated ragged tail is tolerated with the re-fire
 that made it, under the same window as the fire comparison.
 
-A NODE-STOP record whose cause is none of the three is refused (exit 2). In a
-bag stamped past the formats this build reads, a newer or foreign writer added
-the cause, and the resim refuses it as it refuses an unknown record kind,
-saying to upgrade cerulion. In a bag stamped 12 or below, the cause cannot be
-a newer writer's, since a format at or below this build's defines no other
-cause, so the bag is corrupt (`bag internal consistency check failed`).
+A NODE-STOP record whose cause is none of the three is refused (exit 2). For
+a bag stamped past the formats this build reads, the resim never reaches its
+records: `cerulion bag play --resim` refuses it by its format first, saying a
+newer Cerulion recorded it and to upgrade. In a bag stamped 12 or below, the cause
+cannot be a newer writer's, since a format at or below this build's defines no
+other cause, so the bag is corrupt (`bag internal consistency check failed`).
 A Flashback capture that holds one is not resimmable, and its
-`anchor.resimmable_reason` reads the capture's own stamp the same way: a newer
-or foreign writer's cause, with the upgrade remedy, past the formats this
-build reads, and a corrupt trace at 12 or below.
+`anchor.resimmable_reason` reads the capture's own stamp: a newer or foreign
+writer's cause, with the upgrade remedy, past the formats this build reads,
+and a corrupt trace at 12 or below.
 Four more stop records are refused before the first replayed step as a
 corrupt bag (`bag internal consistency check failed`, exit 2): one stamped
 with a rank the bag has no trace manifest for, and three shapes no recorder

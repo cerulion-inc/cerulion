@@ -31,10 +31,11 @@
 //!
 //! # The order is the precedence, and it is not cosmetic
 //!
-//! The arms are asked in the order `run_replay` asks them, so a capture reports
-//! the SAME gap resim would report first. Reporting a later one would send an
-//! operator to fix something that is not what stops them — the "report the arm
-//! an operator can ACT on" rule the trigger gate already follows.
+//! The arms are asked in the order `run_replay` asks them, the coordination
+//! stamp first, so a capture reports the SAME gap resim would report first.
+//! Reporting a later one would send an operator to fix something that is not
+//! what stops them: the "report the arm an operator can ACT on" rule the
+//! trigger gate already follows.
 //!
 //! Within the trace-record arm that order is RECORD ORDER, not a precedence
 //! between KINDS of record. `run_replay` walks the trace once and refuses per
@@ -49,8 +50,9 @@
 //!
 //! Four arms read the capture's coordination stamp. A `recorder.json` that
 //! states no contract this build can read ([`ResimGap::CoordinationUnreadable`])
-//! is refused right after the record walk, where the replay reads that
-//! attachment. Three judge free run only. Several worker ranks whose rank 0
+//! is refused first, above every other arm, as the replay reads that
+//! attachment right after its completeness check, before it looks for a
+//! trace. Three judge free run only. Several worker ranks whose rank 0
 //! resumes mid-run ([`ResimGap::FreeRunResumeUnsupported`]) are asked right
 //! below the state-ring arm, where `resolve_resume` refuses them. A worker rank
 //! with no boundary stream ([`ResimGap::RankWithoutBoundaryStream`]) is asked
@@ -63,7 +65,10 @@
 //! apart and holds a worker rank with no boundary stream names the mixed start,
 //! while the replay refuses that rank first; the remedy is the same. The
 //! mixed-start sentence gives the remedy the free-run mid-run refusal gives:
-//! record the run from its first step.
+//! record the run from its first step. The judge has no arm for the
+//! `trace_format` half of the `recorder.json` contract, so a capture stamped
+//! past the formats this build reads, or with a `trace_format` that is not a
+//! version, names a later gap or none, while resim refuses its format first.
 
 use std::collections::BTreeMap;
 
@@ -809,8 +814,9 @@ pub enum ResimGap {
     },
     /// The capture's `__cerulion/recorder.json` states no coordination
     /// contract this build can read: resim refuses such a bag when it reads
-    /// that attachment (`BagInvalidAttachment`, or `RecordingInconsistent` for
-    /// an unknown stamp).
+    /// the coordination stamp (`BagInvalidAttachment` when the attachment is
+    /// not a JSON object, `CoordinationUnknown` for an unknown stamp), unless
+    /// it refuses the bag's `trace_format` there first.
     CoordinationUnreadable(UnreadableCoordination),
     /// The trace carries records but no step boundary — resim's
     /// `BagNoStepBoundaries`.
@@ -1178,8 +1184,7 @@ impl ResimGap {
                 format!(
                     "this capture's `__cerulion/recorder.json` {stated}, and `cerulion bag play \
                      --resim` refuses a recording whose contract it cannot read before it \
-                     re-executes anything. The frames, the state and the trace are in the bag \
-                     and readable"
+                     re-executes anything"
                 )
             }
             Self::RankWithoutCompleteStep { ranks } => format!(
@@ -1382,8 +1387,10 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 
 /// PURE: may this capture claim `resimmable`?
 ///
-/// `Ok(())` means yes. The arms are asked in `run_replay`'s own order — see the
-/// module docs on why that is a correctness property rather than a style.
+/// `Ok(())` means yes. The arms are asked in `run_replay`'s own order, the
+/// coordination stamp first: see the module docs on why that is a correctness
+/// property rather than a style, and for the format check this judge does not
+/// make.
 ///
 /// # The step-0 arm is a genuine YES, not an oversight
 ///
@@ -1401,7 +1408,18 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// [`ResimGap::MixedStart`], asked before the arm, and a worker rank that kept
 /// no boundary is [`ResimGap::RankWithoutBoundaryStream`], asked first on it.
 pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
-    // 1. `BagNoSchedulerTrace` — the first thing `run_replay` refuses on.
+    // 0. The coordination contract `recorder.json` states. `run_replay` reads
+    //    that attachment right after its completeness check, before it looks
+    //    for a trace, and refuses a stamp it cannot read there, so this arm is
+    //    asked above every other.
+    match &facts.coordination {
+        RecordedCoordination::Unreadable(why) => {
+            return Err(ResimGap::CoordinationUnreadable(why.clone()))
+        }
+        RecordedCoordination::FreeRun | RecordedCoordination::Lockstep { .. } => {}
+    }
+    // 1. `BagNoSchedulerTrace`: the first refusal `run_replay` reaches after
+    //    its `recorder.json` read.
     if facts.trace_records == 0 {
         return Err(ResimGap::NoTrace);
     }
@@ -1521,16 +1539,9 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
             departures: facts.departure_records,
         });
     }
-    // 3c. The coordination contract `recorder.json` states. `run_replay` reads
-    //     that attachment after its record walk and before it resolves a
-    //     resume, and refuses a stamp it cannot read there.
-    let free_run = match &facts.coordination {
-        RecordedCoordination::FreeRun => true,
-        RecordedCoordination::Lockstep { .. } => false,
-        RecordedCoordination::Unreadable(why) => {
-            return Err(ResimGap::CoordinationUnreadable(why.clone()))
-        }
-    };
+    // The contract the arms below judge under: free run or lockstep (an
+    // unreadable stamp was refused at arm 0).
+    let free_run = matches!(facts.coordination, RecordedCoordination::FreeRun);
     // 4. Is there a resume point at all? The AUTHORITATIVE rank's own first
     //    kept boundary, the step `resolve_resume` resumes at (see the field).
     let Some(&first_recorded_step) = facts
@@ -2171,9 +2182,10 @@ mod tests {
         assert_eq!(judge_resimmable(&healthy(&nodes, &anchors)), Ok(()));
     }
 
-    /// The earlier claim, still true and still first: no trace, no resume.
+    /// The earlier claim, still true and first after the coordination stamp:
+    /// no trace, no resume.
     #[test]
-    fn a_capture_with_no_trace_is_refused_before_anything_else_is_examined() {
+    fn a_capture_with_no_trace_is_refused_first_after_the_coordination_stamp() {
         let nodes = vec!["a".to_string()];
         // Every OTHER fact is also broken, so this pins the ORDER as well as the
         // arm: a judge that asked them in any other sequence would report a
@@ -3757,70 +3769,19 @@ mod tests {
     }
 
     /// A `recorder.json` that states no readable contract refuses the capture
-    /// in the replay's position: below every record-walk arm, above the
-    /// boundary arm and every arm below it, a from-start capture included.
+    /// in the replay's position: first, above every other arm, as `run_replay`
+    /// reads that attachment right after its completeness check. A capture
+    /// with no trace, no graph, a hole in its worker roster, an unread trace
+    /// ring, a refused record or a departure, and a from-start or mixed-start
+    /// capture, each get this refusal, with its full reason.
     #[test]
     fn a_coordination_stamp_this_build_cannot_read_refuses_the_capture() {
         let nodes = vec!["a".to_string()];
         let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
         let at_zero = by_rank(&[(0, 0)]);
         let mixed = by_rank(&[(0, 0), (1, 6)]);
-        for why in unreadable() {
-            let refused = |facts: ResimFacts<'_>| {
-                judge_resimmable(&ResimFacts {
-                    coordination: RecordedCoordination::Unreadable(why.clone()),
-                    ..facts
-                })
-            };
-            let gap = Err(ResimGap::CoordinationUnreadable(why.clone()));
-            // A from-start capture and a mixed start, each otherwise accepted
-            // or refused below this arm.
-            assert_eq!(refused(free_run(&nodes, &[], &at_zero)), gap, "{why:?}");
-            assert_eq!(refused(free_run(&nodes, &anchors, &mixed)), gap, "{why:?}");
-            // Below it: no boundary, several state rings, an unknown node map, an
-            // incomplete anchor.
-            for facts in [
-                free_run(&nodes, &anchors, &NO_FIRST_STEP),
-                ResimFacts {
-                    state_rings_declared: 2,
-                    ..healthy(&nodes, &anchors)
-                },
-                ResimFacts {
-                    required_nodes_known: false,
-                    ..healthy(&nodes, &anchors)
-                },
-                healthy(&nodes, &[]),
-            ] {
-                assert_eq!(refused(facts), gap, "{why:?}");
-            }
-            // Above it: the record walk and its backstop.
-            assert_eq!(
-                refused(ResimFacts {
-                    first_record_refusal: Some(TraceRecordRefusal::Departure),
-                    departure_records: 1,
-                    ..healthy(&nodes, &anchors)
-                }),
-                Err(ResimGap::FaultReplay { departures: 1 })
-            );
-            assert_eq!(
-                refused(ResimFacts {
-                    departure_records: 2,
-                    ..healthy(&nodes, &anchors)
-                }),
-                Err(ResimGap::FaultReplay { departures: 2 })
-            );
-            assert!(matches!(
-                refused(ResimFacts {
-                    first_record_refusal: fault(9),
-                    ..healthy(&nodes, &anchors)
-                }),
-                Err(ResimGap::TraceRecordRejected { .. })
-            ));
-        }
-        // The reason states the fact and the replay's refusal, in each form.
         let refusal = "`cerulion bag play --resim` refuses a recording whose contract it cannot \
-                       read before it re-executes anything. The frames, the state and the trace \
-                       are in the bag and readable";
+                       read before it re-executes anything";
         for (why, stated) in [
             (
                 UnreadableCoordination::NotJson,
@@ -3835,10 +3796,101 @@ mod tests {
                 "stamps `coordination` \"barrier\", which is not a contract this Cerulion knows",
             ),
         ] {
-            assert_eq!(
-                ResimGap::CoordinationUnreadable(why).reason(),
-                format!("this capture's `__cerulion/recorder.json` {stated}, and {refusal}")
-            );
+            let reason =
+                format!("this capture's `__cerulion/recorder.json` {stated}, and {refusal}");
+            let refused = |facts: ResimFacts<'_>| {
+                judge_resimmable(&ResimFacts {
+                    coordination: RecordedCoordination::Unreadable(why.clone()),
+                    ..facts
+                })
+            };
+            for (arm, facts) in [
+                // The arms with a row below, each otherwise refusing or
+                // accepting the capture. The no-trace row is what proves the
+                // stamp arm sits above all of them: the judge asks every other
+                // arm after the no-trace arm.
+                (
+                    "no trace",
+                    ResimFacts {
+                        trace_records: 0,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "no graph",
+                    ResimFacts {
+                        graph_attachment_present: false,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "a roster hole",
+                    ResimFacts {
+                        worker_manifest_ranks: &[0, 2],
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "an unread ring",
+                    ResimFacts {
+                        trace_rings_declared: 2,
+                        trace_rings_unreadable: 1,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "a departure",
+                    ResimFacts {
+                        first_record_refusal: Some(TraceRecordRefusal::Departure),
+                        departure_records: 1,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "the departure backstop",
+                    ResimFacts {
+                        departure_records: 2,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "a refused record",
+                    ResimFacts {
+                        first_record_refusal: fault(9),
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                ("a from-start capture", free_run(&nodes, &[], &at_zero)),
+                ("a mixed start", free_run(&nodes, &anchors, &mixed)),
+                ("no boundary", free_run(&nodes, &anchors, &NO_FIRST_STEP)),
+                (
+                    "several state rings",
+                    ResimFacts {
+                        state_rings_declared: 2,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                (
+                    "an unknown node map",
+                    ResimFacts {
+                        required_nodes_known: false,
+                        ..healthy(&nodes, &anchors)
+                    },
+                ),
+                ("an incomplete anchor", healthy(&nodes, &[])),
+            ] {
+                let judged = refused(facts);
+                assert_eq!(
+                    judged,
+                    Err(ResimGap::CoordinationUnreadable(why.clone())),
+                    "{arm}: {why:?}"
+                );
+                assert_eq!(
+                    judged.map_err(|gap| gap.reason()),
+                    Err(reason.clone()),
+                    "{arm}: {why:?}"
+                );
+            }
         }
     }
 

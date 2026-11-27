@@ -691,6 +691,54 @@ pub enum ReplayError {
         detail: String,
     },
 
+    /// The bag's `recorder.json` stamps a `trace_format` above the highest
+    /// version this build reads ([`replay_engine::SUPPORTED_TRACE_FORMAT`]): a
+    /// newer Cerulion wrote its scheduler trace in a layout this build cannot
+    /// decode. Exit 2. The recording is sound, so the remedy is an upgrade and
+    /// never a re-record; `newer_recording_refusal` picks it.
+    #[error(
+        "this bag was recorded by a newer Cerulion{by}: its scheduler-trace format is version \
+         {recorded}, and this Cerulion ({ours}) reads up to version {supported}. Upgrade \
+         Cerulion to replay it.",
+        by = RecordedBy(recorded_by.as_ref()),
+        ours = CERULION_VERSION
+    )]
+    TraceFormatTooNew {
+        /// The `trace_format` the bag stamps.
+        recorded: u32,
+        /// The highest format this build reads.
+        supported: u32,
+        /// The bag's `cerulion_version` stamp, when it names a release above
+        /// this build's.
+        recorded_by: Option<NewerRecorderVersion>,
+    },
+
+    /// The bag's `recorder.json` stamps a `coordination` value this build has
+    /// no contract for, at a `trace_format` it reads: a newer Cerulion recorded
+    /// the run under a contract this build cannot apply. Exit 2. The value is
+    /// refused rather than read as lockstep, since replaying it under the
+    /// lockstep contract would refuse a sound recording or mis-anchor it
+    /// silently. `newer_recording_refusal` picks it.
+    #[error(
+        "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is {shown}, \
+         which this Cerulion ({ours}) does not know. Upgrade Cerulion to replay it.",
+        by = RecordedBy(recorded_by.as_ref()),
+        shown = PrintableAscii(value),
+        ours = CERULION_VERSION
+    )]
+    CoordinationUnknown {
+        /// The stamp as JSON text, as the reader carries it out: a string
+        /// keeps its quotes, and the reader escapes a C0 control byte in it.
+        /// The refusal then prints every char outside printable ASCII (0x20
+        /// to 0x7E) as a JSON `\uXXXX` escape, a char above U+FFFF as its
+        /// surrogate pair, so DEL, a C1 control and a bidi control never
+        /// reach the terminal raw.
+        value: String,
+        /// The bag's `cerulion_version` stamp, when it names a release above
+        /// this build's.
+        recorded_by: Option<NewerRecorderVersion>,
+    },
+
     /// One or more recorded graph-produced topics were recorded
     /// under a DIFFERENT schema layout than the current workspace produces — the
     /// recorded frame's `WireHeader.schema_hash` disagrees with the workspace's
@@ -871,6 +919,8 @@ impl ReplayError {
             | ReplayError::BagGraphMismatch { .. }
             | ReplayError::BagNoStepBoundaries
             | ReplayError::RecordingInconsistent { .. }
+            | ReplayError::TraceFormatTooNew { .. }
+            | ReplayError::CoordinationUnknown { .. }
             | ReplayError::SchemaDrift { .. }
             | ReplayError::DriverSetDrift { .. }
             | ReplayError::StateRestore { .. }
@@ -893,6 +943,141 @@ impl ReplayError {
             ReplayError::Internal { .. } => EXIT_INTERNAL,
         }
     }
+}
+
+/// This build's version as a recording stamps it: `graph_cmd::render_recorder_json`
+/// writes the same `CARGO_PKG_VERSION` as `recorder.json`'s `cerulion_version`, so a
+/// refusal names this build the way a bag names its recorder.
+const CERULION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A recording's `cerulion_version` stamp, held only when it names a release
+/// above this build's: a plain version token (1 to
+/// [`NewerRecorderVersion::MAX_LEN`] bytes, each an ASCII letter or digit, `.`,
+/// `-` or `+`) whose leading `MAJOR.MINOR.PATCH`, read as three integers, is
+/// above this build's. A pre-release or build suffix is not compared.
+///
+/// A refusal prints the stamp after "a newer Cerulion", and the stamp is bag
+/// text, so a refusal prints it only through this type. A stamp that holds any
+/// other byte, whose leading part is not three integers, or whose release is
+/// not above this build's reads as absent, and the refusal names no version.
+///
+/// Only this crate builds one, from this build's own version, so every value
+/// a caller outside it sees names a release above that version. Read it
+/// through its `Display`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerRecorderVersion(String);
+
+impl NewerRecorderVersion {
+    /// The longest stamp held, in bytes.
+    pub const MAX_LEN: usize = 64;
+
+    /// `stamp` when it is a plain version token whose release is above the
+    /// release of `ours`, this build's version; `None` otherwise, and when
+    /// `ours` has no `MAJOR.MINOR.PATCH` either.
+    pub(crate) fn newer_than(stamp: &str, ours: &str) -> Option<Self> {
+        let plain = (1..=Self::MAX_LEN).contains(&stamp.len())
+            && stamp
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'));
+        let newer = match (release_number(stamp), release_number(ours)) {
+            (Some(theirs), Some(ours)) => theirs > ours,
+            _ => false,
+        };
+        (plain && newer).then(|| Self(stamp.to_string()))
+    }
+}
+
+impl std::fmt::Display for NewerRecorderVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// PURE: the leading `MAJOR.MINOR.PATCH` of `version` as three integers. The
+/// release is the text before the first `-` or `+`, and it must be exactly
+/// three `.`-separated whole numbers, each fitting a `u64`; `None` otherwise.
+fn release_number(version: &str) -> Option<[u64; 3]> {
+    let mut parts = version.split(['-', '+']).next()?.split('.');
+    let mut number = [0u64; 3];
+    for slot in &mut number {
+        *slot = parts.next()?.parse().ok()?;
+    }
+    parts.next().is_none().then_some(number)
+}
+
+/// What follows "a newer Cerulion" in a newer-recording refusal: ` (<version>)`
+/// when the bag names a recorder release above this build's, else nothing.
+struct RecordedBy<'a>(Option<&'a NewerRecorderVersion>);
+
+impl std::fmt::Display for RecordedBy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(version) => write!(f, " ({version})"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Bag text as a refusal prints it: every char outside printable ASCII (0x20
+/// to 0x7E) is written as a JSON `\uXXXX` escape in lowercase hex, and a char
+/// above U+FFFF as its surrogate pair, so DEL, C1 controls and bidi controls in
+/// bag text never reach the terminal raw. Printable ASCII is written as is.
+/// Applied to compact JSON text (serde_json's `to_string`), the output is JSON
+/// text for the same value: in compact JSON such a char can sit only inside a
+/// string, where the escape stands for it.
+pub(crate) struct PrintableAscii<'a>(pub(crate) &'a str);
+
+impl std::fmt::Display for PrintableAscii<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for c in self.0.chars() {
+            if (' '..='~').contains(&c) {
+                write!(f, "{c}")?;
+            } else {
+                for unit in c.encode_utf16(&mut [0u16; 2]) {
+                    write!(f, "\\u{unit:04x}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// PURE: the refusal a bag from a newer Cerulion earns at the `recorder.json`
+/// contract gate, or `None` when this build reads both contract keys.
+///
+/// `trace_format` is the bag's stamp, `supported` the highest format this build
+/// reads, `unknown_coordination` the `coordination` stamp the reader could not
+/// map to a contract (as JSON text), and `cerulion_version` the bag's recorder
+/// stamp, printed only when [`NewerRecorderVersion::newer_than`] holds it
+/// against this build's version.
+///
+/// The format is judged first. A bag stamped past `supported` that also
+/// carries an unknown `coordination` value gets
+/// [`ReplayError::TraceFormatTooNew`]: both facts say a newer Cerulion wrote
+/// the bag, and the format refusal also names the format the bag carries and
+/// the one this build reads up to, which is the evidence. The unknown-value
+/// arm, [`ReplayError::CoordinationUnknown`], is what names the same skew on a
+/// bag whose format this build does read.
+fn newer_recording_refusal(
+    trace_format: u32,
+    supported: u32,
+    unknown_coordination: Option<&str>,
+    cerulion_version: Option<&str>,
+) -> Option<ReplayError> {
+    let recorded_by = || {
+        cerulion_version.and_then(|stamp| NewerRecorderVersion::newer_than(stamp, CERULION_VERSION))
+    };
+    if trace_format > supported {
+        return Some(ReplayError::TraceFormatTooNew {
+            recorded: trace_format,
+            supported,
+            recorded_by: recorded_by(),
+        });
+    }
+    unknown_coordination.map(|value| ReplayError::CoordinationUnknown {
+        value: value.to_string(),
+        recorded_by: recorded_by(),
+    })
 }
 
 /// The `node_ids` table decoded from a trace-manifest attachment. Extra
@@ -1472,9 +1657,10 @@ pub struct ReplayOptions {
 
 /// Run `cerulion bag play --resim` end-to-end against `bag`.
 ///
-/// First the replay-grade **entry gates** in order (open, completeness,
-/// scheduler-trace presence, graph attachment, trace manifest, env.json) — any
-/// failure is a typed [`ReplayError`] (exit 2–5). Then the gated artifacts are
+/// First the replay-grade **entry gates** in order (open, completeness, the
+/// `recorder.json` contract (format, then coordination), scheduler-trace
+/// presence, graph attachment, trace manifest, env.json); any failure is a
+/// typed [`ReplayError`] (exit 2 to 5). Then the gated artifacts are
 /// handed to [`crate::replay_engine::run_engine`], which loads the CURRENT
 /// workspace's node cdylibs (a missing type → [`ReplayError::NodeLoad`], exit
 /// 3), re-executes the graph on the recorded-clock re-advance, injects recorded
@@ -1533,6 +1719,67 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         return Err(ReplayError::BagNotFinalized {
             completeness: describe_completeness(&completeness),
         });
+    }
+
+    // 2b. `__cerulion/recorder.json`: OPTIONAL recorder-host identity
+    //     attachment. Absent = silent (pre-recorder.json bags); arch/os
+    //     mismatch vs THIS host = loud WARN (cross-arch float/libm ULP
+    //     advisory). Its contract keys are gated below. Read right after
+    //     completeness, so an unreadable one is refused before the steps
+    //     below; its `node_external` stamp is admitted at 6b, once the graph
+    //     is parsed.
+    let RecorderRead {
+        info: mut recorder,
+        unknown_coordination,
+        driver_stamp,
+    } = read_recorder_info(&reader, bag)?;
+
+    // 2b'. Trace-format version gate: a bag stamped with a `trace_format`
+    //      GREATER than this binary supports carries a layout this Cerulion
+    //      cannot decode: its graph, its trace records or both may use what
+    //      a newer format defines. It is refused here as
+    //      `ReplayError::TraceFormatTooNew` (exit 2, not replay-grade), naming
+    //      the newer recording and saying to upgrade, rather than mis-replayed.
+    //      ORDER: the gate runs right after completeness (step 2) and BEFORE
+    //      the trace presence check (3), the graph parse (4) and the
+    //      trace-record walk (5), so no step that reads the graph or the
+    //      records judges a newer bag. A graph key this build does not
+    //      define, a record kind it does not define, a `reserved` bit it reads
+    //      as part of the rank, or a node-stop cause it does not define would
+    //      each be refused by that step in its own words, some calling the
+    //      bag corrupt, where the format number is the fact that decides it.
+    //      ABSENT `trace_format` decodes to version 1 (full back-compat:
+    //      every unstamped bag). A recorder.json this binary cannot read AT
+    //      ALL never reaches here: an unparseable CONTRACT CARRIER is a
+    //      refusal inside `read_recorder_info` rather than a silent
+    //      treated-as-absent.
+    //
+    // 2b''. There is no free-run refusal here: `run_engine` replays a free-run
+    //       bag through the SEQUENTIAL PER-RANK executor, so a bag this binary
+    //       can decode is a bag it can re-execute. What this gate refuses is an
+    //       UNKNOWN `coordination` value, a contract this binary has no variant
+    //       for at all (`ReplayError::CoordinationUnknown`).
+    //
+    //       ORDER: the UNKNOWN-value refusal sits BELOW the version gate on
+    //       purpose. Both can be true at once, and a bag from a newer Cerulion
+    //       stamping a format PAST `SUPPORTED_TRACE_FORMAT` and a coordination
+    //       mode this binary has no variant for is ONE fact. The version refusal
+    //       names the format the bag carries and the one this build reads up
+    //       to, the evidence that a newer Cerulion wrote it, while the
+    //       unknown-value refusal names only a value this build does not know.
+    //       The more informative refusal therefore wins whenever both apply; the
+    //       unknown-value arm is what catches the same skew on a bag whose
+    //       format version this binary DOES support. `newer_recording_refusal`
+    //       holds that order.
+    if let Some(info) = &recorder {
+        if let Some(refusal) = newer_recording_refusal(
+            info.trace_format,
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            unknown_coordination.as_deref(),
+            info.cerulion_version.as_deref(),
+        ) {
+            return Err(refusal);
+        }
     }
 
     // 3. Scheduler-trace presence — strict replay is driven by the recorded
@@ -1861,76 +2108,14 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
         None
     };
 
-    // 6b. `__cerulion/recorder.json`: OPTIONAL recorder-host identity
-    //     attachment. Absent = silent (pre-recorder.json bags); arch/os
-    //     mismatch vs THIS host = loud WARN (cross-arch float/libm ULP
-    //     advisory). Its contract keys are gated below.
-    let RecorderRead {
-        info: mut recorder,
-        unknown_coordination,
-        driver_stamp,
-    } = read_recorder_info(&reader, bag)?;
-
-    // 6b'. Trace-format version gate: a bag stamped with a `trace_format`
-    //      GREATER than this binary supports carries a scheduler-trace layout
-    //      this Cerulion cannot decode (e.g. a future `reserved`-bit assignment).
-    //      REFUSE it up front with a clear "recorded by a newer Cerulion —
-    //      upgrade to replay" message (exit 2, not replay-grade) rather than
-    //      silently mis-replaying. ABSENT `trace_format` decodes to version 1
-    //      (full back-compat: every unstamped bag). A recorder.json this
-    //      binary cannot read AT ALL never reaches here: an unparseable
-    //      CONTRACT CARRIER is a refusal inside
-    //      `read_recorder_info` rather than a silent treated-as-absent.
-    if let Some(info) = &recorder {
-        if info.trace_format > replay_engine::SUPPORTED_TRACE_FORMAT {
-            return Err(ReplayError::RecordingInconsistent {
-                detail: format!(
-                    "this bag's scheduler-trace format is version {} but this Cerulion \
-                     supports up to version {} — it was recorded by a NEWER Cerulion; \
-                     upgrade to replay it",
-                    info.trace_format,
-                    replay_engine::SUPPORTED_TRACE_FORMAT
-                ),
-            });
-        }
-        // 6b''. There is no free-run refusal here: `run_engine`
-        //       replays a free-run bag through
-        //       the SEQUENTIAL PER-RANK executor,
-        //       so a bag this binary can decode is a bag it can
-        //       re-execute. What this gate refuses is the UNKNOWN-value
-        //       case below, which is about a coordination contract this
-        //       binary has no variant for at all.
-        //
-        //       ORDER: the UNKNOWN-value refusal sits BELOW the version gate on
-        //       purpose. Both can be true at once — a bag from a newer Cerulion
-        //       stamping a format PAST `SUPPORTED_TRACE_FORMAT` and a
-        //       coordination mode this binary
-        //       has no variant for is ONE fact, and the version message states
-        //       its CAUSE ("recorded by a NEWER Cerulion; upgrade") while the
-        //       unknown-value message states only a SYMPTOM. The more
-        //       informative refusal therefore wins whenever both apply; the
-        //       unknown-value arm is what catches the same skew on a bag whose
-        //       format version this binary DOES support.
-        if let Some(value) = &unknown_coordination {
-            return Err(ReplayError::RecordingInconsistent {
-                detail: format!(
-                    "this bag's `coordination` stamp is {value}, which is not a coordination \
-                     contract this Cerulion knows — it was recorded by a NEWER Cerulion; \
-                     upgrade to replay it. (It is REFUSED rather than assumed to be lockstep: \
-                     an unknown stamp is positive evidence the recording was taken under a \
-                     contract this binary cannot apply, so replaying it under the lockstep one \
-                     would either refuse a correct bag as corrupt or mis-anchor it silently.)"
-                ),
-            });
-        }
-    }
-    // 6b'''. The driver stamp (`node_external`): refused when unreadable, and
-    //        checked against the embedded graph (its ros2 entries were taken
-    //        out above) when present. Below the version gate for the same
-    //        reason as the unknown-coordination refusal: a bag from a newer
-    //        Cerulion is named as such first. A validated stamp is what the
-    //        engine classifies drivers by; an absent one leaves the build
-    //        replayed to declare them.
+    // 6b. The driver stamp (`node_external`, read at 2b): refused when
+    //     unreadable, and checked against the embedded graph (its ros2
+    //     entries were taken out above) when present, so it is admitted
+    //     here, after the graph parse. Below the version gate for the same
+    //     reason as the unknown-coordination refusal: a bag from a newer
+    //     Cerulion is named as such first. A validated stamp is what the
+    //     engine classifies drivers by; an absent one leaves the build
+    //     replayed to declare them.
     if let Some(info) = recorder.as_mut() {
         info.driver_stamp = replay_engine::DriverStamp::admit(driver_stamp, &config)?;
     }
@@ -2252,8 +2437,9 @@ struct RecorderRead {
 }
 
 /// The `trace_format` a bag's `recorder.json` stamps, read on its own for the
-/// one record refusal whose remedy depends on it, which the record walk raises
-/// before [`read_recorder_info`] runs. `1` when the attachment is absent or
+/// one record refusal whose remedy depends on it, the record walk's unknown
+/// stop cause. The format gate runs before the walk, so a bag the walk reaches
+/// is stamped at or below this build's format. `1` when the attachment is absent or
 /// carries no readable stamp, as an absent field reads. Read through
 /// `cerulion_core::flashback::resim::recorded_trace_format`, as the capture
 /// judge reads it.
@@ -2362,9 +2548,10 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
             Some(n) => n as u32,
             None => {
                 return Err(invalid(format!(
-                    "`trace_format` is {v}, which is not a scheduler-trace format version — it \
-                     is the key this binary gates on to decide whether it can decode this bag's \
-                     trace at all, so an unreadable value is refused rather than assumed"
+                    "`trace_format` is {}, which is not a scheduler-trace format version \u{2014} \
+                     it is the key this binary gates on to decide whether it can decode this \
+                     bag's trace at all, so an unreadable value is refused rather than assumed",
+                    PrintableAscii(&v.to_string())
                 )))
             }
         },
@@ -2926,6 +3113,23 @@ mod tests {
                 },
                 2,
             ),
+            // A bag from a newer Cerulion is not replay-grade FOR THIS BINARY,
+            // the class of every other recording-side refusal.
+            (
+                ReplayError::TraceFormatTooNew {
+                    recorded: 13,
+                    supported: 12,
+                    recorded_by: NewerRecorderVersion::newer_than("99.0.0", "2.1.0"),
+                },
+                2,
+            ),
+            (
+                ReplayError::CoordinationUnknown {
+                    value: "\"barrier\"".to_string(),
+                    recorded_by: None,
+                },
+                2,
+            ),
             // A build whose drivers differ from the recording's: the bag is
             // not replay-grade FOR THIS WORKSPACE, the SchemaDrift class.
             (
@@ -3117,6 +3321,290 @@ mod tests {
             msg.contains("record 7") && msg.contains("record_type 9"),
             "got: {msg}"
         );
+    }
+
+    // =======================================================================
+    // A recording from a newer Cerulion: which refusal the contract gate
+    // picks, the sentence each renders, and the version token it may print.
+    // The highest format these rows read up to is the literal 12, a
+    // parameter of the pure picker, so the rows do not move with a bump.
+    // =======================================================================
+
+    /// The refusal [`newer_recording_refusal`] picks for a bag at `trace_format`
+    /// read by a build that reads up to 12, rendered, with its exit code.
+    fn newer_refusal(
+        trace_format: u32,
+        unknown_coordination: Option<&str>,
+        cerulion_version: Option<&str>,
+    ) -> Option<(String, u8)> {
+        newer_recording_refusal(trace_format, 12, unknown_coordination, cerulion_version)
+            .map(|err| (err.to_string(), err.exit_code()))
+    }
+
+    /// A newer-recording refusal names no damage: the recording is sound, so
+    /// it never calls the bag corrupt or says to re-record it.
+    fn assert_names_no_damage(text: &str) {
+        for word in ["corrupt", "re-record", "internal consistency"] {
+            assert!(!text.contains(word), "{word:?} in {text:?}");
+        }
+    }
+
+    /// A format past the one this build reads names the newer recording, its
+    /// recorder when the bag stamps one, both formats and this build's
+    /// version, and says to upgrade (exit 2).
+    #[test]
+    fn a_format_past_this_build_names_the_newer_recording_and_says_to_upgrade() {
+        let ours = env!("CARGO_PKG_VERSION");
+        let stamped = format!(
+            "this bag was recorded by a newer Cerulion (99.0.0): its scheduler-trace format is \
+             version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade Cerulion \
+             to replay it."
+        );
+        let unstamped = format!(
+            "this bag was recorded by a newer Cerulion: its scheduler-trace format is version \
+             13, and this Cerulion ({ours}) reads up to version 12. Upgrade Cerulion to replay \
+             it."
+        );
+        assert_eq!(
+            newer_refusal(13, None, Some("99.0.0")),
+            Some((stamped.clone(), 2))
+        );
+        assert_eq!(newer_refusal(13, None, None), Some((unstamped.clone(), 2)));
+        assert_names_no_damage(&stamped);
+        assert_names_no_damage(&unstamped);
+        // Far past the boundary, the same sentence with the bag's number.
+        assert_eq!(
+            newer_refusal(999, None, None).map(|(text, _)| text),
+            Some(format!(
+                "this bag was recorded by a newer Cerulion: its scheduler-trace format is version \
+                 999, and this Cerulion ({ours}) reads up to version 12. Upgrade Cerulion to \
+                 replay it."
+            ))
+        );
+    }
+
+    /// A `coordination` value this build has no contract for, on a format it
+    /// reads, names the newer recording, quotes the value as the reader
+    /// carried it out, and says to upgrade (exit 2).
+    #[test]
+    fn an_unknown_coordination_names_the_newer_recording_and_says_to_upgrade() {
+        let ours = env!("CARGO_PKG_VERSION");
+        let stamped = format!(
+            "this bag was recorded by a newer Cerulion (99.0.0): its `coordination` stamp is \
+             \"barrier\", which this Cerulion ({ours}) does not know. Upgrade Cerulion to \
+             replay it."
+        );
+        let unstamped = format!(
+            "this bag was recorded by a newer Cerulion: its `coordination` stamp is \
+             \"barrier\", which this Cerulion ({ours}) does not know. Upgrade Cerulion to \
+             replay it."
+        );
+        assert_eq!(
+            newer_refusal(12, Some("\"barrier\""), Some("99.0.0")),
+            Some((stamped.clone(), 2))
+        );
+        assert_eq!(
+            newer_refusal(12, Some("\"barrier\""), None),
+            Some((unstamped.clone(), 2))
+        );
+        assert_names_no_damage(&stamped);
+        assert_names_no_damage(&unstamped);
+        // Below the highest format too: the value, not the format, is refused.
+        assert_eq!(
+            newer_refusal(3, Some("\"barrier\""), None),
+            Some((unstamped, 2))
+        );
+    }
+
+    /// A bag past the format AND with an unknown `coordination` value gets the
+    /// format refusal, with or without a recorder stamp; a bag this build reads
+    /// both keys of gets none, the highest format included.
+    #[test]
+    fn the_format_refusal_wins_over_an_unknown_coordination() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            newer_refusal(13, Some("\"barrier\""), Some("99.0.0")).map(|(text, _)| text),
+            Some(format!(
+                "this bag was recorded by a newer Cerulion (99.0.0): its scheduler-trace format \
+                 is version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade \
+                 Cerulion to replay it."
+            ))
+        );
+        assert_eq!(
+            newer_refusal(13, Some("\"barrier\""), None).map(|(text, _)| text),
+            Some(format!(
+                "this bag was recorded by a newer Cerulion: its scheduler-trace format is \
+                 version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade \
+                 Cerulion to replay it."
+            ))
+        );
+        assert_eq!(newer_refusal(12, None, Some("99.0.0")), None);
+        assert_eq!(newer_refusal(1, None, None), None);
+    }
+
+    /// The recorder stamp is printed only when it is a plain version token
+    /// (ASCII letters, digits, `.`, `-`, `+`; 1 to 64 bytes). Each stamp below
+    /// but the empty one names release 99.0.0, above this build's, so only the
+    /// token rule leaves it out: the offending byte, or the 65th, sits in the
+    /// suffix, and the sentence is the unstamped one.
+    #[test]
+    fn a_recorder_stamp_is_printed_only_as_a_plain_version_token() {
+        let ours = env!("CARGO_PKG_VERSION");
+        let unstamped = format!(
+            "this bag was recorded by a newer Cerulion: its scheduler-trace format is version \
+             13, and this Cerulion ({ours}) reads up to version 12. Upgrade Cerulion to replay \
+             it."
+        );
+        let sixty_five = format!("99.0.0-{}", "a".repeat(58));
+        for (stamp, what) in [
+            ("99.0.0-rc\u{7}", "a control byte"),
+            ("99.0.0-\u{1b}[31m", "an escape sequence"),
+            ("99.0.0-rc 1", "a space"),
+            ("", "an empty stamp"),
+            (sixty_five.as_str(), "65 bytes"),
+            ("99.0.0-rc_1", "an underscore"),
+            ("99.0.0-\u{e9}", "a byte past ASCII"),
+        ] {
+            assert_eq!(
+                newer_refusal(13, None, Some(stamp)).map(|(text, _)| text),
+                Some(unstamped.clone()),
+                "{what}: {stamp:?}"
+            );
+            assert_eq!(
+                newer_refusal(12, Some("7"), Some(stamp)).map(|(text, _)| text),
+                Some(format!(
+                    "this bag was recorded by a newer Cerulion: its `coordination` stamp is 7, \
+                     which this Cerulion ({ours}) does not know. Upgrade Cerulion to replay it."
+                )),
+                "{what}: {stamp:?}"
+            );
+        }
+        let sixty_four = format!("99.0.0-{}", "a".repeat(57));
+        for stamp in ["99.0.0-rc.1+abc", sixty_four.as_str()] {
+            assert_eq!(
+                newer_refusal(13, None, Some(stamp)).map(|(text, _)| text),
+                Some(format!(
+                    "this bag was recorded by a newer Cerulion ({stamp}): its scheduler-trace \
+                     format is version 13, and this Cerulion ({ours}) reads up to version 12. \
+                     Upgrade Cerulion to replay it."
+                )),
+            );
+        }
+    }
+
+    /// "a newer Cerulion (<stamp>)" names only a release above this build's:
+    /// the stamp's leading `MAJOR.MINOR.PATCH` against this build's, as three
+    /// integers, its suffix not compared. A stamp equal to this build's
+    /// version, a lower one, and one whose leading part is not three integers
+    /// read as absent, so the sentence is the unstamped one.
+    #[test]
+    fn a_recorder_stamp_is_printed_only_when_its_release_is_above_this_builds() {
+        let ours = env!("CARGO_PKG_VERSION");
+        let format_refusal = |by: &str| {
+            format!(
+                "this bag was recorded by a newer Cerulion{by}: its scheduler-trace format is \
+                 version 13, and this Cerulion ({ours}) reads up to version 12. Upgrade \
+                 Cerulion to replay it."
+            )
+        };
+        let coordination_refusal = |by: &str| {
+            format!(
+                "this bag was recorded by a newer Cerulion{by}: its `coordination` stamp is \
+                 \"barrier\", which this Cerulion ({ours}) does not know. Upgrade Cerulion to \
+                 replay it."
+            )
+        };
+        for (stamp, by) in [
+            ("99.0.0", " (99.0.0)"),
+            ("99.0.0-rc.1", " (99.0.0-rc.1)"),
+            // 100 is above 2 as a number, and below it as text.
+            ("100.0.0", " (100.0.0)"),
+            (ours, ""),
+            ("0.1.0", ""),
+            ("99.0", ""),
+            ("99.0.0.1", ""),
+            ("99", ""),
+        ] {
+            assert_eq!(
+                newer_refusal(13, None, Some(stamp)).map(|(text, _)| text),
+                Some(format_refusal(by)),
+                "{stamp:?}"
+            );
+            assert_eq!(
+                newer_refusal(12, Some("\"barrier\""), Some(stamp)).map(|(text, _)| text),
+                Some(coordination_refusal(by)),
+                "{stamp:?}"
+            );
+        }
+    }
+
+    /// The release comparison reads each of the three numbers as an integer,
+    /// in order, and holds nothing when either side has no
+    /// `MAJOR.MINOR.PATCH`, this build's version included.
+    #[test]
+    fn a_newer_release_is_three_integers_above_this_builds() {
+        let held = |stamp: &str, ours: &str| {
+            NewerRecorderVersion::newer_than(stamp, ours).map(|v| v.to_string())
+        };
+        for (stamp, ours) in [
+            ("2.10.0", "2.9.0"),
+            ("2.1.1", "2.1.0"),
+            ("3.0.0", "2.99.99"),
+            ("2.1.1-rc.1", "2.1.0"),
+            ("2.1.1+abc", "2.1.0-rc.2"),
+        ] {
+            assert_eq!(
+                held(stamp, ours).as_deref(),
+                Some(stamp),
+                "{stamp} > {ours}"
+            );
+        }
+        for (stamp, ours) in [
+            ("2.9.0", "2.10.0"),
+            ("2.1.0", "2.1.0"),
+            ("2.1.0-rc.9", "2.1.0"),
+            ("2.1.0", "2.1.1"),
+            ("2.99.99", "3.0.0"),
+            ("3.0.0", "2.1"),
+            ("3.0.0", ""),
+            ("3.x.0", "2.1.0"),
+            ("18446744073709551616.0.0", "2.1.0"),
+        ] {
+            assert_eq!(held(stamp, ours), None, "{stamp} vs {ours}");
+        }
+    }
+
+    /// JSON text is printed ASCII-only: printable ASCII as is, from the space
+    /// to `~`, and every other char as a `\uXXXX` escape, a char above U+FFFF
+    /// as its surrogate pair.
+    #[test]
+    fn json_text_is_printed_with_every_char_outside_printable_ascii_escaped() {
+        for (text, printed) in [
+            (" \"a~\\\"", " \"a~\\\""),
+            ("\"\u{7f}\"", "\"\\u007f\""),
+            ("\"\u{9b}2J\"", "\"\\u009b2J\""),
+            ("\"\u{202e}x\"", "\"\\u202ex\""),
+            ("\"caf\u{e9}\"", "\"caf\\u00e9\""),
+            ("\"\u{1f600}\"", "\"\\ud83d\\ude00\""),
+            ("\"\u{1f}\"", "\"\\u001f\""),
+        ] {
+            assert_eq!(PrintableAscii(text).to_string(), printed, "{text:?}");
+        }
+    }
+
+    /// Control: a genuine consistency failure keeps its corrupt-bag wrapper,
+    /// byte for byte (exit 2).
+    #[test]
+    fn a_consistency_failure_keeps_its_corrupt_bag_wrapper() {
+        let err = ReplayError::RecordingInconsistent {
+            detail: "boundary step 3 skipped".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "bag internal consistency check failed: boundary step 3 skipped \u{2014} the \
+             recording is corrupt or hand-edited; re-record with `cerulion graph run --record`"
+        );
+        assert_eq!(err.exit_code(), 2);
     }
 
     // =======================================================================

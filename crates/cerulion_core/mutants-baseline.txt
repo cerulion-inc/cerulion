@@ -206,6 +206,17 @@
 #            --in-diff <those changes' diff of that file> -- --lib flashback
 # Result:  4 mutants: 4 caught, 0 missed.
 #
+# And once `judge_resimmable` asked the unreadable-stamp arm first, as the
+# replay reads `recorder.json` right after its completeness check:
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            -f crates/cerulion_core/src/flashback/resim.rs \
+#            --in-diff <that change's diff of that file> -- --lib flashback
+# Result:  1 mutant: 1 caught, 0 missed (`judge_resimmable` replaced with
+#          `Ok(())`). The new arm is a `match` with no wildcard and the
+#          free-run reading a `matches!`, so the tool generates nothing else
+#          on the changed lines.
+#
 # Replay-fed `block` edges: `BagFedBlockEdges::{is_empty, iter, resolve}` and
 # `BagFedEnds::{feeds_consumer, held_producers}` in replay_feed.rs (`new` yields
 # no mutant: cargo-mutants skips every method named `new`), the fed exemption in

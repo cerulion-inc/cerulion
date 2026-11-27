@@ -29889,8 +29889,7 @@ mod ranks_begin_apart_judge_tests {
             not_json.reason(),
             "this capture's `__cerulion/recorder.json` is not JSON, so it states no \
              coordination contract, and `cerulion bag play --resim` refuses a recording whose \
-             contract it cannot read before it re-executes anything. The frames, the state and \
-             the trace are in the bag and readable"
+             contract it cannot read before it re-executes anything"
         );
     }
 
