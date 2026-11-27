@@ -2387,7 +2387,11 @@ supervises; spawning and supervising is ALL it does:
   re-executes the NATIVE nodes against the recorded frames and
   classifies-and-skips the entries: one warn names them, the `--report`
   JSON carries them under `ros2_entries_skipped`, and ROS 2 is never
-  respawned; `bag info` renders them as their own section.
+  respawned; `bag info` renders them as their own section. On a free-run
+  bag `--resim all --verify` feeds the native nodes' reads, those of topics a
+  `ros2:` entry publishes included, by recorded identity; what the ROS 2
+  process itself took is not replayed (`cerulion ros2 run
+  --replay-deliveries` replays one ROS 2 process from its own delivery log).
 - **Not the whole graph.** A graph of only `ros2:` entries is refused: the
   runtime has nothing to schedule; `cerulion ros2 launch <launch-file>` is the
   tool for a bare launch file.

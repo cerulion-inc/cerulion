@@ -1231,6 +1231,15 @@ pub enum ReadOutcomeKind {
     /// (`ReadOutcomeStage::room`); otherwise none is, and the read names only
     /// its newest frame.
     BatchFrame = 8,
+    /// A single-frame take (`CerulionSubscriber::try_receive_one` and its
+    /// owned twin, `trace_format` 13) delivered one frame: `served_seq` is
+    /// that frame's wire sequence, `popped` is 1, the role is `Body`. It is
+    /// not [`Self::Served`] because a take removes only the frame it names:
+    /// on a latest-value input the queue can still hold frames after it,
+    /// where a `Served` read drained the queue to its newest frame. A take
+    /// that finds the queue empty stages [`Self::NoFrame`], as every other
+    /// empty read does.
+    Taken = 9,
 }
 
 impl ReadOutcomeKind {
@@ -1440,11 +1449,12 @@ fn resolve_seq_slot(inner: &mut StageInner, kind: ReadOutcomeKind, served_seq: O
         ReadOutcomeKind::Served
         | ReadOutcomeKind::Held
         | ReadOutcomeKind::DrainedBatch
-        | ReadOutcomeKind::BatchFrame => served_seq.map(u64::from).unwrap_or(STAGE_NO_FRAME),
+        | ReadOutcomeKind::BatchFrame
+        | ReadOutcomeKind::Taken => served_seq.map(u64::from).unwrap_or(STAGE_NO_FRAME),
     };
     if matches!(
         kind,
-        ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch
+        ReadOutcomeKind::Served | ReadOutcomeKind::DrainedBatch | ReadOutcomeKind::Taken
     ) {
         if let Some(seq) = served_seq {
             inner.last_served_seq = Some(seq);
@@ -1532,6 +1542,17 @@ pub struct ReadOutcomeStage {
     /// recorded partner and fill rim slots the recording left free. Read by
     /// the subscriber before each multi-frame read, one `Acquire` load.
     records_batch_frames: AtomicBool,
+    /// Is a single-frame take (`CerulionSubscriber::try_receive_one` and its
+    /// owned twin) a recorded read? `true` at creation, the shape every trace
+    /// format 13 recorder writes: the take consults the replay read gate,
+    /// stages a `Served` record (popped 1) or a `NoFrame` record at an empty
+    /// queue under the `Body` role, and pays the `block` credit word for what it
+    /// popped. A REPLAY adopts the recording's own rule through
+    /// [`Self::adopt_single_take_records`]: below format 13 a take recorded
+    /// nothing and paid no credit, so a replay of such a bag takes the same
+    /// unrecorded path, and a fed replay reports it as an unrecorded take. Read
+    /// by the subscriber at the top of each take, one `Acquire` load.
+    records_single_takes: AtomicBool,
     /// Does `record_with_producer` stage the annotation before EVERY read,
     /// rather than only when the writer differs from the one the read's site
     /// last annotated? `false` at creation, the writer-run rule. The runtime
@@ -1564,6 +1585,7 @@ impl ReadOutcomeStage {
             armed: AtomicBool::new(false),
             records_every_consult: AtomicBool::new(true),
             records_batch_frames: AtomicBool::new(true),
+            records_single_takes: AtomicBool::new(true),
             annotates_every_read: false,
             pending: AtomicU32::new(0),
             inner: Mutex::new(StageInner::default()),
@@ -1754,8 +1776,30 @@ impl ReadOutcomeStage {
         self.records_batch_frames.load(Ordering::Acquire)
     }
 
+    /// Adopt the RECORDING's single-take rule: is a take through
+    /// `CerulionSubscriber::try_receive_one` or its owned twin a recorded read?
+    /// Called once per stage, before step 0, from
+    /// `GraphRuntime::set_read_log_records_single_takes` with the answer the
+    /// bag's `trace_format` gives; a recording run never calls it and keeps the
+    /// creation value `true`.
+    pub(crate) fn adopt_single_take_records(&self, recorded: bool) {
+        self.records_single_takes.store(recorded, Ordering::Release);
+    }
+
+    /// Whether a take through `CerulionSubscriber::try_receive_one` or its
+    /// owned twin is a recorded read on this stage.
+    ///
+    /// `true` at creation, the shape every trace format 13 recorder writes. A
+    /// replay adopts the recording's own answer before step 0, through
+    /// `GraphRuntime::set_read_log_records_single_takes` over every wired
+    /// stage; a recording run never moves it.
+    #[inline]
+    pub fn records_single_takes(&self) -> bool {
+        self.records_single_takes.load(Ordering::Acquire)
+    }
+
     /// Stage one read outcome. `served_seq` is the served frame's wire
-    /// sequence where the kind carries one (`Served` / `Held` /
+    /// sequence where the kind carries one (`Served` / `Held` / `Taken` /
     /// `DrainedBatch`); for `Decimated` it is IGNORED and the stage's
     /// remembered last-served sequence is reported instead; for `NoFrame` it
     /// is ignored (sentinel). `popped` saturates to `u32` for the packed aux
@@ -2511,10 +2555,11 @@ pub enum ReplayReadViolationKind {
         /// The admission's position in the step's installed plan, from 0.
         ordinal: u32,
     },
-    /// A read on a FED stage took a frame through a path the read log does not
-    /// record (`CerulionSubscriber::try_receive_one` and its owned twin, the
-    /// rmw `take` path). Such a read has no recorded identity, so its frames
-    /// cannot be fed and the replay cannot reproduce it.
+    /// A read on a FED stage took a frame through a path the recording did not
+    /// record: `CerulionSubscriber::try_receive_one` or its owned twin in a bag
+    /// below trace format 13, whose recorder staged no record for a take. Such
+    /// a read has no recorded identity, so its frames cannot be fed and the
+    /// replay cannot reproduce it.
     UnrecordedTake,
 }
 
@@ -3487,6 +3532,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             armed,
             records_every_consult,
             records_batch_frames,
+            records_single_takes,
             annotates_every_read,
             pending,
             inner
@@ -3513,7 +3559,7 @@ pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
             // not be added silently.
             run_count
         }),
-        abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer, ReadOutcomeKind::BatchFrame }),
+        abi_pin_enum!(ReadOutcomeKind { ReadOutcomeKind::Served, ReadOutcomeKind::Held, ReadOutcomeKind::NoFrame, ReadOutcomeKind::DrainedBatch, ReadOutcomeKind::Decimated, ReadOutcomeKind::Truncated, ReadOutcomeKind::Producer, ReadOutcomeKind::BatchFrame, ReadOutcomeKind::Taken }),
         abi_pin_enum!(ReadSiteRole { ReadSiteRole::Unstamped, ReadSiteRole::Drain, ReadSiteRole::Body, ReadSiteRole::Peek }),
         abi_pin_enum!(ReadStageRole { ReadStageRole::Body, ReadStageRole::Drain }),
         // ABI v27: the ENFORCEMENT side. The subscriber owns a

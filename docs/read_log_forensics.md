@@ -116,6 +116,7 @@ boundary sets any other bit is refused.
 | 6 | `truncated` | sentinel | REINTERPRETED: records dropped IN THIS MERGE WINDOW. **A MARKED HOLE**, see below |
 | 7 | `producer` | REPEATS the annotated read's sequence (a redundant join key) | unused (0); the payload is the 64-bit token in the aux slot |
 | 8 | `batch_frame` | One frame the NEXT read of the same stage and read site consumed besides the one it served (`trace_format` 9) | 0: the read that follows carries the count |
+| 9 | `taken` | The one frame a single-frame take (`try_receive_one`, `try_receive_one_owned`) delivered (`trace_format` 13); the frames behind it stay queued | **1** |
 
 **`popped` is a QUEUE count, not a served count**, and the difference is the
 useful signal: a `served` record with `popped = 4` means the drain took four

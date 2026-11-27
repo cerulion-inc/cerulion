@@ -144,7 +144,7 @@ pub fn step_boundary_flags(global_level: u32) -> Result<StepBoundaryFlags, u32> 
 ///   ([`encode_manifest_with_inputs`]), bits 14..16 = the READ-SITE
 ///   ROLE ([`ReadSiteRole`] — `0` on every `trace_format` <= 4 bag), bits
 ///   0..14 = the outcome kind ([`READ_OUTCOME_SERVED`] ..
-///   [`READ_OUTCOME_DECIMATED`]),
+///   [`READ_OUTCOME_TAKEN`]),
 /// - `reserved` — rank/discard exactly as for every other kind (0 on the
 ///   ring; `bagd` co-stamps the ring's header rank uniformly at drain time).
 pub const RECORD_TYPE_READ_OUTCOME: u32 = 6;
@@ -175,11 +175,21 @@ pub const RECORD_TYPE_NODE_STOP: u32 = 7;
 /// `cerulion_cli_engine::replay_engine` is this one.
 pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = 12;
 
+/// The lowest `trace_format` whose read log records every single-frame take
+/// (`CerulionSubscriber::try_receive_one` and its owned twin) on a graph-wired
+/// input: a `Taken` record (popped 1, [`READ_OUTCOME_TAKEN`]) or a `NoFrame`
+/// record at an empty queue, under the `Body` read-site role, and the `block` credit word pays
+/// for each frame a take removed
+/// (`read_outcome::ReadOutcomeStage::records_single_takes`). The one place the
+/// number is written: the replay's constant of the same name in
+/// `cerulion_cli_engine::replay_engine` is this one.
+pub const SINGLE_TAKE_MIN_TRACE_FORMAT: u32 = 13;
+
 /// The highest `trace_format` this build reads. The replay's read gate of the
 /// same name in `cerulion_cli_engine::replay_engine` is this constant, and its
 /// doc names what each format adds. The capture judge words an unknown stop
 /// cause against it ([`TraceRecordFault::detail`]), as the replay does.
-pub const SUPPORTED_TRACE_FORMAT: u32 = NODE_STOPS_MIN_TRACE_FORMAT;
+pub const SUPPORTED_TRACE_FORMAT: u32 = SINGLE_TAKE_MIN_TRACE_FORMAT;
 
 /// Read-outcome kind: a fresh frame was served to the read (the low-16
 /// half of the kind-6 `global_level` packing). The wire constants are
@@ -218,6 +228,11 @@ pub const READ_OUTCOME_PRODUCER: u16 = ReadOutcomeKind::Producer as u16;
 /// One consumed frame of a multi-frame read other than the frame the read
 /// names; the read record that follows on the same stage and site popped it.
 pub const READ_OUTCOME_BATCH_FRAME: u16 = ReadOutcomeKind::BatchFrame as u16;
+/// Read-outcome kind: a single-frame take delivered one frame (`trace_format`
+/// 13): served-seq = that frame's wire sequence, popped = 1. The frames
+/// behind it stay queued, which is what separates it from
+/// [`READ_OUTCOME_SERVED`] on a latest-value input.
+pub const READ_OUTCOME_TAKEN: u16 = ReadOutcomeKind::Taken as u16;
 
 /// The "no frame" sentinel for a kind-6 record's served-seq slot
 /// (`fire_time_ns`). A real wire sequence is a `u32`, so the two ranges can
@@ -226,8 +241,8 @@ pub const READ_OUTCOME_NO_FRAME: u64 = u64::MAX;
 
 /// The outcome-kind subfield of a kind-6 record's `global_level`
 /// slot — bits 0..14. It NARROWED from 16 bits when the role bits took the top
-/// of the kind half; the highest kind in use is 8
-/// ([`READ_OUTCOME_BATCH_FRAME`]) and `read_outcome_kind_from_wire` already
+/// of the kind half; the highest kind in use is 9
+/// ([`READ_OUTCOME_TAKEN`]) and `read_outcome_kind_from_wire` already
 /// answers "unknown" for anything it does not recognise, so the narrowing
 /// changes no reachable behaviour.
 pub const READ_OUTCOME_KIND_MASK: u16 = 0x3FFF;
@@ -3822,6 +3837,7 @@ mod tests {
             ReadOutcomeKind::Truncated,
             ReadOutcomeKind::Producer,
             ReadOutcomeKind::BatchFrame,
+            ReadOutcomeKind::Taken,
         ] {
             let constant = match kind {
                 ReadOutcomeKind::Served => READ_OUTCOME_SERVED,
@@ -3832,6 +3848,7 @@ mod tests {
                 ReadOutcomeKind::Truncated => READ_OUTCOME_TRUNCATED,
                 ReadOutcomeKind::Producer => READ_OUTCOME_PRODUCER,
                 ReadOutcomeKind::BatchFrame => READ_OUTCOME_BATCH_FRAME,
+                ReadOutcomeKind::Taken => READ_OUTCOME_TAKEN,
             };
             assert_eq!(kind.wire(), constant);
         }

@@ -483,7 +483,10 @@ with a validation pin in `crates/cerulion_core/tests/graph_test.rs`:
   helper is gone). The resim preflight lifts them back
   out (one warn + `ReplayOutcome::ros2_entries_skipped`; never a BagGraphMismatch, never
   a respawn; pinned structurally by `ros2_resim_no_respawn_test.rs` and behaviorally by
-  the record→resim e2e arm), and `bag info` renders them as their own section.
+  the record→resim e2e arm), and `bag info` renders them as their own section. A
+  `--verify` replay feeds the native reads of such a bag by identity like any other
+  (`replay_engine_test`'s `a_verify_replay_beside_a_skipped_ros2_entry_feeds_every_take_by_identity`);
+  no refusal names the skipped entries.
   `GraphRuntime::build` refuses a config that still carries one, by name.
 - **Core derivations are native-only** (`GraphTopology::build`, `build_trigger_edges`,
   `validate_process_groups`, the partition derivations): `graph levels` and
