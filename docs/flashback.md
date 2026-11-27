@@ -85,7 +85,9 @@ unit captures its node state on its own thread:
 
 A capture of a run of several worker ranks is resimmable only when its window
 reaches the run's step 0: a mid-run free-run recording of several worker ranks
-is refused, since per-rank resume is not supported.
+is refused, since per-rank resume is not supported. A capture whose window
+reaches step 0 on every rank carries its whole trace from step 0, beside the
+checkpoints it holds, and `bag play --resim` re-executes it from the start.
 
 ---
 

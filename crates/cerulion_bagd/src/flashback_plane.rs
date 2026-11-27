@@ -2097,6 +2097,12 @@ pub(crate) struct CaptureManifest<'a> {
     /// A borrowed VERDICT rather than a `bool` beside a `String`, so the
     /// manifest structurally cannot render a claim its own reason contradicts.
     pub resim: &'a Result<(), cerulion_core::flashback::resim::ResimGap>,
+    /// Whether the trace this capture carries begins at its run's own step 0,
+    /// which is what makes a resimmable verdict a replay FROM THE START rather
+    /// than a resume from the checkpoint. Read off the carried trace, never off
+    /// the anchor: a capture can carry a checkpoint and still replay from the
+    /// start, when the trim through it would leave a resume the replay refuses.
+    pub resim_from_start: bool,
     /// `target(S−1)`: the gating-clock value at the ANCHOR
     /// step's own boundary. `None` when that boundary is not in the retention.
     ///
@@ -2626,27 +2632,28 @@ impl AnchorReport {
     fn render(
         &self,
         resim: &Result<(), cerulion_core::flashback::resim::ResimGap>,
+        from_start: bool,
         covered_through_ns: Option<u64>,
     ) -> String {
         let resimmable = resim.is_ok();
         // The POSITIVE claim has two shapes, and one sentence cannot serve both.
-        // `RESIMMABLE_REASON` says the capture "carries … a complete
-        // checkpoint", which is exactly what the ABSENT arm does NOT have: it is
-        // resimmable because its window reaches the run's own step 0 and needs
-        // no anchor. Serving the anchor sentence there tells a reader the bag
-        // holds a checkpoint it can inspect, and it holds none.
+        // `RESIMMABLE_REASON` says the capture "carries … a trace trimmed to its
+        // anchor" and resumes from it, which is not true of a capture whose
+        // carried trace begins at the run's own step 0: that one replays from
+        // the start and reads no checkpoint, whether or not it carries one.
+        // So the shape follows the carried trace (`from_start`), not the
+        // anchor arm. An ABSENT capture that is resimmable is always the
+        // from-start shape, since only a trace that begins at step 0 needs no
+        // anchor.
         //
         // Both positive shapes now name the COVERED RANGE, through the
         // one composer — a renderer that appended it to only one of them would
         // publish a verdict whose scope depended on which arm it took.
-        let reason = esc(&match (resim, self) {
-            (Ok(()), Self::Absent(_)) => {
-                cerulion_core::flashback::resim::resimmable_reason(true, covered_through_ns)
+        let reason = esc(&match resim {
+            Ok(()) => {
+                cerulion_core::flashback::resim::resimmable_reason(from_start, covered_through_ns)
             }
-            (Ok(()), _) => {
-                cerulion_core::flashback::resim::resimmable_reason(false, covered_through_ns)
-            }
-            (Err(gap), _) => gap.reason(),
+            Err(gap) => gap.reason(),
         });
         // JSON `null` for "no boundary to end a range at", never 0 —
         // 0 is a REAL gating-clock value (a run's own step 0 runs at it), and
@@ -2810,6 +2817,7 @@ pub(crate) fn render_capture_manifest(m: &CaptureManifest<'_>, plane: &Flashback
         ref anchor,
         handoff,
         resim,
+        resim_from_start,
         anchor_target_ns,
         resim_covered_through_ns,
     } = *m;
@@ -2898,7 +2906,7 @@ pub(crate) fn render_capture_manifest(m: &CaptureManifest<'_>, plane: &Flashback
             Some(ns) => ns.to_string(),
             None => "null".to_string(),
         },
-        anchor.render(resim, resim_covered_through_ns),
+        anchor.render(resim, resim_from_start, resim_covered_through_ns),
         handoff.render(),
     );
     json.into_bytes()
@@ -3117,6 +3125,7 @@ mod tests {
                 truncated_trace_records: 5,
                 handoff: no_handoff(),
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
             },
@@ -3178,6 +3187,7 @@ mod tests {
                 truncated_trace_records: 0,
                 handoff: no_handoff(),
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
             },
@@ -4006,6 +4016,9 @@ mod tests {
         trace_records_carried: u64,
         resim: &Result<(), ResimGap>,
     ) -> String {
+        // The fixture's carried trace begins at step 0 exactly when no anchor is
+        // embedded, which is the one shape an anchorless capture is resimmable in.
+        let from_start = matches!(anchor, AnchorReport::Absent(_));
         let plane = FlashbackPlane::new(settings(std::path::PathBuf::from("/tmp/fb")), None);
         let finished = FinishedCapture {
             seq: 1,
@@ -4037,6 +4050,7 @@ mod tests {
                     ..no_handoff()
                 },
                 resim,
+                resim_from_start: from_start,
                 anchor_target_ns: Some(4_321),
                 // A DISTINCT value from `anchor_target_ns`, and above
                 // it — the two are the range's endpoints, so an arm that read
@@ -4061,6 +4075,9 @@ mod tests {
         resim: &Result<(), ResimGap>,
         covered_through_ns: Option<u64>,
     ) -> String {
+        // The fixture's carried trace begins at step 0 exactly when no anchor is
+        // embedded, which is the one shape an anchorless capture is resimmable in.
+        let from_start = matches!(anchor, AnchorReport::Absent(_));
         let plane = FlashbackPlane::new(settings(std::path::PathBuf::from("/tmp/fb")), None);
         let finished = FinishedCapture {
             seq: 1,
@@ -4090,6 +4107,7 @@ mod tests {
                     ..no_handoff()
                 },
                 resim,
+                resim_from_start: from_start,
                 anchor_target_ns: Some(4_321),
                 resim_covered_through_ns: covered_through_ns,
             },
@@ -4451,6 +4469,7 @@ mod tests {
                     ..no_handoff()
                 },
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
             },
@@ -4581,6 +4600,7 @@ mod tests {
                 anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                 handoff: no_handoff(),
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
             },
@@ -4674,6 +4694,7 @@ mod tests {
                 anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                 handoff: no_handoff(),
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
             },
@@ -4728,6 +4749,7 @@ mod tests {
                 anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                 handoff: no_handoff(),
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
             },
@@ -4926,6 +4948,7 @@ mod tests {
                 anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                 truncated_trace_records: 0,
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
                 finished: &finished,
@@ -5206,6 +5229,7 @@ mod tests {
                     anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                     truncated_trace_records: truncated,
                     resim: &no_trace(),
+                    resim_from_start: false,
                     anchor_target_ns: None,
                     resim_covered_through_ns: None,
                     finished: &finished,
@@ -5395,6 +5419,7 @@ mod tests {
                 anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                 truncated_trace_records: 0,
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
                 finished: &finished,
@@ -5470,6 +5495,7 @@ mod tests {
                 anchor: AnchorReport::Absent(NoAnchorReason::NothingRetained),
                 truncated_trace_records: 0,
                 resim: &no_trace(),
+                resim_from_start: false,
                 anchor_target_ns: None,
                 resim_covered_through_ns: None,
                 finished: &finished,
