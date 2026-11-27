@@ -831,7 +831,10 @@ fn merge_other_processes(rt: &runtime::Runtime, topics: &mut TopicTypes) {
             }
         }
         Ok(Err(error)) => Some(error.to_string()),
-        Err(_) => Some("the gather panicked".to_string()),
+        Err(payload) => Some(format!(
+            "the gather panicked: {}",
+            super::pubsub::panic_message(payload.as_ref())
+        )),
     };
     let mut latch = lock_regime_latch(&TOPIC_GATHER_FAILURES);
     let Some(error) = failure else {

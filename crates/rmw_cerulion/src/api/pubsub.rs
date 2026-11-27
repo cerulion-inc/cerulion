@@ -618,7 +618,7 @@ fn list_on_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &str) {
 
 /// Count one less local endpoint on `(topic, type_name)`; the inverse of
 /// [`list_on_graph_registry`]. A pair that was never counted (its add was
-/// refused) changes nothing.
+/// refused) changes nothing, so a remove never reports a recovery.
 fn unlist_from_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &str) {
     let Some(writer) = &rt.graph_registry else {
         return;
@@ -627,15 +627,14 @@ fn unlist_from_graph_registry(rt: &runtime::Runtime, topic: &str, type_name: &st
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         writer.remove(topic, type_name)
     }));
-    match outcome {
-        Ok(()) => report_graph_registry_success(topic),
-        Err(payload) => report_graph_registry_failure(
+    if let Err(payload) = outcome {
+        report_graph_registry_failure(
             topic,
             &format!(
                 "graph registry remove panicked: {}",
                 panic_message(payload.as_ref())
             ),
-        ),
+        );
     }
 }
 
@@ -644,7 +643,8 @@ fn report_graph_registry_success(topic: &str) {
         tracing::info!(
             topic = %topic,
             suppressed_count,
-            "rmw graph registry recovered: endpoints list for other processes again"
+            "rmw graph registry: a new endpoint is listed for other processes after \
+             failures; the endpoints that failed stay unlisted"
         );
     }
 }
@@ -678,7 +678,7 @@ fn report_graph_registry_failure(topic: &str, error: &str) {
 
 /// The human-readable text of a caught panic payload (`panic!("…")` carries a
 /// `&str` or a `String`; anything else is named as such rather than dropped).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
         .copied()

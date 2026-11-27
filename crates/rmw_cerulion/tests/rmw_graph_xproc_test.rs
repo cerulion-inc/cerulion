@@ -11,7 +11,8 @@
 //! The test process itself opens no transport. Each child obeys one command per
 //! stdin line (create or destroy an endpoint, list, gather, exit) and answers
 //! each with one `XPROC_REPLY` line, so the arms run in lockstep with no sleep.
-//! Every listing is compared with a hand-written string.
+//! Every listing is compared with a hand-written string. The arms that count
+//! log lines read the child's stderr after it has exited.
 //!
 //! The children share the machine's iceoryx2 and spawn processes, so run serial:
 //!
@@ -26,15 +27,22 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::raw::{c_char, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cerulion_core::testing::{
     child_iceoryx_config, IsolatedRoot, CHILD_IOX2_PREFIX_ENV, CHILD_IOX2_ROOT_ENV,
 };
-use cerulion_core::transport::rmw_graph_registry::GatherCompleteness;
+use cerulion_core::transport::dead_node_sweep::sweep_node_config;
+use cerulion_core::transport::rmw_graph_registry::{
+    GatherCompleteness, RMW_GRAPH_MAX_NODES, RMW_GRAPH_MAX_READERS, RMW_GRAPH_MAX_WRITERS,
+    RMW_GRAPH_QUEUE_DEPTH, RMW_GRAPH_REGISTRY_SERVICE_NAME,
+};
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
+use iceoryx2::node::NodeBuilder;
+use iceoryx2::prelude::ServiceName;
+use iceoryx2::service::ipc_threadsafe::Service as CerService;
 use rmw_cerulion::ffi::{self, RMW_RET_OK};
 use rmw_cerulion::*;
 
@@ -251,9 +259,41 @@ struct ChildState {
     publishers: HashMap<String, *mut ffi::rmw_publisher_t>,
     subscriptions: HashMap<String, *mut ffi::rmw_subscription_t>,
     natives: Vec<cerulion_core::transport::publisher::CerulionPublisher>,
+    /// Every reader slot of the registry service, held by `hog`.
+    held_slots: Vec<iceoryx2::port::subscriber::Subscriber<CerService, [u8], ()>>,
+    raw_node: Option<iceoryx2::node::Node<CerService>>,
 }
 
 impl ChildState {
+    /// Take every reader slot of the registry service, opened with the
+    /// registry's own static config, so a gather cannot open its subscriber.
+    fn hog(&mut self) {
+        let config = child_iceoryx_config().expect("the isolated root");
+        let node = self.raw_node.get_or_insert_with(|| {
+            NodeBuilder::new()
+                .config(&sweep_node_config(&config))
+                .create::<CerService>()
+                .expect("raw node")
+        });
+        let name: ServiceName = RMW_GRAPH_REGISTRY_SERVICE_NAME
+            .try_into()
+            .expect("service name");
+        let service = node
+            .service_builder(&name)
+            .publish_subscribe::<[u8]>()
+            .subscriber_max_buffer_size(RMW_GRAPH_QUEUE_DEPTH)
+            .max_subscribers(RMW_GRAPH_MAX_READERS)
+            .max_publishers(RMW_GRAPH_MAX_WRITERS)
+            .max_nodes(RMW_GRAPH_MAX_NODES)
+            .history_size(0)
+            .enable_safe_overflow(true)
+            .open_or_create()
+            .expect("registry service");
+        self.held_slots = (0..RMW_GRAPH_MAX_READERS)
+            .map(|_| service.subscriber_builder().create().expect("hold a slot"))
+            .collect();
+    }
+
     fn ts(&mut self, name: &str) -> *const ffi::rosidl_message_type_support_t {
         *self
             .type_supports
@@ -360,6 +400,14 @@ impl ChildState {
                 codes.map(|c| c.to_string()).join(",")
             }
             ["faults"] => self.fault_walk(),
+            ["hog"] => {
+                self.hog();
+                "ok".into()
+            }
+            ["unhog"] => {
+                self.held_slots.clear();
+                "ok".into()
+            }
             other => panic!("unknown child command {other:?}"),
         }
     }
@@ -431,6 +479,8 @@ fn subprocess_child_rmw_process() {
             publishers: HashMap::new(),
             subscriptions: HashMap::new(),
             natives: Vec::new(),
+            held_slots: Vec::new(),
+            raw_node: None,
         };
         // A leading newline: libtest has printed `test <name> ... ` already.
         writeln!(out).expect("reply");
@@ -459,12 +509,19 @@ struct Child {
     process: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     replies: Receiver<String>,
+    stderr: Arc<Mutex<Vec<String>>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Child {
     fn spawn(root: &IsolatedRoot, name: &'static str) -> Child {
+        Self::spawn_with(root, name, &[])
+    }
+
+    fn spawn_with(root: &IsolatedRoot, name: &'static str, envs: &[(&str, &str)]) -> Child {
         let exe = std::env::current_exe().expect("current_exe");
-        let mut process = std::process::Command::new(exe)
+        let mut command = std::process::Command::new(exe);
+        command
             .args([
                 "--exact",
                 CHILD_TEST,
@@ -477,11 +534,14 @@ impl Child {
             .env(CHILD_IOX2_PREFIX_ENV, &root.prefix)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .expect("spawn child");
+            .stderr(std::process::Stdio::piped());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        let mut process = command.spawn().expect("spawn child");
         let stdin = process.stdin.take();
         let stdout = process.stdout.take().expect("child stdout");
+        let child_stderr = process.stderr.take().expect("child stderr");
         let (tx, replies) = std::sync::mpsc::channel();
         // Drain stdout to its end even after the parent stops reading, so the
         // child never fails a write on a closed pipe.
@@ -493,11 +553,22 @@ impl Child {
                 }
             }
         });
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&stderr);
+        let stderr_reader = std::thread::spawn(move || {
+            for line in BufReader::new(child_stderr).lines() {
+                let Ok(line) = line else { break };
+                eprintln!("[{name}] {line}");
+                sink.lock().expect("stderr lines").push(line);
+            }
+        });
         let mut child = Child {
             name,
             process,
             stdin,
             replies,
+            stderr,
+            stderr_reader: Some(stderr_reader),
         };
         assert_eq!(child.reply("start"), "ready");
         child
@@ -525,9 +596,18 @@ impl Child {
         self.reply(command)
     }
 
-    /// End the child with `process::exit(0)`, every endpoint still live, and
-    /// wait until it is gone.
-    fn exit_without_destroying(mut self) {
+    /// Send a signal to this child, by the process id this test started.
+    fn signal(&self, signal: &str) {
+        let status = std::process::Command::new("kill")
+            .args([signal, &self.process.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill {signal} child {}", self.name);
+    }
+
+    /// End the child with `process::exit(0)`, every endpoint still live, wait
+    /// until it is gone, and return every line it wrote to stderr.
+    fn exit_without_destroying(mut self) -> Vec<String> {
         let stdin = self.stdin.as_mut().expect("child stdin");
         writeln!(stdin, "exit").expect("write exit");
         stdin.flush().expect("flush exit");
@@ -536,7 +616,7 @@ impl Child {
             match self.process.try_wait().expect("try_wait") {
                 Some(status) => {
                     assert!(status.success(), "child {} exited with {status}", self.name);
-                    return;
+                    break;
                 }
                 None if Instant::now() > deadline => {
                     panic!("child {} did not exit in {REPLY_DEADLINE:?}", self.name)
@@ -544,6 +624,33 @@ impl Child {
                 None => std::thread::sleep(Duration::from_millis(10)),
             }
         }
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("stderr reader");
+        }
+        self.stderr.lock().expect("stderr lines").clone()
+    }
+}
+
+/// How many of `lines` contain `text`.
+fn count(lines: &[String], text: &str) -> usize {
+    lines.iter().filter(|l| l.contains(text)).count()
+}
+
+/// A scratch directory removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn mint(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        Self(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -702,6 +809,18 @@ fn an_endpoint_whose_type_name_is_over_the_frame_bound_is_created_but_listed_onl
         lister.ask(&format!("list {p}")),
         format!("{p}/short=rmw_gx/msg/Short")
     );
+    // The destroy of the refused endpoint succeeds and removes nothing else.
+    assert_eq!(talker.ask(&format!("unpub {p}/long")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/short=rmw_gx/msg/Short")
+    );
+    let talker_log = talker.exit_without_destroying();
+    assert_eq!(
+        count(&talker_log, "an endpoint is not listed for other processes"),
+        1,
+        "the refused name logs once: {talker_log:#?}"
+    );
 }
 
 #[test]
@@ -735,5 +854,143 @@ fn a_failed_allocation_at_every_point_frees_everything_and_leaves_the_out_param_
             "0:{bad}:clean;1:{bad}:clean;2:{bad}:clean;3:{bad}:clean;4:{bad}:clean;\
              5:{bad}:clean;6:0:clean"
         )
+    );
+}
+
+#[test]
+#[serial]
+fn one_pair_lists_once_for_two_processes_and_until_its_last_local_endpoint_leaves() {
+    let root = IsolatedRoot::mint("rgxj");
+    let p = prefix("j");
+    let mut lister = Child::spawn(&root, "lister");
+    let mut talker = Child::spawn(&root, "talker");
+    let mut other = Child::spawn(&root, "other");
+    assert_eq!(talker.ask(&format!("pub {p}/shared Same")), "ok");
+    assert_eq!(other.ask(&format!("pub {p}/shared Same")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/counted Count")), "ok");
+    assert_eq!(talker.ask(&format!("sub {p}/counted Count")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/counted=rmw_gx/msg/Count;{p}/shared=rmw_gx/msg/Same")
+    );
+    assert_eq!(talker.ask(&format!("unpub {p}/counted")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/counted=rmw_gx/msg/Count;{p}/shared=rmw_gx/msg/Same")
+    );
+    assert_eq!(talker.ask(&format!("unsub {p}/counted")), "ok");
+    assert_eq!(talker.ask(&format!("unpub {p}/shared")), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/shared=rmw_gx/msg/Same")
+    );
+}
+
+/// The lister logs at info, so its recovery line is visible.
+const LISTER_LOG: (&str, &str) = ("RUST_LOG", "rmw_cerulion=info,cerulion_core=warn");
+const MISSED: &str = "topic listing may miss topics of other processes; it returns";
+const HEARD_AGAIN: &str = "topic listing hears every other process again";
+
+#[test]
+#[serial]
+fn a_listing_that_cannot_hear_a_stopped_process_returns_its_own_topics_and_warns_once() {
+    let root = IsolatedRoot::mint("rgxk");
+    let p = prefix("k");
+    let mut lister = Child::spawn_with(&root, "lister", &[LISTER_LOG]);
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(lister.ask(&format!("pub {p}/local Local")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/remote Remote")), "ok");
+    let both = format!("{p}/local=rmw_gx/msg/Local;{p}/remote=rmw_gx/msg/Remote");
+    assert_eq!(lister.ask(&format!("list {p}")), both);
+    // A stopped process keeps its live node and its writer, and answers no
+    // doorbell: every listing ends its window `Incomplete`.
+    talker.signal("-STOP");
+    for _ in 0..3 {
+        assert_eq!(
+            lister.ask(&format!("list {p}")),
+            format!("{p}/local=rmw_gx/msg/Local")
+        );
+    }
+    talker.signal("-CONT");
+    assert_eq!(lister.ask(&format!("list {p}")), both);
+    let log = lister.exit_without_destroying();
+    assert_eq!(count(&log, MISSED), 1, "{log:#?}");
+    assert_eq!(count(&log, HEARD_AGAIN), 1, "{log:#?}");
+}
+
+#[test]
+#[serial]
+fn a_listing_whose_gather_cannot_open_returns_its_own_topics_and_warns_once() {
+    let root = IsolatedRoot::mint("rgxl");
+    let p = prefix("l");
+    let mut lister = Child::spawn_with(&root, "lister", &[LISTER_LOG]);
+    let mut talker = Child::spawn(&root, "talker");
+    let mut hog = Child::spawn(&root, "hog");
+    assert_eq!(lister.ask(&format!("pub {p}/local Local")), "ok");
+    assert_eq!(talker.ask(&format!("pub {p}/remote Remote")), "ok");
+    assert_eq!(hog.ask("hog"), "ok");
+    for _ in 0..3 {
+        assert_eq!(
+            lister.ask(&format!("list {p}")),
+            format!("{p}/local=rmw_gx/msg/Local")
+        );
+    }
+    assert_eq!(hog.ask("unhog"), "ok");
+    assert_eq!(
+        lister.ask(&format!("list {p}")),
+        format!("{p}/local=rmw_gx/msg/Local;{p}/remote=rmw_gx/msg/Remote")
+    );
+    let log = lister.exit_without_destroying();
+    assert_eq!(count(&log, MISSED), 1, "{log:#?}");
+    assert!(
+        log.iter()
+            .any(|l| l.contains(MISSED) && l.contains("could not create the gather subscriber")),
+        "the warning names the cause: {log:#?}"
+    );
+    assert_eq!(count(&log, HEARD_AGAIN), 1, "{log:#?}");
+}
+
+#[test]
+#[serial]
+fn a_replayed_process_neither_lists_its_topics_for_others_nor_reads_theirs() {
+    let root = IsolatedRoot::mint("rgxm");
+    let logs = ScratchDir::mint("rgx_delivery_logs");
+    let logs_dir = logs.0.to_str().expect("utf-8 path").to_string();
+    let p = prefix("m");
+    let mut talker = Child::spawn(&root, "talker");
+    assert_eq!(talker.ask(&format!("pub {p}/live Live")), "ok");
+
+    // Recording keeps the live answer: both ways.
+    let mut recorder = Child::spawn_with(
+        &root,
+        "recorder",
+        &[("CERULION_RMW_DELIVERY_LOG", logs_dir.as_str())],
+    );
+    assert_eq!(recorder.ask(&format!("pub {p}/replayed Replayed")), "ok");
+    let both = format!("{p}/live=rmw_gx/msg/Live;{p}/replayed=rmw_gx/msg/Replayed");
+    assert_eq!(recorder.ask(&format!("list {p}")), both);
+    assert_eq!(talker.ask(&format!("list {p}")), both);
+    recorder.exit_without_destroying();
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/live=rmw_gx/msg/Live")
+    );
+
+    let log = std::fs::read_dir(&logs.0)
+        .expect("the recording directory")
+        .map(|e| e.expect("entry").path())
+        .find(|path| path.to_string_lossy().ends_with(".rdl.mcap"))
+        .expect("the recorder wrote a delivery log");
+    let log = log.to_str().expect("utf-8 path").to_string();
+    let mut replayed =
+        Child::spawn_with(&root, "replayed", &[("CERULION_RMW_REPLAY", log.as_str())]);
+    assert_eq!(replayed.ask(&format!("pub {p}/replayed Replayed")), "ok");
+    assert_eq!(
+        replayed.ask(&format!("list {p}")),
+        format!("{p}/replayed=rmw_gx/msg/Replayed")
+    );
+    assert_eq!(
+        talker.ask(&format!("list {p}")),
+        format!("{p}/live=rmw_gx/msg/Live")
     );
 }
