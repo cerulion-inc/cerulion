@@ -172,6 +172,15 @@ value: a failure there is a wire-compatibility break. The two gates are
 deliberately separate: the bare-ref gate catches the CAUSE on any type; the wire
 pin catches the CONSEQUENCE on the measured set.
 
+The instrument for those numbers is
+`rmw_cerulion`'s `rclpy_xproc_test::schema_hash_capture_rclpy_publishers_to_native_subscribers`.
+The Jazzy row of the rmw distro lane (`tools/ci/rmw-distros/gate.sh`) runs it: stock
+`rclpy` publishes each pinned type, plus the fixed-only control `geometry_msgs/Pose`,
+over `rmw_cerulion`; a native subscriber reads `WireHeader::schema_hash` off the first
+frame. The lane prints one `MEASURED <package>/<Name> 0x<hash>` line per type, in the
+log and in the job summary, and fails unless each equals the generated `SCHEMA_HASH`.
+A new or changed table entry is copied from those lines, never from `schema_hash()`.
+
 ## Adding or changing a `.msg`: checklist
 
 1. Edit/add the file under `msg/<pkg>/`; `cargo build -p native_ros2_messages`.
