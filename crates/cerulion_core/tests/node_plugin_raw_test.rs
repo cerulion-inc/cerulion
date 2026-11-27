@@ -1378,3 +1378,150 @@ fn raw_frame_duplicate_block_commit_refusal_is_deterministic() {
         }
     );
 }
+
+#[test]
+fn raw_frame_block_output_commits_in_shutdown_call_after_last_tick_are_sent() {
+    use cerulion_core::credit::CreditWord;
+    use cerulion_core::error::TransportError;
+    use cerulion_core::graph::node::AnyPublisher;
+    use cerulion_core::graph::node_host_abi::HostPortSpec;
+    use cerulion_core::transport::plugin_lease::{LeaseDirection, PluginWireLayout};
+
+    let clock = Arc::new(VirtualClock::new());
+    clock.set(4_200);
+    let manager = TransportManager::init_for_test(
+        TransportConfig {
+            node_name: "node_plugin_raw_block_shutdown".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 8,
+            network: None,
+        },
+        iceoryx_test_config(),
+    )
+    .unwrap();
+    let word = CreditWord::local(3);
+    let mut publisher = manager
+        .create_publisher(
+            "abi/raw/block/shutdown",
+            MaxSliceLen::try_new(64).unwrap(),
+            0,
+        )
+        .unwrap();
+    publisher.register_block_outstanding_named_for_test(word.clone(), "sink", "status_in");
+    let mut subscriber = manager.create_subscriber("abi/raw/block/shutdown").unwrap();
+    let mut publishers = IndexMap::new();
+    publishers.insert("status".into(), AnyPublisher::Ipc(publisher));
+    let env = Arc::new(HashMap::new());
+    let mut native = NodeContext::with_runtime_env(
+        publishers,
+        IndexMap::new(),
+        clock,
+        ShutdownSignal::new(),
+        env.clone(),
+    );
+    native.set_transport(manager.clone());
+    native.set_node_id_for_test("status_node");
+    let specs = vec![HostPortSpec {
+        name: "status".into(),
+        direction: LeaseDirection::Write,
+        layout: PluginWireLayout {
+            schema_hash: Vector3::SCHEMA_HASH,
+            fixed_size: 24,
+            variable_fields: 0,
+            alignment: 8,
+        },
+        read_mode: 0,
+        accumulate_cap: None,
+    }];
+    let context = ContextHandle {
+        value: register_context(HostContext::new(native, specs, env, 2).unwrap()).unwrap(),
+    };
+    // SAFETY (U05): process HOST_API and registered context outlive client and plugin.
+    let client = unsafe { HostClient::connect(&HOST_API, context, 0) }.unwrap();
+    let info = DylibNodeEntry::parse_info_json_labeled(
+        &format!(
+            r#"{{"inputs":[],"outputs":[{{"name":"status","schema_hash":{},"max_slice_len_default":64}}],"policy":{{"period_ms":1}}}}"#,
+            Vector3::SCHEMA_HASH
+        ),
+        "raw block shutdown",
+    )
+    .unwrap();
+    let commit = |plugin: &mut PluginContext, x: f64| -> Result<(), TransportError> {
+        let mut loan = plugin
+            .publisher_mut("status")
+            .unwrap()
+            .loan_raw_frame(HostClient::request::<Vector3>(), 64)
+            .unwrap();
+        let bytes = loan.bytes_mut();
+        let mut header = WireHeader::new(Vector3::SCHEMA_HASH, 0, 0);
+        header.total_size = 64;
+        header.offset_table_offset = 64;
+        header.write_to_buf(bytes);
+        bytes[40..48].copy_from_slice(&x.to_le_bytes());
+        bytes[48..64].fill(0);
+        loan.commit()
+    };
+    // A raw view drains to the newest frame, so each check follows one commit.
+    let mut received = |sequence: u32, x: f64| {
+        let view = subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .expect("status frame delivered");
+        assert_eq!(view.header().sequence, sequence);
+        assert_eq!(&view[40..48], &x.to_le_bytes());
+        drop(view);
+        assert!(subscriber
+            .view_raw_expecting(Vector3::SCHEMA_HASH)
+            .unwrap()
+            .is_none());
+    };
+
+    // Init call: no fire is open, so the per-fire limit does not apply.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    let mut plugin = PluginContext::new(HostClient::share(&client), &info).unwrap();
+    with_context(context.value, HostContext::end_node_call).unwrap();
+
+    // Last tick: one commit inside the fire, as the tick path opens it.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    commit(&mut plugin, 1.0).unwrap();
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    received(0, 1.0);
+    word.record_drained(1);
+    assert_eq!(word.outstanding(), 0);
+
+    // Shutdown call after the last tick: no fire is open, so both final
+    // status frames are sent while the queue has room.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    commit(&mut plugin, 2.0).unwrap();
+    received(1, 2.0);
+    commit(&mut plugin, 3.0).unwrap();
+    received(2, 3.0);
+    assert!(!client.has_failure());
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    assert_eq!(word.outstanding(), 2);
+    word.record_drained(2);
+
+    // A later fire opens the window again and refuses its second commit.
+    with_context(context.value, HostContext::begin_node_call).unwrap();
+    with_context(context.value, HostContext::begin_fire).unwrap();
+    commit(&mut plugin, 4.0).unwrap();
+    let TransportError::HostServiceFailed { reason } = commit(&mut plugin, 5.0).unwrap_err() else {
+        panic!("expected HostServiceFailed on the second commit in a fire");
+    };
+    assert_eq!(
+        reason,
+        "node 'status_node' output 'status' on topic 'abi/raw/block/shutdown' already committed a frame in this fire; block consumer 'sink.status_in' allows at most one commit per output per fire"
+    );
+    with_context(context.value, HostContext::end_node_call).unwrap();
+    assert_eq!(word.outstanding(), 1);
+    received(3, 4.0);
+    assert_eq!(
+        with_context(context.value, |host| Ok(host.counters().committed)).unwrap(),
+        4
+    );
+
+    drop(plugin);
+    drop(client);
+    remove_context(context.value).unwrap();
+}

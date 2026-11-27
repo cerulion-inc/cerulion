@@ -229,6 +229,9 @@ pub struct HostContext {
     native: NodeContext,
     ports: Box<[BoundPort]>,
     call_thread: Option<std::thread::ThreadId>,
+    // Open from `begin_fire` until the tick's node call ends; the per-fire
+    // `block` commit limit applies only inside it, never in init or shutdown.
+    fire_open: bool,
     environment: Arc<HashMap<String, String>>,
     counters: HostLeaseCounters,
     terminal: bool,
@@ -257,6 +260,7 @@ impl HostContext {
             return Err(HostServiceError::InvalidState);
         }
         self.call_thread = None;
+        self.fire_open = false;
         Ok(())
     }
     fn require_node_call(&self) -> Result<(), HostServiceError> {
@@ -442,6 +446,7 @@ impl HostContext {
                 .into_boxed_slice(),
             raw,
             call_thread: None,
+            fire_open: false,
             environment,
             counters: HostLeaseCounters::default(),
             terminal: false,
@@ -569,6 +574,7 @@ impl HostContext {
             bound.committed_this_fire = false;
             bound.duplicate_block_commit_this_fire = false;
         }
+        self.fire_open = true;
         Ok(())
     }
 
@@ -1411,6 +1417,7 @@ impl HostContext {
     pub fn revoke(&mut self) {
         self.terminal = true;
         self.call_thread = None;
+        self.fire_open = false;
         let native = &mut self.native;
         let ports = &self.ports;
         let counters = &mut self.counters;
@@ -1453,7 +1460,7 @@ impl HostContext {
         &mut self,
         index: usize,
     ) -> Result<Option<HostServiceError>, HostServiceError> {
-        if !self.ports[index].committed_this_fire {
+        if !self.ports[index].committed_this_fire || !self.fire_open {
             return Ok(None);
         }
         if self.output_publisher(index)?.block_consumer().is_none() {
