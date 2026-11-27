@@ -323,9 +323,10 @@ cannot. Current builds also refuse a second commit per output per fire on a
 past the depth without that metadata as no release, since an older recording
 can hold one. Re-executing such a recording refuses the second commit, as a
 live run of the current build does, so `--verify` reports the missing frame as
-a divergence on that topic; record the run again with the current build. A step excused only by holds is a
-divergence, and the finding says why, if every slot that excused it shows a
-release with no record before its consumer next reads it.
+a divergence on that topic; record the run again with the current build. A
+step excused only by holds is a divergence, and the finding says why, if every
+slot that excused it shows a release with no record before its consumer next
+reads it.
 
 The slot allows for no hold where:
 
