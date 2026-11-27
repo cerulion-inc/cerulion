@@ -41,7 +41,7 @@ lookup, with a successful request through the same observer after re-enabling.
 
 The surface is `cerulion bag play <bag> --resim all [--verify] [-u|--duration D]
 [--strict-state] [--allow-param-change] [--record-out FILE] [--report FILE] [--tolerance YAML]
-[--feed-index-budget BYTES]`. `resim_cmd.rs` owns flag legality and
+[--feed-index-budget BYTES] [--verifier-record-budget COUNT]`. `resim_cmd.rs` owns flag legality and
 the neutral renderer, `replay_cmd.rs` the entry gates and the stable exit-code surface, and
 `replay_engine.rs` the deterministic re-execution itself. The bag is the golden: it carries
 the graph, env snapshot, recorded frames, and scheduler trace, and the run re-executes the
@@ -67,7 +67,10 @@ that fails warns), and the
 engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
 REQUIRE `--verify`, and so does `--feed-index-budget`, the bytes a fed replay's frame
 index and the producer labels it reads are charged (`replay_feed::FeedNeed::check_budget`;
-default 1 GiB). Every misuse exits 2, never 1:
+default 1 GiB). `--verifier-record-budget` needs only `--resim`, is legal in both modes and refuses `0`
+(`replay_engine::DEFAULT_VERIFIER_RECORD_BUDGET`, 3000000, bounds each rank's read log, frame index
+and per-pass schedule; the separate 200000 reads inside one step is a fixed guard it never raises).
+Every misuse exits 2, never 1:
 under `--verify` 1 means "your code diverged", so a malformed invocation reported as 1
 would make CI announce a regression that does not exist.
 
@@ -710,6 +713,13 @@ opt-in `--scan` subnet sweep is a separate rung that must stay opt-in). The remo
 is best-effort: a session/query failure is a loud note plus exit 0, never silently
 empty, never a hang.
 
+The LOCAL half needs an iceoryx2 node. When one cannot be created, for example on
+macOS when a stopped process left a stale `.shm_state` file on the namespace's global
+management segment, node creation gives up after `creation_timeout` (1 s by default,
+once for the mirror-attribution reader and once for the transport singleton) and the
+verb exits 1 with the `NodeCreation` message, which names `cerulion clean`. It never
+spins and never panics (`topic_list_dangling_shm_test`).
+
 - **The ladder produces candidates, not sessions.** Rungs: mDNS browse (primary), the
   peer cache `~/.cerulion/peers.json` (TTL-bounded), the hostname convention
   (`CERULION_PEERS` / config `peers` / `<name>.local`), and opt-in `--scan`. No rung
@@ -1169,6 +1179,7 @@ hand-oracle unit tests in `replay_value_diff/tests.rs`.
 | `tests/replay_cli_test.rs` | Exit-code contract over the real binary (exit-6 mapping; the exit-3 execution arm via a panicking twin cdylib); a resim on its private namespace delivers nothing to a live input or an egress tap on the shared one (including external-input data-trigger isolation in both `--verify` and neutral modes) and opens no node on the shared namespace; two resims on two different slots write identical reports and `--record-out` bags carrying no slot data; and two resims in a row reuse the slot the first resim claimed, remove a leftover segment planted on it and leave one namespace's files (lockable resim slots are also swept by `ipc_cleanup::sweep_resim_slots` from `clean`, `doctor`, and exit hygiene) | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_perturbed_cdylib`, `test_node_macro_period_panic_cdylib`, `test_node_nondeterministic_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/node_fatal_e2e_test.rs` | A node returning `NodeError::Fatal` on a temp workspace, `--single-process`: exact delivered frames, ONE fatal log line, `graph run` exit 3 (record and plain arms), `bag play --resim all --verify` exit 0 on the recording; a recorded `Logic` error keeps the node firing (a second failure is logged), exit 0 and the same two frames | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
 | `tests/node_fatal_mp_e2e_test.rs` | The same workspace on the multi-process default (Linux only, iceoryx2 2034 waiver on macOS): two workers, ONE fatal line, the worker's and the supervisor's `Error:` lines, exit 3, not degraded, no orphan; a `Logic` error keeps the node firing (a second failure is logged) and exits 0 | yes | `test_node_macro_period_cdylib`, `test_node_error_kind_cdylib` |
+| `tests/verifier_budget_cli_e2e_test.rs` | `--verifier-record-budget` over the real binary: a free-run bag with 200016 reads verifies under the default, is refused at `--verifier-record-budget 200000`, and is admitted with `--duration 1.0`; the usage errors (`0`, no `--resim`) and `--help` | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/mp_record_e2e_test.rs` | Multi-process `--record` bag contracts (one bag, one rank per executor unit with its manifest, departure sentinel, ring sweep) | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `tests/mp_auto_partition_e2e_test.rs` | Unix nonrecording and refusal arms; Linux recording and orphan cleanup (macOS runs none of this binary under the iceoryx2 2034 waiver). Ephemeral multi-process default over PTY and non-TTY stdin, real two-node output and clean worker shutdown; explicit persist, opt-out (one level loop, or one worker hosting every executor unit), refusal never mutates the file; a 3-worker run beside variables that are not valid UTF-8 prints each environment warning once | yes | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib`, `test_node_macro_trigger_block_cdylib` |
 | `tests/mp_split_pair_e2e_test.rs` | The mid-level barrier's PLUMBING over the real binary: classify -> stamp -> serialise -> install, read off each worker's own build line. Pins the `CERULION_EXECUTION_MODE=lockstep` opt-out on purpose: a free-run deployment has no barrier to plumb, so the property under test only exists there. Deliberately NOT the ordering discriminator (that is deterministic only in-process); what it buys is that the extra generation neither desynchronises a real deployment nor loses frames, and that two live runs record byte-identical frames. | yes | `test_node_macro_period_cdylib`, `test_node_macro_period_input_cdylib` |
@@ -1178,6 +1189,7 @@ hand-oracle unit tests in `replay_value_diff/tests.rs`.
 | `tests/network_gateway_mp_e2e_test.rs` | Strict networked multi-process acceptance (worker → SHM → gateway → zenoh → external) | yes | same two |
 | `tests/signal_matrix_e2e_test.rs` | SIGINT/SIGTERM/SIGHUP each exit EXACTLY 0 (`code()==None` would mean a default-disposition kill) + repeat-SIGINT idempotency, the behavioral floor for the §7 signal contract | yes | `test_node_macro_period_cdylib` |
 | `tests/viz_interrupt_e2e_test.rs` | A SIGINT'd viz attach exits 0 with no absence-claim vocabulary; under `CERULION_NETWORK=off`, a `cerulion viz` that reuses a running daemon prints on stderr the note that the switch does not reach it | no | none |
+| `tests/topic_list_dangling_shm_test.rs` | `topic list --no-network` on an isolated prefix (project-local `config/iceoryx2.toml`) whose global management `.shm_state` file names absent shared memory, or is empty: exit 1 within 10 s, no listing, no segment created, and stderr naming `UnableToGenerateUniqueNodeId` and `cerulion clean`; a clean prefix prints `No active local topics.` and exits 0. A 30 s watchdog kills a run that spins (macOS and FreeBSD only) | no | none |
 | `tests/ros2_run_e2e_test.rs` | Both `cerulion ros2` verbs over the real binary with a fixture `ros2` first on PATH: exit-code INHERITANCE through `exec()` (42 → 42) on EACH verb, LEADING-hyphen verbatim forwarding (the raw-argv intercept pin), the heap-hook auto-inject + kill switch + explicit preload, the staged env + ament symlink, and the 69 / 127 / 2 contract; plus the `--adopt-take` refusal over the real binary (both verbs, exit 69, `ros2` never exec'd, the cause and the direct-launch recipe on stderr, with a flagless control that still execs; and that the refusal is decided BEFORE any staging, so it creates nothing) the pin that `cerulion ros2 --help` says the flag is REFUSED rather than that it arms the child; and bytes that are not valid UTF-8 reaching `ros2` as given, a forwarded argument and a `--record-deliveries` directory alike; no ROS 2 needed | no (per-child env only) | none |
 | `tests/argv_not_utf8_cli_test.rs` | A command-line argument that is not valid UTF-8 over the real binary: in a text field and in the place of a verb (top level, under a verb, the `ros2` action) or a long or short flag name, exit 2 with one `Error:` line per such argument (its position and bytes) and the remedy line, every such argument named even when one is a path; in a path field, the verb runs on that path; a usage error about another argument beside such a path keeps clap's text, and `--help` beside it prints the verb's help, exit 0; never a panic | no | none |
 | `tests/graph_launch_args_e2e_test.rs` | Launch arguments over the real binary: a graph with `args:` referenced in `prefix`, an output `topic`, an input `source` and `params:` runs once with defaults and once with `name:=value` overrides; the delivered topic names and the recorded frames match hand oracles from the two fixture bodies, `graph validate` lists the resolved param values, the recorded `graph.yaml` is the resolved graph (overrides applied, no `args:`, no reference) and `bag play --resim all --verify` passes for both bags; a `$$` escape in the file and a `$$` in an override value reach the node once and resim byte for byte from the recorded graph read as written; `--yes` under an override that moves a topic is refused and nothing is written (the graph file byte-identical, no backup); each load error (unknown override, undeclared reference, unterminated reference, wrong type from an override and from a default naming the argument behind the param, a word that is not `name:=value`) exits non-zero naming the argument, and a mistake in the file names its location | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_data_trigger_cdylib` |

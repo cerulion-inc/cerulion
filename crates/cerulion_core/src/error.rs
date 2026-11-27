@@ -14,7 +14,7 @@ pub enum TransportError {
     #[error("Remote access policy for topic '{topic}' refused: {reason}")]
     EgressScope { topic: String, reason: String },
     /// Failed to create iceoryx2 node.
-    #[error("Failed to create node '{node_name}': {reason}. Check that no other Cerulion process is using the same node name, and that shared memory permissions are correct.")]
+    #[error("Failed to create node '{node_name}': {reason}. Check that no other Cerulion process is using the same node name, and that shared memory permissions are correct. If a Cerulion process stopped while it started, run `cerulion clean` to remove the shared memory state it left behind.")]
     NodeCreation { node_name: String, reason: String },
     /// Failed to create publisher.
     #[error("Failed to create publisher on topic '{topic}': {reason}. Verify the topic name in your graph YAML and ensure no conflicting publisher exists.")]

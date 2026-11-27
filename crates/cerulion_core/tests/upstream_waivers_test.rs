@@ -305,6 +305,12 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
          rejected before any node plugin loads, so no process asks for a second \
          resource; its 17 arms passed on macOS at 623c500b",
     ),
+    (
+        "crates/cerulion_cli/tests/verifier_budget_cli_e2e_test.rs",
+        "spawns one `bag play --resim all` child per run, and each child loads its node \
+         plugins once and exits, so no process asks for a second resource after a load; \
+         its one arm passed on Darwin 27 under `-- --test-threads=1`",
+    ),
 ];
 
 /// Binaries waived WHOLE on macOS, as `(path from the workspace root, the upstream

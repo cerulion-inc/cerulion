@@ -1091,6 +1091,11 @@ impl ShmRingProducer {
         self.local_write
     }
 
+    /// Ring capacity in records.
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
     /// This ring's [`OverrunPolicy`].
     pub fn overrun_policy(&self) -> OverrunPolicy {
         self.policy

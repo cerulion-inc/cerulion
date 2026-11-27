@@ -351,10 +351,16 @@ The slot is released, and holds nothing from then on:
 The consecutive-panic breaker releases no slot. After a stop that releases
 the slot, the two releases with no record do not apply. `#[cerulion_node]`
 sets that metadata, a `--raw-ffi` node may set it by hand, and a Python node
-cannot. Without it, a count past the depth is no release, since a `--raw-ffi`
-node can send several frames in one fire. A step excused only by holds is a
-divergence, and the finding says why, if every slot that excused it shows a
-release with no record before its consumer next reads it.
+cannot. Current builds also refuse a second commit per output per fire on a
+`block` topic at the host commit site, naming the node, output, topic and
+`block` consumer without sending the frame. The verifier still reads a count
+past the depth without that metadata as no release, since an older recording
+can hold one. Re-executing such a recording refuses the second commit, as a
+live run of the current build does, so `--verify` reports the missing frame as
+a divergence on that topic; record the run again with the current build. A
+step excused only by holds is a divergence, and the finding says why, if every
+slot that excused it shows a release with no record before its consumer next
+reads it.
 
 The slot allows for no hold where:
 
@@ -418,14 +424,12 @@ the node carries at most one note for it (a `hold_allowed_for` note of code
 unfired. The node carries at most one note for it (a `hold_allowed_for` note
 of code `sync_block_held`), and the node is still judged on every other step
 and on the sets it fired. At any other step either node owes every fire. A
-`hold_allowed_for` note is not a `stand_down`: the rule judged the node. A
-neutral `--resim all` reaches the `Sync` rule for such a node. A `--verify`
-replay of a free-run bag from trace format 8 refuses a per-set `Sync` node
-before its first step (`read_identity_ungateable_stage`, exit 2), whichever
-worker process its trigger topics come from, so it does not reach the rule
-there. Where such an input holds a `Sync` node, the neutral `--resim all`
-reports a read-log divergence at the node's first fire after the hold, and
-exits 0.
+`hold_allowed_for` note is not a `stand_down`: the rule judged the node. Both
+a neutral `--resim all` and a `--verify` replay of a free-run bag from trace
+format 8 reach the `Sync` rule for a per-set `Sync` node: `--verify` feeds its
+trigger inputs by recorded read identity and judges the node, while a neutral
+`--resim all` over a held `Sync` node reports a read-log divergence at the
+node's first fire after the hold and exits 0.
 
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
@@ -486,11 +490,11 @@ node (`sync_unfired_since_anchor`). Each of these stand-downs, the
 two-subscriber one included, prints a warning on stderr on every run, naming
 the node, the code, the bag's `trace_format` and the checkpoint step, and
 changes no exit code; its `stand_down` note is in the `--report` JSON, which
-only a `--verify` run writes. For a per-set `Sync` node a `--verify` replay
-reaches this rule only on a bag below trace format 8: from format 8 a free-run
-`--verify` is fed by read identity, which refuses a per-set `Sync` stage
-before its first step (`read_identity_ungateable_stage`, exit 2), so on such
-a bag a neutral `--resim all` is the replay that reaches it. A node that
+only a `--verify` run writes. For a resumed stopped per-set `Sync` node with
+zero reads in the slice, a `--verify` replay on a bag from trace format 8
+refuses before its first step (`read_log_no_coverage`, exit 2), so on such a
+bag a neutral `--resim all` (or `--verify` on a bag below trace format 8) is
+the replay that reaches this rule. A node that
 exports no state shape, such as a Python node, has no checkpoint part on any
 trace format, so the recording never states its stop: on a resumed pass where
 it neither fires nor reads in its body, these rules stand it down by name from

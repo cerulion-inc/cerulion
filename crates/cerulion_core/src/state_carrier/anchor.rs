@@ -33,7 +33,7 @@
 //! their first write). That is not a loss: one fork covers the whole set, and the
 //! fork's cost is per-PROCESS, not per-node.
 //!
-//! **The carrier split is not part of the bag's contract.** Both carriers call the same
+//! **The carrier split is not part of the bag's contract.** Every carrier calls the same
 //! generated encoder and emit identical bytes, so which nodes went inline and which
 //! forked is invisible in the recording. It is deterministic anyway — declaration order
 //! over identical state — but nothing depends on that.
@@ -49,7 +49,8 @@
 //!
 //! The fork carrier does not have this hazard at all — user code never runs on a node
 //! thread there — which is a genuine advantage of the fork, worth stating beside the
-//! inline path rather than burying.
+//! inline path rather than burying. The direct stream has it again (it runs user code on
+//! the unit thread), so its caller keeps the catch inside the guard's scope the same way.
 //!
 //! NOTE: this module is compiled only on Unix — the `#[cfg(unix)]` gate lives on the
 //! `pub mod state_carrier;` declaration in `lib.rs`.
@@ -66,7 +67,7 @@ use crate::state::{BoundedSink, StateError};
 pub trait InlineCaptureTarget {
     /// `CerulionState::INLINE_SAFE`, surfaced per node.
     ///
-    /// `false` sends the node to the fork carrier BEFORE anything else happens to it.
+    /// `false` sends the node to the deferred set BEFORE anything else happens to it.
     fn inline_safe(&self) -> bool;
 
     /// `CerulionState::cer_probe` — non-blocking, total over the declared state.
@@ -76,7 +77,8 @@ pub trait InlineCaptureTarget {
     fn capture(&self, sink: &mut BoundedSink<'_>) -> Result<(), StateError>;
 }
 
-/// Why a node was deferred to the fork carrier.
+/// Why a node was deferred. The deferred set goes to the fork carrier, or to the
+/// direct stream in a runtime armed without fork.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForkReason {
     /// `INLINE_SAFE` is `false` — the inline-safety gate, applied before any encoding.
@@ -94,15 +96,15 @@ pub enum ForkReason {
 pub struct InlineWalkStats {
     /// Nodes captured inline.
     pub inline_nodes: u32,
-    /// Nodes deferred to the fork carrier.
-    pub forked_nodes: u32,
+    /// Nodes deferred to the fork carrier or the direct stream.
+    pub deferred_nodes: u32,
     /// Bytes of the shared budget consumed, INCLUDING capacity charged to aborted
     /// attempts.
     pub bytes_used: usize,
-    /// Nodes whose encoder panicked (a subset of `forked_nodes`).
+    /// Nodes whose encoder panicked (a subset of `deferred_nodes`).
     pub unwound_nodes: u32,
     /// Nodes refused entry to the arena WITHOUT any encoding being attempted — the
-    /// `INLINE_SAFE` gate (a subset of `forked_nodes`).
+    /// `INLINE_SAFE` gate (a subset of `deferred_nodes`).
     pub gated_nodes: u32,
 }
 
@@ -147,7 +149,7 @@ pub fn walk_inline<T: InlineCaptureTarget>(
         // user-code execution on the node thread.
         if !node.inline_safe() {
             fork_set.push((idx, ForkReason::NotInlineSafe));
-            stats.forked_nodes += 1;
+            stats.deferred_nodes += 1;
             stats.gated_nodes += 1;
             continue;
         }
@@ -205,7 +207,7 @@ pub fn walk_inline<T: InlineCaptureTarget>(
                 stats.unwound_nodes += 1;
             }
             fork_set.push((idx, reason));
-            stats.forked_nodes += 1;
+            stats.deferred_nodes += 1;
         }
     }
 
@@ -342,7 +344,7 @@ mod tests {
 
         assert_eq!(parts, vec![(0, ARENA)], "exactly the first node fits");
         assert_eq!(stats.inline_nodes, 1);
-        assert_eq!(stats.forked_nodes, 9);
+        assert_eq!(stats.deferred_nodes, 9);
         assert_eq!(
             stats.bytes_used, ARENA,
             "the TOTAL inline encoding at a boundary is hard bounded at one budget"

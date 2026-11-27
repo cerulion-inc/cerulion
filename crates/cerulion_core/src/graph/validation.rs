@@ -20,8 +20,9 @@ use indexmap::IndexMap;
 use crate::error::{TransportError, TransportResult};
 use crate::wire::WireHeader;
 
-use super::config::{GraphConfig, NetworkMode};
-use super::topology::MAX_CONSUMER_DEPTH;
+use super::config::{GraphConfig, InputDef, NetworkMode, NodeDef};
+use super::node::{MacroPolicy, NodeInfo};
+use super::topology::{GraphTopology, MAX_CONSUMER_DEPTH};
 use super::{malformed_absolute_name, resolve_output_topic, resolve_source};
 
 /// Resolve the `header.stamp` location of every trigger input of a node that
@@ -1089,6 +1090,228 @@ fn validate_network_topic_list(list: &str, topics: &[String]) -> TransportResult
         }
     }
     Ok(())
+}
+
+/// Which Sync policy triggered a [`SyncWindowPeriodWarning`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum SyncWindowKind {
+    /// `#[cerulion_node(sync_window_ms = window_ms)]` with
+    /// `window_ms >= slowest_period_ms`.
+    Bounded {
+        /// The node's declared `sync_window_ms`.
+        window_ms: u64,
+    },
+    /// `#[cerulion_node(unbounded_sync)]` aligning resolved periodic inputs.
+    Unbounded,
+}
+
+/// Advisory finding for a Sync node whose alignment window is at or above the
+/// slowest resolved trigger-input period (or that uses `unbounded_sync` over
+/// resolved periodic inputs).
+///
+/// A window at or above `input_period - skew` allows a single dropped frame on
+/// the earlier-arriving stream to pair every subsequent sample with the
+/// previous period while keeping both `sync_unmatched_discard_count` and
+/// `sync_closer_skip_count` at zero.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncWindowPeriodWarning {
+    /// The Sync node's id in the graph.
+    pub node_id: String,
+    /// The declared Sync policy (`Bounded` or `Unbounded`).
+    pub kind: SyncWindowKind,
+    /// The trigger input with the slowest resolved effective period (first in
+    /// YAML input order on ties).
+    pub slowest_input: String,
+    /// The slowest resolved trigger-input period, in milliseconds.
+    pub slowest_period_ms: u64,
+}
+
+impl SyncWindowPeriodWarning {
+    /// Emit this finding as one structured `tracing::warn!` at graph build.
+    // hot-path-alloc-ok-fn: cold: graph build only, before the first step
+    pub fn log(&self) {
+        match self.kind {
+            SyncWindowKind::Bounded { window_ms } => tracing::warn!(
+                node_id = %self.node_id,
+                input = %self.slowest_input,
+                period_ms = self.slowest_period_ms,
+                sync_window_ms = window_ms,
+                "sync_window_ms is at or above the slowest resolved trigger-input period: \
+                 after a single dropped frame, a window at or above input_period - skew can \
+                 silently pair every subsequent sample with the previous period while \
+                 sync_unmatched_discard_count and sync_closer_skip_count stay at zero. \
+                 Lower sync_window_ms strictly below the input period minus skew"
+            ),
+            SyncWindowKind::Unbounded => tracing::warn!(
+                node_id = %self.node_id,
+                input = %self.slowest_input,
+                period_ms = self.slowest_period_ms,
+                policy = "unbounded_sync",
+                "unbounded_sync aligns periodic trigger inputs with no window bound: \
+                 after a single dropped frame, it can silently pair every subsequent \
+                 sample with the previous period while sync_unmatched_discard_count \
+                 and sync_closer_skip_count stay at zero. Prefer sync_window_ms \
+                 strictly below the input period minus skew"
+            ),
+        }
+    }
+}
+
+/// Check every Sync node whose trigger inputs all resolve to a known declared
+/// period and return one [`SyncWindowPeriodWarning`] per node whose window is
+/// at or above its slowest resolved trigger-input period (or that uses
+/// `unbounded_sync` over periodic inputs).
+///
+/// Pure and deterministic: walks `config.nodes` in declaration order. Any
+/// trigger input whose period cannot be resolved (external topic,
+/// multi-publisher topic, `External` producer, cyclic or unwired chain) skips
+/// the node rather than guessing, avoiding false positives on asymmetric
+/// external-driver graphs.
+// hot-path-alloc-ok-fn: cold: graph build / validate only
+pub fn check_sync_window_periods(
+    config: &GraphConfig,
+    topology: &GraphTopology,
+    entry_infos: &IndexMap<String, NodeInfo>,
+) -> Vec<SyncWindowPeriodWarning> {
+    let node_by_id: IndexMap<&str, &NodeDef> = config
+        .native_nodes()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    let mut warnings = Vec::new();
+
+    for node_def in config.native_nodes() {
+        let Some(info) = entry_infos.get(&node_def.id) else {
+            continue;
+        };
+        let kind = match info.policy() {
+            Some(MacroPolicy::Sync { window_ms }) => SyncWindowKind::Bounded { window_ms },
+            Some(MacroPolicy::UnboundedSync) => SyncWindowKind::Unbounded,
+            _ => continue,
+        };
+
+        let trigger_names: HashSet<&str> = info
+            .input_meta()
+            .iter()
+            .filter(|m| m.trigger)
+            .map(|m| m.name.as_str())
+            .collect();
+        let wired_triggers: Vec<&InputDef> = node_def
+            .inputs
+            .iter()
+            .filter(|i| trigger_names.contains(i.name.as_str()))
+            .collect();
+        if wired_triggers.len() < 2 || wired_triggers.len() < trigger_names.len() {
+            continue;
+        }
+
+        let mut slowest: Option<(&str, u64)> = None;
+        let mut all_resolved = true;
+        for input in wired_triggers {
+            let mut visited = HashSet::new();
+            visited.insert(node_def.id.as_str());
+            let Some(period_ms) = resolve_input_period_ms(
+                config,
+                topology,
+                entry_infos,
+                &node_by_id,
+                input,
+                &mut visited,
+            ) else {
+                all_resolved = false;
+                break;
+            };
+            if slowest.is_none_or(|(_, best)| period_ms > best) {
+                slowest = Some((input.name.as_str(), period_ms));
+            }
+        }
+
+        if !all_resolved {
+            continue;
+        }
+        let Some((slowest_input, slowest_period_ms)) = slowest else {
+            continue;
+        };
+
+        let should_warn = match kind {
+            SyncWindowKind::Bounded { window_ms } => window_ms >= slowest_period_ms,
+            SyncWindowKind::Unbounded => true,
+        };
+        if should_warn {
+            warnings.push(SyncWindowPeriodWarning {
+                node_id: node_def.id.clone(),
+                kind,
+                slowest_input: slowest_input.to_string(),
+                slowest_period_ms,
+            });
+        }
+    }
+
+    warnings
+}
+
+/// The declared period of the single in-graph producer behind `input`.
+///
+/// A `sample(N)` gate on the input never lifts this period. Each gate keeps
+/// its own phase, set by the first frame it admitted and moved by any dropped
+/// frame, so two gated inputs (or one gated and one plain) can admit frames
+/// one producer period apart from different producer ticks.
+fn resolve_input_period_ms<'a>(
+    config: &'a GraphConfig,
+    topology: &'a GraphTopology,
+    entry_infos: &'a IndexMap<String, NodeInfo>,
+    node_by_id: &IndexMap<&'a str, &'a NodeDef>,
+    input: &InputDef,
+    visited: &mut HashSet<&'a str>,
+) -> Option<u64> {
+    let topic = resolve_source(&config.prefix, &input.source);
+    if config.is_multi_publisher(&topic) {
+        return None;
+    }
+    let producer_id = topology.topic(&topic)?.sole_producer()?;
+    resolve_node_period_ms(
+        config,
+        topology,
+        entry_infos,
+        node_by_id,
+        producer_id,
+        visited,
+    )
+}
+
+fn resolve_node_period_ms<'a>(
+    config: &'a GraphConfig,
+    topology: &'a GraphTopology,
+    entry_infos: &'a IndexMap<String, NodeInfo>,
+    node_by_id: &IndexMap<&'a str, &'a NodeDef>,
+    node_id: &'a str,
+    visited: &mut HashSet<&'a str>,
+) -> Option<u64> {
+    if !visited.insert(node_id) {
+        return None;
+    }
+    let info = entry_infos.get(node_id)?;
+    match info.policy()? {
+        MacroPolicy::Period { period_ms } => (period_ms > 0).then_some(period_ms),
+        MacroPolicy::DataTrigger { input_name } => {
+            let node_def = node_by_id.get(node_id)?;
+            let trigger_input = node_def.inputs.iter().find(|i| i.name == input_name)?;
+            let upstream = resolve_input_period_ms(
+                config,
+                topology,
+                entry_infos,
+                node_by_id,
+                trigger_input,
+                visited,
+            )?;
+            Some(match info.throttle_ms {
+                Some(ms) => upstream.max(ms),
+                None => upstream,
+            })
+        }
+        MacroPolicy::External | MacroPolicy::Sync { .. } | MacroPolicy::UnboundedSync => None,
+    }
 }
 
 #[cfg(test)]
@@ -2221,6 +2444,916 @@ mod capture_sync_stamp_tests {
         assert_eq!(
             resolve_capture_sync_stamps("fuse", &[], &mut builtin_resolver()).expect("empty"),
             vec![]
+        );
+    }
+}
+
+#[cfg(test)]
+mod sync_window_period_tests {
+    use super::*;
+    use crate::graph::node::BackpressurePolicy;
+    use crate::graph::parse_graph;
+
+    fn swp_input_meta(
+        name: &str,
+        trigger: bool,
+        backpressure: BackpressurePolicy,
+    ) -> crate::graph::node::InputMeta {
+        crate::graph::node::InputMeta {
+            name: name.to_string(),
+            schema_hash: 0x1234,
+            trigger,
+            depth: 4,
+            backpressure,
+            expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
+        }
+    }
+
+    fn swp_node_info(
+        inputs: Vec<crate::graph::node::InputMeta>,
+        outputs: Vec<&str>,
+        policy: MacroPolicy,
+    ) -> NodeInfo {
+        let out_meta: Vec<crate::graph::node::OutputMeta> = outputs
+            .into_iter()
+            .map(|n| crate::graph::node::OutputMeta::new(n.to_string(), 0x1234, None))
+            .collect();
+        NodeInfo::with_meta(inputs, out_meta).with_policy(policy)
+    }
+
+    #[test]
+    fn sync_window_below_slowest_period_emits_no_warning() {
+        // Case 1: two 30 Hz (33 ms) producers + sync_window_ms = 15 (< 33).
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: cap
+    type: cap
+    outputs:
+      - name: stamp
+        schema: std_msgs/Header
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: cam/image
+      - name: stamp
+        source: cap/stamp
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let mut infos = IndexMap::new();
+        infos.insert(
+            "cam".to_string(),
+            swp_node_info(vec![], vec!["image"], MacroPolicy::Period { period_ms: 33 }),
+        );
+        infos.insert(
+            "cap".to_string(),
+            swp_node_info(vec![], vec!["stamp"], MacroPolicy::Period { period_ms: 33 }),
+        );
+        infos.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("stamp", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 15 },
+            ),
+        );
+        let topo = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(check_sync_window_periods(&config, &topo, &infos), vec![]);
+
+        // Case 2: asymmetric 200 Hz (5 ms) + 20 Hz (50 ms) with window = 20 (< 50).
+        infos.insert(
+            "cam".to_string(),
+            swp_node_info(vec![], vec!["image"], MacroPolicy::Period { period_ms: 50 }),
+        );
+        infos.insert(
+            "cap".to_string(),
+            swp_node_info(vec![], vec!["stamp"], MacroPolicy::Period { period_ms: 5 }),
+        );
+        infos.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("stamp", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 20 },
+            ),
+        );
+        let topo = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(check_sync_window_periods(&config, &topo, &infos), vec![]);
+    }
+
+    #[test]
+    fn sync_window_equal_to_period_warns_at_exact_boundary() {
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: imu
+        source: imu/sample
+      - name: image
+        source: cam/image
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let make_infos = |window_ms: u64| {
+            let mut infos = IndexMap::new();
+            infos.insert(
+                "cam".to_string(),
+                swp_node_info(vec![], vec!["image"], MacroPolicy::Period { period_ms: 33 }),
+            );
+            infos.insert(
+                "imu".to_string(),
+                swp_node_info(vec![], vec!["sample"], MacroPolicy::Period { period_ms: 5 }),
+            );
+            infos.insert(
+                "fuse".to_string(),
+                swp_node_info(
+                    vec![
+                        swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                        swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    ],
+                    vec![],
+                    MacroPolicy::Sync { window_ms },
+                ),
+            );
+            infos
+        };
+
+        // window == 32 < 33: silent.
+        let infos_32 = make_infos(32);
+        let topo_32 = GraphTopology::build(&config, &infos_32).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo_32, &infos_32),
+            vec![]
+        );
+
+        // window == 33 == slowest period: warns, naming `image` (33 ms).
+        let infos_33 = make_infos(33);
+        let topo_33 = GraphTopology::build(&config, &infos_33).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo_33, &infos_33),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 33 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 33,
+            }]
+        );
+
+        // A non-trigger External input does not participate in Sync alignment
+        // and must NOT suppress the period warning on the two periodic triggers.
+        let yaml_plain = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: cfg
+    type: cfg
+    outputs:
+      - name: params
+        schema: std_msgs/Int32
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: imu
+        source: imu/sample
+      - name: image
+        source: cam/image
+      - name: cfg
+        source: cfg/params
+"#;
+        let config_plain = parse_graph(yaml_plain).unwrap();
+        let mut infos_plain = make_infos(33);
+        infos_plain.insert(
+            "cfg".to_string(),
+            swp_node_info(vec![], vec!["params"], MacroPolicy::External),
+        );
+        infos_plain.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("cfg", false, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 33 },
+            ),
+        );
+        let topo_plain = GraphTopology::build(&config_plain, &infos_plain).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config_plain, &topo_plain, &infos_plain),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 33 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 33,
+            }]
+        );
+    }
+
+    #[test]
+    fn sync_window_over_transitive_data_trigger_chain_resolves_upstream_period() {
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: raw
+        schema: sensor_msgs/Image
+  - id: rect
+    type: rect
+    inputs:
+      - name: raw
+        source: cam/raw
+    outputs:
+      - name: rect_img
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: rect/rect_img
+      - name: imu
+        source: imu/sample
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let mut infos = IndexMap::new();
+        infos.insert(
+            "cam".to_string(),
+            swp_node_info(vec![], vec!["raw"], MacroPolicy::Period { period_ms: 33 }),
+        );
+        infos.insert(
+            "rect".to_string(),
+            swp_node_info(
+                vec![swp_input_meta("raw", true, BackpressurePolicy::DropOldest)],
+                vec!["rect_img"],
+                MacroPolicy::DataTrigger {
+                    input_name: "raw".to_string(),
+                },
+            ),
+        );
+        infos.insert(
+            "imu".to_string(),
+            swp_node_info(
+                vec![],
+                vec!["sample"],
+                MacroPolicy::Period { period_ms: 10 },
+            ),
+        );
+        infos.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 33 },
+            ),
+        );
+        let topo = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo, &infos),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 33 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 33,
+            }]
+        );
+
+        // sample(50) on `imu` does not lift its 10 ms producer period, so the
+        // slowest period stays the 33 ms image stream: window 32 is silent,
+        // while windows 33 and 50 warn naming `image`.
+        for (window_ms, expected) in [
+            (32, vec![]),
+            (
+                33,
+                vec![SyncWindowPeriodWarning {
+                    node_id: "fuse".to_string(),
+                    kind: SyncWindowKind::Bounded { window_ms: 33 },
+                    slowest_input: "image".to_string(),
+                    slowest_period_ms: 33,
+                }],
+            ),
+            (
+                50,
+                vec![SyncWindowPeriodWarning {
+                    node_id: "fuse".to_string(),
+                    kind: SyncWindowKind::Bounded { window_ms: 50 },
+                    slowest_input: "image".to_string(),
+                    slowest_period_ms: 33,
+                }],
+            ),
+        ] {
+            infos.insert(
+                "fuse".to_string(),
+                swp_node_info(
+                    vec![
+                        swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                        swp_input_meta("imu", true, BackpressurePolicy::Sample(50)),
+                    ],
+                    vec![],
+                    MacroPolicy::Sync { window_ms },
+                ),
+            );
+            let topo_sampled = GraphTopology::build(&config, &infos).unwrap();
+            assert_eq!(
+                check_sync_window_periods(&config, &topo_sampled, &infos),
+                expected,
+                "window {window_ms} with sample(50) on imu"
+            );
+        }
+
+        // throttle_ms on intermediate DataTrigger `rect` lifts `image` period
+        // from 33 ms to 60 ms, so window 50 < 60 is silent while window 60 warns.
+        infos.insert(
+            "rect".to_string(),
+            swp_node_info(
+                vec![swp_input_meta("raw", true, BackpressurePolicy::DropOldest)],
+                vec!["rect_img"],
+                MacroPolicy::DataTrigger {
+                    input_name: "raw".to_string(),
+                },
+            )
+            .with_throttle_ms(60),
+        );
+        let topo_throttled_ok = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo_throttled_ok, &infos),
+            vec![]
+        );
+
+        infos.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("imu", true, BackpressurePolicy::Sample(50)),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 60 },
+            ),
+        );
+        let topo_throttled_warn = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo_throttled_warn, &infos),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 60 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 60,
+            }]
+        );
+    }
+
+    #[test]
+    fn unbounded_sync_on_periodic_inputs_warns() {
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: a
+    type: a
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: b
+    type: b
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: a
+        source: a/out
+      - name: b
+        source: b/out
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let mut infos = IndexMap::new();
+        infos.insert(
+            "a".to_string(),
+            swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 33 }),
+        );
+        infos.insert(
+            "b".to_string(),
+            swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 33 }),
+        );
+        infos.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("a", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("b", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::UnboundedSync,
+            ),
+        );
+        let topo = GraphTopology::build(&config, &infos).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config, &topo, &infos),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Unbounded,
+                slowest_input: "a".to_string(),
+                slowest_period_ms: 33,
+            }]
+        );
+    }
+
+    #[test]
+    fn sync_with_external_or_multi_publisher_input_skips_period_warning() {
+        // External producer paired with fast 5 ms periodic producer: must NOT warn.
+        let yaml_ext = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: image
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: cam/image
+      - name: imu
+        source: imu/sample
+"#;
+        let config_ext = parse_graph(yaml_ext).unwrap();
+        let mut infos_ext = IndexMap::new();
+        infos_ext.insert(
+            "cam".to_string(),
+            swp_node_info(vec![], vec!["image"], MacroPolicy::External),
+        );
+        infos_ext.insert(
+            "imu".to_string(),
+            swp_node_info(vec![], vec!["sample"], MacroPolicy::Period { period_ms: 5 }),
+        );
+        infos_ext.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 15 },
+            ),
+        );
+        let topo_ext = GraphTopology::build(&config_ext, &infos_ext).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config_ext, &topo_ext, &infos_ext),
+            vec![]
+        );
+
+        // Multi-publisher topic paired with periodic producer: must NOT warn.
+        let yaml_mp = r#"
+prefix: swp
+multi_publisher_topics:
+  - /shared/pose
+nodes:
+  - id: p1
+    type: p1
+    outputs:
+      - name: pose
+        schema: geometry_msgs/PoseStamped
+        topic: /shared/pose
+  - id: p2
+    type: p2
+    outputs:
+      - name: pose
+        schema: geometry_msgs/PoseStamped
+        topic: /shared/pose
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: pose
+        source: /shared/pose
+      - name: imu
+        source: imu/sample
+"#;
+        let config_mp = parse_graph(yaml_mp).unwrap();
+        let mut infos_mp = IndexMap::new();
+        infos_mp.insert(
+            "p1".to_string(),
+            swp_node_info(vec![], vec!["pose"], MacroPolicy::Period { period_ms: 10 }),
+        );
+        infos_mp.insert(
+            "p2".to_string(),
+            swp_node_info(vec![], vec!["pose"], MacroPolicy::Period { period_ms: 10 }),
+        );
+        infos_mp.insert(
+            "imu".to_string(),
+            swp_node_info(vec![], vec!["sample"], MacroPolicy::Period { period_ms: 5 }),
+        );
+        infos_mp.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("pose", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 20 },
+            ),
+        );
+        let topo_mp = GraphTopology::build(&config_mp, &infos_mp).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config_mp, &topo_mp, &infos_mp),
+            vec![]
+        );
+
+        // Cyclic DataTrigger chain must terminate cleanly with no warning.
+        let yaml_cyc = r#"
+prefix: swp
+nodes:
+  - id: cyc_a
+    type: cyc_a
+    inputs:
+      - name: inp
+        source: cyc_b/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: cyc_b
+    type: cyc_b
+    inputs:
+      - name: inp
+        source: cyc_a/out
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: std_msgs/Int32
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: loop_in
+        source: cyc_a/out
+      - name: imu
+        source: imu/sample
+"#;
+        let config_cyc = parse_graph(yaml_cyc).unwrap();
+        let mut infos_cyc = IndexMap::new();
+        infos_cyc.insert(
+            "cyc_a".to_string(),
+            swp_node_info(
+                vec![swp_input_meta("inp", true, BackpressurePolicy::DropOldest)],
+                vec!["out"],
+                MacroPolicy::DataTrigger {
+                    input_name: "inp".to_string(),
+                },
+            ),
+        );
+        infos_cyc.insert(
+            "cyc_b".to_string(),
+            swp_node_info(
+                vec![swp_input_meta("inp", true, BackpressurePolicy::DropOldest)],
+                vec!["out"],
+                MacroPolicy::DataTrigger {
+                    input_name: "inp".to_string(),
+                },
+            ),
+        );
+        infos_cyc.insert(
+            "imu".to_string(),
+            swp_node_info(vec![], vec!["sample"], MacroPolicy::Period { period_ms: 5 }),
+        );
+        infos_cyc.insert(
+            "fuse".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("loop_in", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 20 },
+            ),
+        );
+        let topo_cyc = GraphTopology::build(&config_cyc, &infos_cyc).unwrap();
+        assert_eq!(
+            check_sync_window_periods(&config_cyc, &topo_cyc, &infos_cyc),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn sync_window_period_warnings_are_deterministic_across_repeated_calls() {
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: p1
+    type: p1
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: p2
+    type: p2
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: fuse_first
+    type: fuse_first
+    inputs:
+      - name: a
+        source: p1/out
+      - name: b
+        source: p2/out
+  - id: fuse_second
+    type: fuse_second
+    inputs:
+      - name: a
+        source: p1/out
+      - name: b
+        source: p2/out
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let mut infos = IndexMap::new();
+        infos.insert(
+            "p1".to_string(),
+            swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 20 }),
+        );
+        infos.insert(
+            "p2".to_string(),
+            swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 40 }),
+        );
+        infos.insert(
+            "fuse_first".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("a", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("b", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::Sync { window_ms: 50 },
+            ),
+        );
+        infos.insert(
+            "fuse_second".to_string(),
+            swp_node_info(
+                vec![
+                    swp_input_meta("a", true, BackpressurePolicy::DropOldest),
+                    swp_input_meta("b", true, BackpressurePolicy::DropOldest),
+                ],
+                vec![],
+                MacroPolicy::UnboundedSync,
+            ),
+        );
+        let topo = GraphTopology::build(&config, &infos).unwrap();
+        let expected = vec![
+            SyncWindowPeriodWarning {
+                node_id: "fuse_first".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 50 },
+                slowest_input: "b".to_string(),
+                slowest_period_ms: 40,
+            },
+            SyncWindowPeriodWarning {
+                node_id: "fuse_second".to_string(),
+                kind: SyncWindowKind::Unbounded,
+                slowest_input: "b".to_string(),
+                slowest_period_ms: 40,
+            },
+        ];
+        let run1 = check_sync_window_periods(&config, &topo, &infos);
+        let run2 = check_sync_window_periods(&config, &topo, &infos);
+        assert_eq!(run1, expected);
+        assert_eq!(run1, run2);
+    }
+
+    /// Hand-written oracles: a `sample(N)` gate never lifts the period the
+    /// check compares against.
+    ///
+    /// Each input's gate keeps its own `last_accepted_ns`, so its phase is set
+    /// by the first frame it admitted and moves after any dropped frame. Two
+    /// 30 ms producers with `sample(31)` on both inputs admit A at 0 and B at 5;
+    /// when A's 60 ms frame is lost, A admits 90, 150, ... while B admits
+    /// 65, 125, ..., so no same-tick pair is ever admitted again and the
+    /// nearest partner is one producer period away (25 ms at 5 ms skew). The
+    /// bound is therefore the producer period, 30 ms, never the 60 ms admitted
+    /// spacing.
+    #[test]
+    fn a_sample_gate_never_lifts_the_producer_period() {
+        let yaml = r#"
+prefix: swp
+nodes:
+  - id: a
+    type: a
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: b
+    type: b
+    outputs:
+      - name: out
+        schema: std_msgs/Int32
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: a
+        source: a/out
+      - name: b
+        source: b/out
+"#;
+        let config = parse_graph(yaml).unwrap();
+        let run_case =
+            |sample_a: BackpressurePolicy, sample_b: BackpressurePolicy, window_ms: u64| {
+                let mut infos = IndexMap::new();
+                infos.insert(
+                    "a".to_string(),
+                    swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 30 }),
+                );
+                infos.insert(
+                    "b".to_string(),
+                    swp_node_info(vec![], vec!["out"], MacroPolicy::Period { period_ms: 30 }),
+                );
+                infos.insert(
+                    "fuse".to_string(),
+                    swp_node_info(
+                        vec![
+                            swp_input_meta("a", true, sample_a),
+                            swp_input_meta("b", true, sample_b),
+                        ],
+                        vec![],
+                        MacroPolicy::Sync { window_ms },
+                    ),
+                );
+                let topo = GraphTopology::build(&config, &infos).unwrap();
+                check_sync_window_periods(&config, &topo, &infos)
+            };
+        let warn_30 = |window_ms: u64| {
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms },
+                slowest_input: "a".to_string(),
+                slowest_period_ms: 30,
+            }]
+        };
+        let s31 = BackpressurePolicy::Sample(31);
+        let plain = BackpressurePolicy::DropOldest;
+
+        // sample(31) on both inputs: windows 32 and 59 warn against the 30 ms
+        // producer period (one dropped frame shifts a gate's phase); 29 is silent.
+        assert_eq!(run_case(s31, s31, 32), warn_30(32));
+        assert_eq!(run_case(s31, s31, 59), warn_30(59));
+        assert_eq!(run_case(s31, s31, 29), vec![]);
+
+        // sample(31) on one input only: the plain input keeps every 30 ms frame,
+        // so the bound is 30 ms with no drop needed; window 32 warns.
+        assert_eq!(run_case(s31, plain, 32), warn_30(32));
+        assert_eq!(run_case(plain, s31, 32), warn_30(32));
+        assert_eq!(run_case(s31, plain, 29), vec![]);
+
+        // Wide gates, a gate on a tick, a gate at or below the period, and the
+        // largest gate: all report the 30 ms producer period.
+        for gate in [0, 15, 30, 60, 61, u64::MAX] {
+            let sampled = BackpressurePolicy::Sample(gate);
+            assert_eq!(
+                run_case(sampled, plain, 29),
+                vec![],
+                "gate={gate}: window 29 is below the 30 ms producer period"
+            );
+            assert_eq!(
+                run_case(sampled, plain, 30),
+                warn_30(30),
+                "gate={gate}: window 30 reaches the 30 ms producer period"
+            );
+        }
+
+        // A sample(31) gate upstream of a DataTrigger node: the DataTrigger
+        // fires only on admitted frames, so its output carries the same
+        // shiftable phase, and the bound stays the 30 ms camera period.
+        let chain_yaml = r#"
+prefix: swp
+nodes:
+  - id: cam
+    type: cam
+    outputs:
+      - name: raw
+        schema: sensor_msgs/Image
+  - id: rect
+    type: rect
+    inputs:
+      - name: raw
+        source: cam/raw
+    outputs:
+      - name: rect_img
+        schema: sensor_msgs/Image
+  - id: imu
+    type: imu
+    outputs:
+      - name: sample
+        schema: sensor_msgs/Imu
+  - id: fuse
+    type: fuse
+    inputs:
+      - name: image
+        source: rect/rect_img
+      - name: imu
+        source: imu/sample
+"#;
+        let chain_config = parse_graph(chain_yaml).unwrap();
+        let chain_case = |window_ms: u64| {
+            let mut infos = IndexMap::new();
+            infos.insert(
+                "cam".to_string(),
+                swp_node_info(vec![], vec!["raw"], MacroPolicy::Period { period_ms: 30 }),
+            );
+            infos.insert(
+                "rect".to_string(),
+                swp_node_info(
+                    vec![swp_input_meta("raw", true, BackpressurePolicy::Sample(31))],
+                    vec!["rect_img"],
+                    MacroPolicy::DataTrigger {
+                        input_name: "raw".to_string(),
+                    },
+                ),
+            );
+            infos.insert(
+                "imu".to_string(),
+                swp_node_info(
+                    vec![],
+                    vec!["sample"],
+                    MacroPolicy::Period { period_ms: 10 },
+                ),
+            );
+            infos.insert(
+                "fuse".to_string(),
+                swp_node_info(
+                    vec![
+                        swp_input_meta("image", true, BackpressurePolicy::DropOldest),
+                        swp_input_meta("imu", true, BackpressurePolicy::DropOldest),
+                    ],
+                    vec![],
+                    MacroPolicy::Sync { window_ms },
+                ),
+            );
+            let topo = GraphTopology::build(&chain_config, &infos).unwrap();
+            check_sync_window_periods(&chain_config, &topo, &infos)
+        };
+        assert_eq!(chain_case(29), vec![]);
+        assert_eq!(
+            chain_case(32),
+            vec![SyncWindowPeriodWarning {
+                node_id: "fuse".to_string(),
+                kind: SyncWindowKind::Bounded { window_ms: 32 },
+                slowest_input: "image".to_string(),
+                slowest_period_ms: 30,
+            }]
         );
     }
 }
