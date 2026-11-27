@@ -686,9 +686,11 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   node creation now fails after the config's `creation_timeout` (1 s by default) with
   `UnableToGenerateUniqueNodeId`. Every `TransportManager` constructor returns that as
   `TransportError::NodeCreation`, whose message names `cerulion clean`; the singleton
-  stays unset, so a later call tries again. The fork does not remove the stale file;
-  `cerulion clean` does, once its creator is gone and no node is registered in the
-  namespace (`dangling_shm_state_iox2_test`).
+  stays unset, so a later call tries again. The fork does not remove the stale file.
+  `cerulion clean` removes it when no node is registered in the namespace and the file
+  is provably unused: its named creator is gone, or, for an empty file, it is older
+  than `EMPTY_STATE_FILE_MIN_AGE` (24 h), so a fresh empty file blocks the namespace
+  until then (`dangling_shm_state_iox2_test`).
 - Binding a listener's datagram socket moves the PROCESS umask, and 0.10 leaks it. iceoryx2's
   `UnixDatagramSocket::bind` sets a process global umask of `!permission` for the bind and
   restores it on scope exit; concurrent binds each save what the other installed, so the

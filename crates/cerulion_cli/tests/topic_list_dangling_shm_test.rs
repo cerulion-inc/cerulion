@@ -10,7 +10,7 @@
 //! Each run reads a project-local `config/iceoryx2.toml` that puts the real
 //! binary on its own prefix and root, so no run reads or writes the default
 //! namespace. The planted state file is named by that prefix and removed on
-//! drop.
+//! drop, and the namespace's own state files are reclaimed on drop.
 
 #![cfg(any(target_os = "macos", target_os = "freebsd"))]
 
@@ -66,6 +66,39 @@ impl IsolatedNamespace {
 
     fn global_mgmt_state_file(&self) -> PathBuf {
         PathBuf::from(format!("/tmp/{}{GLOBAL_MGMT_STEM}.shm_state", self.prefix))
+    }
+
+    /// Every state file in `/tmp` this namespace's prefix names, sorted.
+    fn state_files(&self) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir("/tmp")
+            .expect("read /tmp")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(&self.prefix) && name.ends_with(".shm_state")
+                    })
+            })
+            .collect();
+        files.sort();
+        files
+    }
+}
+
+/// The runs exited, so the namespace's segments are unused: reclaim each with
+/// the reclaimer `cerulion clean` uses, object first and state file second.
+/// Its registry and age checks are not needed on a private prefix. A file it
+/// refuses (such as a planted name it cannot parse) stays for its own guard.
+impl Drop for IsolatedNamespace {
+    fn drop(&mut self) {
+        for file in self.state_files() {
+            let _ = cerulion_cli_engine::shm_state::remove_unused_state_file(
+                &file,
+                &cerulion_cli_engine::shm_state::LibcProbe,
+            );
+        }
     }
 }
 
@@ -151,6 +184,12 @@ fn topic_list_no_network_fails_within_its_bound_on_a_dangling_global_mgmt_state_
 
     let (output, elapsed) = topic_list(&namespace);
 
+    assert_eq!(
+        namespace.state_files(),
+        vec![namespace.global_mgmt_state_file()],
+        "a refused run creates no segment"
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
@@ -176,6 +215,12 @@ fn topic_list_no_network_fails_within_its_bound_on_an_empty_global_mgmt_state_fi
     let _planted = PlantedStateFile::new(namespace.global_mgmt_state_file(), &[]);
 
     let (output, elapsed) = topic_list(&namespace);
+
+    assert_eq!(
+        namespace.state_files(),
+        vec![namespace.global_mgmt_state_file()],
+        "a refused run creates no segment"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");

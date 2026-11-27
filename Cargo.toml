@@ -740,8 +740,8 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # management segment this way, so one such file made every later node in the
 # namespace (and `cerulion topic list`) spin at full CPU. The fork gives up
 # after the timeout (`creation_timeout`, 1 s by default) with
-# `InitializationNotYetFinalized`; it does not remove the stale file, which
-# `cerulion clean` does. Pinned by
+# `InitializationNotYetFinalized`. It does not remove the stale file;
+# `cerulion clean` does once the file is provably unused. Pinned by
 # `crates/cerulion_core/tests/dangling_shm_state_iox2_test.rs`.
 #
 # The same revision also adds Android support: filesystem paths, file-backed

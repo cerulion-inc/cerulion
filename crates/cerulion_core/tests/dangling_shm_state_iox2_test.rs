@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-#![cfg(not(feature = "local-transport"))]
-// Every arm builds a real iceoryx2 node for other processes to see, which
-// local-transport refuses.
 //! A node whose shared memory cannot be set up fails within its creation
 //! timeout, and the transport singleton reports that failure instead of
 //! aborting the process.
@@ -15,11 +12,16 @@
 //!
 //! Every arm runs on its own isolated prefix with a short creation timeout.
 //! A planted state file is named by that prefix, so no arm reads or writes the
-//! default namespace, and each planted file is removed on drop.
+//! default namespace, and each planted file is removed on drop. The segments
+//! a successful creation leaves are reclaimed with `cerulion clean`'s reclaimer.
 //!
 //! The singleton arm runs alone (`-- --test-threads=1`): it is the only arm
 //! that installs the process singleton, and every assertion about
 //! `TransportManager::get()` lives inside it.
+
+// Every arm builds a real iceoryx2 node for other processes to see, which
+// local-transport refuses.
+#![cfg(not(feature = "local-transport"))]
 
 use cerulion_core::testing::iceoryx_test_config;
 use cerulion_core::{TransportConfig, TransportError, TransportManager, VirtualClock};
@@ -34,8 +36,6 @@ type Service = iceoryx2::service::ipc_threadsafe::Service;
 /// The creation timeout every arm configures. Short, so a bounded failure is
 /// quick, and long enough to tell "waited the timeout" from "failed at once".
 const CREATION_TIMEOUT: Duration = Duration::from_millis(200);
-/// Slack on top of [`CREATION_TIMEOUT`] for a loaded machine.
-const RETURN_GRACE: Duration = Duration::from_secs(3);
 /// A call still running after this long is taken to spin forever.
 const WATCHDOG: Duration = Duration::from_secs(20);
 
@@ -106,6 +106,8 @@ fn node_creation_succeeds_on_a_clean_isolated_namespace() {
     let manager = manager.expect("a clean namespace creates a node");
     assert_eq!(registered_nodes(&probe), 1);
     drop(manager);
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    dangling_state_file::reclaim_state_files(&probe);
 }
 
 /// The message a user reads when node creation fails names the command that
@@ -131,6 +133,8 @@ fn node_creation_error_names_cerulion_clean() {
 mod dangling_state_file {
     use super::*;
 
+    /// Slack on top of [`CREATION_TIMEOUT`] for a loaded machine.
+    const RETURN_GRACE: Duration = Duration::from_secs(3);
     /// The directory the PAL keeps state files in, compiled into iceoryx2.
     const STATE_DIRECTORY: &str = "/tmp";
     /// The name of the global management segment after a namespace's prefix:
@@ -148,19 +152,50 @@ mod dangling_state_file {
     /// What iceoryx2 reports when the management segment cannot be opened.
     const REASON: &str = "UnableToGenerateUniqueNodeId";
 
+    fn state_file_prefix(config: &Config) -> String {
+        let prefix = config.global.prefix.to_string();
+        assert!(
+            prefix.starts_with("test_prefix_"),
+            "only an isolated namespace may be touched, got {prefix}"
+        );
+        prefix
+    }
+
+    /// Every state file in `/tmp` the namespace's prefix names, sorted.
+    fn state_files(config: &Config) -> Vec<std::path::PathBuf> {
+        let prefix = state_file_prefix(config);
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(STATE_DIRECTORY)
+            .expect("read the state directory")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".shm_state"))
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Reclaim the segments a successful creation left in the namespace with
+    /// the reclaimer `cerulion clean` uses: object first, state file second.
+    /// Its registry and age checks are not needed on a private prefix.
+    pub(super) fn reclaim_state_files(config: &Config) {
+        for file in state_files(config) {
+            let _ = cerulion_cli_engine::shm_state::remove_unused_state_file(
+                &file,
+                &cerulion_cli_engine::shm_state::LibcProbe,
+            );
+        }
+    }
+
     /// A state file planted for one namespace, removed on drop.
     struct PlantedStateFile(std::path::PathBuf);
 
     impl PlantedStateFile {
         fn for_global_mgmt(config: &Config, content: &[u8]) -> Self {
-            let prefix = config.global.prefix.to_string();
-            assert!(
-                prefix.starts_with("test_prefix_"),
-                "only an isolated namespace may be planted, got {prefix}"
-            );
-            let path = std::path::PathBuf::from(format!(
-                "{STATE_DIRECTORY}/{prefix}{GLOBAL_MGMT_STEM}.shm_state"
-            ));
+            let path = global_mgmt_state_file(config);
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -179,6 +214,13 @@ mod dangling_state_file {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    fn global_mgmt_state_file(config: &Config) -> std::path::PathBuf {
+        let prefix = state_file_prefix(config);
+        std::path::PathBuf::from(format!(
+            "{STATE_DIRECTORY}/{prefix}{GLOBAL_MGMT_STEM}.shm_state"
+        ))
     }
 
     fn dangling_name() -> [u8; REAL_NAME_FIELD_LEN] {
@@ -226,6 +268,11 @@ mod dangling_state_file {
             registered_nodes(config),
             0,
             "a refused node is not registered"
+        );
+        assert_eq!(
+            state_files(config),
+            vec![global_mgmt_state_file(config)],
+            "a refused node creates no segment"
         );
     }
 
@@ -299,5 +346,6 @@ mod dangling_state_file {
         let installed = TransportManager::get().expect("the singleton is installed");
         assert!(Arc::ptr_eq(&manager, &installed));
         assert_eq!(registered_nodes(&config), 1);
+        reclaim_state_files(&config);
     }
 }
