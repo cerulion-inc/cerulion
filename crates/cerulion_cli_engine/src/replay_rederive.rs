@@ -10520,7 +10520,8 @@ mod tests {
     ///   relay's step 2 pop is a finding;
     /// * after the relay's step 3 hold the sink takes a frame at each of steps
     ///   3 and 4 through a read that records nothing and pays the slot nothing
-    ///   (`CerulionSubscriber::try_receive_one`), so the slot counts two frames
+    ///   (`CerulionSubscriber::try_receive_one` in a bag below trace format
+    ///   13; from 13 a take records its read and pays), so the slot counts two frames
     ///   its queue no longer holds; at step 5 its body reads the queue empty,
     ///   which resyncs the slot, so the frame the relay carries unfired at step
     ///   6 is a finding. Without that read the slot still counts two, and so it
@@ -12283,7 +12284,8 @@ mod tests {
     /// An empty read leaves the slot empty. Depth 2: the sink takes the step 0
     /// frame and the relay fills the slot. After the relay's step 3 hold the
     /// sink takes a frame through a read that records nothing and pays the
-    /// slot nothing (`CerulionSubscriber::try_receive_one`), so the slot
+    /// slot nothing (`CerulionSubscriber::try_receive_one` in a bag below trace
+    /// format 13; from 13 a take records its read and pays), so the slot
     /// counts one frame its queue no longer holds; it reads the other at step
     /// 4, and at step 5 reads the frame the relay fires there and then reads
     /// its queue empty, which leaves the slot empty. The relay's step 6 pop of

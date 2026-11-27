@@ -31571,17 +31571,18 @@ nodes:
             )
         );
         assert_eq!(
-            v["trace_format"], 12,
+            v["trace_format"], 13,
             "every bag this binary writes carries read-site roles, folds runs, \
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
              read stage's window, flags every complete checkpoint part of a stopped \
-             node, names every read site's writer at every checkpoint window head \
-             AND records every stop: a reader below 11 never mirrors the reopen, so \
-             an ungated stage near its rim reports a false read_log_diverged, and \
-             never checks the flags word; a reader below 12 refuses a bag that \
-             holds a stop record as an unknown record kind, and the stamp makes it \
-             refuse one that holds none by its format"
+             node, names every read site's writer at every checkpoint window head, \
+             records every stop AND records every single-frame take: a reader below \
+             11 never mirrors the reopen, so an ungated stage near its rim reports a \
+             false read_log_diverged, and never checks the flags word; a reader below \
+             12 refuses a bag that holds a stop record as an unknown record kind; and \
+             a reader below 13 would replay every take unrecorded, so the stamp makes \
+             each of them refuse the bag by its format"
         );
     }
 
@@ -31593,12 +31594,13 @@ nodes:
     /// Each later term overrides the free-run arm in turn: the role term takes
     /// it to 5, folding to 6, the consult record to 7, read identity to 8,
     /// per-frame batch identity to 9, checkpoint stops to 10, checkpoint
-    /// window heads to 11 and node stops to the 12 asserted here.
+    /// window heads to 11, node stops to 12 and single takes to the 13 asserted
+    /// here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_the_node_stops_format() {
+    fn a_free_run_recorder_json_stamps_free_run_and_the_single_take_format() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -31616,9 +31618,10 @@ nodes:
         // every consumed frame of a batch is named. 10, not 9: every complete
         // checkpoint part of a stopped node carries the stopped flag. 11, not
         // 10: every read site names its writer at every checkpoint window head.
-        // 12, not 11: every stop is a NODE-STOP record (`stamp_trace_format`'s
-        // hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 12);
+        // 12, not 11: every stop is a NODE-STOP record. 13, not 12: every
+        // single-frame take is a recorded read (`stamp_trace_format`'s hand
+        // table pins the whole matrix).
+        assert_eq!(v["trace_format"], 13);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -31653,7 +31656,7 @@ nodes:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"node_inputs":{{}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"node_inputs":{{}},"os":"{}","recorded_at_ns":7,"trace_format":13}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,

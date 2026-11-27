@@ -1076,12 +1076,13 @@ fn a_node_stop_record_past_its_manifest_is_exit_2() {
     assert_eq!(err.exit_code(), 2);
 }
 
-/// The version gate sits at the node-stops format: a bag stamped one past it
-/// is refused up front with the upgrade message (exit 2), whatever its records.
+/// The version gate sits past the node-stops format, at the single-take one: a
+/// bag stamped one past that is refused up front with the upgrade message
+/// (exit 2), whatever its records.
 #[test]
 fn a_bag_stamped_past_the_node_stops_format_is_refused_with_the_upgrade_message() {
     let (_dir, path) = tmp_bag("format_past_node_stops.mcap");
-    let past = cerulion_cli_engine::replay_engine::NODE_STOPS_MIN_TRACE_FORMAT + 1;
+    let past = cerulion_cli_engine::replay_engine::SINGLE_TAKE_MIN_TRACE_FORMAT + 1;
     let mut atts = replay_grade_attachments(&["node0"]);
     atts.push(recorder_att(Some(past)));
     write_bag(&path, &[fire(0, 1), fire(0, 2)], &atts, true);

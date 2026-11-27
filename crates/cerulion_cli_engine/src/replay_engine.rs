@@ -2055,6 +2055,9 @@ pub struct RecorderClaims {
     /// Every fire that stopped its node is followed by a NODE-STOP record
     /// ([`recorder_records_node_stops`]).
     pub records_node_stops: bool,
+    /// Every single-frame take on a graph-wired input is a recorded read that
+    /// pays its `block` credit word ([`recorder_records_single_takes`]).
+    pub records_single_takes: bool,
 }
 
 impl RecorderClaims {
@@ -2088,6 +2091,9 @@ impl RecorderClaims {
             // Every fire that stopped its node is followed by a NODE-STOP
             // record.
             records_node_stops: recorder_records_node_stops(),
+            // Every single-frame take is a recorded read that pays its credit
+            // word.
+            records_single_takes: recorder_records_single_takes(),
         }
     }
 }
@@ -2104,11 +2110,12 @@ impl RecorderClaims {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the NODE STOPS term and stamps
-///   [`NODE_STOPS_MIN_TRACE_FORMAT`], because
+///   this binary writes takes the SINGLE TAKE term and stamps
+///   [`SINGLE_TAKE_MIN_TRACE_FORMAT`], because
 ///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`],
-///   [`recorder_states_anchor_stops`], [`recorder_names_window_heads`] and
-///   [`recorder_records_node_stops`] are unconditionally true and this
+///   [`recorder_states_anchor_stops`], [`recorder_names_window_heads`],
+///   [`recorder_records_node_stops`] and [`recorder_records_single_takes`]
+///   are unconditionally true and this
 ///   function returns before the ladder is consulted. The ladder below (the
 ///   fold term at 6, the role term at 5, then the mode and stream arms) is the
 ///   `records_consults == false` fallback, i.e. the rules that produced the
@@ -2140,7 +2147,24 @@ pub fn stamp_trace_format(coordination: CoordinationMode, claims: RecorderClaims
         states_anchor_stops,
         names_window_heads,
         records_node_stops,
+        records_single_takes,
     } = claims;
+    if records_consults
+        && records_identity
+        && states_anchor_stops
+        && names_window_heads
+        && records_node_stops
+        && records_single_takes
+    {
+        // Every single-frame take on a graph-wired input is a recorded read
+        // (a `Served` or `NoFrame` record under the `Body` role) and pays its
+        // `block` credit word. A reader below this format would replay each
+        // take unrecorded against a read log that holds it, so the stamp moves
+        // and that reader refuses the bag by its version gate. The term claims
+        // nothing without the stops, window heads, identity and consult terms
+        // under it.
+        return SINGLE_TAKE_MIN_TRACE_FORMAT;
+    }
     if records_consults
         && records_identity
         && states_anchor_stops
@@ -2309,6 +2333,16 @@ pub fn recorder_records_node_stops() -> bool {
     true
 }
 
+/// Does THIS binary's recorder record every single-frame take
+/// (`CerulionSubscriber::try_receive_one` and its owned twin) on a graph-wired
+/// input as a read, and pay the `block` credit word for what it removed?
+///
+/// `true`, unconditionally: every read stage a recording arms keeps its
+/// creation rule (`cerulion_core::read_outcome::ReadOutcomeStage::records_single_takes`).
+pub fn recorder_records_single_takes() -> bool {
+    true
+}
+
 /// Does THIS binary's recorder state, in every complete checkpoint part, whether
 /// the scheduler had stopped the node at that boundary?
 ///
@@ -2406,6 +2440,38 @@ const _: () = assert!(NODE_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 /// An ABSENT `recorder.json` answers `false`.
 pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= NODE_STOPS_MIN_TRACE_FORMAT)
+}
+
+/// The lowest `trace_format` whose read log records every single-frame take
+/// (`CerulionSubscriber::try_receive_one` and its owned twin) on a graph-wired
+/// input: one `Served` record (popped 1) per frame a take delivered, one
+/// `NoFrame` record per take that found its queue empty, both under the
+/// `Body` role with the writer run annotation of every other read, and a
+/// `block` credit word paid for every frame a take removed.
+///
+/// A `--verify` replay of such a bag feeds a take its recorded frame by
+/// identity like any other read. Below this format a take recorded nothing
+/// and paid nothing, so a replay of an older bag takes the same unrecorded
+/// path ([`replay_records_single_takes`]), and a fed one reports each take as
+/// `unrecorded_take`. A reader below 13 refuses a bag stamped 13 by its
+/// version gate: it would replay a take as unrecorded against a read log that
+/// holds it.
+///
+/// The number is written once, in `cerulion_core::trace_ring`.
+pub const SINGLE_TAKE_MIN_TRACE_FORMAT: u32 =
+    cerulion_core::trace_ring::SINGLE_TAKE_MIN_TRACE_FORMAT;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(SINGLE_TAKE_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does a replay of a bag stamped `trace_format` treat a single-frame take as
+/// the recorded read its recorder made of it
+/// (`GraphRuntime::set_read_log_records_single_takes`)?
+///
+/// An ABSENT stamp answers `false`: no recorder that wrote no `recorder.json`
+/// recorded a take.
+pub fn replay_records_single_takes(trace_format: Option<u32>) -> bool {
+    trace_format.is_some_and(|f| f >= SINGLE_TAKE_MIN_TRACE_FORMAT)
 }
 
 /// PURE: the refusal of trace record `index`, a NODE-STOP record of `rank`
@@ -2648,6 +2714,9 @@ pub fn replay_stages_batch_frames(
 /// holds none. The formats below it stay readable, and their traces say
 /// nothing about stops.
 ///
+/// Bumped to [`SINGLE_TAKE_MIN_TRACE_FORMAT`] (13) by recorded takes; that
+/// constant says what the format adds.
+///
 /// The value is `cerulion_core::trace_ring`'s constant of the same name, which
 /// the capture judge words an unknown stop cause against.
 ///
@@ -2655,11 +2724,12 @@ pub fn replay_stages_batch_frames(
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 12,
+/// them to zero for the bags this binary writes (every one of them stamps 13,
 /// because every one records every consult, every frame each read
 /// consumed when its batch fits the read stage's window, the stopped flag
 /// in every complete checkpoint part of a stopped node, the writer of
-/// every read site at every checkpoint window head, and every stop), but
+/// every read site at every checkpoint window head, every stop, and every
+/// single-frame take), but
 /// the two remain separate functions serving separate
 /// questions, and the READ gate still admits the formats below it
 /// while the WRITE stamp never emits them.
@@ -4971,22 +5041,10 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
          reach its in-rank consumers"
             .to_string()
     };
-    // An rmw (`ros2:`) node is not re-executed and its takes are not in the
-    // read log, so a fed replay cannot claim its reads: refused by name.
-    if fed {
-        if let Some(first) = ros2_entries_skipped.first() {
-            return Err(read_identity_refusal(
-                Some(first.clone()),
-                "read_identity_rmw_node",
-                format!(
-                    "the recorded graph carries ros2 node(s) {} whose takes the read log does \
-                     not record, so a replay fed by read identity cannot reproduce their reads. \
-                     Replay this bag without --verify",
-                    ros2_entries_skipped.join(", ")
-                ),
-            ));
-        }
-    }
+    // A `ros2:` entry is never re-executed (`ros2_entries_skipped`): its
+    // frames are recorded inputs of the native nodes that read them, and those
+    // reads name their writer and sequence like any other, so a fed replay
+    // feeds them by identity and claims nothing about the skipped process.
     // And WHETHER this bag's kind-6 role bits may be read as
     // roles. Resolved here, once, for the same reason `coordination` is —
     // `false` on every archived bag, which is what keeps the pre-roles arm
@@ -16752,6 +16810,11 @@ fn run_rank_pass(
 ) -> Result<PassOutcome, ReplayError> {
     let plan = pass.plan;
     let lockstep = pass.is_lockstep();
+    // The single-take rule this bag's recorder took, adopted before anything
+    // can pop: below format 13 a take recorded nothing, asked no gate and paid
+    // no credit, and the replay's takes must do the same whether or not the
+    // read log verifier runs.
+    runtime.set_read_log_records_single_takes(replay_records_single_takes(pass.trace_format));
 
     // ── clock placement ───────────────────────────────────────────────────
     //
@@ -17976,9 +18039,9 @@ fn run_rank_pass(
                         None,
                         None,
                         format!(
-                            "at step {} the node took a frame through a read path the read log \
-                             does not record (the rmw take path), so the replay holds no \
-                             identity for it and cannot reproduce that read",
+                            "at step {} the node took a frame through `try_receive_one`, which \
+                             a recording below trace format 13 does not record, so the replay \
+                             holds no identity for it and cannot reproduce that read",
                             v.step
                         ),
                     ),
@@ -34729,11 +34792,12 @@ mod recorder_info_version_tests {
         // frame of a batch that fits its read stage, v10 states every
         // stopped node in its checkpoints, v11 names every read site's
         // writer again at every checkpoint window head and flags the boundary
-        // there, and v12 follows every fire that stopped its node with a
-        // NODE-STOP record. A recorder.json stamped v11 is NOT newer than this
-        // binary, and the absent-field back-compat default stays v1
-        // (`trace_format_v1`). A bump must move this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 12);
+        // there, v12 follows every fire that stopped its node with a
+        // NODE-STOP record, and v13 records every single-frame take. A
+        // recorder.json stamped v12 is NOT newer than this binary, and the
+        // absent-field back-compat default stays v1 (`trace_format_v1`). A bump
+        // must move this pin DELIBERATELY.
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 13);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -34747,6 +34811,20 @@ mod recorder_info_version_tests {
         assert_eq!(ANCHOR_STOPS_MIN_TRACE_FORMAT, 10);
         assert_eq!(WINDOW_HEADS_MIN_TRACE_FORMAT, 11);
         assert_eq!(NODE_STOPS_MIN_TRACE_FORMAT, 12);
+        assert_eq!(SINGLE_TAKE_MIN_TRACE_FORMAT, 13);
+    }
+
+    /// A replay takes a single-frame take as a recorded read exactly when its
+    /// bag is stamped 13 or later: an older stamp, and no stamp at all, keep
+    /// the unrecorded take their recorder made.
+    #[test]
+    fn a_replay_records_single_takes_only_for_a_format_thirteen_bag() {
+        for older in [1u32, 7, 8, 12] {
+            assert!(!replay_records_single_takes(Some(older)), "format {older}");
+        }
+        assert!(replay_records_single_takes(Some(13)));
+        assert!(replay_records_single_takes(Some(14)));
+        assert!(!replay_records_single_takes(None));
     }
 
     /// No claim at all: the base every hand row below states its claims over,
@@ -34760,6 +34838,7 @@ mod recorder_info_version_tests {
         states_anchor_stops: false,
         names_window_heads: false,
         records_node_stops: false,
+        records_single_takes: false,
     };
 
     /// The decoupling pin.
@@ -34768,8 +34847,8 @@ mod recorder_info_version_tests {
     /// Under the never-under-claim stamp EVERY bag this binary writes records
     /// its consults and the frames of every batch that fits its read stage's
     /// window, flags every complete checkpoint part of a stopped node, names
-    /// every read site's writer at every checkpoint window head, and records
-    /// every stop, and therefore stamps 12, so the write
+    /// every read site's writer at every checkpoint window head, records
+    /// every stop and every single-frame take, and therefore stamps 13, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -34789,11 +34868,12 @@ mod recorder_info_version_tests {
             RecorderClaims::of_this_recorder(true),
         );
         assert_eq!(
-            stamp, 12,
+            stamp, 13,
             "a recorder that records every consult, the frames of every batch \
              that fits its read stage, flags every complete checkpoint part of a \
              stopped node, names every read site's writer at every checkpoint \
-             window head AND records every stop stamps 12: a format-7 reader would \
+             window head, records every stop AND every single-frame take stamps 13: \
+             a format-12 reader would replay each take unrecorded; a format-7 reader would \
              replay its reads by queue re-creation and call the result clean, a \
              format-8 reader does not know the batch frame record, a format-9 \
              reader reads past the stopped flag, a format-10 reader never mirrors \
@@ -34805,9 +34885,9 @@ mod recorder_info_version_tests {
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: eleven formats this
+        // The gate is strictly WIDER than the stamp: twelve formats this
         // binary reads and never writes, listed by hand.
-        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
+        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -34826,8 +34906,9 @@ mod recorder_info_version_tests {
     /// Every row then carries more expected values: `folds_runs` alone is 6,
     /// `records_consults` is 7 with folding on or off, consults with identity
     /// is 9, consults with identity and checkpoint stops is 10, those three
-    /// with window heads is 11, and those four with node stops is 12, the
-    /// strongest claim. Each claim is set by name over the row's base.
+    /// with window heads is 11, those four with node stops is 12, and those
+    /// five with single takes is 13, the strongest claim. Each claim is set by
+    /// name over the row's base.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [
@@ -35046,6 +35127,35 @@ mod recorder_info_version_tests {
                     ) < 7,
                     "{row}: node stops alone claim nothing above the ladder"
                 );
+                // Single takes ride all five: 13 over every axis, and the term
+                // claims nothing without the node stops under it.
+                let takes = RecorderClaims {
+                    records_single_takes: true,
+                    ..node_stops
+                };
+                assert_eq!(stamp_trace_format(mode, takes), 13, "{row}: single takes");
+                assert_eq!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_node_stops: false,
+                            ..takes
+                        }
+                    ),
+                    11,
+                    "{row}: single takes without node stops stay at the window heads term's 11"
+                );
+                assert!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_single_takes: true,
+                            folds_runs: folds,
+                            ..base
+                        }
+                    ) < 7,
+                    "{row}: single takes alone claim nothing above the ladder"
+                );
             }
         }
         // This binary's own claims are the strongest row.
@@ -35054,7 +35164,7 @@ mod recorder_info_version_tests {
                 CoordinationMode::FreeRun,
                 RecorderClaims::of_this_recorder(false)
             ),
-            12
+            13
         );
     }
 
