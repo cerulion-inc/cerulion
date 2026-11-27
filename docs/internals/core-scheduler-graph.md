@@ -557,7 +557,7 @@ this section is the opt-out's machinery.)
   `state_arm_attach::attach_state_capture_no_fork_from`, as `PlaneRole::HostedUnit`
   (kill switch and knobs apply, the fork-memory gate does not). A single-unit
   worker keeps the fork carrier. Proof over the real binary:
-  `cerulion_cli/tests/flashback_split_units_e2e_test.rs`.
+  `crates/cerulion_cli/tests/flashback_split_units_e2e_test.rs`.
 
 ## Clock model
 
