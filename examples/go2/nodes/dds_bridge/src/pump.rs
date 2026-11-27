@@ -366,7 +366,6 @@ impl RawRouteStats {
     /// The counts [`evaluate_raw_route_health`] judges.
     pub fn counts(&self) -> RawRouteCounts {
         RawRouteCounts {
-            matched_writers_current: self.matched_writers_current.load(Ordering::Relaxed),
             matched_writers_total: self.matched_writers_total.load(Ordering::Relaxed),
             received_total: self.received_total.load(Ordering::Relaxed),
         }
@@ -399,7 +398,6 @@ impl RawRouteStats {
 /// The slice of one route's counters the silent-route verdict reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawRouteCounts {
-    pub matched_writers_current: u64,
     pub matched_writers_total: u64,
     pub received_total: u64,
 }
@@ -1361,8 +1359,7 @@ where
     route
 }
 
-/// The flood latches for the reader status events that can repeat at the
-/// sample rate. A received sample closes the loss and rejection regimes; a
+/// The flood latches for the reader status events that can repeat. A received sample closes the loss and rejection regimes; a
 /// QoS refusal has no success event, so its regime stays open and re-announces
 /// at each decade (the latch's own rule).
 #[derive(Debug, Default)]
@@ -2562,10 +2559,13 @@ mod tests {
         assert_eq!(
             route_stats.counts(),
             RawRouteCounts {
-                matched_writers_current: 1,
                 matched_writers_total: 1,
                 received_total: 1,
             }
+        );
+        assert_eq!(
+            route_stats.matched_writers_current.load(Ordering::Relaxed),
+            1
         );
         assert_eq!(route_stats.last_published_ns.load(Ordering::Relaxed), 7);
     }
@@ -3177,9 +3177,8 @@ mod route_health {
     use super::*;
     use cerulion_go2_dds::ros2_client::rustdds::dds::statusevents::CountWithChange;
 
-    fn counts(current: u64, total: u64, received: u64) -> RawRouteCounts {
+    fn counts(total: u64, received: u64) -> RawRouteCounts {
         RawRouteCounts {
-            matched_writers_current: current,
             matched_writers_total: total,
             received_total: received,
         }
@@ -3193,7 +3192,7 @@ mod route_health {
     /// route streams. Oracle values written by hand.
     #[test]
     fn a_silent_route_beside_a_receiving_sibling_is_flagged_by_kind() {
-        let routes = [counts(0, 0, 0), counts(1, 1, 500), counts(1, 1, 0)];
+        let routes = [counts(0, 0), counts(1, 500), counts(1, 0)];
         assert_eq!(
             evaluate_raw_route_health(&routes, 0),
             vec![
@@ -3208,12 +3207,12 @@ mod route_health {
     fn with_no_ingress_anywhere_there_is_no_baseline_and_no_alarm() {
         assert_eq!(evaluate_raw_route_health(&[], 0), vec![]);
         assert_eq!(
-            evaluate_raw_route_health(&[counts(0, 0, 0)], 0),
+            evaluate_raw_route_health(&[counts(0, 0)], 0),
             vec![RawRouteHealth::NoBaseline],
             "a lone route has no sibling to compare against"
         );
         assert_eq!(
-            evaluate_raw_route_health(&[counts(0, 0, 0), counts(1, 1, 0)], 0),
+            evaluate_raw_route_health(&[counts(0, 0), counts(1, 0)], 0),
             vec![RawRouteHealth::NoBaseline, RawRouteHealth::NoBaseline],
             "matched but quiet everywhere is a quiet DDS side, not one silent route"
         );
@@ -3222,11 +3221,11 @@ mod route_health {
     #[test]
     fn typed_ingress_counts_as_a_sibling() {
         assert_eq!(
-            evaluate_raw_route_health(&[counts(0, 0, 0)], 0),
+            evaluate_raw_route_health(&[counts(0, 0)], 0),
             vec![RawRouteHealth::NoBaseline]
         );
         assert_eq!(
-            evaluate_raw_route_health(&[counts(0, 0, 0)], 1),
+            evaluate_raw_route_health(&[counts(0, 0)], 1),
             vec![RawRouteHealth::SilentNeverMatched],
             "one typed sample is enough of a baseline"
         );
@@ -3236,7 +3235,7 @@ mod route_health {
     fn a_writer_that_matched_and_left_without_data_is_matched_no_samples() {
         // Matched once, unmatched back to zero writers, nothing received.
         assert_eq!(
-            evaluate_raw_route_health(&[counts(0, 1, 0), counts(1, 1, 9)], 0),
+            evaluate_raw_route_health(&[counts(1, 0), counts(1, 9)], 0),
             vec![
                 RawRouteHealth::SilentMatchedNoSamples,
                 RawRouteHealth::Receiving
@@ -3250,11 +3249,7 @@ mod route_health {
         // and a route that lost every writer after receiving: both Receiving.
         assert_eq!(
             evaluate_raw_route_health(
-                &[
-                    counts(0, 0, 3),
-                    counts(0, 2, 7),
-                    counts(u64::MAX, u64::MAX, u64::MAX)
-                ],
+                &[counts(0, 3), counts(2, 7), counts(u64::MAX, u64::MAX)],
                 u64::MAX,
             ),
             vec![RawRouteHealth::Receiving; 3]
@@ -3263,7 +3258,7 @@ mod route_health {
 
     #[test]
     fn the_verdict_is_deterministic_across_two_runs() {
-        let routes = [counts(0, 0, 0), counts(2, 3, 0), counts(1, 1, 42)];
+        let routes = [counts(0, 0), counts(3, 0), counts(1, 42)];
         let oracle = vec![
             RawRouteHealth::SilentNeverMatched,
             RawRouteHealth::SilentMatchedNoSamples,
@@ -3276,17 +3271,18 @@ mod route_health {
     #[test]
     fn record_status_mirrors_the_rustdds_cumulative_counts() {
         let r = lowstate();
+        let current = |r: &RawRouteStats| r.matched_writers_current.load(Ordering::Relaxed);
         r.record_status(&matched(1, 1, 1));
-        assert_eq!(r.counts(), counts(1, 1, 0));
+        assert_eq!((current(&r), r.counts()), (1, counts(1, 0)));
         r.record_status(&matched(2, 2, 1));
         r.record_status(&matched(2, 1, -1));
         assert_eq!(
-            r.counts(),
-            counts(1, 2, 0),
+            (current(&r), r.counts()),
+            (1, counts(2, 0)),
             "one writer left, two ever matched"
         );
         r.record_status(&matched(2, 0, -1));
-        assert_eq!(r.counts(), counts(0, 2, 0));
+        assert_eq!((current(&r), r.counts()), (0, counts(2, 0)));
 
         r.record_status(&incompatible(3));
         assert_eq!(r.incompatible_qos_total.load(Ordering::Relaxed), 3);
@@ -3314,7 +3310,8 @@ mod route_health {
              publish_failures=0 stream_errors=0 last_received_ns=0 last_published_ns=0"
         );
         r.record_status(&matched(-1, -1, -1));
-        assert_eq!(r.counts(), counts(0, 0, 0));
+        assert_eq!(r.counts(), counts(0, 0));
+        assert_eq!(r.matched_writers_current.load(Ordering::Relaxed), 0);
     }
 
     #[test]
