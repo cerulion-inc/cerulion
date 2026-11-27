@@ -123,6 +123,7 @@ use cerulion_core::graph::node_plugin_abi::RawIngress;
 use cerulion_core::transport::TransportManager;
 use cerulion_go2_dds::messages;
 use cerulion_go2_dds::participant::ParticipantConfig;
+use cerulion_go2_dds::ros2_client::rustdds::DataReaderStatus;
 use cerulion_go2_dds::ros2_client::rustdds::Subscriber as DdsSubscriber;
 use cerulion_go2_dds::ros2_client::{MessageTypeName, Name, Node, Subscription};
 use cerulion_go2_dds::{best_effort_qos, reliable_volatile_qos, Go2Participant};
@@ -130,7 +131,7 @@ use futures::{Stream, StreamExt};
 
 use crate::config::{BridgeConfig, QosMode, TopicMapping};
 use crate::generic::raw::{create_raw_reader, RawReader, RawSample};
-use crate::generic::RawIngressRoute;
+use crate::generic::{RawIngressRoute, RawRouteError};
 use crate::latch::{FloodAction, FloodLatch};
 use crate::queue::SampleQueue;
 use crate::registry::{BridgeSample, RosType};
@@ -195,6 +196,9 @@ pub struct PumpStats {
     pub raw_route_failures_total: AtomicU64,
     /// Raw stream item errors (the `Err` arm of a raw drain stream).
     pub raw_stream_errors_total: AtomicU64,
+    /// One entry per raw mapping, replaced as a whole when a DDS init
+    /// builds every raw route. Read it with [`Self::raw_routes`].
+    raw_routes: Mutex<Vec<Arc<RawRouteStats>>>,
 }
 
 impl PumpStats {
@@ -205,7 +209,7 @@ impl PumpStats {
     /// failures → DDS side quiet; `raw_route_failures > 0` → frames arrive
     /// but do not transcode/publish.
     pub fn render(&self) -> String {
-        format!(
+        let line = format!(
             "init_attempts={} init_failures={} streams_started={} streams_ended={} \
              samples_pushed={} stream_errors={} raw_streams_started={} \
              raw_streams_ended={} raw_published={} raw_route_failures={} \
@@ -221,8 +225,204 @@ impl PumpStats {
             self.raw_published_total.load(Ordering::Relaxed),
             self.raw_route_failures_total.load(Ordering::Relaxed),
             self.raw_stream_errors_total.load(Ordering::Relaxed),
+        );
+        let routes = self.raw_routes();
+        if routes.is_empty() {
+            return line;
+        }
+        let per_route: Vec<String> = routes.iter().map(|r| r.render()).collect();
+        format!("{line} raw_routes=[{}]", per_route.join("; "))
+    }
+
+    /// The per-route counters of every raw mapping, in config order. Empty
+    /// before the first DDS init that builds the raw routes.
+    pub fn raw_routes(&self) -> Vec<Arc<RawRouteStats>> {
+        self.raw_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_raw_routes(&self, routes: Vec<Arc<RawRouteStats>>) {
+        *self
+            .raw_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = routes;
+    }
+}
+
+/// Ingress counters for ONE raw mapping, so a route whose reader never
+/// matched a writer, or matched one and never received a sample, stands out
+/// from the sibling routes that do receive. Never reset.
+///
+/// The writer, QoS, loss and rejection counts mirror the cumulative counts
+/// rustdds reports on the reader's status stream, so a status event that
+/// rustdds dropped (its status channel is small) costs no accuracy: the next
+/// event carries the current totals. The receive and publish counts are
+/// bumped by the drain loop itself. `last_*_ns` are transport clock stamps
+/// (the same stamp the published frame carries), `0` until the first one.
+#[derive(Debug)]
+pub struct RawRouteStats {
+    /// The DDS topic the reader subscribes to (the config's `dds_topic`).
+    pub dds_topic: String,
+    /// The Cerulion topic the route publishes on.
+    pub cerulion_topic: String,
+    /// The route's ROS type (`pkg/Type`).
+    pub ros_type: String,
+    /// DDS writers matched to the reader now.
+    pub matched_writers_current: AtomicU64,
+    /// DDS writers ever matched to the reader.
+    pub matched_writers_total: AtomicU64,
+    /// Writers refused because the reader's requested QoS is incompatible
+    /// with their offered QoS.
+    pub incompatible_qos_total: AtomicU64,
+    /// Samples rustdds reports as lost.
+    pub sample_lost_total: AtomicU64,
+    /// Samples rustdds reports as rejected.
+    pub sample_rejected_total: AtomicU64,
+    /// Samples received off DDS (before transcode).
+    pub received_total: AtomicU64,
+    /// Frames transcoded and published.
+    pub published_total: AtomicU64,
+    /// Samples dropped to a CDR decode failure.
+    pub decode_failures_total: AtomicU64,
+    /// Decoded frames the local publish refused.
+    pub publish_failures_total: AtomicU64,
+    /// Sample stream item errors.
+    pub stream_errors_total: AtomicU64,
+    /// Transport clock stamp of the last received sample.
+    pub last_received_ns: AtomicU64,
+    /// Transport clock stamp of the last published frame.
+    pub last_published_ns: AtomicU64,
+}
+
+impl RawRouteStats {
+    /// Zeroed counters for one route.
+    pub fn new(dds_topic: &str, cerulion_topic: &str, ros_type: &str) -> Self {
+        Self {
+            dds_topic: dds_topic.to_string(),
+            cerulion_topic: cerulion_topic.to_string(),
+            ros_type: ros_type.to_string(),
+            matched_writers_current: AtomicU64::new(0),
+            matched_writers_total: AtomicU64::new(0),
+            incompatible_qos_total: AtomicU64::new(0),
+            sample_lost_total: AtomicU64::new(0),
+            sample_rejected_total: AtomicU64::new(0),
+            received_total: AtomicU64::new(0),
+            published_total: AtomicU64::new(0),
+            decode_failures_total: AtomicU64::new(0),
+            publish_failures_total: AtomicU64::new(0),
+            stream_errors_total: AtomicU64::new(0),
+            last_received_ns: AtomicU64::new(0),
+            last_published_ns: AtomicU64::new(0),
+        }
+    }
+
+    /// Fold one reader status event into the counters. rustdds counts are
+    /// `i32`; a negative one (never produced by rustdds) reads as `0`.
+    pub fn record_status(&self, status: &DataReaderStatus) {
+        let store = |counter: &AtomicU64, count: i32| {
+            counter.store(u64::try_from(count).unwrap_or(0), Ordering::Relaxed);
+        };
+        match status {
+            DataReaderStatus::SubscriptionMatched { total, current, .. } => {
+                store(&self.matched_writers_total, total.count());
+                store(&self.matched_writers_current, current.count());
+            }
+            DataReaderStatus::RequestedIncompatibleQos { count, .. } => {
+                store(&self.incompatible_qos_total, count.count());
+            }
+            DataReaderStatus::SampleLost { count } => store(&self.sample_lost_total, count.count()),
+            DataReaderStatus::SampleRejected { count, .. } => {
+                store(&self.sample_rejected_total, count.count());
+            }
+            DataReaderStatus::LivelinessChanged { .. }
+            | DataReaderStatus::RequestedDeadlineMissed { .. } => {}
+        }
+    }
+
+    /// The counts [`evaluate_raw_route_health`] judges.
+    pub fn counts(&self) -> RawRouteCounts {
+        RawRouteCounts {
+            matched_writers_current: self.matched_writers_current.load(Ordering::Relaxed),
+            matched_writers_total: self.matched_writers_total.load(Ordering::Relaxed),
+            received_total: self.received_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// One-line render, the per-route term of [`PumpStats::render`].
+    pub fn render(&self) -> String {
+        format!(
+            "{} matched_writers={} matched_writers_total={} incompatible_qos={} \
+             sample_lost={} sample_rejected={} received={} published={} \
+             decode_failures={} publish_failures={} stream_errors={} \
+             last_received_ns={} last_published_ns={}",
+            self.dds_topic,
+            self.matched_writers_current.load(Ordering::Relaxed),
+            self.matched_writers_total.load(Ordering::Relaxed),
+            self.incompatible_qos_total.load(Ordering::Relaxed),
+            self.sample_lost_total.load(Ordering::Relaxed),
+            self.sample_rejected_total.load(Ordering::Relaxed),
+            self.received_total.load(Ordering::Relaxed),
+            self.published_total.load(Ordering::Relaxed),
+            self.decode_failures_total.load(Ordering::Relaxed),
+            self.publish_failures_total.load(Ordering::Relaxed),
+            self.stream_errors_total.load(Ordering::Relaxed),
+            self.last_received_ns.load(Ordering::Relaxed),
+            self.last_published_ns.load(Ordering::Relaxed),
         )
     }
+}
+
+/// The slice of one route's counters the silent-route verdict reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawRouteCounts {
+    pub matched_writers_current: u64,
+    pub matched_writers_total: u64,
+    pub received_total: u64,
+}
+
+/// The verdict on one raw route, from [`evaluate_raw_route_health`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawRouteHealth {
+    /// The route has received at least one sample.
+    Receiving,
+    /// Nothing has arrived on this route or on any other ingress either, so
+    /// there is no baseline to call it silent against.
+    NoBaseline,
+    /// Silent while other ingress receives: no DDS writer has ever matched
+    /// the route's reader.
+    SilentNeverMatched,
+    /// Silent while other ingress receives: a writer matched (it may have
+    /// gone since), yet no sample arrived.
+    SilentMatchedNoSamples,
+}
+
+/// Judge every raw route against its siblings. A route that has received
+/// nothing is SILENT only when some other ingress did receive: another raw
+/// route, or a typed subscription (`typed_samples_total`, the pump's
+/// `samples_pushed_total`). Pure; the verdicts come back in `routes` order.
+pub fn evaluate_raw_route_health(
+    routes: &[RawRouteCounts],
+    typed_samples_total: u64,
+) -> Vec<RawRouteHealth> {
+    // A route that has not received is never one of the receiving routes,
+    // so any receiving route is a sibling of it.
+    let sibling_received = typed_samples_total > 0 || routes.iter().any(|r| r.received_total > 0);
+    routes
+        .iter()
+        .map(|r| {
+            if r.received_total > 0 {
+                RawRouteHealth::Receiving
+            } else if !sibling_received {
+                RawRouteHealth::NoBaseline
+            } else if r.matched_writers_total == 0 {
+                RawRouteHealth::SilentNeverMatched
+            } else {
+                RawRouteHealth::SilentMatchedNoSamples
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -870,7 +1070,7 @@ fn build_raw_binding(
     mgr: &RawIngress,
     codec: &Arc<CdrCodec>,
     m: &TopicMapping,
-) -> Result<(String, RawReader, RawIngressRoute), String> {
+) -> Result<(Arc<RawRouteStats>, RawReader, RawIngressRoute), String> {
     let (ns, base) = split_topic(&m.dds_topic);
     let name = Name::new(&ns, &base)
         .map_err(|e| format!("invalid DDS topic name {:?}: {e:?}", m.dds_topic))?;
@@ -908,7 +1108,12 @@ fn build_raw_binding(
         qos = ?m.qos,
         "dds_bridge pump: RAW route created (on the drain thread)"
     );
-    Ok((m.dds_topic.clone(), reader, route))
+    let route_stats = Arc::new(RawRouteStats::new(
+        &m.dds_topic,
+        &m.cerulion_topic,
+        &m.ros_type,
+    ));
+    Ok((route_stats, reader, route))
 }
 
 /// One raw mapping's drain loop: `as_async_stream()` over the raw-CDR reader
@@ -920,7 +1125,7 @@ fn build_raw_binding(
 /// lib.rs raw-path docs).
 async fn drain_raw_stream(
     reader: RawReader,
-    dds_topic: String,
+    route_stats: Arc<RawRouteStats>,
     route: RawIngressRoute,
     codec: Arc<CdrCodec>,
     clock: Arc<dyn Clock>,
@@ -931,7 +1136,7 @@ async fn drain_raw_stream(
         .map(|r| r.map(|dcc| dcc.into_value()));
     futures::pin_mut!(stream);
     let now_ns = || clock.now_ns();
-    let _route = drain_raw_from_stream(stream, &dds_topic, route, &codec, &now_ns, &stats).await;
+    let _route = drain_raw_from_stream(stream, route, &codec, &now_ns, &stats, &route_stats).await;
 }
 
 /// The raw drain loop over an ABSTRACT stream — the raw sibling of
@@ -944,16 +1149,17 @@ async fn drain_raw_stream(
 /// can inspect its counters.
 async fn drain_raw_from_stream<E, S>(
     mut stream: Pin<&mut S>,
-    dds_topic: &str,
     mut route: RawIngressRoute,
     codec: &CdrCodec,
     now_ns: &dyn Fn() -> u64,
     stats: &PumpStats,
+    route_stats: &RawRouteStats,
 ) -> RawIngressRoute
 where
     S: Stream<Item = Result<RawSample, E>>,
     E: std::fmt::Debug,
 {
+    let dds_topic = route_stats.dds_topic.as_str();
     stats
         .raw_streams_started_total
         .fetch_add(1, Ordering::Relaxed);
@@ -970,9 +1176,16 @@ where
                     );
                     err_streak = 0;
                 }
-                match route.publish_cdr_body(codec, raw.endianness, &raw.body, now_ns()) {
+                // One stamp per sample: the receive time and the frame's wire
+                // timestamp are the same transport clock reading.
+                let ts = now_ns();
+                route_stats.received_total.fetch_add(1, Ordering::Relaxed);
+                route_stats.last_received_ns.store(ts, Ordering::Relaxed);
+                match route.publish_cdr_body(codec, raw.endianness, &raw.body, ts) {
                     Ok(_recipients) => {
                         stats.raw_published_total.fetch_add(1, Ordering::Relaxed);
+                        route_stats.published_total.fetch_add(1, Ordering::Relaxed);
+                        route_stats.last_published_ns.store(ts, Ordering::Relaxed);
                         if let Some(suppressed) = route_latch.on_recovered() {
                             tracing::info!(
                                 dds_topic = %dds_topic,
@@ -985,6 +1198,11 @@ where
                         stats
                             .raw_route_failures_total
                             .fetch_add(1, Ordering::Relaxed);
+                        let per_route = match &e {
+                            RawRouteError::Decode { .. } => &route_stats.decode_failures_total,
+                            _ => &route_stats.publish_failures_total,
+                        };
+                        per_route.fetch_add(1, Ordering::Relaxed);
                         match route_latch.on_event() {
                             FloodAction::First => tracing::warn!(
                                 dds_topic = %dds_topic,
@@ -1006,6 +1224,9 @@ where
                 err_streak += 1;
                 stats
                     .raw_stream_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                route_stats
+                    .stream_errors_total
                     .fetch_add(1, Ordering::Relaxed);
                 match stream_err_level(err_streak) {
                     StreamErrLevel::Warn => tracing::warn!(
@@ -1272,7 +1493,7 @@ fn drain_thread_body(
     // status/backoff convention as the typed side (`set_failed` → retry);
     // panics ride the whole-body containment.
     let raw_mappings = cfg.raw_mappings();
-    let mut raws: Vec<(String, RawReader, RawIngressRoute)> = Vec::new();
+    let mut raws: Vec<(Arc<RawRouteStats>, RawReader, RawIngressRoute)> = Vec::new();
     let mut raw_codec: Option<Arc<CdrCodec>> = None;
     let mut raw_clock: Option<Arc<dyn Clock>> = None;
     let mut raw_dds_subscriber: Option<DdsSubscriber> = None;
@@ -1304,6 +1525,9 @@ fn drain_thread_body(
                 Err(e) => return status.set_failed(e),
             }
         }
+        // Published only once EVERY route built, so a failed init that the
+        // pump retries never leaves a partial list behind.
+        stats.set_raw_routes(raws.iter().map(|(rs, _, _)| Arc::clone(rs)).collect());
         raw_clock = Some(mgr.clock_arc());
         raw_codec = Some(codec);
         raw_dds_subscriber = Some(dds_sub);
@@ -1371,7 +1595,7 @@ fn drain_thread_body(
     // publishes go straight to iceoryx2 (`publish_raw`) OFF the node tick —
     // they deliberately do NOT touch the `pushed` doorbell bit (there is
     // nothing for the tick to drain).
-    for (dds_topic, reader, route) in raws {
+    for (route_stats, reader, route) in raws {
         let codec = Arc::clone(raw_codec.as_ref().expect("codec built with raw mappings"));
         let clock = Arc::clone(
             raw_clock
@@ -1379,8 +1603,15 @@ fn drain_thread_body(
                 .expect("clock resolved with raw mappings"),
         );
         let st = Arc::clone(&stats);
-        ex.spawn(drain_raw_stream(reader, dds_topic, route, codec, clock, st))
-            .detach();
+        ex.spawn(drain_raw_stream(
+            reader,
+            route_stats,
+            route,
+            codec,
+            clock,
+            st,
+        ))
+        .detach();
     }
     // Drive the executor until the STOP signal, NOT forever: the
     // detached drain tasks are the work; `stop_rx` completing (on shutdown's
@@ -1723,7 +1954,9 @@ mod tests {
     /// Run the raw-drain seam over the canonical 4-item script — Ok(good),
     /// stream Err, Ok(hostile body → route Decode failure), Ok(good) — on a
     /// fresh isolated transport; returns the captured frames + final stats.
-    fn run_raw_drain_script(tag: &str) -> (Vec<Vec<u8>>, PumpStats, RawIngressRoute) {
+    fn run_raw_drain_script(
+        tag: &str,
+    ) -> (Vec<Vec<u8>>, PumpStats, RawIngressRoute, RawRouteStats) {
         use cerulion_core::wire::MaxSliceLen;
         let mgr = raw_test_transport(tag);
         let codec = crate::generic::bridge_codec();
@@ -1757,15 +1990,21 @@ mod tests {
             t.set(t.get() + 100);
             t.get()
         };
+        let route_stats = RawRouteStats::new("/raw_dds", &topic, "geometry_msgs/Vector3");
         let route = smol::block_on(drain_raw_from_stream(
-            stream, "/raw_dds", route, &codec, &now, &stats,
+            stream,
+            route,
+            &codec,
+            &now,
+            &stats,
+            &route_stats,
         ));
-        (captured_frames(&sub), stats, route)
+        (captured_frames(&sub), stats, route, route_stats)
     }
 
     #[test]
     fn drain_raw_from_stream_transcodes_publishes_and_counts() {
-        let (frames, stats, route) = run_raw_drain_script("counts");
+        let (frames, stats, route, route_stats) = run_raw_drain_script("counts");
 
         // The raw hop counters (Principle #3 — these localize a dead raw hop).
         assert_eq!(stats.raw_streams_started_total.load(Ordering::Relaxed), 1);
@@ -1782,6 +2021,19 @@ mod tests {
         assert_eq!(route.published_total(), 2);
         assert_eq!(route.decode_failures_total(), 1);
         assert_eq!(route.next_sequence(), 2, "the failure burned NO sequence");
+        // The same script through the per-route counters: three samples
+        // received (the stream error is not a sample), the truncated one a
+        // decode failure, stamps 100, 200, 300 with the last two the newest.
+        assert_eq!(route_stats.received_total.load(Ordering::Relaxed), 3);
+        assert_eq!(route_stats.published_total.load(Ordering::Relaxed), 2);
+        assert_eq!(route_stats.decode_failures_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            route_stats.publish_failures_total.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(route_stats.stream_errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(route_stats.last_received_ns.load(Ordering::Relaxed), 300);
+        assert_eq!(route_stats.last_published_ns.load(Ordering::Relaxed), 300);
 
         // Delivered frames == hand oracles: gap-free seq 0,1 across the
         // failure; stamps 100 and 300 (the failed attempt consumed 200).
@@ -1795,9 +2047,16 @@ mod tests {
         // Principle #7: the same script on two isolated transports yields
         // byte-identical captures, each anchored to the hand oracle above
         // (never a bare self-compare).
-        let (a, _, _) = run_raw_drain_script("det_a");
-        let (b, _, _) = run_raw_drain_script("det_b");
+        let (a, _, _, ra) = run_raw_drain_script("det_a");
+        let (b, _, _, rb) = run_raw_drain_script("det_b");
         assert_eq!(a, b, "two isolated runs are byte-identical");
+        // Both runs' per-route counters match the same hand-written line.
+        let oracle = "/raw_dds matched_writers=0 matched_writers_total=0 incompatible_qos=0 \
+                      sample_lost=0 sample_rejected=0 received=3 published=2 decode_failures=1 \
+                      publish_failures=0 stream_errors=1 last_received_ns=300 \
+                      last_published_ns=300";
+        assert_eq!(ra.render(), oracle);
+        assert_eq!(rb.render(), oracle);
         assert_eq!(a[0], expected_v3_frame(1.0, 2.0, 3.0, 0, 100));
         assert_eq!(a[1], expected_v3_frame(4.0, 5.0, 6.0, 1, 300));
     }
@@ -1881,9 +2140,18 @@ mod tests {
             t.get()
         };
         let stats = PumpStats::default();
+        let route_stats = RawRouteStats::new("/raw_dds", topic, "geometry_msgs/Vector3");
         let route = smol::block_on(drain_raw_from_stream(
-            stream, "/raw_dds", route, &codec, &now, &stats,
+            stream,
+            route,
+            &codec,
+            &now,
+            &stats,
+            &route_stats,
         ));
+        assert_eq!(route_stats.received_total.load(Ordering::Relaxed), 5);
+        assert_eq!(route_stats.decode_failures_total.load(Ordering::Relaxed), 3);
+        assert_eq!(route_stats.published_total.load(Ordering::Relaxed), 2);
 
         assert_eq!(stats.raw_published_total.load(Ordering::Relaxed), 2);
         assert_eq!(stats.raw_route_failures_total.load(Ordering::Relaxed), 3);
@@ -2350,6 +2618,217 @@ mod tests {
             should_spawn_under_lock(false),
             "the normal path (not stopping) proceeds to spawn"
         );
+    }
+}
+
+#[cfg(test)]
+mod route_health {
+    use super::*;
+    use cerulion_go2_dds::ros2_client::rustdds::dds::statusevents::{
+        CountWithChange, SampleRejectedStatusKind,
+    };
+    use cerulion_go2_dds::ros2_client::rustdds::qos::QosPolicyId;
+    use cerulion_go2_dds::ros2_client::rustdds::{QosPolicies, GUID};
+
+    fn counts(current: u64, total: u64, received: u64) -> RawRouteCounts {
+        RawRouteCounts {
+            matched_writers_current: current,
+            matched_writers_total: total,
+            received_total: received,
+        }
+    }
+
+    fn writer() -> GUID {
+        GUID::from_bytes([7; 16])
+    }
+
+    fn matched(total: i32, current: i32, change: i32) -> DataReaderStatus {
+        DataReaderStatus::SubscriptionMatched {
+            total: CountWithChange::start_from(total, change.max(0)),
+            current: CountWithChange::start_from(current, change),
+            writer: writer(),
+        }
+    }
+
+    fn incompatible(count: i32) -> DataReaderStatus {
+        DataReaderStatus::RequestedIncompatibleQos {
+            count: CountWithChange::start_from(count, 1),
+            last_policy_id: QosPolicyId::Reliability,
+            writer: writer(),
+            requested_qos: Box::new(QosPolicies::qos_none()),
+            offered_qos: Box::new(QosPolicies::qos_none()),
+        }
+    }
+
+    fn lowstate() -> RawRouteStats {
+        RawRouteStats::new("/lowstate", "/go2/lowstate", "unitree_go/LowState")
+    }
+
+    /// The fault this exists to catch: LowState silent while a sibling raw
+    /// route streams. Oracle values written by hand.
+    #[test]
+    fn a_silent_route_beside_a_receiving_sibling_is_flagged_by_kind() {
+        let routes = [counts(0, 0, 0), counts(1, 1, 500), counts(1, 1, 0)];
+        assert_eq!(
+            evaluate_raw_route_health(&routes, 0),
+            vec![
+                RawRouteHealth::SilentNeverMatched,
+                RawRouteHealth::Receiving,
+                RawRouteHealth::SilentMatchedNoSamples,
+            ]
+        );
+    }
+
+    #[test]
+    fn with_no_ingress_anywhere_there_is_no_baseline_and_no_alarm() {
+        assert_eq!(evaluate_raw_route_health(&[], 0), vec![]);
+        assert_eq!(
+            evaluate_raw_route_health(&[counts(0, 0, 0)], 0),
+            vec![RawRouteHealth::NoBaseline],
+            "a lone route has no sibling to compare against"
+        );
+        assert_eq!(
+            evaluate_raw_route_health(&[counts(0, 0, 0), counts(1, 1, 0)], 0),
+            vec![RawRouteHealth::NoBaseline, RawRouteHealth::NoBaseline],
+            "matched but quiet everywhere is a quiet DDS side, not one silent route"
+        );
+    }
+
+    #[test]
+    fn typed_ingress_counts_as_a_sibling() {
+        assert_eq!(
+            evaluate_raw_route_health(&[counts(0, 0, 0)], 0),
+            vec![RawRouteHealth::NoBaseline]
+        );
+        assert_eq!(
+            evaluate_raw_route_health(&[counts(0, 0, 0)], 1),
+            vec![RawRouteHealth::SilentNeverMatched],
+            "one typed sample is enough of a baseline"
+        );
+    }
+
+    #[test]
+    fn a_writer_that_matched_and_left_without_data_is_matched_no_samples() {
+        // Matched once, unmatched back to zero writers, nothing received.
+        assert_eq!(
+            evaluate_raw_route_health(&[counts(0, 1, 0), counts(1, 1, 9)], 0),
+            vec![
+                RawRouteHealth::SilentMatchedNoSamples,
+                RawRouteHealth::Receiving
+            ]
+        );
+    }
+
+    #[test]
+    fn a_received_sample_wins_over_inconsistent_writer_counts() {
+        // Received with no matched writer on record (a dropped status event)
+        // and a route that lost every writer after receiving: both Receiving.
+        assert_eq!(
+            evaluate_raw_route_health(
+                &[
+                    counts(0, 0, 3),
+                    counts(0, 2, 7),
+                    counts(u64::MAX, u64::MAX, u64::MAX)
+                ],
+                u64::MAX,
+            ),
+            vec![RawRouteHealth::Receiving; 3]
+        );
+    }
+
+    #[test]
+    fn the_verdict_is_deterministic_across_two_runs() {
+        let routes = [counts(0, 0, 0), counts(2, 3, 0), counts(1, 1, 42)];
+        let oracle = vec![
+            RawRouteHealth::SilentNeverMatched,
+            RawRouteHealth::SilentMatchedNoSamples,
+            RawRouteHealth::Receiving,
+        ];
+        assert_eq!(evaluate_raw_route_health(&routes, 0), oracle);
+        assert_eq!(evaluate_raw_route_health(&routes, 0), oracle);
+    }
+
+    #[test]
+    fn record_status_mirrors_the_rustdds_cumulative_counts() {
+        let r = lowstate();
+        r.record_status(&matched(1, 1, 1));
+        assert_eq!(r.counts(), counts(1, 1, 0));
+        r.record_status(&matched(2, 2, 1));
+        r.record_status(&matched(2, 1, -1));
+        assert_eq!(
+            r.counts(),
+            counts(1, 2, 0),
+            "one writer left, two ever matched"
+        );
+        r.record_status(&matched(2, 0, -1));
+        assert_eq!(r.counts(), counts(0, 2, 0));
+
+        r.record_status(&incompatible(3));
+        assert_eq!(r.incompatible_qos_total.load(Ordering::Relaxed), 3);
+        r.record_status(&DataReaderStatus::SampleLost {
+            count: CountWithChange::start_from(5, 2),
+        });
+        assert_eq!(r.sample_lost_total.load(Ordering::Relaxed), 5);
+        r.record_status(&DataReaderStatus::SampleRejected {
+            count: CountWithChange::start_from(4, 1),
+            last_reason: SampleRejectedStatusKind::BySamplesLimit,
+        });
+        assert_eq!(r.sample_rejected_total.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn statuses_without_a_counter_change_nothing_and_negative_counts_read_zero() {
+        let r = lowstate();
+        r.record_status(&matched(1, 1, 1));
+        r.record_status(&DataReaderStatus::LivelinessChanged {
+            alive_total: CountWithChange::start_from(9, 1),
+            not_alive_total: CountWithChange::start_from(9, 1),
+        });
+        r.record_status(&DataReaderStatus::RequestedDeadlineMissed {
+            count: CountWithChange::start_from(9, 1),
+        });
+        assert_eq!(
+            r.render(),
+            "/lowstate matched_writers=1 matched_writers_total=1 incompatible_qos=0 \
+             sample_lost=0 sample_rejected=0 received=0 published=0 decode_failures=0 \
+             publish_failures=0 stream_errors=0 last_received_ns=0 last_published_ns=0"
+        );
+        r.record_status(&matched(-1, -1, -1));
+        assert_eq!(r.counts(), counts(0, 0, 0));
+    }
+
+    #[test]
+    fn pump_render_appends_each_raw_route_only_once_routes_exist() {
+        let stats = PumpStats::default();
+        let bare = stats.render();
+        assert!(!bare.contains("raw_routes="), "no routes, no term: {bare}");
+        assert!(bare.ends_with("raw_stream_errors=0"), "{bare}");
+
+        let a = Arc::new(lowstate());
+        a.received_total.store(0, Ordering::Relaxed);
+        let b = Arc::new(RawRouteStats::new("/sportmodestate", "/go2/state", "x/Y"));
+        b.received_total.store(12, Ordering::Relaxed);
+        stats.set_raw_routes(vec![Arc::clone(&a), Arc::clone(&b)]);
+        let line = stats.render();
+        assert!(
+            line.ends_with(&format!(
+                "raw_stream_errors=0 raw_routes=[{}; {}]",
+                a.render(),
+                b.render()
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "/sportmodestate matched_writers=0 matched_writers_total=0 \
+             incompatible_qos=0 sample_lost=0 sample_rejected=0 received=12 "
+            ),
+            "{line}"
+        );
+
+        stats.set_raw_routes(vec![b]);
+        assert_eq!(stats.raw_routes().len(), 1, "a re-init replaces the list");
+        assert_eq!(stats.raw_routes()[0].dds_topic, "/sportmodestate");
     }
 }
 
