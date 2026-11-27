@@ -3444,6 +3444,18 @@ pub type AttachedForkCarrier = crate::graph::runtime::ForkCarrier;
 #[cfg(not(unix))]
 pub type AttachedForkCarrier = std::convert::Infallible;
 
+/// The direct capture stream's per-runtime state, alive only while this runtime is
+/// armed WITHOUT the fork carrier ([`GraphRuntime::attach_state_arm_no_fork`]).
+///
+/// Aliased for the same reason as [`AttachedForkCarrier`].
+#[cfg(unix)]
+pub type AttachedDirectCarrier = crate::state_carrier::DirectCarrier;
+
+/// Non-unix stub for [`AttachedDirectCarrier`], uninhabited: no anchor is taken
+/// there, so the slot can never be anything but `None`.
+#[cfg(not(unix))]
+pub type AttachedDirectCarrier = std::convert::Infallible;
+
 /// How many consecutive cadences a process will REMEMBER having
 /// skipped while its own capture child was still running.
 ///
@@ -3639,6 +3651,23 @@ impl crate::state_carrier::InlineCaptureTarget for NodeCaptureView<'_> {
         // specific encoding fault; the walk's overflow-versus-error split does not
         // depend on recognising `SinkFull` through this mapping, because it also
         // consults the sink's own `refused()` flag.
+        self.entry
+            .capture_state(sink)
+            .map_err(|e| crate::state::StateError::NodeCapture {
+                // hot-path-alloc-ok: cold: error-detail render on a state-capture failure arm
+                detail: e.to_string(),
+            })
+    }
+}
+
+#[cfg(unix)]
+impl crate::state_carrier::DirectCaptureTarget for NodeCaptureView<'_> {
+    fn capture_direct(
+        &self,
+        sink: &mut dyn crate::state::StateSink,
+    ) -> Result<(), crate::state::StateError> {
+        // Same mapping as the inline `capture`: the stream tells a budget refusal
+        // from an encoder error through the sink's own `refused()` flag.
         self.entry
             .capture_state(sink)
             .map_err(|e| crate::state::StateError::NodeCapture {
@@ -4708,7 +4737,8 @@ pub struct GraphRuntime {
     /// runtime carries no arena at all.
     capture_arena: Vec<u8>,
     /// The nodes the inline walk deferred, refilled every
-    /// anchor and reused across them (`walk_inline` CLEARS it).
+    /// anchor and reused across them (`walk_inline` CLEARS it). The set goes to the
+    /// fork carrier, or to the direct stream when `direct_carrier` is `Some`.
     capture_fork_set: Vec<(u32, CarrierForkReason)>,
     /// The fork carrier — the breadcrumb, the child setup and the
     /// reaper thread — or `None` (the default) while no recorder has armed this run.
@@ -4720,6 +4750,10 @@ pub struct GraphRuntime {
     /// `None` — "the bounded inline attempt does everything" stated in the type
     /// system rather than in a comment.
     fork_carrier: Option<AttachedForkCarrier>,
+    /// The direct capture stream, `Some` only while this runtime is armed without
+    /// fork. At most one of this slot and `fork_carrier` is `Some`: which one is
+    /// the carrier mode, so no separate mode flag can disagree with it.
+    direct_carrier: Option<AttachedDirectCarrier>,
     /// Principle #3 observable: how the last anchor's nodes split between the
     /// inline walk and the fork carrier — see [`Self::last_anchor_carriers`].
     last_anchor_carriers: Option<AnchorCarrierSplit>,
@@ -10867,6 +10901,7 @@ impl GraphRuntime {
             capture_arena: Vec::new(),
             capture_fork_set: Vec::new(),
             fork_carrier: None,
+            direct_carrier: None,
             last_anchor_carriers: None,
             // Never poisoned at build (poison requires a participant + a boundary
             // timeout, both post-build).
@@ -11681,7 +11716,56 @@ impl GraphRuntime {
         // Installing here also means no WRITER exists after arm, which closes
         // the same deadlock in the other direction.
         crate::state_carrier::install_fork_panic_hook();
+        self.direct_carrier = None;
         self.start_fork_carrier();
+    }
+
+    /// ARM this runtime WITHOUT the fork carrier: the anchor's deferred set is
+    /// streamed on this runtime's own thread instead of by a `fork(2)` child.
+    ///
+    /// For an executor unit that shares its process with other units. A fork
+    /// copies only the forking thread, so a lock a sibling unit's thread holds at
+    /// that instant stays held in the child forever; this arm never forks. The
+    /// inline walk is unchanged, and each node it defers is encoded into the state
+    /// ring through [`crate::state_carrier::stream_deferred_direct`], whose pushes
+    /// never wait and whose record budget is the ring's free part at the boundary.
+    /// The cost is that a deferred node's encoder (a `#[cerulion(serde)]` field or a
+    /// hand-written `CerulionState`) runs on this thread, and nothing bounds its
+    /// time.
+    ///
+    /// Everything else is [`Self::attach_state_arm`]'s: the catch-up clamp, the
+    /// stored handle and the arena. A fork carrier a previous arm started is torn
+    /// down exactly as `Drop` tears it down, and the fork-exclusion tally is cleared,
+    /// since no capture child will read this process's memory. No panic hook is
+    /// installed and no reaper thread is started.
+    #[cfg(unix)]
+    // hot-path-alloc-ok-fn: cold: arms the Flashback capture plane ONCE at run start (the arena is
+    // allocated here so the anchor never allocates one)
+    pub fn attach_state_arm_no_fork(&mut self, arm: Arc<crate::state_arm::MappedStateArm>) {
+        self.scheduler.attach_catchup_arm(
+            Arc::clone(&arm) as Arc<dyn crate::scheduler::catchup_clamp::CatchupArm>
+        );
+        self.state_arm = Some(arm);
+        if self.capture_arena.is_empty() {
+            self.capture_arena = vec![0u8; crate::state::CAPTURE_INLINE_BUDGET_BYTES];
+        }
+        if let Some(mut carrier) = self.fork_carrier.take() {
+            // `stop` kills and reaps a child still in flight; the ring is ours again
+            // only after that, and the producer's local cursor may be stale by what
+            // the child wrote, so it is re-read before the first direct push.
+            carrier.reaper.stop();
+            crate::state_carrier::clear_fork_panic_breadcrumb();
+            if let Some(producer) = self.state_ring.as_mut() {
+                producer.resync_after_fork();
+            }
+        }
+        self.state_arm_fork_sweep = None;
+        self.direct_carrier = Some(crate::state_carrier::DirectCarrier::new());
+        tracing::info!(
+            graph = %self.config.identity(),
+            "state arm attached without fork: this executor unit captures its deferred \
+             node state on its own thread"
+        );
     }
 
     /// Bring up the fork carrier — the breadcrumb page, the
@@ -11870,6 +11954,18 @@ impl GraphRuntime {
         self.last_anchor_carriers
     }
 
+    /// Principle #3 observable: what the LAST anchor's direct stream did, or `None`
+    /// if this runtime is not armed without fork or has streamed no anchor yet.
+    ///
+    /// The direct stream's refusals reach the bag only as SKIP records, which a
+    /// reader cannot tell apart from a fork child's; this says how many deferred
+    /// nodes were streamed, refused by the ring budget, or failed, and whether their
+    /// encoders ran.
+    #[cfg(unix)]
+    pub fn last_anchor_direct(&self) -> Option<crate::state_carrier::DirectStreamStats> {
+        self.direct_carrier.as_ref().and_then(|c| c.last_stats())
+    }
+
     /// Principle #3 observable: whether a capture child of this process is
     /// still encoding.
     ///
@@ -11930,7 +12026,10 @@ impl GraphRuntime {
     ///
     /// A node the walk defers goes to the FORK carrier:
     /// the parent `fork(2)`s and the child streams that node's state into
-    /// the same ring, framed identically. A node neither carrier can capture
+    /// the same ring, framed identically. In a runtime armed without fork
+    /// ([`Self::attach_state_arm_no_fork`]) it goes to the direct stream instead,
+    /// which encodes it on this thread into the same ring, framed identically,
+    /// and never waits for room. A node no carrier can capture
     /// is reported through the ring's SKIP vocabulary rather than dropped, so a
     /// reader learns which nodes an anchor does not cover and why — never a short
     /// anchor presented as whole.
@@ -12032,7 +12131,15 @@ impl GraphRuntime {
         // This is the resync point AND the only place the ring may be touched
         // after a child has owned it. It runs FIRST so a child that finished between
         // cadences is fully accounted for before this cadence writes a byte.
-        self.reap_finished_children(producer, skip_report);
+        //
+        // A runtime armed without fork has no child, and it skips the graph-wide
+        // gate below too: the recorder selects one checkpoint per rank and accepts
+        // different steps across ranks, so a peer's capture child gives this unit
+        // no reason to skip.
+        let direct = self.direct_carrier.is_some();
+        if !direct {
+            self.reap_finished_children(producer, skip_report);
+        }
 
         // ---- One child at a time, GRAPH-WIDE. ----------------------------------
         //
@@ -12045,10 +12152,11 @@ impl GraphRuntime {
         //
         // Checked BEFORE the walk for the same reason: a boundary that is provably
         // going to be discarded must not pay the inline encoding either.
-        if self
-            .state_arm
-            .as_ref()
-            .is_some_and(|arm| arm.busy_workers() != 0)
+        if !direct
+            && self
+                .state_arm
+                .as_ref()
+                .is_some_and(|arm| arm.busy_workers() != 0)
         {
             // WHOSE child decides how the skip is recorded, not whether. If it is
             // OURS, the ring's producer role is the child's for its lifetime
@@ -12261,7 +12369,7 @@ impl GraphRuntime {
         // does and does not allocate).
         let shapes: Vec<Option<u64>> = views.iter().map(|v| v.entry.state_shape()).collect();
 
-        let mut header_failures: Vec<(u32, String)> = Vec::new();
+        let mut header_failures: Vec<(u32, SkipCause, &'static str)> = Vec::new();
         let stats = walk_inline(&views, arena, fork_set, |idx, payload| {
             let i = idx as usize;
             // Field access, never a destructure: the third element is a
@@ -12277,9 +12385,9 @@ impl GraphRuntime {
                 // itself.
                 header_failures.push((
                     node_idx,
+                    SkipCause::CaptureFailed,
                     "captured state but declares no `state_shape()`, so the anchor cannot be \
-                     framed"
-                        .to_string(),
+                     framed",
                 ));
                 return;
             };
@@ -12314,6 +12422,8 @@ impl GraphRuntime {
         // forever in the child's image by nobody, so the child takes each lock itself.
         let fork_targets: Vec<NodeForkTarget> = fork_set
             .iter()
+            // A runtime armed without fork streams the set itself, below.
+            .filter(|_| !direct)
             .filter_map(|(idx, _)| {
                 let i = *idx as usize;
                 // Field access, never a destructure: the third element is a
@@ -12342,6 +12452,36 @@ impl GraphRuntime {
             .map(|(idx, reason)| (guards[*idx as usize].0, *reason))
             .collect();
 
+        // ---- The direct stream, in a runtime armed without fork. ----------------
+        //
+        // It runs HERE, while the views and guards are alive: each encoder runs under
+        // `catch_unwind` inside the guard's scope, so a panic is caught before it can
+        // unwind through the `MutexGuard` and poison the node for every later tick.
+        // Its failures join `header_failures` and are pushed after the guards drop.
+        if let Some(carrier) = self.direct_carrier.as_mut() {
+            let deferred: Vec<crate::state_carrier::DirectDeferredNode<'_, NodeCaptureView<'_>>> =
+                fork_set
+                    .iter()
+                    .map(|&(idx, reason)| {
+                        let i = idx as usize;
+                        crate::state_carrier::DirectDeferredNode {
+                            node_idx: guards[i].0,
+                            reason,
+                            shape: shapes[i],
+                            framework: &framework[i],
+                            target: &views[i],
+                        }
+                    })
+                    .collect();
+            header_failures.extend(crate::state_carrier::stream_deferred_direct(
+                carrier,
+                producer,
+                step,
+                ANCHOR_RING_HEADROOM_RECORDS,
+                &deferred,
+            ));
+        }
+
         // Guards are dropped HERE, at the end of the walk and BEFORE `fork(2)`. A
         // guard held across the fork would be held forever in the child's image (a
         // fork child has one thread), so every one of the child's `try_lock`s would
@@ -12356,15 +12496,17 @@ impl GraphRuntime {
         // node thread at a step boundary, and a blocking push on a full ring waits
         // five seconds per record.
         let mut header_unpublished = 0u64;
-        for (node_idx, detail) in &header_failures {
-            if !producer.try_push_skip(step, *node_idx, SkipCause::CaptureFailed, detail) {
+        let mut first_unpublished = None;
+        for &(node_idx, cause, detail) in &header_failures {
+            if !producer.try_push_skip(step, node_idx, cause, detail) {
                 header_unpublished += 1;
+                first_unpublished.get_or_insert(cause);
             }
         }
-        if !header_failures.is_empty() {
+        if let Some(&(_, first_cause, _)) = header_failures.first() {
             skip_report.note(
                 step,
-                SkipCause::CaptureFailed,
+                first_unpublished.unwrap_or(first_cause),
                 header_unpublished,
                 header_failures.len() as u64,
             );
@@ -12373,7 +12515,7 @@ impl GraphRuntime {
         tracing::debug!(
             step,
             inline_nodes = stats.inline_nodes,
-            forked_nodes = stats.forked_nodes,
+            deferred_nodes = stats.deferred_nodes,
             gated_nodes = stats.gated_nodes,
             unwound_nodes = stats.unwound_nodes,
             bytes_used = stats.bytes_used,
@@ -12383,7 +12525,9 @@ impl GraphRuntime {
         self.last_anchor_carriers = Some(stats);
 
         // ---- The fork carrier: everything the arena could not hold. ------------
-        self.fork_deferred_nodes(step, producer, fork_targets, skip_report);
+        if !direct {
+            self.fork_deferred_nodes(step, producer, fork_targets, skip_report);
+        }
     }
 
     /// Act on every capture child the reaper thread has

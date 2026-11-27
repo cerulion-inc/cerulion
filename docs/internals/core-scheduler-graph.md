@@ -530,6 +530,28 @@ this section is the opt-out's machinery.)
 - The scheduler → trace-ring hook records fires for the out-of-process recorder;
   recording-ON steady state stays zero-alloc (`trace_ring_hook_zero_alloc_test`).
 
+## Checkpoint carriers (anchor boundary)
+
+- `GraphRuntime::take_anchor` runs at a due step boundary: the bounded inline walk
+  (`state_carrier::walk_inline`, a 64 KiB arena, `INLINE_SAFE` nodes only) and then
+  one carrier for the nodes it defers. Which carrier runs is which of the two runtime
+  slots is `Some`, never a separate flag.
+- `attach_state_arm` starts the FORK carrier: one `fork(2)` child encodes the deferred
+  set, and a peer's child in flight (`busy_workers() != 0`) skips the whole cadence as
+  `StillEncoding`.
+- `attach_state_arm_no_fork` is for an executor unit that shares its process with
+  other units, where a fork would copy one thread and leave a sibling's lock held in
+  the child. It starts no child, reaper or panic hook, skips the `busy_workers()` gate
+  (the recorder picks one checkpoint per rank), and streams the deferred set on the
+  unit thread through `state_carrier::stream_deferred_direct`, inside the node guards'
+  scope so a caught encoder panic cannot poison a node mutex. Its pushes never wait:
+  one record budget per boundary is the ring's free part less one record per deferred
+  node and `ANCHOR_RING_HEADROOM_RECORDS`, so each refusal SKIP still lands and voids
+  a truncated stream. A node refused at a budget is not entered again until the
+  budget grows. Observable: `last_anchor_direct()`. The cost: a deferred node's
+  user-written encoder (serde field, hand `CerulionState`) runs on the unit thread,
+  unbounded in time (`state_anchor_direct_iox2_test`).
+
 ## Clock model
 
 - `real_ns()` does not advance while the machine is suspended, on either platform (Linux

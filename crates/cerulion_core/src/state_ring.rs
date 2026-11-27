@@ -1800,8 +1800,9 @@ impl StateRingProducer {
 ///
 /// # Which path this sink serves, and why it is UNBUDGETED
 ///
-/// The design has two sinks feeding ONE encoder and emitting IDENTICAL bytes, so
-/// which carrier a node took is invisible in the bag:
+/// The design has three sinks feeding ONE encoder and emitting IDENTICAL bytes, so
+/// which carrier a node took is invisible in the bag (the third, [`TryStateRingSink`],
+/// is the direct stream's, budgeted and never waiting, for a runtime that cannot fork):
 ///
 /// - the INLINE carrier's `BoundedSink` — a hard `CAPTURE_INLINE_BUDGET_BYTES`
 ///   capacity over a pre-allocated arena, shared across the boundary's nodes, which

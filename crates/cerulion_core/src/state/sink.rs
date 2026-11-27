@@ -36,10 +36,11 @@ impl From<SinkFull> for StateError {
 
 /// Where a capture's bytes go.
 ///
-/// Two implementations exist across the design: [`BoundedSink`] on the inline
-/// carrier (bounded, refuses past its capacity) and, in the fork carrier, an
-/// unbounded backpressured ring sink. Both feed the *same* encoder and emit
-/// *identical bytes*, so which carrier a node took is invisible in the bag.
+/// Three implementations exist across the design: [`BoundedSink`] on the inline
+/// carrier (bounded, refuses past its capacity), in the fork carrier an unbounded
+/// backpressured ring sink, and in the direct stream a ring sink with a record
+/// budget that never waits. All feed the *same* encoder and emit *identical bytes*,
+/// so which carrier a node took is invisible in the bag.
 pub trait StateSink {
     /// Append `bytes`.
     ///
