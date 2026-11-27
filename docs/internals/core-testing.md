@@ -339,6 +339,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `cross_machine_data_plane_harness.rs` | Two-machine data-plane A/B diagnostic (env-driven roles); not run in CI. | hardware-only | none |
 | `catalog_query_warn_test.rs` | Loud once-per-robot fallback warn on an undecodable catalog reply. | `#[serial]` | none |
 | `node_name_refusal_iox2_test.rs` | An unrepresentable graph identity REFUSES the transport instead of aborting the process, proven at the constructors that really build an iceoryx2 node. | parallel | none |
+| `dangling_shm_state_iox2_test.rs` | A stale macOS/FreeBSD `.shm_state` file on the global management segment (one naming absent shared memory, one empty) fails node creation within its `creation_timeout` with `NodeCreation`, registers no node and creates no segment, the same way on every attempt; the singleton returns that error, stays unset, and initializes once the planted file is removed; the `NodeCreation` text names `cerulion clean`. Every arm plants under an isolated prefix with a 20 s watchdog; on the previous fork revision every planted arm spun past it. | `#[serial]` tt1 (installs the singleton); nextest `default-namespace` fence | none |
 
 ### Network plane
 
