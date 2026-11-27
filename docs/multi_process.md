@@ -838,15 +838,16 @@ each driven to its own recorded boundary targets:
   and report a fire-schedule divergence on a candidate that changed nothing.
   (Such a bag CAN exist: plan time admits a creditable split whose `block`
   input sets no `block_timeout_ms`, so `graph run --record` of one produces
-  a bag carrying a cross-process
-  `block` edge. Replay does not accept it: `replay_engine` builds no
-  credited-edge set, so the consumer's rank sees a producer-less `block` topic
-  and refuses at exit 5.) In replay that
-  gate is demoted to a verifier ASSERT on the partial order the read log does
-  record.
+  a bag carrying a cross-process `block` edge, and replay re-executes it; see
+  [`docs/replay_determinism_footguns.md`](replay_determinism_footguns.md).) In
+  replay that gate is demoted to a verifier ASSERT on the partial order the
+  read log does record.
 - **Cross-rank edges are served from the RECORDED frames**, injected through the
   real accounting drain (never a bypass; a bypass would silently lose
   `BackpressureEvent` dispatch) and steered by the consumer's own read log.
+  A split `block` input is the exception: the replay delivers it no block
+  event (`block_event_not_reproduced`, see
+  [`docs/replay_determinism_footguns.md`](replay_determinism_footguns.md)).
 - **So a divergence LOCALIZES to the producing rank.** The verdict reads "rank A
   produced different bytes" rather than a cascade of consumer-side symptoms in
   every rank downstream of it. A cross-rank edge-read divergence is impossible

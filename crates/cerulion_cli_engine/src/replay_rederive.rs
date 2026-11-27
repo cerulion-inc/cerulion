@@ -376,20 +376,25 @@ impl StopPoint {
     /// consecutive-panic breaker releases none, in the re-execution as in the
     /// recording.
     fn slots_released_after(self, step: u64) -> bool {
+        self.slots_released_at().is_some_and(|stop| step > stop)
+    }
+
+    /// The step after which the stop released the node's `block` slots: the
+    /// checkpoint's step for a stop at the checkpoint, the stopping step for
+    /// a fatal error or a poisoned entry, and `None` for the
+    /// consecutive-panic breaker, which releases none.
+    fn slots_released_at(self) -> Option<u64> {
         match self {
-            Self::AtAnchor { anchor_step } => step > anchor_step,
+            Self::AtAnchor { anchor_step } => Some(anchor_step),
             Self::InPass {
                 step: stop, cause, ..
             }
             | Self::Recorded {
                 step: stop, cause, ..
-            } => {
-                let releases = match cause {
-                    NodeStopCause::FatalError | NodeStopCause::EntryPoisoned => true,
-                    NodeStopCause::DisabledAfterPanics => false,
-                };
-                releases && step > stop
-            }
+            } => match cause {
+                NodeStopCause::FatalError | NodeStopCause::EntryPoisoned => Some(stop),
+                NodeStopCause::DisabledAfterPanics => None,
+            },
         }
     }
 
@@ -463,6 +468,12 @@ impl PassStops {
     /// Where `node_id` was stopped, if it was.
     fn stop_point(&self, node_id: &str) -> Option<StopPoint> {
         self.stopped_at.get(node_id).copied()
+    }
+
+    /// The step after which `node_id`'s stop released its `block` slots, if
+    /// a stop did ([`StopPoint::slots_released_at`]).
+    pub(crate) fn slots_released_at(&self, node_id: &str) -> Option<u64> {
+        self.stop_point(node_id)?.slots_released_at()
     }
 }
 
@@ -937,7 +948,10 @@ pub enum FifoDrain {
     /// throttle can leave a frame unfired below the cap, at any step: a
     /// `block` hold is not allowed for, so a held node can be convicted, and
     /// a short step at which its slot was full by the bag's own record says so
-    /// ([`FindingCaveat::DrainUnrecordedHold`]).
+    /// ([`FindingCaveat::DrainUnrecordedHold`]). A node a `block` input in
+    /// another rank holds ([`NodeDecl::held_across_ranks`]) is the exception:
+    /// its rule stands down, and the refill plan takes it as deferrable at
+    /// every step, as on any drain.
     Unrecorded,
 }
 
@@ -1133,8 +1147,10 @@ pub struct NodeDecl {
     pub throttle_ns: Option<u64>,
     /// The `block` edges in the node's rank that may hold its fire with no
     /// record in the bag ([`BlockHoldEdges`]). A `block` edge across ranks
-    /// reaches this module as a [`BlockEdgeObservation`]; one inside the rank
-    /// reaches it only as this field. Where the node's drain is known (the bag
+    /// reaches this module as [`Self::held_across_ranks`] on its producer
+    /// and, where its conservation is judged, as a [`BlockEdgeObservation`]
+    /// on its consumer's rank; one inside the rank reaches it only as this
+    /// field. Where the node's drain is known (the bag
     /// states it, or a `block` or `sample(N)` declaration settles it), the FIFO
     /// rule lets such a node leave a popped frame or a signal unfired at a step
     /// where an edge's slot was full by the bag's own record
@@ -1152,6 +1168,17 @@ pub struct NodeDecl {
     /// where the bag's fire records put its consumer on a later level than its
     /// producer; any other is [`SlotRecord::Unaccounted`].
     pub may_be_held_by: BlockHoldEdges,
+    /// Does a `block` input in another rank read a topic this node produces?
+    /// Live, that edge's credit word, in the consumer's process, can defer
+    /// the node's fire at any step, and the bag records neither the word nor
+    /// its readings. So the `period_ms`, FIFO and `consume = latest` rules
+    /// stand the node down ([`StandDownReason::BlockGated`]), and the Sync
+    /// rule stands down its owed-fire arm
+    /// ([`StandDownReason::SuppressibleFire`]) and still judges the fires the
+    /// bag records. The FIFO carry walk the replay
+    /// plans its trailing refills from (`FifoCarry`) takes the node as
+    /// deferrable at every step.
+    pub held_across_ranks: bool,
     /// Does this node wire any input that is NOT
     /// `#[input(trigger)]`-marked?
     ///
@@ -1267,8 +1294,9 @@ pub struct RecordedStep {
     pub reads: Vec<RecordedRead>,
 }
 
-/// One cross-rank `block` edge, with the publish count the bag's frame stream
-/// carries for it.
+/// One cross-rank `block` edge, judged on its consumer's rank, with the
+/// publish count the bag's frame stream carries for it. Its producer's rank
+/// knows the edge as [`NodeDecl::held_across_ranks`].
 ///
 /// `published_frames` comes from the FRAMES, not from the producer's fires: a
 /// fire and a publish are not the same event (an output the tick never writes
@@ -1278,15 +1306,14 @@ pub struct RecordedStep {
 pub struct BlockEdgeObservation {
     /// The edge's topic.
     pub topic: String,
-    /// The producing node — its schedule re-derivation stands down.
-    pub producer_node: String,
     /// The consuming node.
     pub consumer_node: String,
     /// The consuming `#[input(backpressure = block)]` port.
     pub consumer_input: String,
     /// The declared `#[input(depth = N)]` ceiling.
     pub depth: u32,
-    /// Frames the bag carries on this edge's topic from the producing rank.
+    /// Frames the bag carries on this edge's topic, from its one in-graph
+    /// producer and from any writer outside the graph.
     pub published_frames: u64,
 }
 
@@ -1969,6 +1996,48 @@ impl fmt::Display for StandDownReason {
     }
 }
 
+// Builds the test-only `EVERY_STAND_DOWN_REASON` and an exhaustive `match`
+// from ONE list, so the list is every `StandDownReason` by construction: a new
+// variant does not compile until it is listed, and a variant listed twice is
+// an unreachable pattern.
+macro_rules! every_stand_down_reason {
+    ($($reason:ident),+ $(,)?) => {
+        /// Every [`StandDownReason`], for the oracles that walk the closed
+        /// set: its own token test, and the engine's check that no
+        /// conservation cause's token collides with one of these.
+        #[cfg(test)]
+        pub(crate) const EVERY_STAND_DOWN_REASON: [StandDownReason;
+            [$(StandDownReason::$reason),+].len()] = [$(StandDownReason::$reason),+];
+        // The `match` with no wildcard arm that makes the list whole.
+        #[cfg(test)]
+        const _: fn(StandDownReason) = |reason| match reason {
+            $(StandDownReason::$reason)|+ => {}
+        };
+    };
+}
+every_stand_down_reason!(
+    BlockGated,
+    NoPhaseAnchor,
+    ZeroInterval,
+    TruncatedReadLog,
+    DecimatedRead,
+    MissingWireStamp,
+    SuppressibleFire,
+    QueueExceedsVerifierRoom,
+    AmbiguousReadSite,
+    ImpossibleReadShape,
+    UnattributableCredit,
+    SyncHeadStampRegressed,
+    CaptureTimeSync,
+    LatestDrainUnrecorded,
+    LatestWritersUncapped,
+    LatestWritersUnnamed,
+    LatestBlockHeld,
+    LatestUnfiredSinceAnchor,
+    FifoUnfiredSinceAnchor,
+    SyncUnfiredSinceAnchor,
+);
+
 /// A decider declined to judge, and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandDown {
@@ -2549,7 +2618,7 @@ pub(crate) fn verify(
     let mut report = RederivationReport::default();
 
     for node in nodes {
-        let block_gated = block_edges.iter().any(|e| e.producer_node == node.node_id);
+        let block_gated = node.held_across_ranks;
 
         // The RECORDING is
         // judged BEFORE any rule is, over ALL of this node's reads.
@@ -5128,10 +5197,16 @@ impl PendingExcuse {
 
 /// PURE state: one FIFO `Data` node's carry rule across the steps of a pass,
 /// the ONE walk [`verify_fifo`] and the replay's trailing-refill plan share.
+///
+/// A node a `block` edge across ranks holds ([`NodeDecl::held_across_ranks`])
+/// is deferrable at every step, whatever its drain: the edge's credit word
+/// can stop its burst at any step with no record in the bag. Only the refill
+/// plan walks such a node, since [`verify_fifo`] stands it down first.
 #[derive(Debug, Clone)]
 pub(crate) struct FifoCarry {
     drain: FifoDrain,
     throttle_declared: bool,
+    held_across_ranks: bool,
     deferral: PreFireDeferral,
     carried: u32,
     first: bool,
@@ -5146,6 +5221,7 @@ impl FifoCarry {
         Self {
             drain,
             throttle_declared: node.throttle_ns.is_some(),
+            held_across_ranks: node.held_across_ranks,
             deferral: PreFireDeferral::new(node, resumed, stops),
             carried: 0,
             first: true,
@@ -5181,12 +5257,14 @@ impl FifoCarry {
         }
         self.first = false;
         let supply = fifo_supply(self.drain, self.carried, popped);
-        let deferrable =
-            fifo_carry_deferrable(self.drain, self.throttle_declared, throttle_now, hold_now);
+        let deferrable = self.held_across_ranks
+            || fifo_carry_deferrable(self.drain, self.throttle_declared, throttle_now, hold_now);
         let outcome = fifo_carry_out(self.drain, self.carried, popped, fired, deferrable);
-        // A step only the hold excused waits on the slots that held there.
-        let without_hold =
-            fifo_carry_deferrable(self.drain, self.throttle_declared, throttle_now, false);
+        // A step only the hold excused waits on the slots that held there. A
+        // hold across ranks has no slot here, so a step it excuses waits on
+        // nothing.
+        let without_hold = self.held_across_ranks
+            || fifo_carry_deferrable(self.drain, self.throttle_declared, throttle_now, false);
         if outcome.is_ok()
             && fifo_carry_out(self.drain, self.carried, popped, fired, without_hold).is_err()
         {
@@ -6364,6 +6442,7 @@ mod tests {
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
             may_be_held_by: BlockHoldEdges::none(),
+            held_across_ranks: false,
         }
     }
 
@@ -7324,17 +7403,13 @@ mod tests {
             .collect()
     }
 
-    /// `node_id` as the producer of a `block` edge, which stands its rule
-    /// down.
-    fn gating(node_id: &str) -> Vec<BlockEdgeObservation> {
-        vec![BlockEdgeObservation {
-            topic: "/blk".to_string(),
-            producer_node: node_id.to_string(),
-            consumer_node: "downstream".to_string(),
-            consumer_input: "inp".to_string(),
-            depth: 4,
-            published_frames: 0,
-        }]
+    /// `nodes` with `node_id` held by a `block` edge across ranks, which
+    /// stands its rule down.
+    fn held_across_ranks(mut nodes: Vec<NodeDecl>, node_id: &str) -> Vec<NodeDecl> {
+        for node in nodes.iter_mut().filter(|n| n.node_id == node_id) {
+            node.held_across_ranks = true;
+        }
+        nodes
     }
 
     /// A resumed slice, steps 4 to 7, of the FIFO `Data` node `sink`: the
@@ -7421,9 +7496,9 @@ mod tests {
         assert_eq!(finding_steps(&unseeded), vec![(4, Decider::FifoPop)]);
 
         let gated = judge_resumed(
-            &fifo_node(),
+            &held_across_ranks(fifo_node(), "sink"),
             &quiet,
-            &gating("sink"),
+            &[],
             RoleTrust::Declined,
             resumed_unstated(),
             Some("sink"),
@@ -7651,7 +7726,12 @@ mod tests {
             vec![StandDownReason::ZeroInterval]
         );
         assert!(zero.is_clean());
-        let gated = judge(&ticker, &slice(&[6]), &gating("ticker"), Some("ticker"));
+        let gated = judge(
+            &held_across_ranks(ticker.clone(), "ticker"),
+            &slice(&[6]),
+            &[],
+            Some("ticker"),
+        );
         assert_eq!(
             stand_down_reasons(&gated),
             vec![StandDownReason::BlockGated]
@@ -8771,15 +8851,8 @@ mod tests {
             step(2, EPOCH + 20 * MS, vec![]),
             step(3, EPOCH + 30 * MS, vec![]),
         ];
-        let edges = vec![BlockEdgeObservation {
-            topic: "/blk".to_string(),
-            producer_node: "producer".to_string(),
-            consumer_node: "sink".to_string(),
-            consumer_input: "inp".to_string(),
-            depth: 4,
-            published_frames: 2,
-        }];
-        let report = verify_unrestored(&nodes, &steps, &edges, RoleTrust::Declined);
+        let held = held_across_ranks(nodes.clone(), "producer");
+        let report = verify_unrestored(&held, &steps, &[], RoleTrust::Declined);
         assert!(
             report.is_clean(),
             "a credit-paced producer must not diverge: {:?}",
@@ -8791,12 +8864,157 @@ mod tests {
             decider: Decider::Period,
             reason: StandDownReason::BlockGated,
         }));
-        // ANTI-TAUTOLOGY: the identical trace with NO block edge IS a
-        // divergence, so the clean verdict above is the fence doing work and
+        // ANTI-TAUTOLOGY: the identical trace of a node NO block edge holds IS
+        // a divergence, so the clean verdict above is the fence doing work and
         // not a fixture that could never diverge.
         let bare = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
         assert!(!bare.is_clean());
         assert_eq!(bare.findings[0].step, 2);
+    }
+
+    /// A node a `block` edge across ranks holds stands each rule that owes
+    /// it a fire down: the `period_ms`, Sync owed-fire, FIFO and
+    /// `consume = latest` rules, in declaration order, on one step that
+    /// fires nothing and reads nothing. The same four nodes held by nothing
+    /// are judged: the Period node, never fired, has no phase anchor, and the
+    /// other three owe nothing on such a step.
+    #[test]
+    fn a_node_held_across_ranks_stands_each_rule_down_by_name() {
+        let nodes = vec![
+            node("ticker", period(10 * MS, None)),
+            node(
+                "fusion",
+                TriggerDecl::Sync {
+                    window_ns: Some(50 * MS),
+                    trigger_inputs: inputs(&["cam", "lidar"]),
+                },
+            ),
+            node(
+                "relay",
+                TriggerDecl::Data {
+                    trigger_inputs: inputs(&["inp"]),
+                    drain: FifoDrain::Unified,
+                },
+            ),
+            node(
+                "latest",
+                TriggerDecl::DataLatest {
+                    trigger_inputs: inputs(&["inp"]),
+                    drain: LatestDrain::Unified,
+                    writers: Some(1),
+                    depth: 4,
+                    identity: EdgeIdentity::EveryEdge,
+                },
+            ),
+        ];
+        let steps = vec![step(0, EPOCH, vec![])];
+        let mut held = nodes.clone();
+        for node in &mut held {
+            node.held_across_ranks = true;
+        }
+        let report = verify_unrestored(&held, &steps, &[], RoleTrust::Declined);
+        let judged: Vec<(&str, Decider, &str)> = report
+            .stand_downs
+            .iter()
+            .map(|sd| (sd.node_id.as_str(), sd.decider, sd.reason.code()))
+            .collect();
+        assert_eq!(
+            judged,
+            vec![
+                ("ticker", Decider::Period, "block_gated"),
+                ("fusion", Decider::Sync, "suppressible_fire"),
+                ("relay", Decider::FifoPop, "block_gated"),
+                ("latest", Decider::LatestFire, "block_gated"),
+            ]
+        );
+        assert!(report.is_clean(), "{:?}", report.findings);
+        let bare = verify_unrestored(&nodes, &steps, &[], RoleTrust::Declined);
+        assert_eq!(
+            stand_down_reasons(&bare),
+            vec![StandDownReason::NoPhaseAnchor]
+        );
+    }
+
+    /// The FIFO carry walk takes a node a `block` edge across ranks holds as
+    /// deferrable at every step: a step that pops a frame and fires nothing
+    /// carries it, and the step waits on no slot, so nothing voids it. The
+    /// same node held by nothing cannot leave a frame unfired below the cap.
+    #[test]
+    fn a_node_held_across_ranks_carries_a_frame_at_any_step() {
+        let mut relay = node(
+            "relay",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+                drain: FifoDrain::Unified,
+            },
+        );
+        let walk = |decl: &NodeDecl| {
+            let mut carry = FifoCarry::new(decl, FifoDrain::Unified, false, &PassStops::none());
+            [(1, 0, 0), (1, 1, 1)]
+                .iter()
+                .map(|&(popped, fired, at)| {
+                    let step = carry.step(
+                        popped,
+                        fired,
+                        at,
+                        EPOCH + at * MS,
+                        Some(EPOCH + (at + 1) * MS),
+                        &[],
+                        &[],
+                        RoleTrust::Declined,
+                    );
+                    (step.supply, step.outcome, step.voided)
+                })
+                .collect::<Vec<_>>()
+        };
+        let bare = walk(&relay);
+        relay.held_across_ranks = true;
+        assert_eq!(walk(&relay), vec![(1, Ok(1), None), (2, Ok(1), None)]);
+        assert_eq!(
+            bare,
+            vec![
+                (
+                    1,
+                    Err(FifoCarryMismatch {
+                        supply: 1,
+                        fires: 0
+                    }),
+                    None
+                ),
+                (1, Ok(0), None),
+            ]
+        );
+    }
+
+    /// The step after which a node's stop released its `block` slots: the
+    /// stopping step for a fatal error, a poisoned entry and a recorded fatal
+    /// stop, the checkpoint's step for a stop the checkpoint states, and none
+    /// for the consecutive-panic breaker or a node that never stopped.
+    #[test]
+    fn a_stop_releases_its_slots_after_its_step_unless_the_breaker_made_it() {
+        let mut stops = PassStops::at_anchor(ANCHOR_STEP, ["anchored"]);
+        stops.note("fatal", 4, 1, NodeStopCause::FatalError);
+        stops.note("poisoned", 5, 2, NodeStopCause::EntryPoisoned);
+        stops.note("breaker", 6, 1, NodeStopCause::DisabledAfterPanics);
+        stops.note_recorded(
+            7,
+            &StepStop {
+                node_id: "recorded".to_string(),
+                rank: 0,
+                fires: NonZeroU32::new(1).unwrap(),
+                cause: NodeStopCause::FatalError,
+            },
+        );
+        let released: Vec<Option<u64>> = [
+            "anchored", "fatal", "poisoned", "breaker", "recorded", "running",
+        ]
+        .iter()
+        .map(|node| stops.slots_released_at(node))
+        .collect();
+        assert_eq!(
+            released,
+            vec![Some(ANCHOR_STEP), Some(4), Some(5), None, Some(7), None]
+        );
     }
 
     // -- Throttle ----------------------------------------------------------
@@ -15259,7 +15477,6 @@ mod tests {
 
         let edges = vec![BlockEdgeObservation {
             topic: "/blk".to_string(),
-            producer_node: "producer".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 4,
@@ -15290,7 +15507,6 @@ mod tests {
     fn a_conservation_breach_is_loud_but_never_gates_the_verdict() {
         let edges = vec![BlockEdgeObservation {
             topic: "/blk".to_string(),
-            producer_node: "producer".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 2,
@@ -15336,7 +15552,6 @@ mod tests {
     fn a_truncated_consumer_log_stands_conservation_down() {
         let edges = vec![BlockEdgeObservation {
             topic: "/blk".to_string(),
-            producer_node: "producer".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 2,
@@ -15954,28 +16169,7 @@ mod tests {
     /// repo has already paid for once (`total_failures=` vs four spellings).
     #[test]
     fn every_stand_down_reason_has_its_own_machine_token() {
-        let all = [
-            StandDownReason::BlockGated,
-            StandDownReason::NoPhaseAnchor,
-            StandDownReason::ZeroInterval,
-            StandDownReason::TruncatedReadLog,
-            StandDownReason::DecimatedRead,
-            StandDownReason::MissingWireStamp,
-            StandDownReason::SuppressibleFire,
-            StandDownReason::QueueExceedsVerifierRoom,
-            StandDownReason::AmbiguousReadSite,
-            StandDownReason::ImpossibleReadShape,
-            StandDownReason::UnattributableCredit,
-            StandDownReason::SyncHeadStampRegressed,
-            StandDownReason::CaptureTimeSync,
-            StandDownReason::LatestDrainUnrecorded,
-            StandDownReason::LatestWritersUncapped,
-            StandDownReason::LatestWritersUnnamed,
-            StandDownReason::LatestBlockHeld,
-            StandDownReason::LatestUnfiredSinceAnchor,
-            StandDownReason::FifoUnfiredSinceAnchor,
-            StandDownReason::SyncUnfiredSinceAnchor,
-        ];
+        let all = EVERY_STAND_DOWN_REASON;
         let codes: std::collections::BTreeSet<&str> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len(), "every reason's token is distinct");
         for r in &all {
@@ -16400,7 +16594,6 @@ mod tests {
         //    subscriber port or two. Here it is two, so the edge declines.
         let edges = vec![BlockEdgeObservation {
             topic: "/t".to_string(),
-            producer_node: "src".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 1,
@@ -16502,19 +16695,11 @@ mod tests {
                 drain: FifoDrain::Unified,
             },
         );
-        let gating = vec![BlockEdgeObservation {
-            topic: "/t".to_string(),
-            producer_node: "n".to_string(),
-            consumer_node: "other".to_string(),
-            consumer_input: "x".to_string(),
-            depth: 4,
-            published_frames: 0,
-        }];
         assert_eq!(
             declined(&verify_unrestored(
-                std::slice::from_ref(&n),
+                &held_across_ranks(vec![n.clone()], "n"),
                 &steps,
-                &gating,
+                &[],
                 RoleTrust::Believed {
                     consults_recorded: false
                 },
@@ -16597,7 +16782,6 @@ mod tests {
     fn block_credit_is_summed_per_port_or_declined() {
         let edges = vec![BlockEdgeObservation {
             topic: "/t".to_string(),
-            producer_node: "src".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 1,
@@ -16815,7 +16999,6 @@ mod tests {
     fn block_credit_basis_follows_the_consumers_declared_trigger() {
         let edges = vec![BlockEdgeObservation {
             topic: "/t".to_string(),
-            producer_node: "src".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 1,
@@ -17029,7 +17212,6 @@ mod tests {
     fn a_believed_bag_conservation_finding_carries_no_read_site_census() {
         let edges = vec![BlockEdgeObservation {
             topic: "/t".to_string(),
-            producer_node: "src".to_string(),
             consumer_node: "sink".to_string(),
             consumer_input: "inp".to_string(),
             depth: 1,
@@ -18030,6 +18212,7 @@ mod tests {
             },
             throttle_ns: None,
             may_be_held_by: BlockHoldEdges::none(),
+            held_across_ranks: false,
             has_non_trigger_inputs: true,
             trigger_input_capacities: [("cam".to_string(), DEPTH)].into_iter().collect(),
         };

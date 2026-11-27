@@ -916,11 +916,9 @@ fn a_node_writing_one_listed_topic_twice_is_still_one_producer() {
     // `validate_graph`'s duplicate-output-topic check and
     // `GraphTopology::build`'s double-producer check both EXEMPT a listed
     // topic, and the topology's own producer list is per NODE and deduped for
-    // exactly this shape. An output-keyed list here named `alpha` twice, which
-    // is not cosmetic — `sole_producer()` answers "has this edge ONE producer
-    // to model a pair with", so the duplicate made a single-writer-to-rank-1
-    // edge look like a shared bus and SILENTLY declined the block-credit
-    // observation the rederive plane would otherwise have made.
+    // exactly this shape. An output-keyed list here named `alpha` twice, so the
+    // edge's `producers` listed one writer as two and the single-writer-to-rank-1
+    // edge read as a shared bus.
     let yaml = "name: shared\n\
                 prefix: mp\n\
                 multi_publisher_topics: [/mp/shared_bus]\n\
@@ -970,14 +968,6 @@ fn a_node_writing_one_listed_topic_twice_is_still_one_producer() {
             }],
         }],
         "one WRITER, however many outputs it writes the topic through"
-    );
-    assert_eq!(
-        edges[0].sole_producer(),
-        Some(&RemoteProducer {
-            rank: 0,
-            node: "alpha".into(),
-        }),
-        "so the edge still has a single producer to model a pair with"
     );
 }
 
@@ -1029,9 +1019,5 @@ fn a_co_located_multi_publisher_edge_names_every_producer_not_the_first() {
             ],
         }],
         "ONE edge (the read log's own key), naming BOTH writers"
-    );
-    assert!(
-        edges[0].sole_producer().is_none(),
-        "and a two-writer edge has no single producer to model a pair with"
     );
 }

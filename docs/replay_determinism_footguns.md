@@ -258,27 +258,61 @@ consumer) whose split `block` input sets no `block_timeout_ms`, the supervisor
 mints the edge a cross-process credit word, and `graph run --record`
 of that deployment writes one.
 
-**Replay REFUSES that bag, at exit 5.** `replay_engine` builds each rank's
-runtime through constructors that pass no credited-edge set, so the consumer's
-rank sees a `Block` consumer on a topic with no in-graph producer and
-`GraphTopology::validate` refuses. The verdict is `ReplayError::Internal`
-("failed to build the replay graph runtime for rank N"), NOT the
-`not-replay-grade` exit-2 class, which is about a corrupt or non-replay-grade
-BAG; this bag is fine and it is the replay build that cannot express the edge. The replay build does not thread the recorded credit edges (from the per-rank
-plan/manifest), so do not
-`--record` a deployment whose `process_groups:` splits a `block` edge if you
-intend to replay it; co-locate that flow, or run `--single-process`, for any
-run you plan to re-execute.
+**Replay re-executes that bag.** The edge's producer and consumer run in
+different passes, so the replay feeds the edge from the bag: the consumer's
+pass builds its `block` input with no producer in its rank, no credit word and
+no backpressure probe, and the producer's pass marks the producer as held by
+the edge. For the split edge the verdict is exit 0, or 1 or 6 on a real
+divergence, and the replay stands its producer down (as `block_gated`, or
+`suppressible_fire` for a Sync producer), so that producer's fire schedule
+is not judged, even where a consumer in its own process also holds it; only
+its `throttle_ms`, and a Sync producer's recorded fires, still are. Every
+other hold in the bag gets the verdict a bag of the same graph in one process
+gets, by the rules below.
 
-The demotion described above is unaffected and remains correct: any such bag
-that does load meets a verifier rather than a spurious divergence, which is
-what the demotion exists for.
+- **The held producer's fire rules stand down.** The consumer's credit word
+  in another process can defer it at any step, and the bag records neither
+  the word nor its readings. Held Period, FIFO and `consume = latest`
+  producers stand down as `block_gated`; a held Sync producer as
+  `suppressible_fire`. A held Sync producer's owed fires go unjudged while
+  the fires the bag records are still judged, and a held producer's
+  `throttle_ms` is still judged. A held FIFO producer's trailing refills are
+  still planned from its recorded pops and fires, so the replay serves the
+  frame a hold froze.
+- **Credit conservation** is judged on the consumer's recorded drains: the
+  frames the bag records on the topic, less those the consumer drained, must
+  stay within the input's depth, and a breach is a report-only
+  `conservation` note. Where the bag does not bound that count, the edge
+  stands down instead, with one `stand_down` note whose subject is the topic
+  and whose code is the first cause that holds, in this order:
+  `outside_writer_counted` (the graph lists the topic in
+  `multi_publisher_topics`, so a writer outside the graph adds frames the
+  credit word never counted), `frames_lost_at_record` (the record-health stamp
+  does not show every frame of the topic recorded), `credit_unknown_at_anchor`
+  (the producer's or the consumer's rank begins past step 0) and
+  `consumer_stopped` (the consumer stopped with a stop that releases its slot).
+  Where `--duration` stops the pass short, an edge judged otherwise stands
+  down with a `stand_down` note that carries no code: the bound cuts the
+  drains short and leaves the publish count whole.
+- **The consumer's block events are not reproduced.** The bag does not record
+  when the input's block events fired, so the replay delivers none. Each such
+  input carries a `block_event_not_reproduced` note (its subject is the
+  consumer) and the verdict prints one `NOTE:` line naming them: a node that
+  reads `BackpressureEvent`s on that input can differ in its outputs or state
+  for that reason alone.
+- Where the bag's graph sets no `backpressure:` key on the input, `block`
+  comes from the consumer's declaration in the build you replay, and the
+  replay warns that the verdict matches the recorded run only if the recorded
+  build declared it too.
 
 What still surfaces structurally: rank-LOCAL decisions the verifier can
 re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
 clock, `Sync` alignment, FIFO pop counts from the read log, and a
 `consume = latest` node's one fire per step from the read log's drains) are
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
+The producer of a split `block` edge is the exception: its Period, FIFO and
+`consume = latest` rules and a Sync rule's owed fires stand down, as above,
+and its `throttle_ms` is still judged.
 
 **A node held by a `block` input in its own rank.** When a `block` input reads
 a topic that a node in the same rank produces, that edge's pre-fire check can

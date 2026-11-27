@@ -615,9 +615,15 @@ pub struct ReplayOutcome {
     /// ignores), and the evidence notes: a read-site census, a producer-label
     /// fault, a carried-heads note, the queue a `consume = latest` input
     /// was judged with before its node's first fire
-    /// (`latest_before_first_fire`), and the hold a `period_ms` or Sync node
-    /// was judged with (`hold_allowed_for`). [`RederivationNoteKind`] is the
-    /// closed set of kinds. Additive + skipped when empty.
+    /// (`latest_before_first_fire`), the hold a `period_ms` or Sync node
+    /// was judged with (`hold_allowed_for`), and the block events a split
+    /// `block` input's consumer is not delivered
+    /// (`block_event_not_reproduced`). A stand-down's subject is a node (the
+    /// consumer, where the verifier stands a `block` edge's conservation down
+    /// on its read log), `rank N` for a whole-rank decline, or the topic where
+    /// a split `block` edge's conservation stands down by its cause or under
+    /// `--duration` ([`RederivationNote::subject`]). [`RederivationNoteKind`]
+    /// is the closed set of kinds. Additive + skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rederivation_notes: Vec<RederivationNote>,
     /// Every node whose trace-driven burst was UNDER-FED by the
@@ -1516,8 +1522,8 @@ pub struct ReplayInputShortfall {
 
 /// What a [`RederivationNote`] can be — a CLOSED set, so no producer can emit
 /// a spelling by typo and no reader has to guess which arm an unknown one
-/// belongs in. SEVEN variants; the count is pinned by the exhaustive `match`
-/// in `rederivation_note_serde_spelling_is_pinned` (an eighth is a
+/// belongs in. EIGHT variants; the count is pinned by the exhaustive `match`
+/// in `rederivation_note_serde_spelling_is_pinned` (a ninth is a
 /// compile error there), not by an ordinal claim here — each variant's own
 /// doc says what it adds and why it is additive on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -1600,6 +1606,17 @@ pub enum RederivationNoteKind {
     /// [`replay_rederive::HoldAllowedForNote`]. Additive on the wire, as the
     /// third to sixth variants are.
     HoldAllowedFor,
+    /// A `block` input the rank manifests split from its producer, which the
+    /// replay feeds from the recording: the bag does not record when the
+    /// input's block events fired, so the replay delivers none to the node,
+    /// and a difference in the node's outputs or state can come from one the
+    /// live run delivered. The subject is the consumer node, one note per
+    /// such input, with no code.
+    ///
+    /// NOT a [`RederivationNoteKind::StandDown`]: nothing stood down, and
+    /// every rule judged what it judges. Additive on the wire, as the third to
+    /// seventh variants are.
+    BlockEventNotReproduced,
 }
 
 /// One thing the rank-local re-derivation verifier said that is
@@ -1612,8 +1629,9 @@ pub enum RederivationNoteKind {
 /// [`replay_rederive::RederivationReport::is_clean`] ignores by design), and the
 /// EVIDENCE kinds: a read-site census, a producer-label fault, the
 /// carried-heads disclosure, the queue a `consume = latest` input was
-/// judged with before its node's first fire, and the hold a `period_ms` or
-/// Sync node was judged with. See [`RederivationNoteKind`].
+/// judged with before its node's first fire, the hold a `period_ms` or Sync
+/// node was judged with, and the block events a split `block` input's
+/// consumer is not delivered. See [`RederivationNoteKind`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RederivationNote {
     /// The rank whose pass produced it.
@@ -1626,9 +1644,12 @@ pub struct RederivationNote {
     /// serde output is the same snake_case string, and nothing can emit an
     /// undeclared value by typo.
     pub kind: RederivationNoteKind,
-    /// What it is about: the node id for a stand-down, a read-site census, a
-    /// carried-heads note, a before-first-fire note or a hold-allowed-for
-    /// note; the topic for a conservation breach or a producer-label note.
+    /// What it is about: the node id for a node's stand-down, a read-site
+    /// census, a carried-heads note, a before-first-fire note, a
+    /// hold-allowed-for note or a block-event note (the consumer); `rank N`
+    /// for a whole-rank decline; the topic for a conservation breach, a split
+    /// `block` edge's conservation stand-down by its cause or under
+    /// `--duration`, or a producer-label note.
     pub subject: String,
     /// The rendered sentence, from the pure module's own `Display`.
     pub detail: String,
@@ -1650,10 +1671,14 @@ pub struct RederivationNote {
     /// week?" has to substring-match a REWORDABLE sentence out of `detail`.
     /// **And for a `hold_allowed_for` note**, from
     /// [`replay_rederive::HeldRule::code`], a closed set too:
-    /// `period_block_held` or `sync_block_held`.
+    /// `period_block_held` or `sync_block_held`. **And for the conservation
+    /// stand-down of a `block` edge the rank manifests split**, whose subject
+    /// is the topic: one of `outside_writer_counted`, `frames_lost_at_record`,
+    /// `consumer_stopped` and `credit_unknown_at_anchor`, one token per cause.
     ///
     /// Still `None` for a conservation breach, a read-site census, a
-    /// carried-heads note and a `latest_before_first_fire` note: those are
+    /// carried-heads note, a `latest_before_first_fire` note and a
+    /// `block_event_not_reproduced` note: those are
     /// addressed by [`Self::subject`] and carry no enum-valued cause, so a
     /// token there would be one this module invented. `None` too on the two
     /// stand-downs whose cause is no closed set: a node whose declared
@@ -1678,6 +1703,34 @@ fn hold_allowed_for_note(
         subject: note.node_id.clone(),
         detail: note.to_string(),
         code: Some(note.rule.code().to_string()),
+    }
+}
+
+/// The warning the replay gives once per split `block` edge whose consumer a
+/// pass holds ([`block_event_note`]).
+const BLOCK_EVENT_NOT_REPRODUCED_WARNING: &str = "replay: the bag does not record when this \
+     split `block` input's block events fired, so the replay delivers none to its node; if the \
+     node reads `BackpressureEvent`s on this input, a difference in its outputs or state can come \
+     from one the live run delivered";
+
+/// The `--report` note for the split `block` edge `edge`, whose consumer the
+/// pass of `rank` holds: kind [`RederivationNoteKind::BlockEventNotReproduced`],
+/// the consumer node as its subject, and no code.
+fn block_event_note(rank: u32, edge: &crate::multiprocess::CreditEdgePlan) -> RederivationNote {
+    let (node, input, topic) = (&edge.consumer_node, &edge.consumer_input, &edge.topic);
+    // A minted edge names its one producer's rank.
+    let producer_rank = edge.producer_ranks.first().copied().unwrap_or_default();
+    RederivationNote {
+        rank,
+        kind: RederivationNoteKind::BlockEventNotReproduced,
+        subject: node.clone(),
+        detail: format!(
+            "block input '{node}.{input}' reads '{topic}' from rank {producer_rank}; the bag does \
+             not record when that input's block events fired, so the replay delivers none to \
+             node '{node}', and if the node reads `BackpressureEvent`s on this input a \
+             difference in its outputs or state can come from one the live run delivered."
+        ),
+        code: None,
     }
 }
 
@@ -5511,10 +5564,16 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // edge no credit word can count exactly (two or more in-graph producers,
     // or `block_timeout_ms`) refuses the replay before rank 0 has run a step,
     // when the whole graph builds (and, for `block_timeout_ms`, validates).
-    // One plan holds every node, so it splits nothing.
-    if plans.len() > 1 {
-        refuse_uncreditable_split_block_edges(&config, &plans, &factories)?;
-    }
+    // Every other split `block` edge is one a live run counts on a
+    // cross-process credit word, and each pass feeds it from the bag. One
+    // plan holds every node, so it splits nothing.
+    let split_block_edges = if plans.len() > 1 {
+        creditable_split_block_edges(&config, &plans, &factories)?
+    } else {
+        Vec::new()
+    };
+    let rank_first_steps: BTreeMap<u32, u64> =
+        plans.iter().map(|p| (p.rank(), p.first_step())).collect();
     // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
     //        the first pass ────────────────────────────────────────────────
     //
@@ -5609,6 +5668,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 node_infos: &node_infos,
                 bag_side: &bag_side,
                 node_info_notes,
+                split_block_edges: &split_block_edges,
+                rank_first_steps: &rank_first_steps,
                 config: &config,
                 driver_nodes: &classes.driver_nodes,
                 recorded_queues: recorder.as_ref().and_then(|r| r.input_queues.as_ref()),
@@ -5647,7 +5708,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                     None
                 },
                 publisher_slots: publisher_slots.clone(),
-                bag_fed_block_edges: cerulion_core::replay_feed::BagFedBlockEdges::default(),
+                bag_fed_block_edges: pass_fed_block_edges(&split_block_edges, plan.members()),
             };
             let mut runtime = match build_pass_runtime(
                 plan,
@@ -10085,10 +10146,21 @@ fn refuse_unlisted_macro_output_in_every_pass(
         .try_for_each(|plan| refuse_unlisted_macro_output(plan.subgraph(), entries))
 }
 
+/// The warning [`creditable_split_block_edges`] gives once per split edge
+/// whose `block` the graph the bag embeds does not set, so the build's own
+/// declaration of the consumer input decides it.
+const SPLIT_BLOCK_FROM_DECLARATION_WARNING: &str = "replay: a split `block` edge takes its \
+     `block` from the consumer's declaration in the build you replay, not from the graph the \
+     bag embeds; the replay feeds the edge from the recording and stands its producer down, \
+     which matches the recorded run only if the recorded build of the consumer also declared \
+     `block` on this input";
+
 /// Refuse a replay of more than one rank whose manifests split a `block` edge
 /// no cross-process credit word can count exactly (two or more in-graph
 /// producers, or `block_timeout_ms`)
-/// ([`replay_rank::classify_split_block_edges`]).
+/// ([`replay_rank::classify_split_block_edges`]), and otherwise return the
+/// split `block` edges a live run counts on a cross-process credit word, in
+/// the classifier's order.
 ///
 /// The classifier reads the WHOLE graph the bag embeds and each node's
 /// declaration in this build, before any pass takes its entry; a node whose
@@ -10110,15 +10182,16 @@ fn refuse_unlisted_macro_output_in_every_pass(
 /// one input or one node, which that node's rank build sees.
 /// The replay keeps the exit, the order and the partial report it gave such a
 /// bag before: a refusal made before the first pass and an earlier rank's
-/// failure still come first. An engine bug the classifier reports is
-/// [`ReplayError::Internal`] (exit 5). The creditable split edges the
-/// classifier returns are not read here: a pass build refuses a `block` input
-/// whose producer runs in another rank.
-fn refuse_uncreditable_split_block_edges(
+/// failure still come first. A whole-graph build or validation fault returns
+/// no edge, so no pass feeds a split edge from the bag and its consumer's rank
+/// build refuses it as above. An engine bug the classifier reports is
+/// [`ReplayError::Internal`] (exit 5). Every edge returned is fed from the bag
+/// by each pass that holds one of its ends ([`pass_fed_block_edges`]).
+fn creditable_split_block_edges(
     config: &GraphConfig,
     plans: &[RankPlan],
     entries: &IndexMap<String, Box<dyn NodeEntry>>,
-) -> Result<(), ReplayError> {
+) -> Result<Vec<crate::multiprocess::CreditEdgePlan>, ReplayError> {
     let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = config
         .nodes
         .iter()
@@ -10129,14 +10202,31 @@ fn refuse_uncreditable_split_block_edges(
         .collect();
     let node_rank = replay_rank::plan_node_ranks(plans);
     match replay_rank::classify_split_block_edges(config, &infos, &node_rank) {
-        Ok(_) => Ok(()),
+        Ok(edges) => {
+            // The classification reads `block` off this build's declarations
+            // where the bag's graph sets no key, so a recording made with a
+            // build that declared otherwise is fed and judged as this one.
+            for edge in edges.iter().filter(|e| {
+                replay_rank::block_declared_by(config, &e.consumer_node, &e.consumer_input)
+                    == replay_rank::BlockDeclaredBy::Node
+            }) {
+                tracing::warn!(
+                    topic = %edge.topic,
+                    consumer_node = %edge.consumer_node,
+                    consumer_input = %edge.consumer_input,
+                    producer = %edge.producer_nodes.join(", "),
+                    "{SPLIT_BLOCK_FROM_DECLARATION_WARNING}"
+                );
+            }
+            Ok(edges)
+        }
         Err(replay_rank::SplitBlockEdgeError::Topology { reason }) => {
             tracing::debug!(
                 error = %reason,
                 "replay: the whole graph does not build or validate with this build's \
                  declarations, so its remaining split `block` edges are left to each rank's build"
             );
-            Ok(())
+            Ok(Vec::new())
         }
         Err(e @ replay_rank::SplitBlockEdgeError::EngineBug { .. }) => Err(ReplayError::Internal {
             reason: e.to_string(),
@@ -10148,6 +10238,35 @@ fn refuse_uncreditable_split_block_edges(
             Err(ReplayError::SplitBlockEdgeTimeout { edge })
         }
     }
+}
+
+/// PURE: the split `block` edges ([`creditable_split_block_edges`]) the pass
+/// over `members` feeds from the bag, as its build's replay wiring names them
+/// ([`cerulion_core::replay_feed::BagFedBlockEdges`]): each edge whose
+/// consumer, or one of whose producers, the pass holds. The build accepts a
+/// consumer end's `block` input with no in-graph producer and installs no
+/// backpressure probe on it, since no credit word counts it, and marks each
+/// producer it holds as held by the edge, so it accepts a trailing refill the
+/// recording holds on it below the burst cap. A pass that holds neither end
+/// of an edge gets no entry for it.
+fn pass_fed_block_edges(
+    edges: &[crate::multiprocess::CreditEdgePlan],
+    members: &[String],
+) -> cerulion_core::replay_feed::BagFedBlockEdges {
+    cerulion_core::replay_feed::BagFedBlockEdges::new(
+        edges
+            .iter()
+            .filter(|e| {
+                members.contains(&e.consumer_node)
+                    || e.producer_nodes.iter().any(|p| members.contains(p))
+            })
+            .map(|e| cerulion_core::replay_feed::BagFedBlockEdge {
+                topic: e.topic.clone(),
+                consumer_node: e.consumer_node.clone(),
+                consumer_input: e.consumer_input.clone(),
+                producer_nodes: e.producer_nodes.clone(),
+            }),
+    )
 }
 
 /// Refuse a graph in which a `#[cerulion_node]` node declares an output that
@@ -10370,6 +10489,12 @@ struct PassInputs<'a> {
     /// one per member whose declared metadata could not be read, so the
     /// verifier's clean claim never covers a node nobody looked at.
     node_info_notes: Vec<RederivationNote>,
+    /// The `block` edges the run's rank manifests split that a live run
+    /// counts on a cross-process credit word
+    /// ([`creditable_split_block_edges`]), the whole run's.
+    split_block_edges: &'a [crate::multiprocess::CreditEdgePlan],
+    /// Each rank's first recorded step ([`RankPlan::first_step`]).
+    rank_first_steps: &'a BTreeMap<u32, u64>,
     /// The whole-graph config — `multi_publisher_topics` is a graph-level
     /// declaration, not a subgraph one.
     config: &'a GraphConfig,
@@ -11182,9 +11307,13 @@ fn derive_trailing_refills(
 /// `sample(N)` declaration settles it) plans nothing, a node with no refill
 /// hook in this replay (`has_refill`) plans nothing, and a `drop_oldest` node
 /// on a bag with no stage set (`FifoDrain::Unrecorded`) is planned on the
-/// rule it is judged on, which allows for no hold. A node whose reads
-/// a pop count cannot be taken over (a node a cross-rank `block` edge gates, a
-/// truncated or decimated stream, a declined verification) carries nothing.
+/// rule it is judged on, which allows for no hold, except a node a `block`
+/// edge across ranks holds, below. A node a `block` edge
+/// across ranks holds (`replay_rederive::NodeDecl::held_across_ranks`) can be
+/// deferred at every step, since the edge's credit word is in another process,
+/// so its burst can end on a trailing refill at any step. A node whose reads
+/// a pop count cannot be taken over (a truncated or decimated stream, a
+/// declined verification) carries nothing.
 /// A step no carry explains (a stopped node, a fire on a re-offered head that
 /// no pop recorded, a signal clamp) carries nothing and is left to the
 /// re-derivation verdict.
@@ -11226,13 +11355,6 @@ fn fifo_trailing_refills(
             replay_rederive::FifoDrain::Unified | replay_rederive::FifoDrain::Unrecorded => {}
         }
         if !has_refill(&decl.node_id) {
-            continue;
-        }
-        if verification
-            .block_edges
-            .iter()
-            .any(|e| e.producer_node == decl.node_id)
-        {
             continue;
         }
         let carry = carries
@@ -12956,8 +13078,9 @@ struct PassVerification {
     reads_by_step: BTreeMap<u64, Vec<replay_rederive::RecordedRead>>,
     /// This rank's declarations, in graph order.
     decls: Vec<replay_rederive::NodeDecl>,
-    /// The rank's cross-rank `block` consumer edges.
-    block_edges: Vec<replay_rederive::BlockEdgeObservation>,
+    /// The split `block` edges whose consumer this rank holds
+    /// ([`creditable_split_block_edges`]).
+    block_edges: Vec<ConsumedSplitEdge>,
     /// `Some(cause)` when this pass DECLINED the two additive gates, carrying
     /// WHICH of the five prepare-time causes fired.
     ///
@@ -14069,6 +14192,143 @@ fn topic_recorded_whole(report: &RecordHealthReport, topic: &str, listed: bool) 
         }
         RecordHealthReport::Absent | RecordHealthReport::Malformed => false,
     }
+}
+
+/// Which end of a split `block` edge a rank holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SplitEdgeEnd {
+    /// The rank holds the edge's producer.
+    Produces,
+    /// The rank holds the edge's consumer.
+    Consumes,
+}
+
+/// Why the re-derivation verifier makes no credit-conservation claim about a
+/// split `block` edge whose consumer its pass holds: a cause under which the
+/// bound it checks (the frames published on the topic, less those the
+/// consumer drained, stay within the input's depth) does not follow from the
+/// bag. Each cause has its own stable token ([`Self::code`]), the note's
+/// `code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConservationStandDown {
+    /// The graph lists the topic in `multi_publisher_topics`, so a writer
+    /// outside the graph can add frames the bag counts as published.
+    OutsideWriterCounted,
+    /// The bag's record-health stamp does not show every frame of the topic
+    /// recorded ([`topic_recorded_whole`]), so the publish count can be short.
+    FramesLostAtRecord,
+    /// The consumer stopped at `step` with a stop that releases its slot, so
+    /// frames published after it are never drained.
+    ConsumerStopped {
+        /// The stopping step.
+        step: u64,
+    },
+    /// `rank`, which holds the `end` named, begins at `step`, past step 0,
+    /// so the bag's trace holds none of that rank's reads or fires before it,
+    /// and no edge's outstanding count at it.
+    CreditUnknownAtAnchor {
+        /// The rank that begins late.
+        rank: u32,
+        /// The end of the edge it holds.
+        end: SplitEdgeEnd,
+        /// Its first recorded step.
+        step: u64,
+    },
+}
+
+impl ConservationStandDown {
+    /// The stable machine token of the cause.
+    fn code(self) -> &'static str {
+        match self {
+            Self::OutsideWriterCounted => "outside_writer_counted",
+            Self::FramesLostAtRecord => "frames_lost_at_record",
+            Self::ConsumerStopped { .. } => "consumer_stopped",
+            Self::CreditUnknownAtAnchor { .. } => "credit_unknown_at_anchor",
+        }
+    }
+
+    /// The note's sentence for `edge`.
+    fn detail(self, edge: &replay_rederive::BlockEdgeObservation) -> String {
+        let replay_rederive::BlockEdgeObservation {
+            topic,
+            consumer_node: node,
+            consumer_input: input,
+            ..
+        } = edge;
+        let why = match self {
+            Self::OutsideWriterCounted => format!(
+                "the graph lists '{topic}' in `multi_publisher_topics`, so a writer outside the \
+                 graph adds frames the bag records and the edge's credit word never counted"
+            ),
+            Self::FramesLostAtRecord => {
+                format!("the bag's record health does not show every frame of '{topic}' recorded")
+            }
+            Self::ConsumerStopped { step } => format!(
+                "node '{node}' stopped at step {step}, which releases its slot, so frames \
+                 published after the stop are never drained"
+            ),
+            Self::CreditUnknownAtAnchor { rank, end, step } => {
+                let verb = match end {
+                    SplitEdgeEnd::Produces => "produces",
+                    SplitEdgeEnd::Consumes => "consumes",
+                };
+                format!(
+                    "rank {rank}, which {verb} '{topic}', begins at step {step}, past step 0, and \
+                     the bag records no edge's outstanding count there"
+                )
+            }
+        };
+        format!("{}{why}", no_conservation_claim(topic, node, input))
+    }
+}
+
+/// The start of every note in which the re-derivation verifier makes no
+/// credit-conservation claim about the `block` edge `topic` ->
+/// `node.input`: a cause's ([`ConservationStandDown::detail`]) and the
+/// `--duration` bound's.
+fn no_conservation_claim(topic: &str, node: &str, input: &str) -> String {
+    format!(
+        "the rank-local re-derivation verifier makes NO credit-conservation claim about \
+         '{topic}' -> {node}.{input}: "
+    )
+}
+
+/// PURE: why the re-derivation verifier cannot judge a split `block` edge's
+/// credit conservation, from what the graph and the bag say before its
+/// consumer's pass runs, or `None` when nothing does. `listed` says whether
+/// the graph lists the edge's topic in `multi_publisher_topics`,
+/// `recorded_whole` whether the bag's record health shows every frame of it
+/// ([`topic_recorded_whole`]), and `starts` the first recorded step of the
+/// producer's rank and of the consumer's, in that order. The first cause that
+/// holds wins: an outside writer, then lost frames, then the first rank of the
+/// two that begins past step 0. A consumer's stop is known only once its pass
+/// has run, and comes last ([`ConservationStandDown::ConsumerStopped`]).
+fn split_edge_unjudgeable(
+    listed: bool,
+    recorded_whole: bool,
+    starts: [(SplitEdgeEnd, u32, u64); 2],
+) -> Option<ConservationStandDown> {
+    if listed {
+        return Some(ConservationStandDown::OutsideWriterCounted);
+    }
+    if !recorded_whole {
+        return Some(ConservationStandDown::FramesLostAtRecord);
+    }
+    starts
+        .into_iter()
+        .find(|&(_, _, step)| step > 0)
+        .map(|(end, rank, step)| ConservationStandDown::CreditUnknownAtAnchor { rank, end, step })
+}
+
+/// One split `block` edge whose consumer a pass holds
+/// ([`PassVerification::block_edges`]).
+#[derive(Debug, Clone)]
+struct ConsumedSplitEdge {
+    /// What the re-derivation verifier judges its credit conservation on.
+    observation: replay_rederive::BlockEdgeObservation,
+    /// Why that cannot be judged, where the graph or the bag says so before
+    /// the pass runs ([`split_edge_unjudgeable`]).
+    unjudgeable: Option<ConservationStandDown>,
 }
 
 /// PURE: the inputs `input`'s consumer reads before it at every fire
@@ -15386,7 +15646,7 @@ fn decode_enforcement_read(
 /// "no coverage" shapes rather than with a guess, so a hole shows up as a
 /// reported stand-down instead of a schedule nobody can justify.
 #[allow(clippy::too_many_lines)]
-// SIXTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
+// EIGHTEEN arguments. `roles_stamped` is a per-BAG contract term resolved once
 // at `run_engine` entry beside `coordination`, so it arrives the same way every
 // other pass input does.
 // Bundling the other borrows into a struct only to satisfy the ceiling would not
@@ -15434,6 +15694,11 @@ fn prepare_pass_verification(
     step_end: Option<u64>,
     // Configured whole-recording record budget.
     verifier_record_budget: u64,
+    // The run's split `block` edges a live run counts on a cross-process
+    // credit word ([`creditable_split_block_edges`]).
+    split_block_edges: &[crate::multiprocess::CreditEdgePlan],
+    // Each rank's first recorded step.
+    rank_first_steps: &BTreeMap<u32, u64>,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -16418,6 +16683,11 @@ fn prepare_pass_verification(
                 may_be_held_by: replay_rederive::BlockHoldEdges::new(
                     block_holds.remove(id.as_str()).unwrap_or_default(),
                 ),
+                // A split edge's producer and consumer are in different
+                // ranks by its classification, so its consumer is never here.
+                held_across_ranks: split_block_edges
+                    .iter()
+                    .any(|e| e.producer_nodes.contains(id)),
                 has_non_trigger_inputs: node_has_non_trigger_inputs(info, wired),
                 trigger_input_capacities: trigger_input_capacities(
                     info,
@@ -16430,66 +16700,38 @@ fn prepare_pass_verification(
         })
         .collect();
 
-    let cross: std::collections::HashMap<(String, String), &replay_rank::CrossRankEdge> = plan
-        .cross_rank_consumed()
+    // The split `block` edges whose consumer this rank holds, which the
+    // pass's re-derivation verdict judges for their credit conservation on
+    // the consumer's recorded drains where the graph and the bag allow it.
+    let block_edges = split_block_edges
         .iter()
-        .map(|e| ((e.consumer_node.clone(), e.consumer_input.clone()), e))
+        .filter(|e| plan.members().contains(&e.consumer_node))
+        .map(|e| {
+            let listed = config.is_multi_publisher(&e.topic);
+            // A minted edge names its one producer's rank, which `plans` holds.
+            let producer_rank = e.producer_ranks.first().map_or(0, |&r| r as u32);
+            let producer_start = rank_first_steps.get(&producer_rank).copied().unwrap_or(0);
+            ConsumedSplitEdge {
+                observation: replay_rederive::BlockEdgeObservation {
+                    topic: e.topic.clone(),
+                    consumer_node: e.consumer_node.clone(),
+                    consumer_input: e.consumer_input.clone(),
+                    depth: e.depth,
+                    // The FRAMES, never the producer's fires (an output the
+                    // tick never writes never publishes).
+                    published_frames: recorded_messages.frame_count(&e.topic) as u64,
+                },
+                unjudgeable: split_edge_unjudgeable(
+                    listed,
+                    topic_recorded_whole(record_health, &e.topic, listed),
+                    [
+                        (SplitEdgeEnd::Produces, producer_rank, producer_start),
+                        (SplitEdgeEnd::Consumes, plan.rank(), plan.first_step()),
+                    ],
+                ),
+            }
+        })
         .collect();
-    // MEASURED, see
-    // `a_crafted_cross_rank_block_edge_is_refused_at_the_rank_build_never_verified`:
-    // this loop is UNREACHABLE with a non-empty result on any bag the engine
-    // will build. A cross-rank `block` edge is refused TWICE before it could
-    // reach here: `validate_partition` refuses a split at record time,
-    // and `build_pass_runtime` builds THIS rank's subgraph, whose
-    // `GraphTopology::validate` refuses a `block` input with no in-graph
-    // producer (exit 5) strictly before the pass that reads `block_edges`
-    // runs. So no pass ever judges a non-empty list, and the `verify_conservation`
-    // plane it feeds is held by its pure oracles alone. It stays because
-    // deleting it is a design call over that plane (`Decider::BlockCredit`,
-    // three stand-down reasons, eight oracles), not a local tidy-up.
-    let mut block_edges = Vec::new();
-    for (topic, node, input) in &consumed {
-        let Some(edge) = cross.get(&(node.clone(), input.clone())) else {
-            continue; // an intra-rank block edge is decided inside one runtime.
-        };
-        let Some(info) = node_infos.get(node.as_str()) else {
-            continue;
-        };
-        let Some(meta) = info.input_meta().iter().find(|m| m.name == *input) else {
-            continue;
-        };
-        if meta.backpressure != cerulion_core::graph::node::BackpressurePolicy::Block {
-            continue;
-        }
-        // A `BlockEdgeObservation` models ONE producer/consumer
-        // pair, and a split multi-publisher topic has no single producer to put
-        // in the producer slot. Picking the first in graph order would attribute
-        // the whole published-frame count to a writer that produced part of it,
-        // so the observation is DECLINED instead — the rederive plane simply
-        // sees no block edge here, which is what it already sees for every
-        // intra-rank one.
-        let Some(producer) = edge.sole_producer() else {
-            tracing::debug!(
-                topic = %topic,
-                consumer_node = %node,
-                consumer_input = %input,
-                producers = edge.producers.len(),
-                "replay: a cross-rank `block` edge on a multi-producer topic has no single \
-                 producer to observe — its block-credit observation is declined"
-            );
-            continue;
-        };
-        block_edges.push(replay_rederive::BlockEdgeObservation {
-            topic: topic.clone(),
-            producer_node: producer.node.clone(),
-            consumer_node: node.clone(),
-            consumer_input: input.clone(),
-            depth: meta.depth as u32,
-            // The FRAMES, never the producer's fires (an output the
-            // tick never writes never publishes).
-            published_frames: recorded_messages.frame_count(topic) as u64,
-        });
-    }
 
     Ok(PassVerification {
         steered,
@@ -16968,6 +17210,8 @@ fn plan_pass_verification(
         pass.stops_recorded,
         step_end,
         pass.verifier_record_budget,
+        pass.split_block_edges,
+        pass.rank_first_steps,
     )?;
     Ok(verification)
 }
@@ -18101,7 +18345,32 @@ fn run_rank_pass(
     // And what PLANNING said about this bag's record-time producer
     // labels. Minted before the step loop, reported with the rest.
     rederivation_notes.append(&mut verification.notes);
+    // Each split `block` edge this pass consumes: the replay feeds it from
+    // the bag and delivers its input no block event, whatever the verifier
+    // makes of the pass.
+    for edge in pass
+        .split_block_edges
+        .iter()
+        .filter(|e| plan.members().contains(&e.consumer_node))
+    {
+        let note = block_event_note(plan.rank(), edge);
+        tracing::warn!(
+            rank = plan.rank(),
+            topic = %edge.topic,
+            consumer_node = %edge.consumer_node,
+            consumer_input = %edge.consumer_input,
+            producer_rank = edge.producer_ranks.first().copied().unwrap_or_default(),
+            "{BLOCK_EVENT_NOT_REPRODUCED_WARNING}"
+        );
+        rederivation_notes.push(note);
+    }
     if !lockstep {
+        // A split `block` edge the replay feeds from the bag has no credit
+        // word in this runtime, so it has no entry here; the re-derived check
+        // after the pass judges it or stands it down by name. Where the rank's
+        // verifier declines the whole rank, nothing judges the edge's
+        // conservation, and no note says so: the decline note names the
+        // rank's deciders only.
         for credit in runtime.block_credits() {
             if credit.conservation_broken() {
                 // Reported as well as warned — the SYMMETRY the re-derived twin
@@ -18543,10 +18812,43 @@ fn run_rank_pass(
                 ),
             });
         } else {
+            // A split `block` edge whose credit conservation the bag cannot
+            // bound is stood down by its cause, and the verifier judges the
+            // rest. The consumer's stop is read off this pass's stops.
+            let mut judged_edges: Vec<replay_rederive::BlockEdgeObservation> = Vec::new();
+            for edge in &verification.block_edges {
+                let cause = edge.unjudgeable.or_else(|| {
+                    rederive_stops
+                        .slots_released_at(&edge.observation.consumer_node)
+                        .map(|step| ConservationStandDown::ConsumerStopped { step })
+                });
+                let Some(cause) = cause else {
+                    judged_edges.push(edge.observation.clone());
+                    continue;
+                };
+                let detail = cause.detail(&edge.observation);
+                tracing::debug!(
+                    rank = plan.rank(),
+                    topic = %edge.observation.topic,
+                    consumer_node = %edge.observation.consumer_node,
+                    consumer_input = %edge.observation.consumer_input,
+                    code = cause.code(),
+                    detail = %detail,
+                    "replay: no credit-conservation claim about this split `block` edge (see \
+                     `code` and `detail`)"
+                );
+                rederivation_notes.push(RederivationNote {
+                    rank: plan.rank(),
+                    kind: RederivationNoteKind::StandDown,
+                    subject: edge.observation.topic.clone(),
+                    detail,
+                    code: Some(cause.code().to_string()),
+                });
+            }
             let report = replay_rederive::verify(
                 &verification.decls,
                 &rederive_steps,
-                &verification.block_edges,
+                &judged_edges,
                 // The conversion of the two bag terms to `RoleTrust` the verdict
                 // uses (the trailing-refill pre-pass makes the same one). They
                 // stay bools at the pass boundary because the injection
@@ -18753,13 +19055,12 @@ fn run_rank_pass(
             // pass really published and drained, so a bound moves both halves
             // together.
             if bounded_out {
-                for e in &verification.block_edges {
+                for e in &judged_edges {
                     let detail = format!(
-                        "the rank-local re-derivation verifier makes NO credit-conservation \
-                         claim about '{}' -> {}.{}: the `--duration` bound stopped this pass \
-                         short, so the drains it observed cover part of the recording while the \
-                         publish count it would compare them against covers all of it",
-                        e.topic, e.consumer_node, e.consumer_input
+                        "{}the `--duration` bound stopped this pass short, so the drains it \
+                         observed cover part of the recording while the publish count it would \
+                         compare them against covers all of it",
+                        no_conservation_claim(&e.topic, &e.consumer_node, &e.consumer_input)
                     );
                     tracing::warn!(
                         rank = plan.rank(),
@@ -23091,6 +23392,7 @@ mod node_trigger_decl_tests {
             trigger,
             throttle_ns: None,
             may_be_held_by: BlockHoldEdges::none(),
+            held_across_ranks: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: Default::default(),
         };
@@ -23243,6 +23545,7 @@ mod node_trigger_decl_tests {
             ),
             throttle_ns: None,
             may_be_held_by: BlockHoldEdges::none(),
+            held_across_ranks: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: Default::default(),
         };
@@ -33779,6 +34082,20 @@ pub fn render_verdict(outcome: &ReplayOutcome, bag: &Path) -> String {
         }
     }
 
+    // The block events of a split `block` edge's consumer, which the replay
+    // does not deliver, rendered in BOTH the PASS and the FAIL path: one
+    // line, every such input's sentence in it, so a difference on that
+    // consumer's outputs has its possible cause in sight.
+    let block_events: Vec<&str> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| n.kind == RederivationNoteKind::BlockEventNotReproduced)
+        .map(|n| n.detail.as_str())
+        .collect();
+    if !block_events.is_empty() {
+        let _ = writeln!(s, "NOTE: {}", block_events.join(" "));
+    }
+
     // The topics whose frame comparison was DECLINED. Rendered
     // for the same reason as the two blocks below — an operator reading the terminal
     // must see what was NOT judged — and FIRST, because unlike those two it
@@ -42322,6 +42639,7 @@ mod trigger_input_capacity_tests {
                 },
                 throttle_ns: None,
                 may_be_held_by: BlockHoldEdges::new(holds.remove("relay").unwrap_or_default()),
+                held_across_ranks: false,
                 has_non_trigger_inputs: false,
                 trigger_input_capacities: Default::default(),
             }
@@ -42915,6 +43233,254 @@ mod enforcement_decode_tests {
 }
 
 #[cfg(test)]
+mod conservation_stand_down_tests {
+    use super::*;
+    use ConservationStandDown::{
+        ConsumerStopped, CreditUnknownAtAnchor, FramesLostAtRecord, OutsideWriterCounted,
+    };
+    use SplitEdgeEnd::{Consumes, Produces};
+
+    /// A producer rank 0 and a consumer rank 1 beginning at these steps.
+    fn starts(producer: u64, consumer: u64) -> [(SplitEdgeEnd, u32, u64); 2] {
+        [(Produces, 0, producer), (Consumes, 1, consumer)]
+    }
+
+    /// One oracle row: `(listed, recorded whole, starts)` against the cause.
+    type UnjudgeableRow = (
+        (bool, bool, [(SplitEdgeEnd, u32, u64); 2]),
+        Option<ConservationStandDown>,
+    );
+
+    /// Each cause alone, and every pair that tests the order: an outside
+    /// writer, then lost frames, then the producer's late start, then the
+    /// consumer's. A start at step 1 is past step 0; a start at 0 is not.
+    #[test]
+    fn a_split_edge_is_unjudgeable_by_the_first_cause_that_holds() {
+        let rows: &[UnjudgeableRow] = &[
+            ((false, true, starts(0, 0)), None),
+            ((true, true, starts(0, 0)), Some(OutsideWriterCounted)),
+            ((true, false, starts(4, 4)), Some(OutsideWriterCounted)),
+            ((false, false, starts(0, 0)), Some(FramesLostAtRecord)),
+            ((false, false, starts(4, 4)), Some(FramesLostAtRecord)),
+            (
+                (false, true, starts(1, 0)),
+                Some(CreditUnknownAtAnchor {
+                    rank: 0,
+                    end: Produces,
+                    step: 1,
+                }),
+            ),
+            (
+                (false, true, starts(0, 2)),
+                Some(CreditUnknownAtAnchor {
+                    rank: 1,
+                    end: Consumes,
+                    step: 2,
+                }),
+            ),
+            (
+                (false, true, starts(3, 2)),
+                Some(CreditUnknownAtAnchor {
+                    rank: 0,
+                    end: Produces,
+                    step: 3,
+                }),
+            ),
+        ];
+        for &((listed, whole, starts), want) in rows {
+            assert_eq!(
+                split_edge_unjudgeable(listed, whole, starts),
+                want,
+                "listed {listed}, whole {whole}, starts {starts:?}"
+            );
+        }
+    }
+
+    /// Each cause's note, sentence and token, against the hand-written text;
+    /// no two causes share a token.
+    #[test]
+    fn each_conservation_stand_down_names_its_cause_and_its_own_token() {
+        let edge = replay_rederive::BlockEdgeObservation {
+            topic: "/sp/src/out".to_string(),
+            consumer_node: "sink".to_string(),
+            consumer_input: "inp".to_string(),
+            depth: 3,
+            published_frames: 7,
+        };
+        let prefix = "the rank-local re-derivation verifier makes NO credit-conservation claim \
+                      about '/sp/src/out' -> sink.inp: ";
+        let rows: [(ConservationStandDown, &str, &str); 5] = [
+            (
+                OutsideWriterCounted,
+                "outside_writer_counted",
+                "the graph lists '/sp/src/out' in `multi_publisher_topics`, so a writer outside \
+                 the graph adds frames the bag records and the edge's credit word never counted",
+            ),
+            (
+                FramesLostAtRecord,
+                "frames_lost_at_record",
+                "the bag's record health does not show every frame of '/sp/src/out' recorded",
+            ),
+            (
+                ConsumerStopped { step: 6 },
+                "consumer_stopped",
+                "node 'sink' stopped at step 6, which releases its slot, so frames published \
+                 after the stop are never drained",
+            ),
+            (
+                CreditUnknownAtAnchor {
+                    rank: 0,
+                    end: Produces,
+                    step: 2,
+                },
+                "credit_unknown_at_anchor",
+                "rank 0, which produces '/sp/src/out', begins at step 2, past step 0, and the \
+                 bag records no edge's outstanding count there",
+            ),
+            (
+                CreditUnknownAtAnchor {
+                    rank: 1,
+                    end: Consumes,
+                    step: 1,
+                },
+                "credit_unknown_at_anchor",
+                "rank 1, which consumes '/sp/src/out', begins at step 1, past step 0, and the \
+                 bag records no edge's outstanding count there",
+            ),
+        ];
+        for (cause, code, why) in rows {
+            assert_eq!(cause.code(), code, "{cause:?}");
+            assert_eq!(cause.detail(&edge), format!("{prefix}{why}"), "{cause:?}");
+        }
+        let tokens: BTreeSet<&str> = rows.iter().map(|(cause, ..)| cause.code()).collect();
+        assert_eq!(tokens.len(), 4, "one token per cause: {tokens:?}");
+    }
+
+    /// A cause's token and a node's stand-down reason both fill a
+    /// `stand_down` note's code, so no cause shares a token with a reason.
+    #[test]
+    fn no_conservation_cause_shares_a_token_with_a_stand_down_reason() {
+        let reasons: BTreeSet<&str> = replay_rederive::EVERY_STAND_DOWN_REASON
+            .iter()
+            .map(replay_rederive::StandDownReason::code)
+            .collect();
+        assert_eq!(reasons.len(), 20, "{reasons:?}");
+        for cause in [
+            OutsideWriterCounted,
+            FramesLostAtRecord,
+            ConsumerStopped { step: 1 },
+            CreditUnknownAtAnchor {
+                rank: 1,
+                end: Produces,
+                step: 1,
+            },
+        ] {
+            assert!(!reasons.contains(cause.code()), "{cause:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod fed_block_edge_tests {
+    use super::*;
+    use crate::multiprocess::CreditEdgePlan;
+
+    /// The split edge `topic` -> `consumer.inp`, which `producer` alone writes.
+    fn edge(topic: &str, consumer: &str, producer: &str) -> CreditEdgePlan {
+        CreditEdgePlan {
+            topic: topic.to_string(),
+            consumer_node: consumer.to_string(),
+            consumer_input: "inp".to_string(),
+            depth: 3,
+            producer_ranks: vec![0],
+            consumer_rank: 1,
+            producer_nodes: vec![producer.to_string()],
+        }
+    }
+
+    fn members(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_string()).collect()
+    }
+
+    /// Each entry as `(topic, consumer, producers)`, in the set's order.
+    fn named(set: &cerulion_core::replay_feed::BagFedBlockEdges) -> Vec<(&str, &str, Vec<&str>)> {
+        set.iter()
+            .map(|e| {
+                (
+                    e.topic.as_str(),
+                    e.consumer_node.as_str(),
+                    e.producer_nodes.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A pass that holds an edge's producer or its consumer feeds that
+    /// edge, a pass that holds neither of its ends feeds nothing, and the set
+    /// comes out in its own order whatever order the classification gave.
+    #[test]
+    fn a_pass_feeds_the_split_edges_it_holds_an_end_of() {
+        let edges = vec![
+            edge("/t/b", "sink_b", "src_b"),
+            edge("/t/a", "sink_a", "src_a"),
+        ];
+        let front = pass_fed_block_edges(&edges, &members(&["src_a", "src_b", "mid"]));
+        assert_eq!(
+            named(&front),
+            vec![
+                ("/t/a", "sink_a", vec!["src_a"]),
+                ("/t/b", "sink_b", vec!["src_b"]),
+            ]
+        );
+        let reversed: Vec<CreditEdgePlan> = edges.iter().rev().cloned().collect();
+        assert_eq!(
+            pass_fed_block_edges(&reversed, &members(&["src_a", "src_b", "mid"])),
+            front
+        );
+        let one = pass_fed_block_edges(&edges, &members(&["src_b"]));
+        assert_eq!(named(&one), vec![("/t/b", "sink_b", vec!["src_b"])]);
+        assert!(pass_fed_block_edges(&edges, &members(&["mid"])).is_empty());
+        let back = pass_fed_block_edges(&edges, &members(&["sink_b", "sink_a"]));
+        assert_eq!(back, front, "the consumer ends name the same edges");
+        let mixed = pass_fed_block_edges(&edges, &members(&["src_a", "sink_b"]));
+        assert_eq!(back, mixed, "one producer end and one consumer end");
+        let consumer = pass_fed_block_edges(&edges, &members(&["sink_a"]));
+        assert_eq!(named(&consumer), vec![("/t/a", "sink_a", vec!["src_a"])]);
+        assert!(pass_fed_block_edges(&[], &members(&["src_a"])).is_empty());
+    }
+
+    /// A split edge's block-event note names the input, its topic and its
+    /// producer's rank, with the consumer as its subject and no code.
+    #[test]
+    fn a_split_edges_block_event_note_names_its_input_and_its_producers_rank() {
+        let mut split = edge("/t/a", "sink_a", "src_a");
+        split.producer_ranks = vec![2];
+        let note = block_event_note(3, &split);
+        assert_eq!(
+            (
+                note.rank,
+                note.kind,
+                note.subject.as_str(),
+                note.code.as_deref()
+            ),
+            (
+                3,
+                RederivationNoteKind::BlockEventNotReproduced,
+                "sink_a",
+                None
+            )
+        );
+        assert_eq!(
+            note.detail,
+            "block input 'sink_a.inp' reads '/t/a' from rank 2; the bag does not record when \
+             that input's block events fired, so the replay delivers none to node 'sink_a', and \
+             if the node reads `BackpressureEvent`s on this input a difference in its outputs or \
+             state can come from one the live run delivered."
+        );
+    }
+}
+
+#[cfg(test)]
 mod trailing_refill_tests {
     use super::*;
     use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
@@ -42945,6 +43511,7 @@ mod trailing_refill_tests {
             },
             throttle_ns,
             may_be_held_by: holds,
+            held_across_ranks: false,
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
         }
@@ -43091,25 +43658,12 @@ mod trailing_refill_tests {
         assert_eq!(got, vec![(0, vec!["n".to_string()]), (1, vec![])]);
     }
 
-    /// No refill hook, a block-gated node, or a declined verification: nothing.
+    /// No refill hook, or a declined verification: nothing.
     #[test]
     fn a_node_that_cannot_carry_marks_nothing() {
         let rows: Vec<Row> = vec![(0, 0, vec![("n", CAP + 1, CAP, 0)])];
         let v = verification(vec![unified("n")], &rows);
         assert_eq!(derive(&v, &rows, STAMPED, false, false), vec![(0, vec![])]);
-        let mut blocked = verification(vec![unified("n")], &rows);
-        blocked.block_edges = vec![replay_rederive::BlockEdgeObservation {
-            topic: "/t".to_string(),
-            producer_node: "n".to_string(),
-            consumer_node: "c".to_string(),
-            consumer_input: "inp".to_string(),
-            depth: 1,
-            published_frames: 0,
-        }];
-        assert_eq!(
-            derive(&blocked, &rows, STAMPED, false, true),
-            vec![(0, vec![])]
-        );
         let mut declined = verification(vec![unified("n")], &rows);
         declined.declined = Some(VerifierDecline::ReadLogBudget(ReadLogOverrun {
             reads: 2,
@@ -43120,6 +43674,40 @@ mod trailing_refill_tests {
         assert_eq!(
             derive(&declined, &rows, STAMPED, false, true),
             vec![(0, vec![])]
+        );
+    }
+
+    /// A node a `block` edge across ranks holds can be deferred at every
+    /// step, whatever its drain, so a step below the cap that fires and pops
+    /// one frame more than it fires marks a trailing refill: the held relay's
+    /// shape, a step that pops a frame and fires nothing (step 0, no refill
+    /// to mark), a step that fires the frozen frame while its refill pops the
+    /// next (step 1), and one that fires that frame (step 2). The same node
+    /// held by nothing marks nothing, since no cap explains a step.
+    #[test]
+    fn a_node_a_block_edge_across_ranks_holds_marks_its_trailing_refills() {
+        let rows: Vec<Row> = vec![
+            (0, 0, vec![("n", 1, 0, 0)]),
+            (1, 5_000, vec![("n", 1, 1, 0)]),
+            (2, 10_000, vec![("n", 0, 1, 0)]),
+        ];
+        for drain in [
+            replay_rederive::FifoDrain::Unified,
+            replay_rederive::FifoDrain::Unrecorded,
+        ] {
+            let mut held = decl("n", drain, None, replay_rederive::BlockHoldEdges::none());
+            held.held_across_ranks = true;
+            let v = verification(vec![held], &rows);
+            assert_eq!(
+                marked(derive(&v, &rows, STAMPED, false, true)),
+                vec![1],
+                "{drain:?}"
+            );
+        }
+        let v = verification(vec![unified("n")], &rows);
+        assert_eq!(
+            marked(derive(&v, &rows, STAMPED, false, true)),
+            Vec::<u64>::new()
         );
     }
 
