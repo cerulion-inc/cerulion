@@ -185,6 +185,12 @@ frame. The lane prints one `MEASURED <package>/<Name> 0x<hash>` line per type, i
 log and in the job summary, and fails unless each equals the generated `SCHEMA_HASH`.
 A new or changed table entry is copied from those lines, never from `schema_hash()`.
 
+`RECIPE3_WIRE_HASHES` keeps the values measured under hash recipe 3. They pin
+`MessageSchema::schema_hash_recipe3`, the function that recognizes a recording made before
+recipe 4; never re-bless them either. The Header and Time sweeps mutate one corpus type,
+resolve again, and assert that the hash of exactly the types reaching it moved, with the
+set computed by a plain name walk over the parsed `.msg` files.
+
 ## Adding or changing a `.msg`: checklist
 
 1. Edit/add the file under `msg/<pkg>/`; `cargo build -p native_ros2_messages`.
@@ -208,7 +214,7 @@ A new or changed table entry is copied from those lines, never from `schema_hash
 |---|---|---|---|
 | `layout_equivalence_test.rs` | Runtime `LayoutResolver` layout == compile-time `#[repr(C)]` layout, exhaustively over every vendored schema (a hard corpus-count assert guards the exhaustive claim); `offset_of!` spot-checks on nested/padding/large-array layouts | no | none |
 | `roundtrip_test.rs` | Every schema round-trips `<Name>Snapshot` → SHM publish → `try_view` snapshot, over an isolated iceoryx2 `TestTransport` per test | no | none |
-| `schema_hash_pin_test.rs` | Generated `SCHEMA_HASH`/`WIRE_FIXED_SIZE` == values recomputed through the same parse→resolve pipeline (whole-corpus resolve is required: a recursively-fixed nested field folds the target's hash into the parent); plus the wire-capture hash pin (never re-bless) | no | none |
+| `schema_hash_pin_test.rs` | Generated `SCHEMA_HASH`/`WIRE_FIXED_SIZE` == values recomputed through the same parse→resolve pipeline (whole-corpus resolve is required: every nested reference folds its target's hash into the parent only after resolution); plus the wire-capture hash pins, recipe 4 and recipe 3 (never re-bless), and the Header and Time sweeps | no | none |
 | `upstream_drift_test.rs` | Corpus-vs-manifest adjudication (a pure `adjudicate` function driven by synthetic-input oracles), provenance cross-check, waiver scoping, the bare-ref zero-tolerance gate, and fail-closed behavior | no | none |
 | `vendored_types_test.rs` | Acceptance for later-vendored packages (vision/radar/grid_map + the UUID dep): real loan/fill round-trips over `TestTransport`, pairwise-distinct hashes including bare-name twins across packages | no | none |
 | `generated_bindings_test.rs` | Package-qualified schema-hash linkage, rosidl scalar-default parity, and bool-array wire semantics, against the real generated bindings | no | none |
