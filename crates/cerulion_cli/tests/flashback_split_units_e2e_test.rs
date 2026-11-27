@@ -22,7 +22,7 @@
 //!   of `p0`) and three "checkpoint state ring created" lines (one per rank);
 //! * the capture's `anchor.per_rank` has exactly the keys `0`, `1` and `2`, each
 //!   with `nodes == 1` and `complete == 1`, and `anchor.missing_ranks` is empty;
-//! * the run is younger than the 30 s back window, so the capture holds every
+//! * the run is younger than its 300 s back window, so the capture holds every
 //!   rank's step 0 and reads `resimmable: true`, and `cerulion bag play --resim
 //!   all` re-executes it from the start with exit 0.
 //!
@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use cerulion_core::flashback::{FLASHBACK_CADENCE_MS_ENV, FLASHBACK_ENV};
+use cerulion_core::flashback::{FLASHBACK_CADENCE_MS_ENV, FLASHBACK_ENV, FLASHBACK_WINDOW_MS_ENV};
 use serial_test::serial;
 
 mod mp_support;
@@ -72,6 +72,10 @@ const RESIM_COMPLETES: Duration = Duration::from_secs(240);
 /// The run anchors every 2 s, so the 15 s post window holds several checkpoints
 /// of every rank.
 const ANCHOR_CADENCE_MS: &str = "2000";
+
+/// A back window far longer than the run's age at the capture, so the capture
+/// holds every rank's step 0 however slowly the run started.
+const BACK_WINDOW_MS: &str = "300000";
 
 /// The window recorder is up and holding.
 const WINDOW_HELD: &str = "flashback: holding a rolling window";
@@ -175,6 +179,7 @@ fn a_process_that_hosts_several_units_takes_a_checkpoint_in_every_unit() {
             // turn every arm of this file into a refusal.
             (FLASHBACK_ENV, "on"),
             (FLASHBACK_CADENCE_MS_ENV, ANCHOR_CADENCE_MS),
+            (FLASHBACK_WINDOW_MS_ENV, BACK_WINDOW_MS),
             (
                 "RUST_LOG",
                 "cerulion=info,cerulion_core=info,cerulion_cli_engine=info,cerulion_bagd=info",
@@ -315,8 +320,8 @@ fn a_process_that_hosts_several_units_takes_a_checkpoint_in_every_unit() {
         serde_json::json!([]),
         "no rank may be missing from the checkpoint: {manifest}"
     );
-    // The run is younger than the 30 s back window, so the capture still holds
-    // every rank's step 0 and replays from the start, beside its checkpoints.
+    // The run is younger than the back window, so the capture still holds every
+    // rank's step 0 and replays from the start, beside its checkpoints.
     assert_eq!(
         anchor["resimmable"],
         serde_json::json!(true),

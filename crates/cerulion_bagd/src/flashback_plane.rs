@@ -6222,4 +6222,55 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    /// The positive reason follows where the CARRIED trace begins, not the
+    /// anchor arm. One embedded checkpoint, three verdicts: beside a trace that
+    /// begins at step 0 it reads as a replay from the start, beside a trimmed
+    /// trace as a resume from the checkpoint, and a refusal keeps its own
+    /// sentence whatever the trace's start.
+    #[test]
+    fn a_resimmable_reason_follows_where_the_carried_trace_begins() {
+        let embedded = with_sole_rank(
+            AnchorReport::Embedded {
+                run_id: 0xABCD,
+                step: 0,
+                nodes: 2,
+                complete: 2,
+                records: 2,
+                fit: AnchorFit::CoversTheClaimedWindow,
+                taken_at_ns: 0,
+                frames_before_anchor_ms: 0,
+                frames_missing_after_anchor_ms: 0,
+                per_rank: std::collections::BTreeMap::new(),
+                missing_ranks: Vec::new(),
+            },
+            CAPTURE_SEQ,
+        );
+        let reason = |resim: &Result<(), ResimGap>, from_start: bool| -> String {
+            let block: serde_json::Value =
+                serde_json::from_str(&embedded.render(resim, from_start, None))
+                    .expect("the anchor block is JSON");
+            assert_eq!(block["embedded"], serde_json::json!(true), "{block}");
+            block["resimmable_reason"]
+                .as_str()
+                .expect("a verdict states its reason")
+                .to_string()
+        };
+        assert_eq!(
+            reason(&Ok(()), true),
+            "this capture's window reaches its run's own step 0, so it carries a scheduler \
+             trace and needs no checkpoint: `cerulion bag play <bag> --resim all` re-executes \
+             it from the start"
+        );
+        assert_eq!(
+            reason(&Ok(()), false),
+            "this capture carries a scheduler trace trimmed to its anchor and a complete \
+             checkpoint: `cerulion bag play <bag> --resim all` resumes from it"
+        );
+        assert_eq!(reason(&no_trace(), true), reason(&no_trace(), false));
+        assert!(
+            reason(&no_trace(), true).starts_with("no scheduler trace in this capture"),
+            "a refusal keeps its own sentence"
+        );
+    }
 }

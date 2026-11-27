@@ -21379,14 +21379,26 @@ fn trace_plan_bytes(workers: usize) -> u64 {
     ))
 }
 
+/// PURE: what a deployment of `workers` ranks asks of `/dev/shm`: one state ring
+/// of `state_ring_bytes` per rank, and its trace rings unless `no_rings`.
+#[cfg(unix)]
+fn deployment_shm_ask(workers: usize, state_ring_bytes: u64, no_rings: bool) -> (u64, Option<u64>) {
+    (
+        state_ring_bytes.saturating_mul(workers as u64),
+        (!no_rings).then(|| trace_plan_bytes(workers)),
+    )
+}
+
 /// Whether this deployment's checkpoint state rings fit in `/dev/shm`, one per
 /// rank, beside the trace rings it provisions unless `no_rings`. A refusal is
 /// one loud warn: the run takes no checkpoints and runs normally.
 #[cfg(unix)]
 fn deployment_state_rings_fit(graph: &str, workers: usize, no_rings: bool) -> bool {
-    let state_bytes =
-        crate::state_arm_attach::state_ring_apparent_bytes().saturating_mul(workers as u64);
-    let trace_bytes = (!no_rings).then(|| trace_plan_bytes(workers));
+    let (state_bytes, trace_bytes) = deployment_shm_ask(
+        workers,
+        crate::state_arm_attach::state_ring_apparent_bytes(),
+        no_rings,
+    );
     match crate::state_arm_attach::gate_state_rings(shm_free_bytes(), state_bytes, trace_bytes) {
         Ok(()) => true,
         Err(reason) => {
@@ -27563,6 +27575,25 @@ process_groups:
             "a failure with an empty reason is still a FAILURE — dropping it to UNKNOWN would \
              let a rank that really failed be handed a `--ring`"
         );
+    }
+
+    /// A deployment asks for one state ring per rank and, unless `--no-rings`,
+    /// one trace ring per rank plus the departure ring. Three ranks with
+    /// default rings: 3 * 67 174 464 state bytes, and 3 * 42 008 640 + 106 560
+    /// trace bytes.
+    #[cfg(unix)]
+    #[test]
+    fn a_deployment_asks_for_a_state_ring_and_a_trace_ring_per_rank() {
+        assert_eq!(
+            deployment_shm_ask(3, 67_174_464, false),
+            (201_523_392, Some(126_132_480))
+        );
+        assert_eq!(
+            deployment_shm_ask(3, 67_174_464, true),
+            (201_523_392, None),
+            "`--no-rings` provisions no trace ring, so none is charged"
+        );
+        assert_eq!(deployment_shm_ask(1, 7, false), (7, Some(42_115_200)));
     }
 
     /// The `/dev/shm` gate refuses only on POSITIVE evidence,

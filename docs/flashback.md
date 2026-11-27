@@ -85,9 +85,11 @@ unit captures its node state on its own thread:
 
 Each rank's state ring (64 MiB by default, `CERULION_FLASHBACK_STATE_RING_MB`)
 lives in shared memory. On Linux a run checks, before any rank creates its
-ring, that every rank's ring fits in the free space of `/dev/shm` beside the
-scheduler-trace rings. A run whose rings do not fit takes no checkpoints and
-logs a warning; the graph runs normally.
+ring, that every rank's ring fits in the free space of `/dev/shm`, beside the
+scheduler-trace rings when the run provisions them. A run whose rings do not
+fit takes no checkpoints and logs a warning; the graph runs normally. The check
+reads the free space at launch and reserves nothing, so another process that
+fills `/dev/shm` later can still exhaust it.
 
 A capture of a run of several worker ranks is resimmable only when its window
 reaches the run's step 0: a mid-run free-run recording of several worker ranks
@@ -221,9 +223,12 @@ keeps one is not resimmable, and `anchor.resimmable_reason` names the rank.
 Each worker rank's trace begins at that rank's own checkpoint, or, for a rank
 that kept none, where its retained trace begins, so the ranks of one capture can
 begin at different steps. A capture of a free-run graph with several worker
-ranks is resimmable only when every worker rank begins at step 0. When one
-begins at step 0 and another past it, as in a capture where one rank kept no
-checkpoint (`anchor.missing_ranks`), `anchor.resimmable_reason` names each rank
+ranks is resimmable only when every worker rank begins at step 0. When the
+retained trace still begins at step 0 on every rank, the capture carries that
+whole trace beside its checkpoints instead, and is resimmable from the start
+when the frames its trace reads are in the bag. Otherwise, when one
+begins at step 0 and another past it, as when one rank's retained trace begins
+past step 0, `anchor.resimmable_reason` names each rank
 that kept a step boundary and the step it begins at. When every rank that kept a
 step boundary begins at step 0 and a worker rank's trace holds none,
 `anchor.resimmable_reason` names that rank. When rank 0 begins past step 0, the
@@ -441,14 +446,15 @@ a pre-anchor frame before a writer's first held sequence is refused before step
 1 (exit 2, `read_identity_frame_missing`) naming the writer's first held
 sequence rather than blaming recorder loss.
 
-**An early capture whose free-run worker ranks begin apart is not resimmable.** In a
-capture taken within one Flashback window of the start, a rank that kept no
-checkpoint keeps its trace from step 0, while a rank that kept one begins at
-its checkpoint. Re-executing ranks that begin apart is not supported, so the
-capture is stamped not resimmable, and `anchor.resimmable_reason` names each
-rank and the step it begins at. Record the run with
-`cerulion graph run --record`. A capture of that shape written by 2.1.0 or
-earlier can claim `anchor.resimmable: true`.
+**An early capture whose free-run worker ranks begin apart is not resimmable.** A
+capture of several worker ranks taken within one Flashback window of the start
+carries every rank's trace from step 0, beside the checkpoints it holds, and
+replays from the start. When a rank's retained trace begins past step 0 while
+another's begins at step 0, the ranks begin apart. Re-executing ranks that begin
+apart is not supported, so the capture is stamped not resimmable, and
+`anchor.resimmable_reason` names each rank and the step it begins at. Record
+the run with `cerulion graph run --record`. A capture of that shape written by
+2.1.0 or earlier can claim `anchor.resimmable: true`.
 
 **A topic that first publishes mid-recording gets no channel.** A
 bag's channel set is fixed when the bag is created, so a producer that appears

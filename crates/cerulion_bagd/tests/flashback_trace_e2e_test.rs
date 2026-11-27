@@ -2557,3 +2557,60 @@ fn a_two_rank_free_run_capture_that_begins_mid_run_keeps_its_trim_and_reads_not_
     );
     h.cleanup();
 }
+
+/// A whole retention that begins at step 0 on rank 0 but whose peer begins at
+/// step 5 is refused too (the ranks begin apart), so the capture keeps its trim
+/// and the trim's own refusal, rather than the whole trace or its sentence.
+///
+/// HAND ORACLE. Rank 0 is handed steps 0 to 3 and anchored at step 0; the peer
+/// is handed steps 5 to 8 and anchored at step 5. Trimmed, rank 0 begins at
+/// step 1 and the peer at step 6, and a resume of several state rings is
+/// refused.
+#[test]
+fn a_two_rank_capture_whose_whole_trace_begins_apart_keeps_its_trim_and_its_refusal() {
+    let rank0 = trace_from_step_zero();
+    let peer: Vec<TraceRingRecord> = (5..=8u64)
+        .flat_map(|step| [boundary(step), fire(step, 0), fire(step, 1)])
+        .collect();
+    let state: Vec<Vec<u8>> = checkpoint_on(0, 0)
+        .into_iter()
+        .chain(checkpoint_on(1, 5))
+        .collect();
+    let h = capture_inner_full(
+        "apartanchored",
+        &rank0,
+        &state,
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        1,
+        false,
+        &peer,
+        &[recorder_json(r#""free_run""#)],
+    );
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(
+        embedded_steps_by_rank(&m),
+        std::collections::BTreeMap::from([("0".to_string(), 0), ("1".to_string(), 5)]),
+        "PRECONDITION: each rank anchored at its own first step: {m}"
+    );
+    assert_eq!(
+        first_steps_by_rank(&h.bag),
+        std::collections::BTreeMap::from([(0, 1), (1, 6)]),
+        "the trace stays trimmed through each rank's checkpoint"
+    );
+    assert_eq!(m["anchor"]["resimmable"], serde_json::json!(false), "{m}");
+    let reason = m["anchor"]["resimmable_reason"]
+        .as_str()
+        .expect("a refusal states its reason");
+    assert!(
+        reason.contains("state rings"),
+        "the trimmed trace's own refusal: {reason}"
+    );
+    assert!(
+        !reason.contains("begins at step 5"),
+        "not the refusal of the whole trace it did not carry: {reason}"
+    );
+    h.cleanup();
+}
