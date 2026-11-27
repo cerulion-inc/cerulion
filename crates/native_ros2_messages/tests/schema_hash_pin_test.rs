@@ -165,7 +165,7 @@ pin_schema!(
 
 // Variable schema (Header → string frame_id) embedding RECURSIVELY-FIXED
 // nested fields (Quaternion + Vector3 ×2, inlined as <Target>Shm) plus
-// FixedArray covariances (float64[9] ×3). This is the recipe-3 oracle that
+// FixedArray covariances (float64[9] ×3). This is the oracle that
 // exercises BOTH the FixedArray layout arithmetic AND the inlined
 // fixed-nested size/alignment against rustc — it only passes if the corpus
 // was resolved first (see module docs).

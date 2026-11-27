@@ -385,7 +385,7 @@ pub struct SchemaDrift {
     pub topic: String,
     /// The `schema_hash` stamped in the recording's frames on `topic`.
     pub recorded_hash: u64,
-    /// The current workspace's recipe-3 `schema_hash` for `topic`'s producing
+    /// The current workspace's wire `schema_hash` for `topic`'s producing
     /// output — what the candidate would stamp today.
     pub current_hash: u64,
 }
@@ -694,7 +694,7 @@ pub enum ReplayError {
     /// One or more recorded graph-produced topics were recorded
     /// under a DIFFERENT schema layout than the current workspace produces — the
     /// recorded frame's `WireHeader.schema_hash` disagrees with the workspace's
-    /// current recipe-3 hash for that topic's producing output. Refused as a
+    /// current wire hash for that topic's producing output. Refused as a
     /// PRE-FLIGHT (exit 2, not replay-grade FOR THIS WORKSPACE) so the operator
     /// sees the actionable drift table up front, instead of an unexplained
     /// per-frame byte mismatch (exit 1) on every affected topic. Fires only for
@@ -2060,7 +2060,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
 /// The schema-drift PRE-FLIGHT (exit 2). Compares each recorded
 /// graph-produced topic's recorded schema hash (the first recorded frame's
 /// `WireHeader.schema_hash`, already parsed by the `RecordedMessages` fold)
-/// against the CURRENT workspace's recipe-3 hash for that topic (resolved via
+/// against the CURRENT workspace's wire hash for that topic (resolved via
 /// [`crate::replay_field_registry::FieldRegistry`], the same machinery the
 /// tolerance gate uses). Any topic whose recorded and current hashes disagree is
 /// a [`SchemaDrift`]; a non-empty set is refused with
@@ -2073,7 +2073,7 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
 ///   unresolvable schemas are skipped.
 /// * Skips topics whose bag channel was NOT recorded under the current hash
 ///   recipe (a legacy bag would carry a recipe-1 frame hash that is
-///   not comparable to the recipe-3 registry hash — those surface as an
+///   not comparable to the current registry hash: those surface as an
 ///   unexplained byte mismatch, out of this preflight's scope).
 /// * A `channels()` read failure conservatively DISABLES the preflight (the
 ///   replay proceeds) rather than misclassifying a bag read error as schema drift.
@@ -2089,7 +2089,7 @@ fn detect_schema_drift(
     use cerulion_core::trace::bag::HASH_RECIPE;
 
     // Current per-topic produced-schema hashes (workspace `schemas/*.yaml` +
-    // built-in ROS 2 registry), computed codegen-faithfully (recipe 3).
+    // built-in ROS 2 registry), computed codegen-faithfully (current recipe).
     let registry = crate::replay_field_registry::FieldRegistry::from_graph(config, workspace_root);
 
     // Recipe guard: map each recorded topic → whether its channel descriptor was

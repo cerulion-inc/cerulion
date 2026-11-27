@@ -1901,7 +1901,7 @@ fn fixed_parent_with_transitive_large_array_derives_default() {
             package: None,
             fixed: Some(NestedFixedInfo {
                 has_large_array: true,
-                // Recipe-3 layout fields: this test hand-builds a
+                // Layout-sensitive hash fields: this test hand-builds a
                 // pre-resolved nested (no `Cov` schema exists in the set),
                 // so these are placeholders — the derive matrix keys only on
                 // `has_large_array`.

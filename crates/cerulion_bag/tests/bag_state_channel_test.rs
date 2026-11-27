@@ -17,7 +17,7 @@
 //!   the constant to a literal;
 //! - the descriptor (`schema_hash` 0, `wire_fixed_size` = `STATE_RECORD_SIZE`) —
 //!   hash 0 for the same reason its siblings carry it, the payload being a
-//!   framework record with no recipe-3 schema to look up;
+//!   framework record with no user schema to look up;
 //! - the records round-trip BYTE-IDENTICALLY, against records built by
 //!   `cerulion_core`'s own `encode_record` / `encode_skip_record` and compared to
 //!   a HAND-BUILT expectation (never a self-compare against a second run of the

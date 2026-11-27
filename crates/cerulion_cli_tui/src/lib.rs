@@ -117,7 +117,7 @@ fn pump_echo(state: &mut Option<EchoSubscription>, app: &mut App) {
         |msg: cerulion_core::transport::subscriber::ReceivedMessage<'_>| {
             let header = msg.header();
             let payload = msg.payload();
-            // Recipe-3 (layout + FQN): single source of truth for the
+            // Layout-sensitive wire hash (layout + FQN): single source of truth for the
             // pinned schema hashes — a `const fn` over the name alone cannot
             // reproduce a layout-sensitive hash. Kept in sync with the
             // generated constants by `pinned_hashes_match_generated_constants`

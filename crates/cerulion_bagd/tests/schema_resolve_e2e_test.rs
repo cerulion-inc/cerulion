@@ -1023,7 +1023,7 @@ fn the_recorder_never_re_dials_a_daemon_that_hangs_up_after_its_hello() {
 const PEER_TEXT: &str = "float64 x\nfloat64 y\nfloat64 z\n";
 const PEER_TYPE: &str = "peer_msgs/Widget";
 
-/// The recipe-3 hash and fixed size a real publisher of [`PEER_TYPE`] would put
+/// The wire schema hash and fixed size a real publisher of [`PEER_TYPE`] would put
 /// on the wire — derived HERE from the same text the fake serves, through the
 /// repo's own parser, so the fixture cannot drift from what the recorder
 /// recomputes without this test noticing.

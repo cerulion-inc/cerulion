@@ -540,7 +540,7 @@ fn build_vector3_frame(seq: u32, ts: u64, v: [f64; 3]) -> Vec<u8> {
 
 /// A full CUSTOM `probe/Widget` wire frame (two f64 `x`,`y` — padding-free,
 /// so the hand-built layout needs no alignment guesswork). Stamped with the caller-
-/// supplied `schema_hash` (the recipe-3 hash of the `.msg`), so the daemon's
+/// supplied `schema_hash` (the wire hash of the `.msg`), so the daemon's
 /// gateway ingress hash-validates it against the SEEDED walker's hash — a mis-seed
 /// (wrong hash) would drop every frame. Published raw via `publish_raw` (there is
 /// no generated `probe::Widget` Rust type — this is a robot-only custom type).
@@ -4119,7 +4119,7 @@ fn schema_less_remote_attach_catalog_resolves_seeds_and_taps() {
         deps: vec![],
     };
 
-    // The recipe-3 wire hash of the custom type, computed INDEPENDENTLY via the
+    // The wire schema hash of the custom type, computed INDEPENDENTLY via the
     // same seed helper the daemon uses — the producer stamps its frames with THIS,
     // so a mis-seed on the daemon side (a wrong hash) would make gateway ingress
     // REJECT every frame (hash mismatch) → zero delivery. Never a self-compare.

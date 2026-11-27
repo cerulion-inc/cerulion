@@ -10,7 +10,7 @@
 //! (per-test SHM root → parallel-safe, no `#[serial]` needed), and the new
 //! schema hashes are asserted pairwise-distinct (incl. the
 //! `vision_msgs/Pose2D` vs `geometry_msgs/Pose2D` bare-name pair, which the
-//! recipe-3 hash keeps distinct on the wire — though note these two differ
+//! wire schema hash keeps distinct, though note these two differ
 //! in BOTH package and field layout, so this pair alone does not isolate
 //! package-qualification from layout-sensitivity).
 
@@ -278,7 +278,7 @@ fn grid_map_info_is_fixed_and_round_trips_scalars() {
 // =====================================================================
 
 /// Every newly vendored type must hash distinctly on the wire. This is the
-/// regression guard for the recipe-3 (package-qualified, layout-sensitive)
+/// regression guard for the (package-qualified, layout-sensitive)
 /// schema hash: in particular, `vision_msgs/Pose2D` and the pre-existing
 /// `geometry_msgs/Pose2D` share a bare NAME but MUST NOT share a wire hash
 /// (they have different layouts AND different packages).

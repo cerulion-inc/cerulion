@@ -2328,7 +2328,7 @@ pub fn seed_framewalker(docs: &[cerulion_core::SchemaDoc]) -> cerulion_core::cod
 /// it only knew two pinned built-in hashes. This builds the missing local walker
 /// (the workspace-wins ladder: built-ins, then the store, then workspace
 /// YAML, so a workspace type shadows a same-named built-in) with the store
-/// type's recipe-3 `schema_hash` present, so the wire hash resolves locally and
+/// type's wire `schema_hash` present, so the wire hash resolves locally and
 /// the remote fetch stays the FALLBACK for types the desk genuinely lacks.
 ///
 /// `None` (no workspace) yields a built-ins-only walker — still an improvement
@@ -7892,7 +7892,7 @@ mod tests {
     /// resolves that store type's wire `schema_hash` LOCALLY, closing the
     /// gap left when the store type is absent from the echo walker (so
     /// `/lf/lowstate` falls through to the remote tier). The oracle is a THIRD,
-    /// independent recipe-3 hash (`LayoutResolver` over the same corpus), and the
+    /// independent schema hash (`LayoutResolver` over the same corpus), and the
     /// remote seed walker (built from the SAME `.msg` text) resolves the SAME
     /// hash — proving the store-parsed and served-doc hashes are ONE computation.
     #[test]
@@ -7909,7 +7909,7 @@ mod tests {
         std::fs::create_dir_all(&msg_dir).unwrap();
         std::fs::write(msg_dir.join("Widget.msg"), text).unwrap();
 
-        // Hand oracle: the recipe-3 wire hash via an INDEPENDENT resolver over
+        // Hand oracle: the wire hash via an INDEPENDENT resolver over
         // built-ins + the custom type (what a compile-time twin's SCHEMA_HASH is).
         let mut oracle_schemas = crate::schema_cmd::parse_builtin_schemas();
         oracle_schemas.push(parse_rosmsg(text, "Widget", Some("demo_msgs")).unwrap());

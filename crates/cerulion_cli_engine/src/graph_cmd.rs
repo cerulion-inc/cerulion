@@ -804,7 +804,7 @@ pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
     })
 }
 
-/// Build a (schema name → recipe-3 `schema_hash`) map from every
+/// Build a (schema name → wire `schema_hash`) map from every
 /// `*.yaml` in the workspace `schemas/` directory PLUS every workspace
 /// `.msg` store schema (`schemas/<pkg>/msg/<Type>.msg`, read via the shared
 /// [`crate::schema_store::SchemaStore`] seam — msg-store parity: a store
@@ -835,7 +835,7 @@ pub fn embedded_live_monitor_wait_policy() -> cerulion_core::MonitorWaitPolicy {
 /// set BEFORE hashing — a fixed-nested field (whose target is recursively
 /// fixed-size) is inlined into the parent's fixed section, which changes
 /// the parent's `wire_fixed_size()` and folds the target's own hash into
-/// the parent (recipe 3). So this builder parses EVERY workspace
+/// the parent. So this builder parses EVERY workspace
 /// `schemas/*.yaml` into one combined set, resolves it once, and only then
 /// hashes — hashing a single file's schemas in isolation would diverge
 /// from codegen for any schema with a fixed-nested field and fire the warn
@@ -1035,7 +1035,7 @@ pub fn build_workspace_schema_hashes(
             // ROS2 `std_msgs/Header` (out-of-set)). Codegen resolves the
             // external type against its broader set (native_ros2_messages)
             // while a workspace-only resolution leaves it unresolved, so
-            // the inlined layout — and thus the recipe-3 hash folded up
+            // the inlined layout, and thus the wire hash folded up
             // into A — diverges from codegen's `SCHEMA_HASH`. Emitting a
             // hash would false-positive the divergence warn. Skip — emit NO
             // entry. (A DIRECT external ref is the depth-0 case of the same
@@ -1238,7 +1238,7 @@ impl ProvenancedSchemas {
 /// Why transitive: a DIRECT-only check passes
 /// for schema A → B (in-set) even when B → C (external/ROS2, out-of-set).
 /// But codegen resolves C against its broader set and folds C's resolved
-/// layout into B and then into A's recipe-3 hash, whereas a workspace-only
+/// layout into B and then into A's wire hash, whereas a workspace-only
 /// resolution leaves C unresolved → A's builder hash diverges from its
 /// `SCHEMA_HASH` → a false-positive divergence warn on A. Only a schema
 /// whose entire closure is in-set can be hashed to match codegen.
@@ -7110,7 +7110,7 @@ pub fn graph_run(
         );
     }
 
-    // Workspace schema-name → recipe-3 hash map for the
+    // Workspace schema-name → wire hash map for the
     // YAML-`schema:`-vs-macro-output divergence warn. Advisory only;
     // best-effort (a missing/malformed schemas/ dir yields an empty map and
     // simply produces no divergence warns).
@@ -18698,8 +18698,8 @@ fn report_record_schema_coverage(
         //
         // The SENTENCE stays scoped to what was actually checked — a resolved
         // HASH, not a verified closure. `deps_of` silently drops a dep whose
-        // file is unreadable, and a variable nested field does not fold its
-        // target's hash (recipe 3 folds FIXED-resolved targets only), so a doc
+        // file is unreadable, and an unresolved reference folds only its name
+        // rather than its target's hash, so a doc
         // can ship with a dangling reference while its own hash resolves fine.
         // Claiming closure sufficiency here would be a claim this check cannot
         // support.

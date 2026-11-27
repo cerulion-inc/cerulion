@@ -1945,7 +1945,7 @@ fn a_state_shape_separates_every_edit_that_changes_the_bytes() {
         .field("x", <f64 as CerulionState>::STATE_SHAPE)
         .finish();
     assert_ne!(goal, transposed);
-    // A nested type's DEFINITION reaches the parent (recipe 3's property).
+    // A nested type's DEFINITION reaches the parent (the schema_hash property).
     let parent_of_two = StateShape::of("Parent")
         .field("inner", StateShape::of("Inner").count(2).finish())
         .finish();

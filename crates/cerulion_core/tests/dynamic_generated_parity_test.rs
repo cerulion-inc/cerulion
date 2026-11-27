@@ -239,7 +239,7 @@ mod cli_parser_parity {
     use cerulion_core::dynamic::FieldType;
 
     /// Everything about a schema that reaches the wire: qualified name, field
-    /// names and types in declaration order, and the recipe-3 hash.
+    /// names and types in declaration order, and the wire hash.
     type IrShape = (String, Vec<(String, FieldType)>, u64);
 
     fn ir_shape(schemas: &[MessageSchema]) -> Vec<IrShape> {

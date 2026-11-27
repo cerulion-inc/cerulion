@@ -824,7 +824,7 @@ pub struct RecordedTopic {
     pub topic: String,
     /// The qualified schema name (e.g. `sensor_msgs/Image`).
     pub schema_name: String,
-    /// The layout-sensitive schema hash (recipe-3).
+    /// The layout-sensitive schema hash.
     pub schema_hash: u64,
     /// The schema's fixed wire size in bytes.
     pub wire_fixed_size: u32,
@@ -6577,7 +6577,7 @@ fn merge_schema_closures(
 ///
 /// The VERIFICATION is not optional and not deferrable: a demanded answer is a
 /// claim about identity made by a machine the recorder does not control, so the served text
-/// is parsed with its closure, its recipe-3 hash recomputed, and the answer used
+/// is parsed with its closure, its schema hash recomputed, and the answer used
 /// only if that hash equals the one the frames on this topic actually carry. A
 /// refusal is LOUD and leaves the channel `"unknown"` — a channel that lies
 /// about its own type is worse than one that admits it does not know, because

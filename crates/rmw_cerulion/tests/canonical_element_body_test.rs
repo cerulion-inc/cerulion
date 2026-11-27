@@ -58,10 +58,8 @@ use rmw_cerulion::type_bridge::BridgedMessage;
 // `rmw_cerulion::type_bridge::ros_type`.
 //
 // `ROS_TYPE_INT32` is `13`; `6` is BOOLEAN. A `Time` fixture that declares
-// `sec` with the wrong id goes unnoticed, because `Time` is
-// recursively FIXED (copied wholesale at `size_of_`, so no byte moves) and
-// because a VARIABLE nested field like `Header` contributes only its qualified
-// NAME to the parent's schema hash (recipe 3), so no hash gate sees it either.
+// `sec` with the wrong id goes unnoticed by the byte oracles, because `Time` is
+// recursively FIXED (copied wholesale at `size_of_`, so no byte moves).
 // A fixture that puts an `int32` in a VARIABLE element's own fixed section
 // would skew for real.
 const ROS_TYPE_BOOL: u8 = 6;
@@ -1372,9 +1370,8 @@ fn rmw_point_field_element_relocates_three_fixed_members_across_interior_padding
 /// The fixtures re-type the rosidl `field_types.h` numbers as local constants,
 /// and a wrong one is close to invisible: a `ROS_TYPE_INT32` reading `6` (BOOLEAN)
 /// goes unnoticed while the only place it is used sits inside a
-/// recursively-FIXED nested message (copied wholesale — no byte moves) whose
-/// parent folds in just its qualified NAME (recipe 3 — no hash moves). Byte
-/// oracles and the `walk_by_hash` gate are both structurally blind to it; the
+/// recursively-FIXED nested message (copied wholesale, so no byte moves). Byte
+/// oracles are structurally blind to it; the
 /// error is reachable only when a VARIABLE element has its own fixed
 /// section. This is the cheap standing check that a wrong constant fails loudly.
 #[test]

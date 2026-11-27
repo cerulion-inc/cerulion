@@ -169,7 +169,7 @@ pub fn generate_schema(schema: &MessageSchema) -> String {
     // the compile_error fires first; any cascading rustc noise is harmless.
     structs::emit_reserved_prefix_compile_error(&mut out, schema);
 
-    // Recipe 3: `schema_hash` is a computed METHOD (layout + qualified name
+    // `schema_hash` is a computed METHOD (layout + qualified name
     // + recursive nested fold), not a stored field, so there is nothing to
     // drift — `generate_schema_constants` calls `schema.schema_hash()`
     // directly. (The #55 stored-field tripwire was dropped on the recipe

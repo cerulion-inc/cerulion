@@ -61,7 +61,7 @@ fn main() {
     }
 
     // Same resolution phase the codec runs, so nested-reference fixedness (and
-    // therefore the wire layout AND the recipe-3 schema hash) is decided
+    // therefore the wire layout AND the schema hash) is decided
     // identically on both sides. A warning here means a nested reference in the
     // store could not be resolved — that silently changes the parent's layout,
     // so fail rather than emit types that disagree with the bridge.

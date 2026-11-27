@@ -32,8 +32,8 @@
 //! decode is wrong, and nothing says so.
 //!
 //! This matters most exactly when it is hardest to debug. The variable-nested
-//! element framing the rmw bridge converged on is INVISIBLE to `schema_hash` (the recipe
-//! folds no `DynamicArray` element layout — `MessageSchema::schema_hash`), so
+//! element framing the rmw bridge converged on is INVISIBLE to `schema_hash`
+//! (`MessageSchema::schema_hash` hashes the schema, not the encoded framing), so
 //! an old-publisher/new-subscriber pair passes the hash gate and then fails to
 //! decode. Without this signal that skew is silent in BOTH directions.
 //!

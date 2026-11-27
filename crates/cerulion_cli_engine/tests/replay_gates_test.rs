@@ -2774,7 +2774,7 @@ fn write_produced_topic_bag(
     w.finalize().unwrap();
 }
 
-/// The current workspace's recipe-3 schema hash for `topic`, resolved through
+/// The current workspace's wire schema hash for `topic`, resolved through
 /// the SAME field-registry machinery `run_replay`'s preflight uses. Built-in ROS
 /// 2 types (Image/Imu/Vector3) are never shadowed by a workspace schema, so this
 /// value is stable across the discovered workspace root run_replay picks.
@@ -2904,7 +2904,7 @@ fn matching_produced_topic_hash_is_no_drift_and_reaches_engine() {
 // `detect_schema_drift`'s recipe guard — `recipe_current.get(topic) != Some(true)`
 // — SKIPS any produced topic whose channel descriptor was NOT stamped with the
 // current `HASH_RECIPE`: a legacy (recipe-1) bag carries a frame hash that
-// is not comparable to the recipe-3 registry hash, so it proceeds to the engine
+// is not comparable to the current registry hash, so it proceeds to the engine
 // (an unexplained byte mismatch downstream) rather than a spurious schema-drift refusal.
 // The pin below covers that `continue`: it crafts a bag with a GENUINE
 // frame-hash drift but a LEGACY recipe descriptor and proves it is NOT refused
@@ -2966,7 +2966,7 @@ fn legacy_recipe_channel_skips_drift_preflight_and_reaches_engine() {
         &[(topic, "sensor_msgs/Image", 8, stale)],
     );
     // Downgrade the channel to a legacy recipe (1): the recorded frame hash
-    // is now recipe-incomparable to the recipe-3 registry, so the preflight must
+    // is now recipe-incomparable to the current registry, so the preflight must
     // SKIP it even though the frame hash genuinely drifted.
     let patched = downgrade_channel_recipe(&path, 8, 1);
     assert!(

@@ -244,7 +244,7 @@ pub enum GatewayEgressPolicy {
 pub struct GatewayIngressEntry {
     /// Canonical absolute topic the gateway re-injects inbound frames into.
     pub topic: String,
-    /// Expected wire `schema_hash` (recipe-3) — a mismatch is a counted drop.
+    /// Expected wire `schema_hash`: a mismatch is a counted drop.
     pub schema_hash: u64,
 }
 
@@ -279,14 +279,14 @@ pub struct TopicSchema {
 /// One hash→qualified-name binding — a reverse-map entry
 /// the gateway uses to NAME a RUNTIME-registered topic (a `ros2 attach` raw route
 /// that arrives over the reg-channel carrying only a `(topic, schema_hash)` — no
-/// name). The CLI computes each served type's recipe-3 `schema_hash` (it holds
+/// name). The CLI computes each served type's `schema_hash` (it holds
 /// the parsed IR for BOTH `.msg` and YAML encodings, and resolves nested targets
 /// against the built-in corpus so the hash matches the wire) and hands the
 /// bindings across; the gateway materializes them into a hash→name map read at
 /// catalog-build time. Serde-clean.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaHashName {
-    /// The served type's recipe-3 wire `schema_hash`.
+    /// The served type's wire `schema_hash`.
     pub schema_hash: u64,
     /// Its qualified `pkg/Type` (or package-less bare) name.
     pub qualified: String,
@@ -354,7 +354,7 @@ pub struct SchemaServing {
 pub struct SchemaServingHandles {
     /// Canonical topic → qualified schema name (the catalog's first resolution).
     topic_schemas: Arc<Mutex<HashMap<String, String>>>,
-    /// Recipe-3 `schema_hash` → qualified name (names runtime-registered topics).
+    /// `schema_hash` → qualified name (names runtime-registered topics).
     hash_names: Arc<Mutex<HashMap<u64, String>>>,
     /// Qualified name → served doc (the `schema` verb's source).
     docs: Arc<Mutex<std::collections::BTreeMap<String, super::cerulion_q::SchemaDoc>>>,
@@ -468,7 +468,7 @@ impl SchemaServingHandles {
     /// merge IDEMPOTENT and keeps the boot seed authoritative (the boot serving's
     /// customs-first order is preserved: an already-bound topic, hash, or doc is
     /// never overwritten — and a duplicate hash implies a duplicate name anyway,
-    /// since the qualified name folds into the recipe-3 digest). Topics are
+    /// since the qualified name folds into the digest). Topics are
     /// canonicalized exactly as the boot materialization canonicalizes them, so a
     /// merged binding and a boot binding for one topic land on ONE key.
     ///

@@ -555,7 +555,7 @@ mod dispatch_tests {
                 matches!(&*bridge, AnyBridge::Cpp(_)),
                 "cpp dispatcher must yield the AnyBridge::Cpp arm"
             );
-            // recipe-3: the bridged frame carries the NATIVE schema hash,
+            // the bridged frame carries the NATIVE schema hash,
             // proving cpp-resolved frames interop byte-for-byte.
             assert_eq!(
                 bridge.schema_hash(),

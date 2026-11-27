@@ -39,7 +39,7 @@ path = "src/lib.rs"
 cerulion_core = { workspace = true }
 # The hand-rolled zero-copy MCAP writer/reader (BagWriter / BagReader).
 cerulion_bag = { workspace = true }
-# Recomputing a served doc's recipe-3 hash requires resolving it
+# Recomputing a served doc's schema hash requires resolving it
 # against its whole closure INCLUDING the built-in corpus — a custom type nesting
 # `geometry_msgs/Vector3` mis-hashes without Vector3's layout, and a wrong hash is a
 # FALSE REFUSAL. `cerulion_cli_engine::schema_cmd::parse_builtin_schemas` is the same

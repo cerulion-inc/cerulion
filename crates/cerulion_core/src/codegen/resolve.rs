@@ -1906,9 +1906,9 @@ mod tests {
         [("position", "Point"), ("orientation", "Quaternion")];
     const ORIENTATION_FIRST: [(&str, &str); 2] =
         [("orientation", "Quaternion"), ("position", "Point")];
-    /// Read off the wire from a stock ROS 2 Jazzy publisher.
+    /// Read off the wire from a stock ROS 2 Jazzy publisher (the same under both recipes).
     const POSE_WIRE_HASH: u64 = 0x8db061f3f9baff7d;
-    /// Read off the wire from a stock ROS 2 Jazzy publisher.
+    /// Recipe 3 hash read off the wire from a stock ROS 2 Jazzy publisher.
     const POSE_STAMPED_WIRE_HASH: u64 = 0x7bae8da2598b0993;
     /// `geometry_msgs/PoseArray`'s recipe-3 hash, from an implementation
     /// outside this repository: both `Pose` field orders give it.

@@ -80,7 +80,7 @@ struct TopicEntry {
     /// (external topics, or a produced topic whose schema is not in the set —
     /// e.g. a schema referencing a type absent from both workspace + built-ins).
     schema_qname: Option<String>,
-    /// The recipe-3 `schema_hash` of the resolved layout for `schema_qname`,
+    /// The wire `schema_hash` of the resolved layout for `schema_qname`,
     /// computed once over the combined (workspace + built-in) set exactly as
     /// codegen does (`resolve_fixed_nested` then `MessageSchema::schema_hash`).
     /// The [`FrameDecoder`] compares each frame's `WireHeader.schema_hash`
@@ -271,7 +271,7 @@ impl FieldRegistry {
 
         // Resolve fixed-nested over a clone of the FULL combined set (exactly
         // the phase codegen runs before computing `ShmMessage::SCHEMA_HASH`),
-        // then index each schema's recipe-3 `schema_hash`. Because the set is
+        // then index each schema's wire `schema_hash`. Because the set is
         // workspace + ALL built-ins, a workspace schema nesting a ROS 2 type
         // resolves here just as codegen resolves it — so the resulting hash is
         // codegen-faithful (the `build_workspace_schema_hashes` closure-escape
@@ -623,7 +623,7 @@ impl FieldRegistry {
             .unwrap_or_else(|| canonical.to_string())
     }
 
-    /// The CURRENT-workspace recipe-3 `schema_hash` this replay
+    /// The CURRENT-workspace wire `schema_hash` this replay
     /// expects for `topic`'s root schema, or `None` when the schema is
     /// unavailable (an external/consumed-only topic, or a produced topic whose
     /// schema does not resolve in the combined set). The schema-drift preflight
@@ -956,7 +956,7 @@ impl FieldRegistry {
 pub struct FrameDecoder {
     layouts: LayoutResolver,
     root_qname: String,
-    /// The expected recipe-3 `schema_hash` of `root_qname`'s resolved layout.
+    /// The expected wire `schema_hash` of `root_qname`'s resolved layout.
     /// Every [`FrameDecoder::locate`] gates the frame's
     /// `WireHeader.schema_hash` against this (mismatch =
     /// [`DecodeError::SchemaHashMismatch`]). `None` when the topic's schema
@@ -1471,7 +1471,7 @@ fn resolve_schema_name(
     }
 }
 
-/// Index every schema's codegen-faithful recipe-3 `schema_hash` by qualified
+/// Index every schema's codegen-faithful wire `schema_hash` by qualified
 /// name. Clones the set, runs `resolve_fixed_nested` (the same phase codegen
 /// runs before computing `ShmMessage::SCHEMA_HASH`), then hashes each resolved
 /// schema. The input MUST be the FULL combined workspace + built-in set so

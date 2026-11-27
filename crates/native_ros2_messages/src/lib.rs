@@ -182,8 +182,8 @@ include!(concat!(env!("OUT_DIR"), "/msg_registry.rs"));
 /// into the serving they hand across; the desk then resolves a named built-in
 /// from its own compiled corpus with NO served doc (the local-first rule).
 ///
-/// Hashes are the recipe-3 wire hashes (`MessageSchema::schema_hash`), resolved
-/// with `resolve_fixed_nested` over the whole corpus so a fixed nested target
+/// Hashes are the wire hashes (`MessageSchema::schema_hash`), resolved
+/// with `resolve_fixed_nested` over the whole corpus so a nested target
 /// (e.g. `std_msgs/Header` inside `sensor_msgs/Imu`) folds exactly as the
 /// generated type stamps it — pinned against the generated `SCHEMA_HASH`
 /// constants below. A built-in never references a custom type, so resolving the

@@ -511,7 +511,7 @@ fn workspace_info_reports_fixed_and_variable_columns() {
 /// padded to align 8 → 32 bytes, `origin` NOT variable. The loud
 /// workspace nested marker stays. The displayed HASH stays the
 /// single-file UNRESOLVED-parse value, pinned against a hand-built IR
-/// oracle (nested field contributes only its qualified name; the
+/// oracle (an unresolved nested field contributes only its qualified name; the
 /// unresolved `wire_fixed_size` input is kind-only = 1).
 ///
 /// Provenance note: this test therefore pins a pair of

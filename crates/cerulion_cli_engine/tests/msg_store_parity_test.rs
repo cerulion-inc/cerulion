@@ -73,7 +73,7 @@ fn goal_store_ir() -> MessageSchema {
 /// The `.msg` text matching [`goal_store_ir`].
 const GOAL_MSG: &str = "float64 x\nfloat64 y\n";
 
-/// Resolve a hand-built set and return the recipe-3 hash of the schema whose
+/// Resolve a hand-built set and return the wire hash of the schema whose
 /// QUALIFIED name is `target` (bypasses every file-parse path under test).
 /// A built-in's IR from the vendored `.msg` text: the oracle
 /// side of "the fold resolves against the compiled corpus", parsed here by

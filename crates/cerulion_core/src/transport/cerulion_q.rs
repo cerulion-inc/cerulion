@@ -414,7 +414,7 @@ pub struct CatalogEntry {
     pub egress_qos: Option<super::carrier::EgressQos>,
     /// The canonical absolute topic name (leading `/`).
     pub topic: String,
-    /// The wire `schema_hash` (recipe-3) the gateway advertises for the topic, or
+    /// The wire `schema_hash` the gateway advertises for the topic, or
     /// `None` when the gateway holds no hash (a boot-plan hashless announce). A
     /// decoder tolerates the field being absent.
     #[serde(default)]

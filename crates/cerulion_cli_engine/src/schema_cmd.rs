@@ -250,7 +250,7 @@ fn schema_info_entries(
 /// `MessageSchema` IR, in declaration order.
 ///
 /// The graph-run path uses this to compute each workspace
-/// schema's recipe-3 `schema_hash` for the YAML-`schema:`-vs-macro-output
+/// schema's wire `schema_hash` for the YAML-`schema:`-vs-macro-output
 /// divergence warn. It shares the IR-building loop with [`schema_info`]
 /// (both call the core parser - same strict field-key parsing +
 /// `FixedArray` length guards) but skips the per-field display
@@ -714,8 +714,8 @@ pub(crate) struct RemovedDefinitions {
     /// and both scrub — which is right: both are hostile.
     ///
     /// Precise IN THE `identity_source` STATE, and only there. Recorded
-    /// UNRESOLVED (the state every caller's predicate sees), recipe 3 folds
-    /// only a nested target's NAME, so two same-identity definitions
+    /// UNRESOLVED (the state every caller's predicate sees), a nested reference
+    /// folds only its target's NAME, so two same-identity definitions
     /// differing solely INSIDE a fixed-nested target hash alike and scrub
     /// together. They must already share `(package, name)` and their whole
     /// declared field list to collide, so the over-scrub is bounded to
@@ -1102,7 +1102,7 @@ pub(crate) fn workspace_yaml_files(schemas_dir: &Path) -> Vec<std::path::PathBuf
 /// The displayed HASH is deliberately NOT recomputed: it stays the
 /// single-file unresolved-parse value, where a nested field contributes
 /// only its schema name (see [`MessageSchema::schema_hash`] — the
-/// fixed-nested `target_hash` fold and the `wire_fixed_size` input only
+/// nested `target_hash` fold and the `wire_fixed_size` input only
 /// change for RESOLVED IR, which this function never hashes). So a
 /// workspace entry with a fixed-nested field intentionally renders a
 /// pair of DIFFERENT provenance: the RESOLVED wire fixed size (the true
@@ -4315,7 +4315,7 @@ fn render_listing_hash(hash: Option<u64>) -> String {
 pub struct WorkspaceSchemaEntry {
     /// Schema name (the YAML `schemas:` mapping key, not the file stem).
     pub name: String,
-    /// Recipe-3 hash of the single-file parse — the same value
+    /// Wire hash of the single-file parse, the same value
     /// [`schema_info`] displays for this entry; `None` when the entry's
     /// frame prefix fails the wire ceiling — as DECLARED (`schema
     /// info` REFUSES such an entry) or as RESOLVED through fixed-nested
@@ -4366,7 +4366,7 @@ pub struct StoreSchemaEntry {
     pub name: String,
     /// The `<pkg>` path segment — the grouping key in the listing.
     pub package: String,
-    /// Layout-resolved recipe-3 hash (over built-ins + the full store) so a
+    /// Layout-resolved wire hash (over built-ins + the full store) so a
     /// nested store type reports the wire-contract hash that matches a
     /// compile-time twin; falls back to the single-file hash if a nested
     /// reference is absent from the set.

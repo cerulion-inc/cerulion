@@ -58,7 +58,7 @@
 //! identity is believed**. `SchemaReply` carries text, and `CatalogEntry` carries
 //! a `schema_hash` the peer chose; this module uses NEITHER as evidence. It
 //! parses the served text, runs the repo's own `resolve_fixed_nested` over the
-//! doc PLUS its closure PLUS the built-in corpus, recomputes the recipe-3
+//! doc PLUS its closure PLUS the built-in corpus, recomputes the
 //! [`MessageSchema::schema_hash`], and accepts the answer only if that
 //! recomputed hash equals the hash observed **on the wire, locally**.
 //!
@@ -259,7 +259,7 @@ pub(crate) fn builtin_qualified_names() -> BTreeSet<String> {
 /// is two corpora in a trench coat — and the two halves of this type must not
 /// disagree about which one wins. With first-wins INDEXES (`or_insert`)
 /// while `resolve_fixed_nested` is LATER-wins (`resolve.rs`'s own warning says
-/// "later definition wins in resolution"), and recipe 3 folding a FIXED-resolved
+/// "later definition wins in resolution"), and the hash folding a resolved
 /// nested target's hash AND size into its parent, one duplicate rewrites the
 /// recomputed identity of every parent that nests it while the index still
 /// reports the first definition for the duplicated name itself. MEASURED: a
@@ -277,9 +277,9 @@ pub(crate) fn builtin_qualified_names() -> BTreeSet<String> {
 /// take a name from us.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ResolvedCorpus {
-    /// qualified name → (recipe-3 hash, wire fixed size)
+    /// qualified name → (schema hash, wire fixed size)
     by_name: BTreeMap<String, (u64, u32)>,
-    /// recipe-3 hash → (qualified name, wire fixed size) — the size is carried
+    /// schema hash → (qualified name, wire fixed size); the size is carried
     /// HERE, off the hash-matched schema itself, rather than looked back up
     /// through `by_name`. Reading it through the name index means reading a
     /// DIFFERENT schema's size whenever two entries share a qualified name, and
@@ -1238,7 +1238,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Build a corpus holding exactly one hand-written type, so its recomputed
-    /// hash is a real recipe-3 hash of real text rather than a literal.
+    /// hash is a real schema hash of real text rather than a literal.
     fn one_type_corpus() -> (ResolvedCorpus, u64, u32) {
         let schema = parse_rosmsg(
             "float64 x\nfloat64 y\nfloat64 z\n",
@@ -1329,8 +1329,8 @@ mod tests {
         assert_eq!(
             hash,
             native_ros2_messages::geometry_msgs::Twist::SCHEMA_HASH,
-            "the recomputed recipe-3 hash must equal the compiled type's — a nested-FIXED \
-             type mis-hashes when the corpus is not resolved as one closure"
+            "the recomputed hash must equal the compiled type's: a type with a nested \
+             reference mis-hashes when the corpus is not resolved as one closure"
         );
         assert_eq!(
             size as usize,
@@ -1524,7 +1524,7 @@ mod tests {
     /// not be able to change what our own types hash to.
     ///
     /// A first-wins index while `resolve_fixed_nested` is later-wins, with
-    /// recipe 3 folding a nested target's hash and size into its parent, lets one
+    /// the hash folding a nested target's hash and size into its parent, lets one
     /// served redefinition of a leaf rewrite the identity of every parent
     /// nesting it while the index still reports OUR leaf. MEASURED with a
     /// first-wins index: `name_for_wire_hash(root)` went `Some(("p/Root", 32))` →
