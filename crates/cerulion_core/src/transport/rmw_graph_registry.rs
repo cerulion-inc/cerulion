@@ -25,9 +25,11 @@
 //! the last one sent and wraps past the end, so a snapshot of `P` parts lands
 //! whole within `P.div_ceil(send_budget(listed))` sends, even when `P` is
 //! larger than [`RMW_GRAPH_QUEUE_DEPTH`]. A writer alone on the service sends
-//! 64 parts a send. Each other gather that runs at the same time adds rings,
-//! and a queue that overflows then loses parts of a different window on each
-//! send, never the same parts each time.
+//! 64 parts a send. Each other gather that runs at the same time adds rings.
+//! When more than two sends of one writer reach a reader between two of its
+//! drains, that queue drops its oldest parts. The cursor has moved on by
+//! then, so a later send usually carries the dropped parts again, but a
+//! gather that overlaps others has no fixed bound.
 //!
 //! # Gather verdict
 //!
@@ -815,7 +817,7 @@ struct WriterState {
     /// The part the next send starts at; see [`send_window`].
     cursor: usize,
     ports: Option<WriterPorts>,
-    /// Frames sent so far, raised once per send after its last frame.
+    /// Frames sent so far, raised once per send when the send ends.
     frames_sent: u64,
     open_failures: FailureRegimeLatch,
     send_failures: FailureRegimeLatch,
@@ -1048,8 +1050,9 @@ impl RmwGraphWriter {
         self.shared.rings_answered.load(Ordering::Relaxed)
     }
 
-    /// How many frames this writer has sent. A send raises it once, after
-    /// its last frame, so a raised count means that send is whole.
+    /// How many frames this writer has sent. A send raises it once, when it
+    /// ends, by the frames it sent: after its last frame, or at the frame
+    /// that failed to send.
     #[must_use]
     pub fn frames_sent(&self) -> u64 {
         self.shared.lock().frames_sent

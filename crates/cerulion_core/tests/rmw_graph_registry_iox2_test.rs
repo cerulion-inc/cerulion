@@ -312,16 +312,74 @@ fn assert_holds_every_pair(
 
 #[test]
 #[serial]
-fn a_snapshot_larger_than_the_reader_queue_settles_with_every_pair() {
+fn a_snapshot_larger_than_the_reader_queue_settles_with_every_pair_before_and_after_a_change() {
     let root = IsolatedRoot::mint("rg_q");
     let tm = manager("deep_w", &root.config());
     let reader = manager("deep_r", &root.config());
     let writer = tm.open_rmw_graph_writer();
-    let pairs = add_a_129_part_snapshot(&writer);
+    let mut pairs = add_a_129_part_snapshot(&writer);
 
     let got = gather(&reader, None, SETTLE_WINDOW);
     assert_eq!(got.completeness, GatherCompleteness::Settled);
     assert_holds_every_pair(&got.topics, &pairs);
+
+    // A change after the walk moved on: the next gather holds the new set,
+    // not parts of the old one.
+    let (gone_topic, gone_type) = pairs.remove(0);
+    writer.remove(&gone_topic, &gone_type);
+    writer.add("/late", "pkg/msg/Late").expect("pair");
+    let got = gather(&reader, None, SETTLE_WINDOW);
+    assert_eq!(got.completeness, GatherCompleteness::Settled);
+    assert_eq!(got.topics.len(), 387);
+    assert!(
+        !got.topics.contains_key(&gone_topic),
+        "the removed pair is gone"
+    );
+    assert_eq!(
+        got.topics.get("/late"),
+        Some(&BTreeSet::from(["pkg/msg/Late".to_string()]))
+    );
+    for (topic, type_name) in &pairs {
+        assert_eq!(
+            got.topics.get(topic),
+            Some(&BTreeSet::from([type_name.clone()]))
+        );
+    }
+}
+
+/// With two writers listed on the service, one send carries 32 parts: an
+/// even share of half a 128-frame queue.
+#[test]
+#[serial]
+fn a_send_carries_its_share_of_half_a_queue_when_two_writers_are_listed() {
+    let root = IsolatedRoot::mint("rg_t");
+    let tm = manager("share_w", &root.config());
+    let other = manager("share_o", &root.config());
+    let writer = tm.open_rmw_graph_writer();
+    add_a_129_part_snapshot(&writer);
+    let other_writer = other.open_rmw_graph_writer();
+    other_writer.add("/other", "pkg/msg/Other").expect("pair");
+
+    let node = raw_node(&root.config());
+    let doorbell_name: ServiceName = RMW_GRAPH_DOORBELL_SERVICE_NAME
+        .try_into()
+        .expect("service name");
+    let bell = node
+        .service_builder(&doorbell_name)
+        .event()
+        .open()
+        .expect("the writers created the doorbell")
+        .notifier_builder()
+        .create()
+        .expect("raw notifier");
+
+    let before = writer.frames_sent();
+    bell.notify().expect("ring");
+    let deadline = Instant::now() + SETTLE_WINDOW;
+    while writer.frames_sent() == before && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(writer.frames_sent() - before, 32);
 }
 
 /// Each ring here is drained only after the send it caused is whole, so every
