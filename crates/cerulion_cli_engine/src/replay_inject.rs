@@ -1268,6 +1268,29 @@ impl StepGroup {
 /// See the module docs for the rules. Pure and total: every input shape yields
 /// either a schedule or a typed stand-down, and nothing is logged.
 pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> TopicPlan {
+    plan_topic_injection_inner(topic, local, false)
+}
+
+/// [`plan_topic_injection`] when a `--duration` bound truncated the read-log
+/// census before this topic's first recorded read, and the caller has already
+/// confirmed that the recording reads this topic at or after the bound.
+///
+/// Inside the window the recording read nothing on the topic, so a topic no
+/// edge covers is steered with an EMPTY schedule, which injects nothing, rather
+/// than stood down to the recorded-clock window, which would publish frames the
+/// window never read. Every other stand-down (a fold refusal, a fan-out
+/// conflict) is kept. The frames are not reported as unconsumed: the reads that
+/// account for them lie past the bound.
+#[must_use]
+pub fn plan_topic_injection_covered(topic: &TopicReplay, local: &LocalProducers) -> TopicPlan {
+    plan_topic_injection_inner(topic, local, true)
+}
+
+fn plan_topic_injection_inner(
+    topic: &TopicReplay,
+    local: &LocalProducers,
+    covered_outside_window: bool,
+) -> TopicPlan {
     let mut covered: Vec<EdgePlan> = Vec::new();
     let mut uncovered: Vec<EdgeId> = Vec::new();
 
@@ -1288,6 +1311,26 @@ pub fn plan_topic_injection(topic: &TopicReplay, local: &LocalProducers) -> Topi
         }
     }
 
+    if covered.is_empty() && covered_outside_window {
+        let local_frames = topic
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| local.node_for(frame.producer.as_ref()).is_some())
+            .map(|(frame_index, frame)| DueFrame {
+                frame_index,
+                sequence: frame.sequence,
+            })
+            .collect();
+        return TopicPlan::Steered(InjectionSchedule {
+            topic: topic.topic.clone(),
+            per_step: Vec::new(),
+            uncovered,
+            unconsumed: Vec::new(),
+            local_frames,
+            depth_raises: Vec::new(),
+        });
+    }
     if covered.is_empty() {
         return TopicPlan::StandDown(StandDown {
             topic: topic.topic.clone(),
@@ -2595,6 +2638,24 @@ fn record_is_batch(body: &RecordedReadBody) -> bool {
 /// and nothing is logged.
 #[must_use]
 pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    plan_edge_admission_inner(topic, stages, false)
+}
+
+/// [`plan_edge_admission`] when a `--duration` bound truncated the read-log
+/// census before this topic's first recorded read, and the caller has already
+/// confirmed that the recording carries read-log records for this topic at or
+/// after the bound. Keeps every wiring and skew refusal intact while arming
+/// gateable stages with empty schedules instead of refusing `NoCoverage`.
+#[must_use]
+pub fn plan_edge_admission_covered(topic: &TopicAdmission, stages: &StageTable) -> AdmissionPlan {
+    plan_edge_admission_inner(topic, stages, true)
+}
+
+fn plan_edge_admission_inner(
+    topic: &TopicAdmission,
+    stages: &StageTable,
+    covered_outside_window: bool,
+) -> AdmissionPlan {
     let refused = |reason: AdmissionRefusalReason| {
         AdmissionPlan::Refused(AdmissionRefusal {
             topic: topic.topic.clone(),
@@ -2893,7 +2954,7 @@ pub fn plan_edge_admission(topic: &TopicAdmission, stages: &StageTable) -> Admis
     if planned.is_empty() {
         return AdmissionPlan::NotGateable(ungateable);
     }
-    if !any_records {
+    if !any_records && !covered_outside_window {
         return refused(AdmissionRefusalReason::NoCoverage { keys: offered });
     }
     AdmissionPlan::Enforced {
@@ -5704,6 +5765,101 @@ mod tests {
         assert_eq!(
             drain.per_step.iter().map(|s| s.step).collect::<Vec<_>>(),
             vec![0, 1]
+        );
+    }
+
+    /// `plan_edge_admission_covered` arms empty schedules when `--duration`
+    /// excludes every read on a covered topic, while still refusing wiring and
+    /// stage-set skew errors.
+    #[test]
+    fn covered_outside_window_arms_empty_schedule_without_hiding_skew() {
+        let single = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        );
+        let empty = one_edge(vec![]);
+        assert!(matches!(
+            plan_edge_admission(&empty, &single),
+            AdmissionPlan::Refused(AdmissionRefusal {
+                reason: AdmissionRefusalReason::NoCoverage { .. },
+                ..
+            })
+        ));
+        let AdmissionPlan::Enforced { stages: plans, .. } =
+            plan_edge_admission_covered(&empty, &single)
+        else {
+            panic!("covered outside window must arm empty schedules");
+        };
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].per_step.is_empty());
+
+        // Skew still refuses even when covered outside the window.
+        let skewed = StageTable::new(
+            &inputs("relay", &["inp"]),
+            &census("relay", 0, &[ReadStageRole::Body]),
+        )
+        .with_recorded_stages(vec![
+            StageKey {
+                node: "relay".into(),
+                input_idx: 0,
+                role: ReadStageRole::Body,
+            },
+            StageKey {
+                node: "relay".into(),
+                input_idx: 0,
+                role: ReadStageRole::Drain,
+            },
+        ]);
+        assert!(matches!(
+            plan_edge_admission_covered(&empty, &skewed),
+            AdmissionPlan::Refused(AdmissionRefusal {
+                reason: AdmissionRefusalReason::StageSetSkew { .. },
+                ..
+            })
+        ));
+    }
+
+    /// `plan_topic_injection_covered` steers a topic no edge covers with an
+    /// empty schedule (nothing due, nothing uncovered or unconsumed, the local
+    /// frames still named), and plans a covered topic exactly as
+    /// `plan_topic_injection` does.
+    #[test]
+    fn covered_outside_window_steers_an_uncovered_topic_empty() {
+        let mut stream = frames(&[10, 11, 12]);
+        stream[1].producer = Some(ResolvedProducer::Named("relay_label".to_string()));
+        let empty = topic(true, stream, vec![]);
+        assert!(matches!(
+            expect_stand_down(plan_no_local(&empty)).reason,
+            StandDownReason::NoCoverage { .. }
+        ));
+        let local = LocalProducers::from_pairs([("relay_label".to_string(), "relay".to_string())]);
+        let s = expect_steered(plan_topic_injection_covered(&empty, &local));
+        assert!(s.per_step.is_empty(), "nothing is due inside the window");
+        assert!(s.uncovered.is_empty() && s.unconsumed.is_empty() && s.depth_raises.is_empty());
+        assert_eq!(
+            s.local_frames,
+            vec![DueFrame {
+                frame_index: 1,
+                sequence: 11
+            }]
+        );
+
+        let read = topic(
+            false,
+            frames(&[10, 11]),
+            vec![edge(
+                edge_id("fusion", "lidar"),
+                ConsumeMode::EachFifo,
+                vec![served(4, 10, 1), served(5, 11, 1)],
+            )],
+        );
+        assert_eq!(
+            shape(&expect_steered(plan_topic_injection_covered(
+                &read,
+                &LocalProducers::none()
+            ))),
+            vec![(4, vec![10]), (5, vec![11])],
+            "a covered topic plans its reads as before"
         );
     }
 

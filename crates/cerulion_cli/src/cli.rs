@@ -2216,6 +2216,17 @@ pub enum BagAction {
         /// more is refused with exit 2 naming the size it needs.
         #[arg(long, value_name = "BYTES")]
         feed_index_budget: Option<u64>,
+        /// With `--resim`: how many records the verifier may hold in memory for
+        /// each process of a free-run recording: its reads, the recorded frames
+        /// it consumes, and its recorded schedule (default 3000000; 3000000
+        /// reads take about 1 GiB). With `--duration`, only the reads inside
+        /// that window count. Reads or frames past it are refused with exit 2,
+        /// naming the count and this flag, when the replay feeds or gates them;
+        /// otherwise, and for the schedule, the check stands down with a note.
+        /// Lockstep recordings are never refused or stood down by it. Valid in
+        /// BOTH resim modes.
+        #[arg(long, value_name = "COUNT")]
+        verifier_record_budget: Option<u64>,
     },
     /// Show what a bag holds (topics, frame counts, schemas, time span) without
     /// publishing anything.
@@ -5038,6 +5049,48 @@ mod verb_log_class_tests {
                 "{argv:?}"
             );
         }
+    }
+
+    /// `--verifier-record-budget` parses onto `bag play` in both resim modes
+    /// and stays `None` when omitted.
+    #[test]
+    fn bag_play_parses_verifier_record_budget_in_both_resim_modes() {
+        for (extra, want) in [
+            (vec!["--verifier-record-budget", "500000"], Some(500_000)),
+            (
+                vec!["--verify", "--verifier-record-budget", "500000"],
+                Some(500_000),
+            ),
+            (vec![], None),
+        ] {
+            let mut argv = vec!["cerulion", "bag", "play", "b.mcap", "--resim", "all"];
+            argv.extend(extra);
+            let cli = Cli::try_parse_from(&argv).expect("must parse");
+            let Commands::Bag {
+                action:
+                    BagAction::Play {
+                        verifier_record_budget,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected `bag play`");
+            };
+            assert_eq!(verifier_record_budget, want, "{argv:?}");
+        }
+
+        let mut cmd = crate::families::cli_command();
+        let bag = cmd
+            .find_subcommand_mut("bag")
+            .expect("bag subcommand exists");
+        let play = bag
+            .find_subcommand_mut("play")
+            .expect("bag play subcommand exists");
+        let help = play.render_long_help().to_string();
+        assert!(
+            help.contains("--verifier-record-budget <COUNT>") && help.contains("3000000"),
+            "bag play --help must document --verifier-record-budget <COUNT> and default 3000000:\n{help}"
+        );
     }
 
     /// `graph run` and `bag play` print their own result, so they default

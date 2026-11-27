@@ -267,6 +267,12 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
         "spawns `graph run --record --single-process`; its one arm passed at 4166b190",
     ),
     (
+        "crates/cerulion_cli/tests/flashback_split_units_e2e_test.rs",
+        "spawns a multi-process `graph run` whose `p0` worker hosts two executor units, \
+         and `cerulion flashback`; its one arm passed 4 of 4 runs on Darwin 27 under \
+         `-- --test-threads=1`",
+    ),
+    (
         "crates/cerulion_cli/tests/graph_launch_args_e2e_test.rs",
         "spawns `graph run --single-process` (and one multi-process run its `--yes` guard \
          refuses before any node plugin loads); its 4 macOS arms passed on Darwin 27 \
@@ -304,6 +310,12 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
         "spawns `graph run no_such_graph` in a workspace with no graphs: the run is \
          rejected before any node plugin loads, so no process asks for a second \
          resource; its 17 arms passed on macOS at 623c500b",
+    ),
+    (
+        "crates/cerulion_cli/tests/verifier_budget_cli_e2e_test.rs",
+        "spawns one `bag play --resim all` child per run, and each child loads its node \
+         plugins once and exits, so no process asks for a second resource after a load; \
+         its one arm passed on Darwin 27 under `-- --test-threads=1`",
     ),
 ];
 

@@ -579,6 +579,7 @@ fn workspace_info_resolves_nested_ref_against_builtin_registry() {
             schema_name: "Point".to_string(),
             package: Some("geometry_msgs".to_string()),
             fixed: None,
+            target_hash: None,
         },
     ));
     oracle.add_field(FieldDef::new("kind", FieldType::U8));

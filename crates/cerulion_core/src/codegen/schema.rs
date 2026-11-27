@@ -590,6 +590,19 @@ pub enum FieldType {
         /// `None` (the parser default) keeps the conservative
         /// classification: variable, opaque-bytes accessors.
         fixed: Option<NestedFixedInfo>,
+        /// The target schema's own resolved
+        /// [`schema_hash`](MessageSchema::schema_hash), stamped by
+        /// [`resolve_fixed_nested`](crate::codegen::resolve_fixed_nested)
+        /// on a reference that is NOT inlined: a variable target, or any
+        /// element under a `DynamicArray`. Exclusive with `fixed`: an
+        /// inlined target carries its hash in
+        /// [`NestedFixedInfo::target_hash`] and this stays `None`. Also
+        /// `None` for an unresolved reference, a reference inside a
+        /// reference cycle, and a target whose fixed section cannot be
+        /// sized. Absent from the JSON when `None`, so a fixed reference
+        /// serializes as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_hash: Option<u64>,
     },
 }
 
@@ -854,6 +867,7 @@ impl FieldType {
                         schema_name: msg.to_string(),
                         package: Some(pkg.to_string()),
                         fixed: None,
+                        target_hash: None,
                     })
                 } else {
                     // LOUD-REJECT a bare case-variant of a known primitive
@@ -892,6 +906,7 @@ impl FieldType {
                         schema_name: other.to_string(),
                         package: None,
                         fixed: None,
+                        target_hash: None,
                     })
                 }
             }
@@ -1020,6 +1035,7 @@ mod tests {
             schema_name: "Header".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         }
         .is_variable());
     }
@@ -1034,6 +1050,7 @@ mod tests {
             schema_name: "Header".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         }
         .is_definitely_fixed());
     }
@@ -1113,6 +1130,7 @@ mod tests {
                 schema_name: "Other".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         ));
         assert_eq!(
@@ -1132,6 +1150,7 @@ mod tests {
             schema_name: "Other".to_string(),
             package: None,
             fixed: None,
+            target_hash: None,
         };
         assert!(!unresolved().is_definitely_variable());
         assert!(!FieldType::FixedArray {
@@ -1249,6 +1268,7 @@ mod tests {
                 schema_name: "Header".to_string(),
                 package: None,
                 fixed: None,
+                target_hash: None,
             }
             .canonical_str(),
             "Header"
@@ -1260,6 +1280,7 @@ mod tests {
                 schema_name: "Header".to_string(),
                 package: Some("std_msgs".to_string()),
                 fixed: None,
+                target_hash: None,
             }
             .canonical_str(),
             "std_msgs/Header"
@@ -1340,5 +1361,50 @@ mod tests {
         // The packaged and bare hashes must differ even with overlapping
         // structure — qualification is in the stream.
         assert_ne!(point.schema_hash(), blob.schema_hash());
+    }
+
+    fn header_ref(target_hash: Option<u64>) -> FieldType {
+        FieldType::Nested {
+            schema_name: "Header".to_string(),
+            package: Some("std_msgs".to_string()),
+            fixed: None,
+            target_hash,
+        }
+    }
+
+    #[test]
+    fn an_unstamped_nested_reference_serializes_without_a_target_hash_key() {
+        assert_eq!(
+            serde_json::to_string(&header_ref(None)).unwrap(),
+            r#"{"Nested":{"schema_name":"Header","package":"std_msgs","fixed":null}}"#
+        );
+    }
+
+    #[test]
+    fn a_stamped_nested_reference_round_trips_its_target_hash() {
+        let json = r#"{"Nested":{"schema_name":"Header","package":"std_msgs","fixed":null,"target_hash":18446744073709551615}}"#;
+        assert_eq!(
+            serde_json::to_string(&header_ref(Some(u64::MAX))).unwrap(),
+            json
+        );
+        assert_eq!(
+            serde_json::from_str::<FieldType>(json).unwrap(),
+            header_ref(Some(u64::MAX))
+        );
+    }
+
+    #[test]
+    fn a_nested_reference_written_before_the_target_hash_existed_still_parses() {
+        let json = r#"{"Nested":{"schema_name":"Header","package":"std_msgs","fixed":null}}"#;
+        assert_eq!(
+            serde_json::from_str::<FieldType>(json).unwrap(),
+            header_ref(None)
+        );
+    }
+
+    #[test]
+    fn a_target_hash_of_the_wrong_type_is_refused() {
+        let json = r#"{"Nested":{"schema_name":"Header","package":"std_msgs","fixed":null,"target_hash":"0x1"}}"#;
+        assert!(serde_json::from_str::<FieldType>(json).is_err());
     }
 }

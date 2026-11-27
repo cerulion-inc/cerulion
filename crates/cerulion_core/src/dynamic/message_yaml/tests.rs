@@ -433,6 +433,7 @@ fn zero_default_of_an_unsupported_array_is_refused() {
                 schema_name: format!("{name}Inner"),
                 package: None,
                 fixed: None,
+                target_hash: None,
             },
         );
         let (set, _) = SchemaSet::from_schemas(vec![inner, outer]).unwrap();
@@ -2360,6 +2361,7 @@ fn twin_schemas() -> Vec<MessageSchema> {
         schema_name: "Leaf".to_string(),
         package: None,
         fixed: None,
+        target_hash: None,
     };
     let mut leaf = MessageSchema::new_in_package("Leaf", "pkg2");
     leaf.fields.push(FieldDef::new("v", FieldType::F64));

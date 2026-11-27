@@ -380,12 +380,11 @@ const DECLARED_SITES: &[Declared] = &[
     },
     Declared {
         path: "cerulion_cli_engine/src/state_arm_attach.rs",
-        interpolation: 4,
+        interpolation: 3,
         pass_through: 0,
         messages: &[
             "Flashback STATE capture is OFF for this process — forking a #49542ebf",
             "Flashback STATE capture is OFF for this process — its {} MiB#a191a3af",
-            "Flashback capture plane ARMED for this deployment — every ra#14008da8",
             "Flashback capture plane ARMED — this run anchors node state #fa2c82bd",
         ],
         reason: "DEBT (CLI operator surface): lines splicing a runtime \
