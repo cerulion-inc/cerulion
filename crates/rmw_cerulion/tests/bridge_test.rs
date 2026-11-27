@@ -193,7 +193,7 @@ fn fixed_message_bridges_with_zero_copy_loan() {
     use cerulion_core::message::ShmMessage;
     let bridge = unsafe { BridgedMessage::new(vector3_members()) }.expect("bridge");
     assert_eq!(bridge.qualified_name, "geometry_msgs/Vector3");
-    // recipe-3: the bridge hash must equal the NATIVE generated
+    // The bridge hash must equal the NATIVE generated
     // SCHEMA_HASH (byte-compatible interop), not a name-only literal.
     assert_eq!(
         bridge.schema_hash(),
@@ -235,7 +235,7 @@ fn nested_fixed_message_bridges_and_roundtrips() {
     assert_eq!(frame.len(), WireHeader::SIZE + 56);
 
     let header = WireHeader::read_from_buf(&frame).expect("header");
-    // recipe-3: bridged frame carries the NATIVE generated SCHEMA_HASH.
+    // The bridged frame carries the NATIVE generated SCHEMA_HASH.
     assert_eq!(
         header.schema_hash,
         <native_ros2_messages::geometry_msgs::Transform as ShmMessage>::SCHEMA_HASH

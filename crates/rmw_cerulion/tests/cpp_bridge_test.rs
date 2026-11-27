@@ -333,7 +333,7 @@ fn cpp_fixed_message_is_zero_copy_loanable() {
     use cerulion_core::message::ShmMessage;
     let bridge = unsafe { CppBridgedMessage::new(vector3_members_cpp()) }.expect("bridge");
     assert_eq!(bridge.qualified_name, "geometry_msgs/Vector3");
-    // recipe-3: the C++ bridge hash must equal the NATIVE generated
+    // The C++ bridge hash must equal the NATIVE generated
     // SCHEMA_HASH (byte-compatible interop), not a name-only literal.
     assert_eq!(
         bridge.schema_hash(),
@@ -375,7 +375,7 @@ fn cpp_string_frame_decodes_via_native_reader_and_matches_schema_hash() {
     use native_ros2_messages::std_msgs::StringShm;
 
     let bridge = unsafe { CppBridgedMessage::new(string_msg_members_cpp()) }.expect("bridge");
-    // recipe-3: bridged frame carries the NATIVE generated SCHEMA_HASH.
+    // The bridged frame carries the NATIVE generated SCHEMA_HASH.
     assert_eq!(
         bridge.schema_hash(),
         <native_ros2_messages::std_msgs::String as ShmMessage>::SCHEMA_HASH

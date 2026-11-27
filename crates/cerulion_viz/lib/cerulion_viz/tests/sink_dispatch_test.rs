@@ -2117,7 +2117,7 @@ fn build_lowstate_frame(qs: &[f32; 20], timestamp_ns: u64) -> Vec<u8> {
     let layout = resolver
         .layout_of("unitree_go/LowState")
         .expect("LowState layout");
-    // The walker keys on the RESOLVED layout hash (recipe-3, nested MotorState
+    // The walker keys on the RESOLVED layout hash (nested MotorState
     // folded), NOT the unresolved `MessageSchema::schema_hash()` — stamp that.
     let low_hash = layout.schema_hash;
     assert_eq!(

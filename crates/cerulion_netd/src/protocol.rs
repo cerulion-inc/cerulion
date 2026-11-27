@@ -287,7 +287,7 @@ pub enum Request {
         robot: String,
         /// The absolute canonical topic to mirror (e.g. `/utlidar/robot_odom`).
         topic: String,
-        /// The topic's wire `schema_hash` (recipe-3) — netd validates every
+        /// The topic's wire `schema_hash`; netd validates every
         /// inbound frame against it before re-injecting. The consumer resolves the
         /// `pkg/Type` name to this hash before demanding (name→hash resolution is a
         /// consumer concern; C3's migrated consumers reuse the catalog).

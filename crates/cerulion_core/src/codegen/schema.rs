@@ -93,8 +93,9 @@ impl MessageSchema {
     /// subscribers built from different recipes will reject each other's
     /// frames as `SchemaMismatch`.
     ///
-    /// # Recipe (recipe id 3; recipe 2 was layout + bare name; recipe 1 was
-    /// the earlier name-only `fnv1a(name)`) — see `trace/bag.rs::HASH_RECIPE`.
+    /// # Recipe (recipe id 4; recipe 3 folded only inlined targets, recipe 2
+    /// was layout + bare name, recipe 1 the earlier name-only
+    /// `fnv1a(name)`), see `trace/bag.rs::HASH_RECIPE`.
     ///
     /// FNV-1a 64 (offset `0xcbf29ce484222325`, prime `0x100000001b3`) over
     /// a byte stream built as:
@@ -102,38 +103,39 @@ impl MessageSchema {
     /// 1. `(qualified_name().len() as u64).to_le_bytes()` then the
     ///    **qualified** name bytes (`"pkg/Name"`, or bare `"Name"` for
     ///    package-less workspace schemas)
-    /// 2. `(wire_fixed_size() as u64).to_le_bytes()` — fixed 8 bytes, no
+    /// 2. `(wire_fixed_size() as u64).to_le_bytes()`: fixed 8 bytes, no
     ///    length prefix needed
     /// 3. For each field **in declaration order**:
     ///    - `(field_name.len() as u64).to_le_bytes()` then the name bytes
     ///    - `(canonical_type.len() as u64).to_le_bytes()` then the bytes
     ///      of [`FieldType::canonical_str`] (`"pkg/Name"` for packaged
     ///      nested refs)
-    ///    - **for a fixed-resolved nested field only**, the target schema's
-    ///      own 8-byte `schema_hash` (LE), carried in
-    ///      [`NestedFixedInfo::target_hash`] by `resolve_fixed_nested`.
+    ///    - **for a resolved nested reference**, at any array depth, the
+    ///      target schema's own 8-byte `schema_hash` (LE), stamped by
+    ///      `resolve_fixed_nested`: in [`NestedFixedInfo::target_hash`]
+    ///      for an inlined target, in `FieldType::Nested::target_hash`
+    ///      for any other reference.
     ///
     /// Length-prefix framing makes the encoding injective by construction:
     /// two schemas whose concatenated name/type bytes are identical but
-    /// split differently hash differently (deliberate review-driven
-    /// design).
+    /// split differently hash differently.
     ///
-    /// Descriptions / doc strings are **not** hashed — they carry no
+    /// Descriptions / doc strings are **not** hashed: they carry no
     /// layout meaning.
     ///
     /// # Nested coverage
     ///
-    /// A **fixed-resolved** nested field is inlined as `<Target>Shm` in the
-    /// parent's fixed section, so a layout change *inside* the target shifts
-    /// the parent's bytes. Recipe 3 folds the target's full `schema_hash`
-    /// (step 3, third item) into the parent, so ANY change to a fixed nested
-    /// target (size, reorder, retype, rename, add/remove) bumps the parent
-    /// hash — no silent corruption. A **variable** nested field lives in the
-    /// offset table (self-describing, length-prefixed on the wire); it
-    /// contributes only its package-qualified name via `canonical_str()`,
-    /// matching its self-describing wire shape.
+    /// Every resolved nested reference folds its target's full hash: a
+    /// direct field, a `FixedArray` element and a `DynamicArray` element,
+    /// whether the target is inlined (fixed) or lives in the variable
+    /// payload. So ANY layout change inside a target (size, reorder,
+    /// retype, rename, add/remove) changes the hash of every schema that
+    /// references it, at any depth. A reference that carries no stamp (an
+    /// unresolved reference, a reference inside a reference cycle, a target
+    /// whose fixed section cannot be sized) contributes its
+    /// package-qualified name only; the resolver warns for each one.
     pub fn schema_hash(&self) -> u64 {
-        self.hash_with_fixed_size(self.wire_fixed_size())
+        self.hash_with_fixed_size(self.wire_fixed_size(), fold_nested_target_hash)
     }
 
     /// Fallible twin of [`schema_hash`](Self::schema_hash): the SAME recipe
@@ -142,17 +144,43 @@ impl MessageSchema {
     /// that method's field-naming error instead of panicking on a hostile
     /// `FixedArray` length. For consumers that must DISPLAY or INDEX a
     /// definition they could not resolve (a `schema info` / `schema list`
-    /// fallback, a recorder's served-schema corpus) — a schema whose fixed
+    /// fallback, a recorder's served-schema corpus): a schema whose fixed
     /// section cannot be sized has no wire hash, and saying so loudly beats
     /// a panic or a fabricated number.
     pub fn checked_schema_hash(&self) -> Result<u64, String> {
-        Ok(self.hash_with_fixed_size(self.checked_wire_fixed_size()?))
+        Ok(self.hash_with_fixed_size(self.checked_wire_fixed_size()?, fold_nested_target_hash))
     }
 
-    /// The recipe-3 fold over an already-computed fixed-section size — the
-    /// ONE body behind both hash entry points, so the panicking and the
-    /// fallible twin can never drift.
-    fn hash_with_fixed_size(&self, wire_fixed_size: usize) -> u64 {
+    /// The schema hash under the previous recipe (recipe 3), the hash that
+    /// recordings and binaries made before recipe 4 carry. Recipe 3 folds
+    /// the target hash of an INLINED target only (a direct fixed nested
+    /// field or a `FixedArray` element of one); a variable target and any
+    /// `DynamicArray` element contribute their name only.
+    ///
+    /// Call it on a schema resolved by `resolve_fixed_nested`. An inlined
+    /// target is recursively fixed, so it has no reference the two recipes
+    /// fold differently, and its recipe-4 stamp equals its recipe-3 hash.
+    /// Same panic as [`schema_hash`](Self::schema_hash).
+    pub fn schema_hash_recipe3(&self) -> u64 {
+        self.hash_with_fixed_size(self.wire_fixed_size(), fold_inlined_target_hash)
+    }
+
+    /// Fallible twin of [`schema_hash_recipe3`](Self::schema_hash_recipe3),
+    /// for untrusted definitions (see
+    /// [`checked_schema_hash`](Self::checked_schema_hash)).
+    pub fn checked_schema_hash_recipe3(&self) -> Result<u64, String> {
+        Ok(self.hash_with_fixed_size(self.checked_wire_fixed_size()?, fold_inlined_target_hash))
+    }
+
+    /// The hash stream over an already-computed fixed-section size, the ONE
+    /// body behind every hash entry point, so the panicking and the
+    /// fallible twins can never drift. `fold` feeds the target hashes the
+    /// recipe folds after a field's type.
+    fn hash_with_fixed_size(
+        &self,
+        wire_fixed_size: usize,
+        fold: fn(&FieldType, &mut Fnv1aHasher),
+    ) -> u64 {
         // FNV-1a streaming accumulator. Length prefixes (`u64` LE) then the
         // corresponding bytes, in order, incrementally with zero heap
         // allocation. The value is byte-for-byte identical to
@@ -170,17 +198,11 @@ impl MessageSchema {
             let ty = field.field_type.canonical_str();
             hash.feed(&(ty.len() as u64).to_le_bytes());
             hash.feed(ty.as_bytes());
-            // Recipe 3: a fixed-resolved nested field is inlined in
-            // the fixed section, so the parent hash must depend on the
-            // target's full layout. `resolve_fixed_nested` stamps the
-            // target's own `schema_hash` into `NestedFixedInfo::target_hash`
-            // (bottom-up, so the target is fully resolved first). This must
-            // also reach a fixed nested embedded inside a `FixedArray`
-            // (e.g. `Point[4]`), which is inlined too — `canonical_str`
-            // only carries the element NAME, not its layout, so without
-            // this fold a same-size reorder inside the array element would
-            // not bump the parent hash (silent wire skew).
-            fold_fixed_nested_target_hash(&field.field_type, &mut hash);
+            // `canonical_str` carries only a nested target's NAME, so
+            // without this fold a layout change inside the target that
+            // keeps its name would leave this hash unchanged: two builds
+            // would accept each other's frames and misread the nested bytes.
+            fold(&field.field_type, &mut hash);
         }
         hash.finish()
     }
@@ -328,26 +350,38 @@ impl MessageSchema {
     }
 }
 
-/// Fold the recursive `target_hash` of every fixed-resolved nested type
-/// reachable through a field type into the schema hash (recipe 3).
-///
-/// A fixed nested is inlined into the parent's fixed section — directly
-/// (`Nested`) or as array elements (`FixedArray` of `Nested`, possibly
-/// nested arrays). `canonical_str` carries only the type NAME, so a
-/// layout change inside the inlined target that preserves its name and
-/// size (e.g. a same-type field reorder) would otherwise leave the parent
-/// hash unchanged — silent wire skew. Folding the target's own
-/// `schema_hash` closes that gap for both shapes. `DynamicArray` is NOT
-/// folded: it lives in the offset table (variable, `fixed: None`) and is
-/// self-describing on the wire.
-fn fold_fixed_nested_target_hash(ft: &FieldType, hash: &mut Fnv1aHasher) {
+/// Recipe 4: fold the stamped target hash of the nested reference a field
+/// type holds, at any array depth (`FixedArray` and `DynamicArray`). An
+/// inlined target carries it in [`NestedFixedInfo::target_hash`], any
+/// other resolved reference in `FieldType::Nested::target_hash`; the
+/// resolver writes exactly one of the two. A reference with neither stamp
+/// folds nothing.
+fn fold_nested_target_hash(ft: &FieldType, hash: &mut Fnv1aHasher) {
+    match ft {
+        FieldType::Nested {
+            fixed, target_hash, ..
+        } => {
+            if let Some(target) = fixed.map(|info| info.target_hash).or(*target_hash) {
+                hash.feed(&target.to_le_bytes());
+            }
+        }
+        FieldType::FixedArray { element_type, .. } | FieldType::DynamicArray { element_type } => {
+            fold_nested_target_hash(element_type, hash)
+        }
+        _ => {}
+    }
+}
+
+/// Recipe 3: fold the target hash of an INLINED nested target only, a
+/// direct field or a `FixedArray` element (possibly under more
+/// `FixedArray` layers). A variable target and any `DynamicArray` element
+/// fold nothing.
+fn fold_inlined_target_hash(ft: &FieldType, hash: &mut Fnv1aHasher) {
     match ft {
         FieldType::Nested {
             fixed: Some(info), ..
         } => hash.feed(&info.target_hash.to_le_bytes()),
-        FieldType::FixedArray { element_type, .. } => {
-            fold_fixed_nested_target_hash(element_type, hash)
-        }
+        FieldType::FixedArray { element_type, .. } => fold_inlined_target_hash(element_type, hash),
         _ => {}
     }
 }
@@ -629,7 +663,7 @@ pub struct NestedFixedInfo {
     /// (== `size_of::<<Target>Shm>()` under `#[repr(C)]`). Lets
     /// [`FieldType::fixed_size`] report a real size for the field without a
     /// schema registry, so the parent's `wire_fixed_size()` stays equal to
-    /// `size_of::<<Parent>FixedSection>()` (recipe 3).
+    /// `size_of::<<Parent>FixedSection>()`.
     pub fixed_size: usize,
 
     /// Alignment of the inlined `<Target>Shm`, i.e. the target's
@@ -638,12 +672,11 @@ pub struct NestedFixedInfo {
     /// align-up arithmetic in `wire_fixed_size()`.
     pub alignment: usize,
 
-    /// The target schema's own [`MessageSchema::schema_hash`] (recipe 3).
-    /// Folded into the parent's hash so ANY layout change inside the
-    /// inlined target (size, reorder, retype, rename, add/remove) bumps the
-    /// parent's hash — closing the silent-corruption gap that an inline
-    /// fixed nested would otherwise open (a variable nested is
-    /// offset-table-self-describing and needs no such fold).
+    /// The target schema's own [`MessageSchema::schema_hash`]. Folded into
+    /// the parent's hash so ANY layout change inside the inlined target
+    /// (size, reorder, retype, rename, add/remove) changes the parent's
+    /// hash. A reference that is not inlined carries the same value in
+    /// `FieldType::Nested::target_hash` instead.
     pub target_hash: u64,
 }
 
@@ -1306,7 +1339,7 @@ mod tests {
         assert_eq!(schema.variable_field_count(), 2);
     }
 
-    /// Independent oracle for the recipe-3 hash recipe: hand-assemble
+    /// Independent oracle for the hash recipe: hand-assemble
     /// the documented byte stream and one-shot FNV-1a it, then compare to the
     /// streaming `schema_hash()`. Every OTHER hash test runs the same recipe
     /// function on both sides (so they cannot catch a bug INSIDE the recipe);
@@ -1314,13 +1347,12 @@ mod tests {
     /// length prefix, a dropped `wire_fixed_size`, or a bare-vs-qualified name
     /// mistake would diverge here.
     ///
-    /// Covers the no-nested portion (steps 1–3 a/b). The nested `target_hash`
-    /// fold (step 3c) is proven by the `resolve.rs` reorder/array/3-level
-    /// tests, which would fail if the fold were wrong — re-deriving it here
-    /// would not be independent (it would reuse the same recipe to hash the
-    /// target).
+    /// Covers the no-nested portion (steps 1 to 3 a/b). The nested target hash
+    /// fold (step 3c) over literal stamps is
+    /// `schema_hash_folds_every_stamped_reference_at_any_array_depth`; the
+    /// stamps themselves are pinned by the `resolve.rs` tests.
     #[test]
-    fn schema_hash_matches_hand_assembled_recipe3_stream() {
+    fn schema_hash_matches_hand_assembled_stream() {
         use crate::wire::fnv1a_hash;
         fn oracle(schema: &MessageSchema) -> u64 {
             let mut bytes = Vec::new();
@@ -1361,6 +1393,150 @@ mod tests {
         // The packaged and bare hashes must differ even with overlapping
         // structure — qualification is in the stream.
         assert_ne!(point.schema_hash(), blob.schema_hash());
+    }
+
+    /// `name` as a stamped nested reference: `inlined` puts the hash in a
+    /// fixed stamp (an inlined 8-byte target), otherwise in `target_hash`.
+    fn stamped_ref(name: &str, hash: Option<u64>, inlined: bool) -> FieldType {
+        FieldType::Nested {
+            schema_name: name.to_string(),
+            package: Some("demo".to_string()),
+            fixed: match (inlined, hash) {
+                (true, Some(target_hash)) => Some(NestedFixedInfo {
+                    has_large_array: false,
+                    fixed_size: 8,
+                    alignment: 8,
+                    target_hash,
+                }),
+                _ => None,
+            },
+            target_hash: if inlined { None } else { hash },
+        }
+    }
+
+    fn array_of(element: FieldType, length: Option<usize>) -> FieldType {
+        let element_type = Box::new(element);
+        match length {
+            Some(length) => FieldType::FixedArray {
+                element_type,
+                length,
+            },
+            None => FieldType::DynamicArray { element_type },
+        }
+    }
+
+    /// `demo/Mix`: one field per nested reference shape, each stamp a
+    /// literal, so the oracle below needs no resolver and no hash of a
+    /// target.
+    fn mix_schema() -> MessageSchema {
+        let mut s = MessageSchema::new_in_package("Mix", "demo");
+        s.add_field(FieldDef::new("count", FieldType::U32));
+        s.add_field(FieldDef::new(
+            "fixed",
+            stamped_ref("Fix", Some(0x1111), true),
+        ));
+        s.add_field(FieldDef::new(
+            "var",
+            stamped_ref("Var", Some(0x2222), false),
+        ));
+        s.add_field(FieldDef::new(
+            "fixed_arr",
+            array_of(stamped_ref("Fix", Some(0x1111), true), Some(2)),
+        ));
+        s.add_field(FieldDef::new(
+            "dyn_arr",
+            array_of(stamped_ref("Fix", Some(0x3333), false), None),
+        ));
+        s.add_field(FieldDef::new(
+            "dyn_of_fixed",
+            array_of(
+                array_of(stamped_ref("Var", Some(0x4444), false), Some(3)),
+                None,
+            ),
+        ));
+        s.add_field(FieldDef::new("loose", stamped_ref("Gone", None, false)));
+        s
+    }
+
+    /// The `demo/Mix` byte stream, assembled from literals: `recipe4`
+    /// folds every stamp, recipe 3 only the two inlined ones.
+    fn mix_oracle(recipe4: bool) -> u64 {
+        fn prefixed(bytes: &mut Vec<u8>, text: &str) {
+            bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        let fields: [(&str, &str, Option<u64>, bool); 7] = [
+            ("count", "uint32", None, true),
+            ("fixed", "demo/Fix", Some(0x1111), true),
+            ("var", "demo/Var", Some(0x2222), false),
+            ("fixed_arr", "demo/Fix[2]", Some(0x1111), true),
+            ("dyn_arr", "demo/Fix[]", Some(0x3333), false),
+            ("dyn_of_fixed", "demo/Var[3][]", Some(0x4444), false),
+            ("loose", "demo/Gone", None, false),
+        ];
+        let mut bytes = Vec::new();
+        prefixed(&mut bytes, "demo/Mix");
+        // u32 (4) + pad to 8 + Fix (8) + [Fix; 2] (16) = 32.
+        bytes.extend_from_slice(&32u64.to_le_bytes());
+        for (name, ty, hash, inlined) in fields {
+            prefixed(&mut bytes, name);
+            prefixed(&mut bytes, ty);
+            if let Some(hash) = hash.filter(|_| recipe4 || inlined) {
+                bytes.extend_from_slice(&hash.to_le_bytes());
+            }
+        }
+        crate::wire::fnv1a_hash(&bytes)
+    }
+
+    #[test]
+    fn schema_hash_folds_every_stamped_reference_at_any_array_depth() {
+        let mix = mix_schema();
+        assert_eq!(mix.wire_fixed_size(), 32);
+        assert_eq!(mix.fields[5].field_type.canonical_str(), "demo/Var[3][]");
+        assert_eq!(mix.schema_hash(), mix_oracle(true));
+        assert_eq!(mix.checked_schema_hash(), Ok(mix_oracle(true)));
+    }
+
+    #[test]
+    fn schema_hash_recipe3_folds_only_inlined_targets() {
+        let mix = mix_schema();
+        assert_eq!(mix.schema_hash_recipe3(), mix_oracle(false));
+        assert_eq!(mix.checked_schema_hash_recipe3(), Ok(mix_oracle(false)));
+        assert_ne!(mix_oracle(false), mix_oracle(true));
+    }
+
+    #[test]
+    fn a_schema_with_no_reference_hashes_the_same_under_both_recipes() {
+        let mut point = MessageSchema::new_in_package("Point", "geometry_msgs");
+        for f in ["x", "y", "z"] {
+            point.add_field(FieldDef::new(f, FieldType::F64));
+        }
+        assert_eq!(point.schema_hash_recipe3(), point.schema_hash());
+    }
+
+    #[test]
+    fn a_changed_stamp_under_a_dynamic_array_changes_only_the_recipe4_hash() {
+        let mut changed = mix_schema();
+        changed.fields[4].field_type = array_of(stamped_ref("Fix", Some(0x3334), false), None);
+        assert_ne!(changed.schema_hash(), mix_schema().schema_hash());
+        assert_eq!(
+            changed.schema_hash_recipe3(),
+            mix_schema().schema_hash_recipe3()
+        );
+    }
+
+    #[test]
+    fn both_recipes_refuse_a_fixed_section_that_cannot_be_sized() {
+        let mut s = MessageSchema::new_in_package("Huge", "demo");
+        for name in ["a", "b"] {
+            s.add_field(FieldDef::new(
+                name,
+                array_of(FieldType::U64, Some(usize::MAX / 8)),
+            ));
+        }
+        let current = s.checked_schema_hash().unwrap_err();
+        assert!(current.contains("schema `Huge` field `b`"), "{current}");
+        assert_eq!(s.checked_schema_hash_recipe3(), Err(current));
     }
 
     fn header_ref(target_hash: Option<u64>) -> FieldType {

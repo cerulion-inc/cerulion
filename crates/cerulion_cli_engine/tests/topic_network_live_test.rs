@@ -951,7 +951,7 @@ fn schema_verb_serves_custom_type_and_desk_decodes_a_real_frame() {
     let session = desk.session().expect("desk session");
 
     // HAND oracle frame: Widget { x: 3.5, y: -7.25 } — a fixed-only frame is the
-    // 40-byte header (carrying the recipe-3 hash) + [x_le][y_le]. Compute the hash
+    // 40-byte header (carrying the wire hash) + [x_le][y_le]. Compute the hash
     // the SAME way the walker does, so `walk_by_hash` resolves it.
     let widget_schema = parse_rosmsg(widget_text, "Widget", Some("probe_msgs")).expect("parse");
     let widget_hash = widget_schema.schema_hash();
@@ -1789,7 +1789,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
         )
         .expect("declare query surface");
 
-    // Hand oracle: the recipe-3 wire hash the walker + robot both compute; a real
+    // Hand oracle: the wire hash the walker + robot both compute; a real
     // Widget frame = 40-byte header (carrying the hash) + [x_le][y_le].
     let widget_hash = parse_rosmsg(widget_text, "Widget", Some("absent_probe_msgs"))
         .expect("parse widget")
@@ -1893,7 +1893,7 @@ fn resolve_remote_ingress_target_finds_robot_schema_hash_and_walker() {
 /// succeed is LOCAL resolution — that IS the "no wire fetch" proof. A CUSTOM type
 /// the desk lacks AND the robot does not serve still yields `SchemaUnavailable`
 /// (the wire fetch stays the fallback, and it correctly fails for a genuinely
-/// unknown type). Hand oracles (the built-in's recipe-3 hash via `parse_rosmsg`,
+/// unknown type). Hand oracles (the built-in's wire hash via `parse_rosmsg`,
 /// and a decoded Vector3 frame), NOT self-compares. Real zenoh, scouting off.
 #[test]
 fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
@@ -1971,7 +1971,7 @@ fn resolve_built_in_type_uses_local_corpus_without_wire_fetch() {
         )
         .expect("declare query surface");
 
-    // Independent oracle: the recipe-3 hash of geometry_msgs/Vector3 from its bare
+    // Independent oracle: the wire hash of geometry_msgs/Vector3 from its bare
     // .msg fields (comments/whitespace do not affect the hash) — the SAME hash the
     // desk's built-in corpus computes and the robot would stamp on the wire.
     let vec3_hash = parse_rosmsg(

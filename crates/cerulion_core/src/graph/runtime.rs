@@ -551,7 +551,7 @@ fn resolve_max_slice_len(
 /// The YAML `schema:` string is the operator's *intent* for an output
 /// port; the macro's `OutputMeta::schema_hash` is the *actual* layout the
 /// node writes (and the `max_slice_len_default` the runtime uses for that
-/// port). When a workspace `schema:` resolves to a recipe-3 hash that
+/// port). When a workspace `schema:` resolves to a wire hash that
 /// differs from the macro's declared hash, the runtime silently keeps the
 /// macro's tier-2 default — so the operator's `schema:` is a no-op they
 /// have no way to notice. House style is loud-over-silent: emit a
@@ -559,7 +559,7 @@ fn resolve_max_slice_len(
 /// hashes, so the divergence is visible every build.
 ///
 /// `schema_hashes` maps a (normalized, `/`-separated) schema name → its
-/// expected recipe-3 hash, supplied by the CLI from the workspace
+/// expected wire hash, supplied by the CLI from the workspace
 /// `schemas/` directory. The check is PURELY ADVISORY and additive:
 ///
 /// - `schema_hashes == None` (every existing `build`/`build_for_test`
@@ -716,7 +716,7 @@ pub fn check_declared_outputs_listed(node: &NodeDef, info: &NodeInfo) -> Result<
 ///
 /// Every received network frame is validated against ONE expected hash
 /// before re-injection (`NetworkManager::register_ingress` — the same
-/// recipe-3 hash the remote producer stamps into each wire header), so the
+/// wire hash the remote producer stamps into each wire header), so the
 /// graph must agree on exactly one expectation. Resolution scans
 /// `config.nodes` inputs whose resolved source equals `topic` (the same
 /// `resolve_source` derivation the subscriber wiring uses) and reads each
@@ -5015,7 +5015,7 @@ impl GraphRuntime {
         Self::build_with_schema_hashes(config, node_factories, transport, clock, None)
     }
 
-    /// [`Self::build`] plus an optional schema-name → recipe-3
+    /// [`Self::build`] plus an optional schema-name → wire
     /// `schema_hash` map for the YAML-`schema:`-vs-macro-output divergence
     /// warn (see the private `warn_on_schema_hash_divergence`).
     ///

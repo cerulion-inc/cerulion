@@ -2752,7 +2752,7 @@ A worked in-repo example is `examples/perception/schemas/detections.yaml`.
 | `<T>[N]` | Fixed-size array (where `N` is a literal `usize`). Fixed if `T` is fixed. |
 | `<T>[]` | Dynamic array. Variable. |
 | `string_fixed[N]` | Fixed-capacity string. Fixed. |
-| `<SchemaName>` | Nested schema reference. Resolved BOTTOM-UP: if the target is recursively fixed, the reference is **fixed** and its layout is inlined into the parent's fixed section (and folded into the parent's schema hash). Only a reference whose target is variable (or which cannot be resolved) classifies variable. |
+| `<SchemaName>` | Nested schema reference. Resolved BOTTOM-UP: if the target is recursively fixed, the reference is **fixed** and its layout is inlined into the parent's fixed section. Only a reference whose target is variable (or which cannot be resolved) classifies variable. Every resolved reference, fixed or variable and at any array depth, folds its target's schema hash into the parent's, so a layout change inside a nested type changes the hash of every type that holds it. |
 
 A schema is "fixed" iff every field is fixed: a primitive, a `string_fixed[N]`, a `FixedArray` of fixed elements, or a nested reference that resolved fixed. Otherwise it's "variable" and the runtime allocates per-publisher iceoryx2 SHM sized by the 3-tier `max_slice_len` ladder above.
 

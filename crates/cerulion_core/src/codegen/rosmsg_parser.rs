@@ -830,7 +830,7 @@ string name
     }
 
     /// The schema hash is computed over the
-    /// QUALIFIED name (recipe 3 feeds `qualified_name()`), so identically
+    /// QUALIFIED name (the hash feeds `qualified_name()`), so identically
     /// named messages in different packages never collide on the wire.
     #[test]
     fn test_fqn_schema_hash_distinguishes_packages() {
@@ -842,12 +842,12 @@ string name
         let moveit_mesh = parse_rosmsg(mesh, "Mesh", Some("moveit_msgs")).unwrap();
 
         // Same bare name + same content — but the qualified name feeds the
-        // recipe-3 hash, so the wire hashes MUST differ across packages.
+        // schema hash, so the wire hashes MUST differ across packages.
         assert_ne!(shape_mesh.schema_hash(), moveit_mesh.schema_hash());
         assert_eq!(shape_mesh.qualified_name(), "shape_msgs/Mesh");
         assert_eq!(shape_mesh.package.as_deref(), Some("shape_msgs"));
 
-        // Recipe 3 is layout-sensitive: the hash folds in wire_fixed_size +
+        // The hash is layout-sensitive: it folds in wire_fixed_size +
         // per-field canonical_str, so it is NOT a name-only FNV over the
         // qualified name (the superseded recipe-1/#55 form).
         assert_ne!(shape_mesh.schema_hash(), fnv1a_hash(b"shape_msgs/Mesh"));

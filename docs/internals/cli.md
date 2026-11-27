@@ -938,9 +938,11 @@ spins and never panics (`topic_list_dangling_shm_test`).
 ### Pinned schema-hash constants
 
 `topic_cmd.rs` pins `STD_MSGS_STRING_SCHEMA_HASH` and `SENSOR_MSGS_IMAGE_SCHEMA_HASH`
-(the TUI reuses them). After an INTENTIONAL hash-recipe change: run
-`cargo test -p cerulion_cli_engine --test integration_test pinned_hashes` and copy the
-actual values from the assertion failure into the constants. Never hand-compute them.
+(the TUI reuses them). `integration_test.rs` checks them twice: against the
+hand-assembled hash streams of the vendored `.msg` definitions
+(`pinned_hashes_are_the_hand_assembled_streams`) and against the generated constants
+(`pinned_hashes_match_generated_constants`). After an INTENTIONAL hash-recipe change,
+the new values come from the hand-assembled streams, never from the generated side.
 
 ---
 
@@ -1144,7 +1146,7 @@ They perform no helper execution or network access.
 | `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean; a resim in a re-executed child whose environment holds a value that is not valid UTF-8 matches its recorded hash, and a two-pass resim beside such variables prints the node-environment line once). Checkpoint window heads: the reference recorder takes the steps a checkpoint is due at and reopens every stage after each through the production reopen, and can arm hand-chosen rims that the bag states and the replay adopts; `an_ungated_stage_at_its_rim_reads_the_same_log_across_a_mid_pass_window_head` and `a_lockstep_bag_reopens_each_ranks_stages_on_its_own_flag` are the replay reopen mirror's pins (each fails with the mirror off, the second also with a mirror that reopens every rank), and in `replay_engine.rs`'s lib tests `the_reopen_mirror_reaches_exactly_the_flagged_ranks_nodes` is its pure predicate's hand table, while `a_free_run_pass_hands_the_reopen_mirror_its_own_boundarys_flag_and_no_rank_map` and `a_lockstep_pass_hands_the_reopen_mirror_each_ranks_own_flag_and_the_rank_map` pin the flags each pass hands it (no engine fixture makes the free-run arm observable: the one shape it can move, a batch read that another read of its stage precedes in a reopened window, is pinned in `cerulion_core` only) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `replay_driver_stamp_cdylib_test.rs` | A crafted bag's `node_external` stamp reaches the engine through `run_replay`: a workspace build that runs a recorded driver as an ordinary node is refused with `DriverSetDrift` (exit 2) | one test (moves the working directory, mints the resim transport) | `test_node_macro_period_cdylib` |
-| `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
+| `integration_test.rs` | Engine integration incl. `pinned_hashes_are_the_hand_assembled_streams` and `pinned_hashes_match_generated_constants` (the pinned-hash seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
 | `partition_emit_test.rs` | Surgical `process_groups:` splice, block scanner, `process_group_order` removal, atomic write + `.bak`; `node stage` over a file byte-identical to the CLI's own `graph create` + `node stage` writes (default or `-n` prefix) takes no `.bak` and no warn, any byte the re-render does not reproduce keeps both | no | none |

@@ -99,10 +99,10 @@ pub struct FieldLayout {
 pub struct WireLayout {
     /// Qualified schema name (`"pkg/Name"` or bare).
     pub qualified_name: String,
-    /// The wire `schema_hash`: the recipe-3 layout-sensitive hash from
+    /// The wire `schema_hash`: the layout-sensitive hash from
     /// [`MessageSchema::schema_hash`](crate::codegen::MessageSchema::schema_hash)
     /// (FNV-1a over qualified name + `wire_fixed_size` + each field's
-    /// name/canonical type + recursively-folded fixed-nested target hashes).
+    /// name/canonical type + recursively-folded nested target hashes).
     /// NOT a name-only hash — the layout delegates the canonical method so
     /// this value matches the generated type's `SCHEMA_HASH`.
     pub schema_hash: u64,
@@ -479,11 +479,11 @@ mod tests {
         FieldDef::new(name, FieldType::F64)
     }
 
-    /// Recipe-3 hash of the schema named `qname` after resolving
+    /// Wire hash of the schema named `qname` after resolving
     /// `schemas` (mirrors `LayoutResolver::new`'s internal
     /// [`resolve_fixed_nested`] run). A [`WireLayout`] delegates this
     /// hash, so the layout's `schema_hash` equals it. Pinned
-    /// recipe-agnostically: recipe 3 is layout + qualified name + nested
+    /// recipe-agnostically: the hash is layout + qualified name + nested
     /// fold, NOT a name-only `fnv1a` literal.
     fn resolved_hash(mut schemas: Vec<MessageSchema>, qname: &str) -> u64 {
         crate::codegen::resolve_fixed_nested(&mut schemas);

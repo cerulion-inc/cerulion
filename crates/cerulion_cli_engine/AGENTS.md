@@ -18,7 +18,7 @@ Ports: `graph_cmd::stage_declared_node`.
 - `node build` uses Cargo's rustc/MSRV, no pin; load checks the frozen boundary, never compiler provenance.
 - Android libs: <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn; account TLS: system roots, no JVM.
 - Ports/triggers: only `node_metadata::parse_node_metadata`; INFO_END before INFO_START is fatal.
-- Pinned hashes: run `pinned_hashes`, copy into `topic_cmd.rs`; never hand-compute.
+- `topic_cmd.rs` pinned hashes come from `integration_test.rs` hand streams only.
 - Completions: no hangs/spawns/network (`run_bounded`, `completions_test`).
 - Size ports before acceptance; unverifiable: `CliError::SchemaUnchecked`.
   Un-carryable duplicate bearers refuse.

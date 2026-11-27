@@ -75,11 +75,9 @@ use crate::ffi;
 /// PUBLIC so that hand-built introspection fixtures in the integration tests
 /// can be DRIFT-GUARDED against this table instead of re-typing the numbers
 /// by hand. A re-typed number is close to invisible: a canonical-element
-/// fixture declaring `ROS_TYPE_INT32 = 6`, which is `BOOLEAN`, is something nothing
-/// can see — `Time` is recursively fixed (copied wholesale, so no byte
-/// moves) and a VARIABLE nested field contributes only its qualified NAME to
-/// the parent's schema hash, so neither the byte oracles nor the hash gate
-/// is sensitive to it.
+/// fixture declaring `ROS_TYPE_INT32 = 6`, which is `BOOLEAN`, is something the
+/// byte oracles cannot see: `Time` is recursively fixed (copied wholesale, so
+/// no byte moves).
 pub mod ros_type {
     pub const FLOAT: u8 = 1;
     pub const DOUBLE: u8 = 2;
@@ -936,7 +934,7 @@ impl BridgedMessage {
         })
     }
 
-    /// Wire schema hash (FNV-1a of the qualified name — identical to the
+    /// Wire schema hash (the layout-sensitive FNV-1a, identical to the
     /// native generated `SCHEMA_HASH`).
     pub fn schema_hash(&self) -> u64 {
         self.layout.schema_hash

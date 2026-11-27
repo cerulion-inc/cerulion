@@ -405,6 +405,10 @@ raises `BagError` naming `cerulion bag migrate`, which writes a current copy of
 it.
 `Record.view(schema)` decodes a typed message from those bytes; `schema` is a
 message class, or a schema name with `schemas=`.
+A bag recorded before schema hash recipe 4 carries the earlier hash for every
+type that holds a variable-size nested field or a nested array (such as
+`sensor_msgs/Image`, through its `std_msgs/Header`), so `view()` with the
+current class raises `SchemaMismatch` for those records.
 A record whose embedded wire header is shorter than 40 bytes, or whose
 `total_size` disagrees with the record length, raises `BagError`. An
 unknown topic filter raises `ValueError`.

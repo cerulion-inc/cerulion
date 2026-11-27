@@ -682,8 +682,8 @@ pub fn build_schema_docs(
     //     gateway names a RUNTIME-registered topic (a `ros2 attach` raw route,
     //     absent from the node-output `topic_schemas` below) by resolving ITS
     //     reg-channel `schema_hash` through this map. Compute each served type's
-    //     recipe-3 `schema_hash` the SAME way the wire does
-    //     (`MessageSchema::schema_hash`), resolving nested FIXED targets against
+    //     wire `schema_hash` the SAME way the wire does
+    //     (`MessageSchema::schema_hash`), resolving nested targets against
     //     the built-in corpus first (so a custom type nesting e.g. `std_msgs/Header`
     //     folds the same target hash the producer's generated type stamped — an
     //     unresolved fold would mis-hash and the topic would stay unnamed). The

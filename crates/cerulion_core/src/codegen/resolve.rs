@@ -32,9 +32,9 @@
 //!    `<Target>Shm` — zero-copy, direct field access. The stamp also
 //!    carries the target's resolved `(wire_fixed_size, wire_alignment,
 //!    schema_hash)`, computed **bottom-up** so the parent's own
-//!    `wire_fixed_size()` and recipe-3 `schema_hash()` see the true inlined
-//!    layout and fold in the target's full hash (recipe 3 — a
-//!    layout change inside an inlined target bumps every embedder's hash).
+//!    `wire_fixed_size()` and `schema_hash()` see the true inlined
+//!    layout and fold in the target's full hash (a layout change inside an
+//!    inlined target changes every embedder's hash).
 //! 3. Stamps every other bound reference (a variable target, or any
 //!    element under a `DynamicArray`) with the target's own resolved
 //!    `schema_hash` in `FieldType::Nested::target_hash`, also bottom-up.
@@ -82,7 +82,7 @@ enum Fixedness {
     Variable,
 }
 
-/// Fully-resolved layout of a recursively-fixed schema (recipe 3),
+/// Fully-resolved layout of a recursively-fixed schema,
 /// computed bottom-up and memoized. Every value is taken from a clone of the
 /// schema whose nested refs have ALL been resolved first, so the `#[repr(C)]`
 /// methods ([`MessageSchema::wire_fixed_size`] / `wire_alignment` /
@@ -93,7 +93,7 @@ struct ResolvedFixed {
     wire_fixed_size: usize,
     /// `align_of::<<Target>Shm>()` (≤ 8).
     wire_alignment: usize,
-    /// The target's own recipe-3 `schema_hash()` (folded into parents so a
+    /// The target's own `schema_hash()` (folded into parents so a
     /// change anywhere inside the target bumps every embedder's hash).
     schema_hash: u64,
     /// Transitive large-array flag (mirrors [`Fixedness::Fixed`]).
@@ -1309,7 +1309,7 @@ mod tests {
         assert_eq!(schemas[1].variable_field_count(), 1);
         // The element is never inlined (the array stays opaque); it carries
         // the target's hash instead.
-        let point = recipe3_hash(
+        let point = hand_hash(
             "geometry_msgs/Point",
             24,
             &[
@@ -1594,10 +1594,10 @@ mod tests {
         }
     }
 
-    // ---- Recipe 3: recursive nested layout fold (Option D) ----
+    // ---- Recursive nested layout fold through inlined targets ----
 
     /// Build `[Point, Quaternion(quat_fields), Pose{position, orientation}]`,
-    /// resolve, and return Pose's recipe-3 `schema_hash()` plus the
+    /// resolve, and return Pose's `schema_hash()` plus the
     /// [`NestedFixedInfo`] stamped on its `orientation` (fixed Quaternion).
     fn pose_hash_with_quaternion(quat_fields: &[&str]) -> (u64, NestedFixedInfo) {
         let mut quat = MessageSchema::new_in_package("Quaternion", "geometry_msgs");
@@ -1632,7 +1632,7 @@ mod tests {
         assert_eq!(info.alignment, 8);
         assert!(!info.has_large_array);
         // The stamped target_hash must equal the standalone target's own
-        // recipe-3 hash (single recipe, no drift).
+        // hash (single recipe, no drift).
         let mut quat = MessageSchema::new_in_package("Quaternion", "geometry_msgs");
         for f in ["x", "y", "z", "w"] {
             quat.add_field(FieldDef::new(f, FieldType::F64));
@@ -1657,10 +1657,10 @@ mod tests {
     }
 
     /// A SAME-SIZE field reorder inside an inlined nested target must STILL
-    /// bump the parent hash. This is precisely what distinguishes recipe 3
-    /// (recursive hash fold, Option D) from a size-only scheme (Option B):
-    /// a same-size reorder is invisible to a size-only parent hash but is
-    /// caught here — no silent wire corruption.
+    /// bump the parent hash. This is what distinguishes the recursive hash
+    /// fold from a size-only scheme: a same-size reorder is invisible to a
+    /// size-only parent hash but is caught here, so no silent wire
+    /// corruption.
     #[test]
     fn recursive_fold_nested_reorder_bumps_parent_hash() {
         let (canonical, info_c) = pose_hash_with_quaternion(&["x", "y", "z", "w"]);
@@ -1673,12 +1673,12 @@ mod tests {
         assert_ne!(info_c.target_hash, info_r.target_hash);
         assert_ne!(
             canonical, reordered,
-            "recipe 3 must catch a same-size reorder inside an inlined nested target"
+            "the hash must catch a same-size reorder inside an inlined nested target"
         );
     }
 
     /// Build `[Point2(fields), Corners { Point2[4] corners }]`, resolve, and
-    /// return `Corners`'s recipe-3 hash. Exercises a fixed nested embedded in
+    /// return `Corners`'s hash. Exercises a fixed nested embedded in
     /// a `FixedArray` (inlined as `[Point2Shm; 4]`).
     fn corners_hash_with_point2(point_fields: &[&str]) -> u64 {
         let mut p2 = MessageSchema::new_in_package("Point2", "geometry_msgs");
@@ -1716,7 +1716,7 @@ mod tests {
         let reordered = corners_hash_with_point2(&["z", "x", "y"]);
         assert_ne!(
             canonical, reordered,
-            "recipe 3 must catch a same-size reorder inside a FixedArray-of-fixed-nested element"
+            "the hash must catch a same-size reorder inside a FixedArray-of-fixed-nested element"
         );
     }
 
@@ -1751,12 +1751,14 @@ mod tests {
 
     // ---- Target hash stamps on references that are not inlined ----
 
-    /// The documented recipe-3 byte stream (`MessageSchema::schema_hash`),
+    /// The documented hash byte stream (`MessageSchema::schema_hash`),
     /// assembled by hand from literals: the length-prefixed qualified name,
     /// the fixed-section size, then per field its length-prefixed name and
-    /// canonical type and, for an inlined target only, that target's hash.
-    /// Never calls into `MessageSchema`.
-    fn recipe3_hash(qname: &str, fixed_size: u64, fields: &[(&str, &str, Option<u64>)]) -> u64 {
+    /// canonical type and, when the third element is `Some`, the target hash
+    /// folded after it. Recipe 4 folds the target of every stamped
+    /// reference, recipe 3 the target of an inlined reference only. Never
+    /// calls into `MessageSchema`.
+    fn hand_hash(qname: &str, fixed_size: u64, fields: &[(&str, &str, Option<u64>)]) -> u64 {
         fn prefixed(bytes: &mut Vec<u8>, text: &str) {
             bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
             bytes.extend_from_slice(text.as_bytes());
@@ -1807,7 +1809,7 @@ mod tests {
     }
 
     fn inner_hash(id_type: &str) -> u64 {
-        recipe3_hash(
+        hand_hash(
             "demo/Inner",
             4,
             &[("label", "string", None), ("id", id_type, None)],
@@ -1818,10 +1820,23 @@ mod tests {
     /// repository: both `Inner` definitions give it.
     const OUTER_RECIPE3_HASH: u64 = 0x2ab5685f302463b2;
 
+    /// `demo/Outer`'s hash when `Inner` holds `id_type`: the variable
+    /// target's hash is folded after its reference.
+    fn outer_hash(id_type: &str) -> u64 {
+        hand_hash(
+            "demo/Outer",
+            1,
+            &[
+                ("inner", "demo/Inner", Some(inner_hash(id_type))),
+                ("tag", "uint8", None),
+            ],
+        )
+    }
+
     #[test]
-    fn a_variable_target_reference_is_stamped_with_the_target_hash_and_moves_no_hash() {
+    fn a_layout_change_inside_a_variable_target_changes_the_parent_hash() {
         assert_eq!(
-            recipe3_hash(
+            hand_hash(
                 "demo/Outer",
                 1,
                 &[("inner", "demo/Inner", None), ("tag", "uint8", None)]
@@ -1830,6 +1845,7 @@ mod tests {
             "the hand-assembled stream must reproduce the outside value"
         );
         assert_ne!(inner_hash("uint32"), inner_hash("float32"));
+        assert_ne!(outer_hash("uint32"), outer_hash("float32"));
         for (id_type, id_name) in [(FieldType::U32, "uint32"), (FieldType::F32, "float32")] {
             let mut schemas = vec![inner(id_type), outer()];
             let warnings = resolve_fixed_nested(&mut schemas);
@@ -1839,7 +1855,9 @@ mod tests {
                 stamped("Inner", "demo", Some(inner_hash(id_name))),
                 "Inner {{ {id_name} id }}"
             );
-            assert_eq!(schemas[1].schema_hash(), OUTER_RECIPE3_HASH);
+            assert_eq!(schemas[1].schema_hash(), outer_hash(id_name));
+            // Recipe 3 cannot tell the two definitions apart.
+            assert_eq!(schemas[1].schema_hash_recipe3(), OUTER_RECIPE3_HASH);
         }
     }
 
@@ -1888,21 +1906,21 @@ mod tests {
         [("position", "Point"), ("orientation", "Quaternion")];
     const ORIENTATION_FIRST: [(&str, &str); 2] =
         [("orientation", "Quaternion"), ("position", "Point")];
-    /// Read off the wire from a stock ROS 2 Jazzy publisher.
+    /// Read off the wire from a stock ROS 2 Jazzy publisher (the same under both recipes).
     const POSE_WIRE_HASH: u64 = 0x8db061f3f9baff7d;
-    /// Read off the wire from a stock ROS 2 Jazzy publisher.
+    /// Recipe 3 hash read off the wire from a stock ROS 2 Jazzy publisher.
     const POSE_STAMPED_WIRE_HASH: u64 = 0x7bae8da2598b0993;
     /// `geometry_msgs/PoseArray`'s recipe-3 hash, from an implementation
     /// outside this repository: both `Pose` field orders give it.
     const POSE_ARRAY_RECIPE3_HASH: u64 = 0x26b786e1cb2b91bc;
 
     fn header_hash() -> u64 {
-        let time = recipe3_hash(
+        let time = hand_hash(
             "builtin_interfaces/Time",
             8,
             &[("sec", "int32", None), ("nanosec", "uint32", None)],
         );
-        recipe3_hash(
+        hand_hash(
             "std_msgs/Header",
             8,
             &[
@@ -1913,7 +1931,7 @@ mod tests {
     }
 
     fn pose_hash(pose_fields: [(&str, &str); 2]) -> u64 {
-        let point = recipe3_hash(
+        let point = hand_hash(
             "geometry_msgs/Point",
             24,
             &[
@@ -1922,7 +1940,7 @@ mod tests {
                 ("z", "float64", None),
             ],
         );
-        let quat = recipe3_hash(
+        let quat = hand_hash(
             "geometry_msgs/Quaternion",
             32,
             &[
@@ -1943,13 +1961,34 @@ mod tests {
             .iter()
             .map(|(name, ty, hash)| (*name, ty.as_str(), *hash))
             .collect();
-        recipe3_hash("geometry_msgs/Pose", 56, &fields)
+        hand_hash("geometry_msgs/Pose", 56, &fields)
+    }
+
+    /// `geometry_msgs/PoseArray`'s hash with `Pose` fields in `pose_fields`
+    /// order: the `Header` and the array element's `Pose` hash are folded.
+    fn pose_array_hash(pose_fields: [(&str, &str); 2]) -> u64 {
+        hand_hash(
+            "geometry_msgs/PoseArray",
+            0,
+            &[
+                ("header", "std_msgs/Header", Some(header_hash())),
+                (
+                    "poses",
+                    "geometry_msgs/Pose[]",
+                    Some(pose_hash(pose_fields)),
+                ),
+            ],
+        )
     }
 
     #[test]
     fn a_dynamic_array_element_is_stamped_with_the_target_hash_and_never_inlined() {
         assert_eq!(pose_hash(POSITION_FIRST), POSE_WIRE_HASH);
         assert_ne!(pose_hash(ORIENTATION_FIRST), POSE_WIRE_HASH);
+        assert_ne!(
+            pose_array_hash(POSITION_FIRST),
+            pose_array_hash(ORIENTATION_FIRST)
+        );
         for pose_fields in [POSITION_FIRST, ORIENTATION_FIRST] {
             let mut schemas = pose_family(pose_fields);
             let warnings = resolve_fixed_nested(&mut schemas);
@@ -1967,7 +2006,9 @@ mod tests {
                     Some(pose_hash(pose_fields))
                 ))
             );
-            assert_eq!(pose_array.schema_hash(), POSE_ARRAY_RECIPE3_HASH);
+            assert_eq!(pose_array.schema_hash(), pose_array_hash(pose_fields));
+            // Recipe 3 cannot tell the two `Pose` field orders apart.
+            assert_eq!(pose_array.schema_hash_recipe3(), POSE_ARRAY_RECIPE3_HASH);
         }
     }
 
@@ -1989,7 +2030,18 @@ mod tests {
             } => assert_eq!(info.target_hash, POSE_WIRE_HASH),
             other => panic!("pose must inline with no target_hash, got {other:?}"),
         }
-        assert_eq!(pose_stamped.schema_hash(), POSE_STAMPED_WIRE_HASH);
+        assert_eq!(
+            pose_stamped.schema_hash(),
+            hand_hash(
+                "geometry_msgs/PoseStamped",
+                56,
+                &[
+                    ("header", "std_msgs/Header", Some(header_hash())),
+                    ("pose", "geometry_msgs/Pose", Some(POSE_WIRE_HASH)),
+                ],
+            )
+        );
+        assert_eq!(pose_stamped.schema_hash_recipe3(), POSE_STAMPED_WIRE_HASH);
     }
 
     /// `demo/A { demo/B b; string s }`, `demo/B { demo/A a; string s }` and
@@ -2017,8 +2069,8 @@ mod tests {
 
     #[test]
     fn a_reference_cycle_is_not_stamped_and_an_outside_referrer_is_stamped_in_every_order() {
-        let a_hash = recipe3_hash("demo/A", 0, &[("b", "demo/B", None), ("s", "string", None)]);
-        let t_hash = recipe3_hash("demo/T", 0, &[("a", "demo/A", None)]);
+        let a_hash = hand_hash("demo/A", 0, &[("b", "demo/B", None), ("s", "string", None)]);
+        let t_hash = hand_hash("demo/T", 0, &[("a", "demo/A", Some(a_hash))]);
         let mut expected_warnings = vec![
             "A.b: 'demo/B' is in a reference cycle with 'demo/A'; the reference carries no \
              target hash, so a layout change in 'demo/B' does not change the hash of 'demo/A'"
@@ -2229,7 +2281,7 @@ mod tests {
         fixed_inner.add_field(FieldDef::new("id", FieldType::U32));
         let mut now_fixed = vec![fixed_inner, resolved_outer];
         assert!(resolve_fixed_nested(&mut now_fixed).is_empty());
-        let fixed_hash = recipe3_hash("demo/Inner", 4, &[("id", "uint32", None)]);
+        let fixed_hash = hand_hash("demo/Inner", 4, &[("id", "uint32", None)]);
         match &now_fixed[1].fields[0].field_type {
             FieldType::Nested {
                 fixed: Some(info),
@@ -2267,7 +2319,7 @@ mod tests {
         ));
         let mut schemas = vec![point_schema("geometry_msgs"), list];
         assert!(resolve_fixed_nested(&mut schemas).is_empty());
-        let point = recipe3_hash(
+        let point = hand_hash(
             "geometry_msgs/Point",
             24,
             &[
@@ -2313,7 +2365,7 @@ mod tests {
             ),
             "{warnings:?}"
         );
-        let point = recipe3_hash(
+        let point = hand_hash(
             "geometry_msgs/Point",
             24,
             &[
@@ -2356,7 +2408,7 @@ mod tests {
                 })
                 .collect()
         };
-        let d_hash = recipe3_hash("demo/D", 0, &[("s", "string", None)]);
+        let d_hash = hand_hash("demo/D", 0, &[("s", "string", None)]);
         for order in [[0, 1, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1]] {
             let mut schemas = build(order);
             let warnings = resolve_fixed_nested(&mut schemas);
@@ -2408,7 +2460,7 @@ mod tests {
         let mut schemas = vec![inner(FieldType::U32), point_schema("geometry_msgs"), holder];
         let warnings = resolve_fixed_nested(&mut schemas);
         assert!(warnings.is_empty(), "{warnings:?}");
-        let point = recipe3_hash(
+        let point = hand_hash(
             "geometry_msgs/Point",
             24,
             &[
@@ -2511,16 +2563,20 @@ mod tests {
         chain
     }
 
-    /// The recipe-3 hash of chain link `link`, assembled by hand. A
-    /// variable target's hash is never folded into recipe 3, so each link's
-    /// hash reads only its own fields.
-    fn chain_link_hash(link: usize) -> u64 {
-        let name = format!("acme/L{link}");
-        if link == CHAIN_LINKS {
-            recipe3_hash(&name, 1, &[("x", "uint8", None)])
-        } else {
-            recipe3_hash(&name, 0, &[("next", &chain_next_type(link), None)])
+    /// The hash of every chain link, index = link, assembled by hand from
+    /// the last link back: each link folds the hash of the next one.
+    fn chain_link_hashes() -> Vec<u64> {
+        let mut hashes = vec![0; CHAIN_LINKS + 1];
+        hashes[CHAIN_LINKS] =
+            hand_hash(&format!("acme/L{CHAIN_LINKS}"), 1, &[("x", "uint8", None)]);
+        for link in (0..CHAIN_LINKS).rev() {
+            hashes[link] = hand_hash(
+                &format!("acme/L{link}"),
+                0,
+                &[("next", &chain_next_type(link), Some(hashes[link + 1]))],
+            );
         }
+        hashes
     }
 
     /// Resolve `schemas` on a thread with the test harness's stack size, so
@@ -2541,6 +2597,7 @@ mod tests {
     }
 
     fn assert_chain_stamped(schemas: &[MessageSchema]) {
+        let hashes = chain_link_hashes();
         for schema in schemas {
             let Some(link) = schema
                 .name
@@ -2552,18 +2609,14 @@ mod tests {
             if link == CHAIN_LINKS {
                 continue;
             }
-            let next = stamped(
-                &format!("L{}", link + 1),
-                "acme",
-                Some(chain_link_hash(link + 1)),
-            );
+            let next = stamped(&format!("L{}", link + 1), "acme", Some(hashes[link + 1]));
             let expected = if link.is_multiple_of(2) {
                 next
             } else {
                 dynamic(next)
             };
             assert_eq!(schema.fields[0].field_type, expected, "acme/L{link}.next");
-            assert_eq!(schema.schema_hash(), chain_link_hash(link), "acme/L{link}");
+            assert_eq!(schema.schema_hash(), hashes[link], "acme/L{link}");
         }
     }
 

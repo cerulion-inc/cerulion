@@ -2,7 +2,7 @@
 //!
 //! The recipe is deliberately the same shape as
 //! [`MessageSchema::schema_hash`](crate::codegen::MessageSchema::schema_hash)
-//! (hash recipe 3): FNV-1a 64 over a length-prefixed stream, folding each
+//! (layout-sensitive recipe): FNV-1a 64 over a length-prefixed stream, folding each
 //! member's own hash into the parent so a change *inside* a nested type bumps
 //! the parent. It reuses that hash's constants rather than carrying a copy.
 //!

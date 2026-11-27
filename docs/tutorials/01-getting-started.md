@@ -309,7 +309,7 @@ cerulion schema info sensor_msgs/LaserScan
 schema: sensor_msgs/LaserScan
 source: built-in (ROS 2)
 wire fixed size: 28 bytes
-hash: 0x64cc8631dc24946b
+hash: 0x983637f60bf66408
 fields: 10
   header: std_msgs/Header (variable)
     stamp: builtin_interfaces/Time (fixed)
@@ -961,7 +961,7 @@ cerulion topic echo /demo/lidar_sensor/scan --truncate-length 4
 ```
 
 ```
-# seq=331 ts=1997429329506375ns schema=0x64cc8631dc24946b size=1361
+# seq=331 ts=1997429329506375ns schema=0x983637f60bf66408 size=1361
 # sensor_msgs/LaserScan
 header:
   stamp:
@@ -1014,7 +1014,7 @@ cerulion topic info /demo/lidar_sensor/scan
 
 ```
 Topic: /demo/lidar_sensor/scan
-Schema: sensor_msgs/LaserScan (0x64cc8631dc24946b)
+Schema: sensor_msgs/LaserScan (0x983637f60bf66408)
 Last sequence: 516
 Last timestamp: 1997447829523916ns
 ```

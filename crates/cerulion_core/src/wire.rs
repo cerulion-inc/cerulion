@@ -132,12 +132,12 @@ pub struct WireHeader {
     /// remove) change the hash. For a nested field it depends on how the
     /// nested schema resolved:
     ///
-    /// - A FIXED-size nested schema is inlined in the parent's fixed section,
-    ///   so its own full `schema_hash` is folded into the parent. ANY change
-    ///   inside it changes the parent's hash.
-    /// - A VARIABLE-size nested schema rides the offset table and
-    ///   contributes only its package-qualified name. A layout change inside
-    ///   it does NOT change the parent's hash.
+    /// - Every resolved nested reference (a direct field, or a fixed or
+    ///   dynamic array element; a fixed or a variable target) folds its
+    ///   target's full `schema_hash` into the parent. ANY change inside it
+    ///   changes the parent's hash.
+    /// - A reference with no stamp (unresolved, in a reference cycle, or an
+    ///   unsizable target) contributes only its package-qualified name.
     pub schema_hash: u64,
 
     /// Total message size in bytes (including header)

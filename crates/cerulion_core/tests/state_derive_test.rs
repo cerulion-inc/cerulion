@@ -257,7 +257,7 @@ fn a_derived_shape_folds_field_names_so_a_transposition_cannot_pass() {
         <GoalSwapped as CerulionState>::STATE_SHAPE
     );
 
-    // A nested type's change bumps the PARENT's shape (recipe 3).
+    // A nested type's change bumps the PARENT's shape (the schema_hash property).
     assert_ne!(
         <Odom as CerulionState>::STATE_SHAPE,
         StateShape::of("Odom")

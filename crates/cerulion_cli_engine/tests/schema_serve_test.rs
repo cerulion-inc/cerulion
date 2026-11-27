@@ -194,7 +194,7 @@ fn build_serving_empty_workspace_serves_nothing_but_still_names_builtins() {
 }
 
 /// The serving carries a hash→qualified-name REVERSE
-/// binding for every served custom type — each hash EQUAL to the recipe-3 wire
+/// binding for every served custom type, each hash EQUAL to the wire
 /// hash a producer stamps (`MessageSchema::schema_hash`), so the gateway can NAME
 /// a runtime-registered raw route (a `ros2 attach` topic, absent from
 /// `topic_schemas`) by ITS reg-channel hash. Hand oracle (a flat custom type —

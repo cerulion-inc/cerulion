@@ -8,7 +8,7 @@
 //! ```text
 //! offset  size  field                type   value
 //! 0       2     descriptor_version   u16    = 2  (DESCRIPTOR_VERSION)
-//! 2       4     hash_recipe          u32    = cerulion_core::trace::bag::HASH_RECIPE (3)
+//! 2       4     hash_recipe          u32    = cerulion_core::trace::bag::HASH_RECIPE (4)
 //! 6       8     schema_hash          u64    the layout-sensitive schema hash
 //! 14      4     wire_fixed_size      u32    the schema's fixed wire size in bytes
 //! 18      2     wire_header_version  u16    = cerulion_core::wire::WIRE_HEADER_VERSION

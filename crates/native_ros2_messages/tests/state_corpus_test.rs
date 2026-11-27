@@ -76,8 +76,8 @@ fn a_nested_ros_snapshot_folds_through_its_members() {
     assert_eq!(capture(&t), want);
     assert_eq!(read_exact::<TwistSnapshot>(&want), t);
 
-    // A change INSIDE the nested type must bump the parent's shape (recipe 3,
-    // which the derive inherits by folding the member's own STATE_SHAPE).
+    // A change INSIDE the nested type must bump the parent's shape (which the
+    // derive inherits by folding the member's own STATE_SHAPE).
     //
     // Comparing `Twist`'s shape with `Vector3`'s does NOT test that, which is
     // what this assertion used to do: two differently-named types with

@@ -41,8 +41,8 @@ cargo test -p native_ros2_messages   # whole crate; parallel-safe (isolated SHM 
   (the drift gate fails closed on a missing entry).
 - Run the FULL crate suite after touching the corpus - a curated local run masks
   the exhaustive tests.
-- Never re-bless `schema_hash_pin_test`'s wire-capture hashes from the actual
-  value: a failure there is a wire-compatibility break, not a stale pin.
+- Never re-bless `schema_hash_pin_test`'s wire-capture hashes (both recipe tables)
+  from the actual value: a failure there is a wire-compatibility break, not a stale pin.
 
 ## Gotchas
 

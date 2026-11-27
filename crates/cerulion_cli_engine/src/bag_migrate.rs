@@ -4123,10 +4123,10 @@ mod tests {
 
     #[test]
     fn a_version_1_descriptor_channel_is_carried_and_an_unknown_version_cannot_decode() {
-        // A version 1 blob: 18 bytes, recipe 3, hash 0xAB, fixed size 12.
+        // A version 1 blob: 18 bytes, the current recipe, hash 0xAB, fixed size 12.
         let mut v1 = [0u8; cerulion_bag::DESCRIPTOR_V1_LEN];
         v1[0] = 1;
-        v1[2] = 3;
+        v1[2] = cerulion_core::trace::bag::HASH_RECIPE as u8;
         v1[6] = 0xAB;
         v1[14] = 12;
         let d = cerulion_bag::SchemaDescriptor::decode(&v1).expect("v1 decodes");

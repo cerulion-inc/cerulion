@@ -108,7 +108,7 @@ fn build_single_output(
 }
 
 /// Build a single-publisher graph over the real iceoryx2 transport with
-/// the given output meta AND an optional schema-name → recipe-3 hash map
+/// the given output meta AND an optional schema-name → wire hash map
 /// for the divergence warn. Routes through `build_for_test_with_schema_hashes` so the
 /// YAML-`schema:`-vs-macro-output divergence warn can be exercised
 /// end-to-end. Returns the runtime so its publishers stay alive for the
@@ -250,7 +250,7 @@ fn tier2_does_not_emit_warn_when_resolved() {
 // ============================================================
 // YAML-`schema:`-vs-macro-output schema-hash divergence warn.
 //
-// When the CLI supplies a (schema name → recipe-3 hash) map and a graph
+// When the CLI supplies a (schema name → wire hash) map and a graph
 // YAML output's `schema:` resolves to a hash DIFFERENT from the macro
 // output field's `OutputMeta::schema_hash`, the runtime keeps the macro's
 // max_slice_len default but warns loudly so the no-op `schema:` override is

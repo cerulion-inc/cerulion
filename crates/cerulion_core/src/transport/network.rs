@@ -2612,7 +2612,7 @@ pub struct CatalogSource {
     /// `Mutex` - the same discipline as [`Self::hashes`] beside it.
     pub topic_schemas: Arc<Mutex<HashMap<String, String>>>,
     /// The hash→qualified-name REVERSE map - the CLI
-    /// computes each served type's recipe-3 `schema_hash` (it holds the parsed IR
+    /// computes each served type's `schema_hash` (it holds the parsed IR
     /// for both `.msg` and YAML encodings) and hands the bindings to the gateway.
     /// A RUNTIME-registered topic (a `ros2 attach` raw route) arrives over the
     /// reg-channel carrying only a `(topic, schema_hash)` - NO name - so it is

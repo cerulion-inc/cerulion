@@ -66,8 +66,9 @@ set.walker(); set.layout("Probe"); set.layout_for_hash(h); set.schema_hash("Prob
 - **Every bound reference carries its target's hash in exactly one stamp.** An inlined
   target's hash is in `NestedFixedInfo::target_hash` (`fixed: Some`); every other bound
   reference (a variable target, or any element under a `DynamicArray`) carries it in
-  `FieldType::Nested::target_hash`, and the two are never both set. The schema hash recipe
-  does not read `target_hash` yet. No stamp is written for an unbound reference, for a
+  `FieldType::Nested::target_hash`, and the two are never both set. `schema_hash` (recipe 4)
+  folds whichever stamp a reference carries; `schema_hash_recipe3` folds the inlined stamp
+  only, which is the hash recordings made before recipe 4 carry. No stamp is written for an unbound reference, for a
   reference inside a reference cycle (decided on the reference graph's strongly connected
   components, never on input order; warned except for a schema's reference to itself), or
   for a target whose fixed section cannot be sized (warned, never a panic). `WireLayout::to_json`

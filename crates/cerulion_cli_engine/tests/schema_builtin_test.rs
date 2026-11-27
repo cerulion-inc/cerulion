@@ -509,17 +509,8 @@ fn workspace_info_reports_fixed_and_variable_columns() {
 /// fixed (24 B, align 8), so `origin` inlines into the fixed section
 /// exactly as codegen would lay it out: origin@0 (24) + kind@24 (1),
 /// padded to align 8 → 32 bytes, `origin` NOT variable. The loud
-/// workspace nested marker stays. The displayed HASH stays the
-/// single-file UNRESOLVED-parse value, pinned against a hand-built IR
-/// oracle (nested field contributes only its qualified name; the
-/// unresolved `wire_fixed_size` input is kind-only = 1).
-///
-/// Provenance note: this test therefore pins a pair of
-/// INTENTIONALLY different provenance on ONE entry — the RESOLVED wire
-/// fixed size (32, the true inlined SHM layout) next to the UNRESOLVED
-/// recipe hash (whose own `wire_fixed_size` input was 1). Both are
-/// correct; neither may be "fixed" to match the other. See
-/// `enrich_entries_with_resolved_layout`'s doc in `schema_cmd.rs`.
+/// workspace nested marker stays. The displayed HASH is the wire hash of the
+/// resolved layout, pinned against a hand-assembled byte stream.
 #[test]
 fn workspace_info_resolves_nested_ref_against_builtin_registry() {
     let tmp = tempfile::tempdir().unwrap();
@@ -570,24 +561,32 @@ fn workspace_info_resolves_nested_ref_against_builtin_registry() {
         "workspace nested built-in ref must expand inline:\n{rendered}"
     );
 
-    // Hash oracle: the single-file UNRESOLVED parse (hand-built IR —
-    // never a rerun of the CLI's own YAML parse).
-    let mut oracle = MessageSchema::new("Marker");
-    oracle.add_field(FieldDef::new(
-        "origin",
-        FieldType::Nested {
-            schema_name: "Point".to_string(),
-            package: Some("geometry_msgs".to_string()),
-            fixed: None,
-            target_hash: None,
-        },
-    ));
-    oracle.add_field(FieldDef::new("kind", FieldType::U8));
-    assert_eq!(oracle.wire_fixed_size(), 1, "unresolved IR: kind only");
+    // Hash oracle: the wire hash, assembled by hand from literals. The
+    // `origin` field folds the hash of `geometry_msgs/Point` (three float64,
+    // 24 bytes), and the fixed section is the resolved 32 bytes.
+    fn prefixed(bytes: &mut Vec<u8>, text: &str) {
+        bytes.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(text.as_bytes());
+    }
+    let mut point = Vec::new();
+    prefixed(&mut point, "geometry_msgs/Point");
+    point.extend_from_slice(&24u64.to_le_bytes());
+    for name in ["x", "y", "z"] {
+        prefixed(&mut point, name);
+        prefixed(&mut point, "float64");
+    }
+    let mut marker = Vec::new();
+    prefixed(&mut marker, "Marker");
+    marker.extend_from_slice(&32u64.to_le_bytes());
+    prefixed(&mut marker, "origin");
+    prefixed(&mut marker, "geometry_msgs/Point");
+    marker.extend_from_slice(&cerulion_core::wire::fnv1a_hash(&point).to_le_bytes());
+    prefixed(&mut marker, "kind");
+    prefixed(&mut marker, "uint8");
     assert_eq!(
         entry.schema_hash,
-        Some(oracle.schema_hash()),
-        "hash must stay the single-file unresolved-parse value"
+        Some(cerulion_core::wire::fnv1a_hash(&marker)),
+        "hash must be the wire hash that folds the Point hash"
     );
 }
 

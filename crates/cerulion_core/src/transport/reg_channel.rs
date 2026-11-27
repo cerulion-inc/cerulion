@@ -341,7 +341,7 @@ pub const MAX_REG_RECORD_LEN: usize = REG_HEADER_LEN + MAX_REG_TOPIC_LEN;
 pub struct RegRecord {
     /// Canonical (leading-slash) egress topic the producing process registered.
     pub topic: String,
-    /// The wire `schema_hash` (recipe-3) the producer advertised for the topic.
+    /// The wire `schema_hash` the producer advertised for the topic.
     pub schema_hash: u64,
 }
 

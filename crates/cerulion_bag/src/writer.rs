@@ -585,7 +585,7 @@ fn reserved_channels() -> [(&'static str, &'static str, SchemaDescriptor); 4] {
             // a 40-byte `StateRecordHeader` over a 472-byte payload region, which
             // is the framing this channel writes. `schema_hash` is 0 for the
             // same reason its siblings' is — the payload is a framework
-            // record, not a user schema, so there is no recipe-3 hash to
+            // record, not a user schema, so there is no schema hash to
             // carry and fabricating one would make a reader think it could
             // look the layout up.
             SchemaDescriptor::new(0, STATE_RECORD_SIZE),

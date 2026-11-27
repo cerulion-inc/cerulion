@@ -27,7 +27,7 @@ use native_ros2_messages::moveit_msgs::{
 // FQN schema-hash linkage
 // =====================================================================
 
-/// The generated `SCHEMA_HASH` is the recipe-3 layout-sensitive,
+/// The generated `SCHEMA_HASH` is the layout-sensitive,
 /// package-qualified hash — NOT a name-only FNV. This closes the two
 /// regressions that would silently revert cross-package / layout
 /// isolation: a generator that hashes the bare name, or one that hashes
@@ -36,8 +36,8 @@ use native_ros2_messages::moveit_msgs::{
 fn generated_schema_hash_is_layout_and_fqn_sensitive() {
     // Not the bare-name recipe (recipe 1).
     assert_ne!(<Pose as ShmMessage>::SCHEMA_HASH, fnv1a_hash(b"Pose"));
-    // Not a qualified-NAME-only hash either: recipe 3 folds in
-    // wire_fixed_size + per-field canonical_str + (for fixed nested) the
+    // Not a qualified-NAME-only hash either: the wire schema_hash folds in
+    // wire_fixed_size + per-field canonical_str + (for nested) the
     // target's recursive hash, so the value differs from FNV over just the
     // qualified name string.
     assert_ne!(
@@ -60,7 +60,7 @@ fn generated_schema_hash_is_layout_and_fqn_sensitive() {
     // CLI's `STD_MSGS_STRING_SCHEMA_HASH` / `SENSOR_MSGS_IMAGE_SCHEMA_HASH`
     // literals are asserted equal to `<T>::SCHEMA_HASH` there. (Separately,
     // `schema_hash_pin_test` in this crate pins the IR `schema_hash()` ==
-    // generated `SCHEMA_HASH`.) A recipe-3 layout hash cannot be reproduced
+    // generated `SCHEMA_HASH`.) A layout-sensitive hash cannot be reproduced
     // by `const fn fnv1a_hash` over a name, so those are literal pins, not a
     // name-only equality here.
 }

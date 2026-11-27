@@ -113,12 +113,11 @@
 //!   to that reader's `READ_ALIGN`), and a fixed-only `<Name>Shm::read_unaligned` copies one
 //!   element of a fixed-element array out of the blob.
 //! - **Element-schema skew is not hash-covered.** The wire `schema_hash`
-//!   folds a *fixed*-resolved nested target's hash into the parent but NOT a
-//!   variable one (it is self-describing on the wire), so a producer/consumer
-//!   schema skew *inside* a variable element type is not detectable from the
-//!   header. This is a pre-existing property of single variable-nested fields
-//!   (the walker resolves the element layout from its OWN schema set); arrays
-//!   inherit it rather than introducing it.
+//!   folds each resolved nested target's hash into the parent, but a
+//!   reference with no stamp (unresolved, in a reference cycle, or an
+//!   unsizable target) contributes only its name, so a producer/consumer
+//!   schema skew *inside* such an element type is not detectable from the
+//!   header (the walker resolves the element layout from its OWN schema set).
 //!
 //! # What it does NOT decode
 //!
@@ -3727,7 +3726,7 @@ mod tests {
     }
 
     /// The built-in schemas AFTER `resolve_fixed_nested` — so `schema_hash()`
-    /// is the RESOLVED (recipe-3, nested-folded) hash the walker actually
+    /// is the RESOLVED (nested-folded) hash the walker actually
     /// stores, not the raw parse-time hash.
     fn resolved_builtin_schemas() -> Vec<MessageSchema> {
         use crate::codegen::{parse_rosmsg, resolve_fixed_nested};

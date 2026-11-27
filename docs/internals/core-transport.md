@@ -116,7 +116,8 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   it; one shorter than the header, or declaring a size past its end or below the
   header, is served unchanged and counted (`bag migrate` refuses such a bag). The canonical schema-hash recipe lives in
   exactly ONE place: `MessageSchema::schema_hash` (`src/codegen/schema.rs`). Never
-  re-implement it. The recipe identifier is the `HASH_RECIPE` constant
+  re-implement it. `MessageSchema::schema_hash_recipe3` is the previous recipe, the hash a
+  recording made before recipe 4 carries; it shares the same body. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original
   recipe.
 - A data service created with a history floor (`TopicServiceConfig::create_history_floor`,

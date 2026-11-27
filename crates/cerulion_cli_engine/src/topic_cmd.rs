@@ -2328,7 +2328,7 @@ pub fn seed_framewalker(docs: &[cerulion_core::SchemaDoc]) -> cerulion_core::cod
 /// it only knew two pinned built-in hashes. This builds the missing local walker
 /// (the workspace-wins ladder: built-ins, then the store, then workspace
 /// YAML, so a workspace type shadows a same-named built-in) with the store
-/// type's recipe-3 `schema_hash` present, so the wire hash resolves locally and
+/// type's wire `schema_hash` present, so the wire hash resolves locally and
 /// the remote fetch stays the FALLBACK for types the desk genuinely lacks.
 ///
 /// `None` (no workspace) yields a built-ins-only walker — still an improvement
@@ -4518,22 +4518,23 @@ fn silence_notice(topic: &str, source_desc: &str, silent_for: Duration) -> Strin
     )
 }
 
-/// Pinned recipe-3 (layout-sensitive + package-qualified) schema hash for
+/// Pinned (layout-sensitive + package-qualified) schema hash for
 /// `std_msgs/String`, used by `topic_echo` (and the TUI) to pretty-print
 /// known payloads.
 ///
-/// Pinned literal — kept in sync with the generated
+/// Pinned literal, kept in sync with the generated
 /// `<String as ShmMessage>::SCHEMA_HASH` by the
 /// `pinned_hashes_match_generated_constants` test in
-/// `crates/cerulion_cli_engine/tests/integration_test.rs`. After an intentional
-/// hash-recipe change, run that test, copy the actual values from the
-/// failure message, and update these literals (never hand-compute).
+/// `crates/cerulion_cli_engine/tests/integration_test.rs`, and with the
+/// hand-assembled hash stream by `pinned_hashes_are_the_hand_assembled_streams`
+/// in the same file. After an intentional hash-recipe change, take the new
+/// values from the hand-assembled streams, never from the generated side.
 pub const STD_MSGS_STRING_SCHEMA_HASH: u64 = 0xC3D3C3AB405F5F49;
 
-/// Pinned recipe-3 (layout-sensitive + package-qualified) schema hash for
+/// Pinned (layout-sensitive + package-qualified) schema hash for
 /// `sensor_msgs/Image`. See [`STD_MSGS_STRING_SCHEMA_HASH`] for the sync
 /// contract.
-pub const SENSOR_MSGS_IMAGE_SCHEMA_HASH: u64 = 0xBD08DAFCECCFA89E;
+pub const SENSOR_MSGS_IMAGE_SCHEMA_HASH: u64 = 0xF3445F1169091663;
 
 /// The one-time remote-fallback breadcrumb `topic echo` prints when a
 /// frame's type is not compiled locally and is instead decoded via a robot's
@@ -7891,7 +7892,7 @@ mod tests {
     /// resolves that store type's wire `schema_hash` LOCALLY, closing the
     /// gap left when the store type is absent from the echo walker (so
     /// `/lf/lowstate` falls through to the remote tier). The oracle is a THIRD,
-    /// independent recipe-3 hash (`LayoutResolver` over the same corpus), and the
+    /// independent schema hash (`LayoutResolver` over the same corpus), and the
     /// remote seed walker (built from the SAME `.msg` text) resolves the SAME
     /// hash — proving the store-parsed and served-doc hashes are ONE computation.
     #[test]
@@ -7908,7 +7909,7 @@ mod tests {
         std::fs::create_dir_all(&msg_dir).unwrap();
         std::fs::write(msg_dir.join("Widget.msg"), text).unwrap();
 
-        // Hand oracle: the recipe-3 wire hash via an INDEPENDENT resolver over
+        // Hand oracle: the wire hash via an INDEPENDENT resolver over
         // built-ins + the custom type (what a compile-time twin's SCHEMA_HASH is).
         let mut oracle_schemas = crate::schema_cmd::parse_builtin_schemas();
         oracle_schemas.push(parse_rosmsg(text, "Widget", Some("demo_msgs")).unwrap());
