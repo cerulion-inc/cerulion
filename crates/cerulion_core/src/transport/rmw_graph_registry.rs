@@ -819,6 +819,10 @@ struct WriterState {
     ports: Option<WriterPorts>,
     /// Frames sent so far, raised once per send when the send ends.
     frames_sent: u64,
+    /// When set, the pump sends only after a ring. Read and written under
+    /// the state lock, so no send that skipped this check is still running
+    /// once a setter returns. Only a test sets it.
+    timed_sends_held: bool,
     open_failures: FailureRegimeLatch,
     send_failures: FailureRegimeLatch,
 }
@@ -986,6 +990,7 @@ impl RmwGraphWriter {
                     cursor: 0,
                     ports: None,
                     frames_sent: 0,
+                    timed_sends_held: false,
                     open_failures: FailureRegimeLatch::new(),
                     send_failures: FailureRegimeLatch::new(),
                 }),
@@ -1058,6 +1063,16 @@ impl RmwGraphWriter {
         self.shared.lock().frames_sent
     }
 
+    /// Hold or release the sends the pump makes with no ring, so that each
+    /// ring a test sends causes exactly one send and nothing else moves
+    /// [`frames_sent`](Self::frames_sent). A send that is running when this is
+    /// called ends before it returns. Sends after `add`, `remove` or a ring
+    /// are not held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn hold_timed_sends_for_test(&self, held: bool) {
+        self.shared.lock().timed_sends_held = held;
+    }
+
     fn sync(&self, mut state: std::sync::MutexGuard<'_, WriterState>, changed: bool) {
         if changed {
             state.snapshot_changed();
@@ -1115,24 +1130,32 @@ impl RmwGraphWriter {
 fn pump_loop(exit: &AtomicBool, shared: &WriterShared, doorbell: Option<Listener<CerService>>) {
     let mut wait_failures = FailureRegimeLatch::new();
     while !exit.load(Ordering::Relaxed) {
-        match doorbell.as_ref() {
+        let rang = match doorbell.as_ref() {
             Some(listener) => match listener.timed_wait(|_| {}, RMW_GRAPH_REPUBLISH_INTERVAL) {
                 Ok(rings) => {
                     shared.rings_answered.fetch_add(rings, Ordering::Relaxed);
                     report_recovery(&mut wait_failures, "doorbell_wait");
+                    rings > 0
                 }
                 Err(e) => {
                     report_failure(&mut wait_failures, "doorbell_wait", &e.to_string());
                     // A failing wait returns at once; sleep so it cannot spin.
                     std::thread::sleep(RMW_GRAPH_REPUBLISH_INTERVAL);
+                    false
                 }
             },
-            None => std::thread::sleep(RMW_GRAPH_REPUBLISH_INTERVAL),
-        }
+            None => {
+                std::thread::sleep(RMW_GRAPH_REPUBLISH_INTERVAL);
+                false
+            }
+        };
         if exit.load(Ordering::Relaxed) {
             return;
         }
-        shared.lock().publish();
+        let mut state = shared.lock();
+        if rang || !state.timed_sends_held {
+            state.publish();
+        }
     }
 }
 

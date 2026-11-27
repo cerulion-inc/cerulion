@@ -348,7 +348,8 @@ fn a_snapshot_larger_than_the_reader_queue_settles_with_every_pair_before_and_af
 }
 
 /// With two writers listed on the service, one send carries 32 parts: an
-/// even share of half a 128-frame queue.
+/// even share of half a 128-frame queue. The pump's own interval sends are
+/// held, so the one ring here causes the one send that is counted.
 #[test]
 #[serial]
 fn a_send_carries_its_share_of_half_a_queue_when_two_writers_are_listed() {
@@ -359,86 +360,92 @@ fn a_send_carries_its_share_of_half_a_queue_when_two_writers_are_listed() {
     add_a_129_part_snapshot(&writer);
     let other_writer = other.open_rmw_graph_writer();
     other_writer.add("/other", "pkg/msg/Other").expect("pair");
+    writer.hold_timed_sends_for_test(true);
+    let bell = raw_doorbell_notifier(&raw_node(&root.config()));
 
-    let node = raw_node(&root.config());
+    assert_eq!(
+        sent_after_one_ring(&writer, &bell),
+        32,
+        "one send with two writers listed"
+    );
+}
+
+/// A raw notifier on the doorbell the writers created.
+fn raw_doorbell_notifier(
+    node: &iceoryx2::node::Node<Ipc>,
+) -> iceoryx2::port::notifier::Notifier<Ipc> {
     let doorbell_name: ServiceName = RMW_GRAPH_DOORBELL_SERVICE_NAME
         .try_into()
         .expect("service name");
-    let bell = node
-        .service_builder(&doorbell_name)
+    node.service_builder(&doorbell_name)
         .event()
         .open()
         .expect("the writers created the doorbell")
         .notifier_builder()
         .create()
-        .expect("raw notifier");
+        .expect("raw notifier")
+}
 
+/// Ring once and return the frames the writer sent for it. The caller holds
+/// the writer's interval sends, so the ring causes exactly one send and the
+/// count moves once, by that send, when the send ends.
+fn sent_after_one_ring(
+    writer: &RmwGraphWriter,
+    bell: &iceoryx2::port::notifier::Notifier<Ipc>,
+) -> u64 {
     let before = writer.frames_sent();
     bell.notify().expect("ring");
     let deadline = Instant::now() + SETTLE_WINDOW;
-    while writer.frames_sent() == before && Instant::now() < deadline {
+    let mut now = writer.frames_sent();
+    while now == before && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
+        now = writer.frames_sent();
     }
-    assert_eq!(writer.frames_sent() - before, 32);
+    now - before
 }
 
-/// Each ring here is drained only after the send it caused is whole, so every
-/// send lands in the queue at once. A writer alone on the service sends 64
-/// parts a send (a queue of 128 holds two sends of each listed writer), so
-/// the 129 parts need 3 sends and one send is never enough.
+/// The pump's interval sends are held, so each ring causes exactly one send,
+/// and each is drained only after it is whole. A writer alone on the service
+/// sends 64 parts a send (a queue of 128 holds two sends of each listed
+/// writer), and the sends walk on from part to part, so the 129 parts are
+/// whole after the third send and not before.
 #[test]
 #[serial]
-fn whole_sends_drained_between_rings_deliver_every_part_within_three_rings() {
+fn whole_sends_drained_between_rings_deliver_every_part_on_the_third_ring() {
     let root = IsolatedRoot::mint("rg_r");
     let tm = manager("ring_w", &root.config());
     let writer = tm.open_rmw_graph_writer();
     let pairs = add_a_129_part_snapshot(&writer);
     let writer_id = writer.writer_id().expect("the writer is live");
+    writer.hold_timed_sends_for_test(true);
 
     let node = raw_node(&root.config());
     let subscriber = raw_registry(&node)
         .subscriber_builder()
         .create()
         .expect("raw subscriber");
-    let doorbell_name: ServiceName = RMW_GRAPH_DOORBELL_SERVICE_NAME
-        .try_into()
-        .expect("service name");
-    let bell = node
-        .service_builder(&doorbell_name)
-        .event()
-        .open()
-        .expect("the writer created the doorbell")
-        .notifier_builder()
-        .create()
-        .expect("raw notifier");
+    let bell = raw_doorbell_notifier(&node);
 
     let mut fold = RmwGraphGatherFold::new();
-    let mut complete_after = None;
+    let mut complete = Vec::new();
     for ring in 1..=3 {
-        let before = writer.frames_sent();
-        bell.notify().expect("ring");
-        let deadline = Instant::now() + SETTLE_WINDOW;
-        while writer.frames_sent() == before && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(writer.frames_sent() > before, "ring {ring} was answered");
+        assert_eq!(
+            sent_after_one_ring(&writer, &bell),
+            64,
+            "ring {ring} caused one send of a lone writer"
+        );
+        let mut received = 0;
         while let Some(sample) = subscriber.receive().expect("receive") {
             fold.ingest(decode_frame(sample.payload()).expect("a valid frame"));
+            received += 1;
         }
-        if ring == 1 {
-            assert!(
-                !fold.is_writer_complete(writer_id),
-                "one send carries fewer parts than the snapshot has"
-            );
-        }
-        if fold.is_writer_complete(writer_id) {
-            complete_after = Some(ring);
-            break;
-        }
+        assert_eq!(received, 64, "ring {ring} delivered its whole send");
+        complete.push(fold.is_writer_complete(writer_id));
     }
-    assert!(
-        complete_after.is_some(),
-        "every part arrived within 3 rings"
+    assert_eq!(
+        complete,
+        vec![false, false, true],
+        "64 and 128 parts are not the whole snapshot; 192 cover all 129"
     );
     let got = fold.finish(&BTreeSet::from([writer_id]));
     assert_eq!(got.completeness, GatherCompleteness::Settled);

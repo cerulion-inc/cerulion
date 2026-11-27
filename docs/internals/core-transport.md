@@ -580,7 +580,10 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   most `send_budget(listed publishers)` parts (an even share of half a reader queue, so
   a queue holds two sends of every writer) from a cursor that moves on by every part
   sent, so a snapshot larger than the 128-frame queue still lands whole within
-  `parts.div_ceil(budget)` sends. `gather_rmw_graph(own_writer, window)` waits only for
+  `parts.div_ceil(budget)` sends. A test that counts the sends one ring causes holds the
+  interval sends with `hold_timed_sends_for_test` (`test-helpers`), because an interval
+  send that ends just before a ring is answered adds a second send to the count.
+  `gather_rmw_graph(own_writer, window)` waits only for
   the listed publishers whose owner node is not `Dead` when the gather starts, minus
   `own_writer` (`required_writers`); it reads the node list once and never reaps, and
   reads the publisher list on each pass, so a writer that leaves the list mid-gather
