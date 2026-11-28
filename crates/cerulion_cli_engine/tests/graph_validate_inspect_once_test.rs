@@ -13,13 +13,12 @@
 //! cargo test -p cerulion_cli_engine --test graph_validate_inspect_once_test
 //! ```
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Mutex;
 
 use cerulion_cli_engine::error::CliResult;
-use cerulion_cli_engine::graph_cmd::{
-    cdylib_name, cdylib_target_base, graph_validate_with_inspector,
-};
+use cerulion_cli_engine::graph_cmd::{cdylib_name, graph_validate_with_inspector};
 use cerulion_cli_engine::node_inspector::NodeInspector;
 use cerulion_core::graph::NodeInfo;
 
@@ -63,8 +62,27 @@ network:
     - /once/incoming
 ";
 
+struct TargetDirGuard(Option<OsString>);
+
+impl TargetDirGuard {
+    fn clear() -> Self {
+        let prior = std::env::var_os("CARGO_TARGET_DIR");
+        std::env::remove_var("CARGO_TARGET_DIR");
+        Self(prior)
+    }
+}
+
+impl Drop for TargetDirGuard {
+    fn drop(&mut self) {
+        if let Some(prior) = self.0.take() {
+            std::env::set_var("CARGO_TARGET_DIR", prior);
+        }
+    }
+}
+
 #[test]
 fn validate_reads_each_node_library_once_across_its_checks() {
+    let _target_dir = TargetDirGuard::clear();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     std::fs::create_dir_all(root.join("graphs")).unwrap();
@@ -73,9 +91,7 @@ fn validate_reads_each_node_library_once_across_its_checks() {
     std::fs::write(root.join("nodes/cam/src/lib.rs"), "").unwrap();
     // The cdylib check only resolves a path; the counting inspector never
     // loads it, so an empty file is a library as far as validate can tell.
-    let lib = cdylib_target_base(root)
-        .join("debug")
-        .join(cdylib_name("cam"));
+    let lib = root.join("target/debug").join(cdylib_name("cam"));
     std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
     std::fs::write(&lib, b"").unwrap();
 
