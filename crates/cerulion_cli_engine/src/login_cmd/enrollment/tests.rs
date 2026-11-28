@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cerulion_pairing::format::{
@@ -97,8 +97,7 @@ struct Service {
     url: String,
 }
 impl Service {
-    fn start(mode: Mode, home: std::path::PathBuf) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fn start(listener: TcpListener, mode: Mode, home: std::path::PathBuf) -> Self {
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let redirect_trap = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -286,7 +285,8 @@ impl Fixture {
         };
         auth::write_to(&home.path().join("auth.json"), &state).unwrap();
         auth::atomic_write_secret(&home.path().join("desk.key"), &SEED).unwrap();
-        let service = Service::start(mode, home.path().to_owned());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let service = Service::start(listener, mode, home.path().to_owned());
         let environment = vec![
             Env::set("CERULION_HOME", home.path()),
             Env::set("CERULION_ACCOUNT_SERVICE", &service.url),
@@ -466,6 +466,40 @@ fn enrollment_never_creates_a_missing_device_key() {
     assert_eq!(fixture.service.count.load(Ordering::SeqCst), 0);
     assert!(!fixture.home.path().join("identity/device.key").exists());
     assert!(!fixture.home.path().join("device.cert").exists());
+}
+
+#[test]
+fn an_incomplete_request_does_not_stop_the_enrollment_service() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let send = |request: &[u8]| {
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(request).unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        client
+    };
+    // Close the write side before starting the worker. The short body never
+    // forms a complete request, so its missing auth headers must not panic.
+    let mut incomplete = send(b"POST /v1/devices HTTP/1.1\r\nContent-Length: 5\r\n\r\n{");
+    let mut complete = send(
+        format!("GET /v1/me HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {TOKEN}\r\nCerulion-Pairing-Protocol: 1\r\n\r\n").as_bytes(),
+    );
+    let service = Service::start(listener, Mode::Allow, home.path().to_owned());
+
+    let incomplete_read = incomplete.read(&mut [0]);
+    let mut response = String::new();
+    let complete_read = complete.read_to_string(&mut response);
+    let completed = service.count.load(Ordering::SeqCst);
+    drop(service);
+
+    assert_eq!(incomplete_read.unwrap(), 0);
+    complete_read.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert_eq!(completed, 1);
 }
 
 #[test]
