@@ -25,9 +25,59 @@ struct Producer {
     schema_hash: u64,
 }
 
+/// What one catalog snapshot decides for a declared input that no check has
+/// refused. Of these verdicts, only a missing schema hash keeps discovery reading.
+#[derive(Debug, PartialEq, Eq)]
+enum Selection {
+    Ready(Producer),
+    SchemaUnknown,
+}
+
+/// What one catalog snapshot decides for every declared input together.
+#[derive(Debug, PartialEq, Eq)]
+enum Judged<'a> {
+    Ready(Vec<Producer>),
+    SchemaUnknown(&'a GatewayIngressEntry),
+}
+
 /// A declaration selects exactly one live authorized writer, never a matching
 /// hash among several writers. Unknown metadata cannot authorize a graph input.
-fn select_producer(input: &GatewayIngressEntry, robots: &[RobotCatalog]) -> CliResult<Producer> {
+/// A refusal of any input is reported ahead of an input whose schema hash is
+/// still unknown, so an unknown schema is named only when it is all that is left.
+fn select_producers(
+    inputs: &[GatewayIngressEntry],
+    robots: &[RobotCatalog],
+) -> CliResult<Vec<Producer>> {
+    match judge_inputs(inputs, robots)? {
+        Judged::Ready(producers) => Ok(producers),
+        Judged::SchemaUnknown(input) => Err(CliError::Validation(format!(
+            "graph ingress '{}': producer schema is unknown because the robot reported no schema hash for the topic within the discovery limit; check that the producer is publishing",
+            input.topic
+        ))),
+    }
+}
+
+fn judge_inputs<'a>(
+    inputs: &'a [GatewayIngressEntry],
+    robots: &[RobotCatalog],
+) -> CliResult<Judged<'a>> {
+    let mut producers = Vec::with_capacity(inputs.len());
+    let mut unknown = None;
+    for input in inputs {
+        match judge_producer(input, robots)? {
+            Selection::Ready(producer) => producers.push(producer),
+            Selection::SchemaUnknown => {
+                unknown.get_or_insert(input);
+            }
+        }
+    }
+    Ok(match unknown {
+        Some(input) => Judged::SchemaUnknown(input),
+        None => Judged::Ready(producers),
+    })
+}
+
+fn judge_producer(input: &GatewayIngressEntry, robots: &[RobotCatalog]) -> CliResult<Selection> {
     let mut candidates = Vec::new();
     for robot in robots {
         let Some(catalog) = &robot.catalog else {
@@ -69,12 +119,6 @@ fn select_producer(input: &GatewayIngressEntry, robots: &[RobotCatalog]) -> CliR
         return Err(CliError::Validation(format!("graph ingress '{}': {} authorized producers found; start exactly one declared egress producer", input.topic, candidates.len())));
     }
     let (robot, key, entry) = candidates[0];
-    if entry.schema_hash != Some(input.schema_hash) {
-        return Err(CliError::Validation(format!(
-            "graph ingress '{}': producer schema does not match the consuming graph",
-            input.topic
-        )));
-    }
     let policy = entry.egress_qos.as_ref().ok_or_else(|| {
         CliError::Validation(format!(
             "graph ingress '{}': producer queue policy is unknown; upgrade and restart its graph",
@@ -84,12 +128,83 @@ fn select_producer(input: &GatewayIngressEntry, robots: &[RobotCatalog]) -> CliR
     if policy.topic != input.topic || policy.reliability != EgressReliability::Reliable {
         return Err(CliError::Validation(format!("graph ingress '{}': authenticated wire ingress requires a declared reliable producer policy", input.topic)));
     }
-    Ok(Producer {
+    match entry.schema_hash {
+        None => return Ok(Selection::SchemaUnknown),
+        Some(hash) if hash != input.schema_hash => {
+            return Err(CliError::Validation(format!(
+                "graph ingress '{}': producer schema 0x{hash:016x} does not match the consuming graph's 0x{:016x}",
+                input.topic, input.schema_hash
+            )));
+        }
+        Some(_) => {}
+    }
+    Ok(Selection::Ready(Producer {
         topic: input.topic.clone(),
         route: robot.route.clone(),
         key,
         schema_hash: input.schema_hash,
+    }))
+}
+
+fn any_answered(robots: &[RobotCatalog]) -> bool {
+    robots.iter().any(|robot| {
+        robot
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.error.is_none())
     })
+}
+
+/// A robot fills a catalog entry's schema hash from a message the producer
+/// publishes within a short per-catalog budget, so a catalog can list a live
+/// single writer with no hash and a later catalog can name it. Discovery has
+/// settled when no robot is known, or when a robot answered and the snapshot
+/// either refuses some declared input or names every hash it needs.
+fn discovery_settled(inputs: &[GatewayIngressEntry], robots: &[RobotCatalog]) -> bool {
+    robots.is_empty()
+        || (any_answered(robots)
+            && !matches!(judge_inputs(inputs, robots), Ok(Judged::SchemaUnknown(_))))
+}
+
+/// Reads catalogs until discovery settles or `deadline` passes. At the deadline
+/// a last read in which no robot returned a catalog is replaced by the latest
+/// answered one, which says more about why the inputs are unresolved; a robot's
+/// refusal in the last read is kept.
+fn discover_until_settled(
+    inputs: &[GatewayIngressEntry],
+    graph: &str,
+    deadline: Instant,
+    cancelled: &impl Fn() -> bool,
+    mut discover: impl FnMut() -> CliResult<RemoteCatalogs>,
+) -> CliResult<RemoteCatalogs> {
+    let mut answered_before = None;
+    let mut waiting = false;
+    loop {
+        check_cancelled(cancelled)?;
+        let catalogs = discover()?;
+        if discovery_settled(inputs, &catalogs.robots) {
+            return Ok(catalogs);
+        }
+        if Instant::now() >= deadline {
+            let reached = catalogs.robots.iter().any(|robot| robot.catalog.is_some());
+            return Ok(match answered_before {
+                Some(earlier) if !reached => earlier,
+                _ => catalogs,
+            });
+        }
+        if !waiting {
+            waiting = true;
+            tracing::debug!(
+                graph,
+                ingress_topics = inputs.len(),
+                "graph ingress discovery is waiting for a robot to answer or for a producer schema hash"
+            );
+        }
+        if any_answered(&catalogs.robots) {
+            answered_before = Some(catalogs);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[derive(Clone)]
@@ -150,31 +265,16 @@ fn open_session(
     let catalogs = if registration.plan.ingress.is_empty() {
         RemoteCatalogs::default()
     } else {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            check_cancelled(cancelled)?;
-            let catalogs = automatic::discover()?;
-            if catalogs.robots.is_empty()
-                || catalogs.robots.iter().any(|robot| {
-                    robot
-                        .catalog
-                        .as_ref()
-                        .is_some_and(|catalog| catalog.error.is_none())
-                })
-                || Instant::now() >= deadline
-            {
-                break catalogs;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        discover_until_settled(
+            &registration.plan.ingress,
+            &registration.graph,
+            Instant::now() + Duration::from_secs(10),
+            cancelled,
+            automatic::discover,
+        )?
     };
-    let producers = registration
-        .plan
-        .ingress
-        .iter()
-        .map(|input| select_producer(input, &catalogs.robots))
-        .collect::<CliResult<Vec<_>>>()
-        .map_err(|error| {
+    let producers =
+        select_producers(&registration.plan.ingress, &catalogs.robots).map_err(|error| {
             if catalogs.diagnostics.is_empty() {
                 error
             } else {
@@ -744,6 +844,9 @@ mod tests {
             schema_hash: 7,
         }
     }
+    fn select_one(robots: &[RobotCatalog]) -> CliResult<Producer> {
+        select_producers(&[input()], robots).map(|mut producers| producers.remove(0))
+    }
     fn robot(route: &str) -> RobotCatalog {
         RobotCatalog {
             route: route.into(),
@@ -783,16 +886,13 @@ mod tests {
             schema_hash: 7,
         };
         for _ in 0..2 {
-            assert_eq!(
-                select_producer(&input(), &[robot("paired-camera")]).unwrap(),
-                expected
-            );
+            assert_eq!(select_one(&[robot("paired-camera")]).unwrap(), expected);
         }
     }
 
     #[test]
     fn canonical_ingress_reconnect_refuses_any_source_identity_change() {
-        let original = select_producer(&input(), &[robot("paired-camera")]).unwrap();
+        let original = select_one(&[robot("paired-camera")]).unwrap();
         let expected = [original.clone()];
         require_same_producers(None, &expected).unwrap();
         require_same_producers(Some(&expected), &expected).unwrap();
@@ -818,21 +918,21 @@ mod tests {
 
     #[test]
     fn canonical_ingress_refuses_missing_foreign_and_ambiguous_producers() {
-        assert!(select_producer(&input(), &[])
+        assert!(select_one(&[])
             .unwrap_err()
             .to_string()
             .contains("0 authorized producers"));
         let mut foreign = robot("foreign");
         foreign.catalog.as_mut().unwrap().error = Some("not paired".into());
-        assert!(select_producer(&input(), &[foreign])
+        assert!(select_one(&[foreign])
             .unwrap_err()
             .to_string()
             .contains("0 authorized producers"));
         let mut unavailable = robot("unreachable");
         unavailable.catalog = None;
-        assert!(select_producer(&input(), &[unavailable]).is_err());
+        assert!(select_one(&[unavailable]).is_err());
         for sources in [[robot("a"), robot("b")], [robot("b"), robot("a")]] {
-            assert!(select_producer(&input(), &sources)
+            assert!(select_one(&sources)
                 .unwrap_err()
                 .to_string()
                 .contains("2 authorized producers"));
@@ -841,7 +941,7 @@ mod tests {
 
     #[test]
     fn canonical_ingress_refuses_every_unverified_schema_writer_and_queue_arm() {
-        let mutate: [fn(&mut RobotCatalog); 11] = [
+        let mutate: [fn(&mut RobotCatalog); 12] = [
             |r| r.endpoint_key = None,
             |r| r.catalog.as_mut().unwrap().version += 1,
             |r| r.catalog.as_mut().unwrap().wire_header_version += 1,
@@ -850,6 +950,7 @@ mod tests {
             |r| r.catalog.as_mut().unwrap().entries[0].producer_count = Some(0),
             |r| r.catalog.as_mut().unwrap().entries[0].producer_count = Some(2),
             |r| r.catalog.as_mut().unwrap().entries[0].schema_hash = Some(8),
+            |r| r.catalog.as_mut().unwrap().entries[0].schema_hash = None,
             |r| r.catalog.as_mut().unwrap().entries[0].egress_qos = None,
             |r| {
                 r.catalog.as_mut().unwrap().entries[0]
@@ -869,11 +970,296 @@ mod tests {
         for change in mutate {
             let mut source = robot("paired-camera");
             change(&mut source);
-            assert!(select_producer(&input(), &[source]).is_err());
+            assert!(select_one(&[source]).is_err());
         }
         let mut duplicate = robot("paired-camera");
         let entries = &mut duplicate.catalog.as_mut().unwrap().entries;
         entries.push(entries[0].clone());
-        assert!(select_producer(&input(), &[duplicate]).is_err());
+        assert!(select_one(&[duplicate]).is_err());
+    }
+
+    fn with_schema(route: &str, schema_hash: Option<u64>) -> RobotCatalog {
+        let mut source = robot(route);
+        source.catalog.as_mut().unwrap().entries[0].schema_hash = schema_hash;
+        source
+    }
+
+    #[test]
+    fn canonical_ingress_names_an_unknown_producer_schema_apart_from_a_mismatch() {
+        assert_eq!(
+            select_one(&[with_schema("paired-camera", None)])
+                .unwrap_err()
+                .to_string(),
+            "graph ingress '/camera/vector': producer schema is unknown because the robot \
+             reported no schema hash for the topic within the discovery limit; check that the \
+             producer is publishing"
+        );
+        assert_eq!(
+            select_one(&[with_schema("paired-camera", Some(8))])
+                .unwrap_err()
+                .to_string(),
+            "graph ingress '/camera/vector': producer schema 0x0000000000000008 does not match \
+             the consuming graph's 0x0000000000000007"
+        );
+    }
+
+    /// A second declared input whose single writer is best effort, which
+    /// graph ingress refuses on any snapshot.
+    fn arm_input() -> GatewayIngressEntry {
+        GatewayIngressEntry {
+            topic: "/arm/state".into(),
+            schema_hash: 9,
+        }
+    }
+    fn with_best_effort_arm(mut source: RobotCatalog) -> RobotCatalog {
+        let entries = &mut source.catalog.as_mut().unwrap().entries;
+        let mut arm = entries[0].clone();
+        arm.topic = "/arm/state".into();
+        arm.schema_hash = Some(9);
+        arm.egress_qos = Some(EgressQos {
+            topic: "/arm/state".into(),
+            reliability: EgressReliability::BestEffort,
+            send_queue: None,
+        });
+        entries.push(arm);
+        source
+    }
+
+    #[test]
+    fn a_refused_input_is_reported_ahead_of_an_unknown_schema_in_either_order() {
+        let source = with_best_effort_arm(with_schema("paired-camera", None));
+        for inputs in [[input(), arm_input()], [arm_input(), input()]] {
+            assert_eq!(
+                select_producers(&inputs, std::slice::from_ref(&source))
+                    .unwrap_err()
+                    .to_string(),
+                "graph ingress '/arm/state': authenticated wire ingress requires a declared \
+                 reliable producer policy"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_settles_on_every_final_answer_and_waits_only_on_an_unknown_schema() {
+        let inputs = [input()];
+        let edit = |route: &str, change: fn(&mut RobotCatalog)| {
+            let mut source = with_schema(route, None);
+            change(&mut source);
+            source
+        };
+        let refused = || {
+            edit("refused", |r| {
+                r.catalog.as_mut().unwrap().error = Some("not paired".into())
+            })
+        };
+        let unreached = || edit("unreached", |r| r.catalog = None);
+        // Each of these refuses the input on this snapshot, so discovery stops.
+        let snapshot_refusals: [fn(&mut RobotCatalog); 7] = [
+            |r| r.endpoint_key = None,
+            |r| r.catalog.as_mut().unwrap().entries[0].producer_count = None,
+            |r| r.catalog.as_mut().unwrap().entries[0].producer_count = Some(2),
+            |r| r.catalog.as_mut().unwrap().entries[0].egress_qos = None,
+            |r| {
+                r.catalog.as_mut().unwrap().entries[0]
+                    .egress_qos
+                    .as_mut()
+                    .unwrap()
+                    .reliability = EgressReliability::BestEffort
+            },
+            |r| r.catalog.as_mut().unwrap().entries[0].topic = "/camera/other".into(),
+            |r| r.catalog.as_mut().unwrap().entries[0].producer_count = Some(0),
+        ];
+        let both = [input(), arm_input()];
+        for _ in 0..2 {
+            assert!(discovery_settled(&inputs, &[]));
+            assert!(discovery_settled(&inputs, &[robot("paired-camera")]));
+            assert!(discovery_settled(
+                &[],
+                &[with_schema("paired-camera", None)]
+            ));
+            assert!(!discovery_settled(
+                &inputs,
+                &[with_schema("paired-camera", None)]
+            ));
+            assert!(!discovery_settled(&inputs, &[unreached()]));
+            assert!(!discovery_settled(&inputs, &[refused()]));
+            assert!(!discovery_settled(
+                &inputs,
+                &[refused(), unreached(), with_schema("paired-camera", None)]
+            ));
+            // A second writer is refused at once, whichever of the two lacks a hash.
+            assert!(discovery_settled(
+                &inputs,
+                &[robot("a"), with_schema("b", None)]
+            ));
+            assert!(discovery_settled(
+                &inputs,
+                &[with_schema("a", None), robot("b")]
+            ));
+            for change in snapshot_refusals {
+                assert!(discovery_settled(&inputs, &[edit("paired-camera", change)]));
+            }
+            // One refused input ends discovery even while another lacks its hash.
+            assert!(discovery_settled(
+                &both,
+                &[with_best_effort_arm(with_schema("paired-camera", None))]
+            ));
+            let mut hashed_arm = with_best_effort_arm(with_schema("paired-camera", None));
+            hashed_arm.catalog.as_mut().unwrap().entries[1]
+                .egress_qos
+                .as_mut()
+                .unwrap()
+                .reliability = EgressReliability::Reliable;
+            assert!(!discovery_settled(&both, &[hashed_arm]));
+        }
+    }
+
+    fn snapshot(robots: Vec<RobotCatalog>) -> RemoteCatalogs {
+        let mut catalogs = RemoteCatalogs::default();
+        catalogs.robots = robots;
+        catalogs
+    }
+
+    fn unreachable_robot() -> RobotCatalog {
+        let mut source = robot("paired-camera");
+        source.catalog = None;
+        source
+    }
+
+    #[test]
+    fn discovery_reads_catalogs_until_the_producer_schema_hash_arrives() {
+        let mut sequence = vec![
+            snapshot(vec![robot("paired-camera")]),
+            snapshot(vec![with_schema("paired-camera", None)]),
+            snapshot(vec![unreachable_robot()]),
+        ];
+        let mut reads = 0;
+        let catalogs = discover_until_settled(
+            &[input()],
+            "ingress",
+            Instant::now() + Duration::from_secs(60),
+            &|| false,
+            || {
+                reads += 1;
+                Ok(sequence
+                    .pop()
+                    .expect("discovery read past the settled catalog"))
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 3);
+        assert_eq!(
+            select_one(&catalogs.robots).unwrap(),
+            Producer {
+                topic: "/camera/vector".into(),
+                route: "paired-camera".into(),
+                key: [3; 32],
+                schema_hash: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn discovery_past_its_deadline_keeps_the_snapshot_and_refuses_the_unknown_schema() {
+        let mut reads = 0;
+        let catalogs =
+            discover_until_settled(&[input()], "ingress", Instant::now(), &|| false, || {
+                reads += 1;
+                assert_eq!(reads, 1, "discovery read again past its deadline");
+                Ok(snapshot(vec![with_schema("paired-camera", None)]))
+            })
+            .unwrap();
+        assert!(select_one(&catalogs.robots)
+            .unwrap_err()
+            .to_string()
+            .contains("producer schema is unknown"));
+    }
+
+    #[test]
+    fn discovery_at_its_deadline_keeps_the_latest_answer_over_an_unreached_robot() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut reads = 0;
+        let catalogs = discover_until_settled(&[input()], "ingress", deadline, &|| false, || {
+            reads += 1;
+            match reads {
+                1 => Ok(snapshot(vec![with_schema("paired-camera", None)])),
+                2 => Ok(snapshot(vec![unreachable_robot()])),
+                3 => {
+                    while Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(snapshot(vec![unreachable_robot()]))
+                }
+                _ => panic!("discovery read again past its deadline"),
+            }
+        })
+        .unwrap();
+        assert_eq!(reads, 3);
+        assert!(select_one(&catalogs.robots)
+            .unwrap_err()
+            .to_string()
+            .contains("producer schema is unknown"));
+        // A robot that refuses in the last read is reported, not hidden by an
+        // earlier answer.
+        let mut reads = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let catalogs = discover_until_settled(&[input()], "ingress", deadline, &|| false, || {
+            reads += 1;
+            match reads {
+                1 => Ok(snapshot(vec![with_schema("paired-camera", None)])),
+                2 => {
+                    while Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let mut refused = robot("paired-camera");
+                    refused.catalog.as_mut().unwrap().error = Some("not paired".into());
+                    Ok(snapshot(vec![refused]))
+                }
+                _ => panic!("discovery read again past its deadline"),
+            }
+        })
+        .unwrap();
+        assert_eq!(reads, 2);
+        assert_eq!(
+            catalogs.robots[0]
+                .catalog
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("not paired")
+        );
+    }
+
+    #[test]
+    fn discovery_stops_reading_once_cancelled_and_passes_a_discovery_error_through() {
+        let reads = std::cell::Cell::new(0);
+        let Err(interrupted) = discover_until_settled(
+            &[input()],
+            "ingress",
+            Instant::now() + Duration::from_secs(60),
+            &|| reads.get() > 0,
+            || {
+                reads.set(reads.get() + 1);
+                assert_eq!(reads.get(), 1, "discovery read again after cancellation");
+                Ok(snapshot(vec![with_schema("paired-camera", None)]))
+            },
+        ) else {
+            panic!("a cancelled discovery must stop");
+        };
+        assert_eq!(
+            interrupted.to_string(),
+            "authenticated graph network setup was interrupted"
+        );
+        let Err(failed) = discover_until_settled(
+            &[input()],
+            "ingress",
+            Instant::now() + Duration::from_secs(60),
+            &|| false,
+            || Err(CliError::Validation("directory unavailable".into())),
+        ) else {
+            panic!("a failed discovery must pass its error through");
+        };
+        assert_eq!(failed.to_string(), "directory unavailable");
     }
 }

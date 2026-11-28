@@ -732,7 +732,13 @@ and preserves queued frames, with `wan_refused` distinct from `wan_dropped`.
 A missing policy is unverified; best-effort datagram graph ingress is refused
 on the authenticated wire path. Before releasing graph workers, the CLI resolves
 each declared ingress topic to exactly one authenticated account or paired
-producer and checks its schema, reliable policy and single live writer. The
+producer and checks its schema, reliable policy and single live writer. A
+robot reads each schema from a message its producer publishes, and it spends at
+most one second per catalog on topics whose schema it has not seen yet, in name
+order, so a catalog can list a topic without its schema while the producer
+publishes. While no declared input is refused and some input lacks only its
+schema, the CLI keeps reading catalogs until 10 seconds have passed, at startup
+and on each reconnect, and then refuses with `producer schema is unknown`. The
 producer's native service must also allow at most one publisher; a
 multi-publisher service with one live writer is refused for graph import.
 Missing or ambiguous producers fail startup. Held demands reconnect to the
