@@ -482,21 +482,32 @@ fn an_incomplete_request_does_not_stop_the_enrollment_service() {
         client.shutdown(Shutdown::Write).unwrap();
         client
     };
-    // Close the write side before starting the worker. The short body never
+    // Close each write side before starting the worker. The short body never
     // forms a complete request, so its missing auth headers must not panic.
-    let mut incomplete = send(b"POST /v1/devices HTTP/1.1\r\nContent-Length: 5\r\n\r\n{");
+    let mut incomplete = [
+        ("request line", send(b"")),
+        ("headers", send(b"GET /v1/me HTTP/1.1\r\nContent-Length:")),
+        (
+            "body",
+            send(b"POST /v1/devices HTTP/1.1\r\nContent-Length: 5\r\n\r\n{"),
+        ),
+    ];
     let mut complete = send(
         format!("GET /v1/me HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {TOKEN}\r\nCerulion-Pairing-Protocol: 1\r\n\r\n").as_bytes(),
     );
     let service = Service::start(listener, Mode::Allow, home.path().to_owned());
 
-    let incomplete_read = incomplete.read(&mut [0]);
+    let incomplete_reads = incomplete
+        .each_mut()
+        .map(|(stage, client)| (*stage, client.read(&mut [0])));
     let mut response = String::new();
     let complete_read = complete.read_to_string(&mut response);
     let completed = service.count.load(Ordering::SeqCst);
     drop(service);
 
-    assert_eq!(incomplete_read.unwrap(), 0);
+    for (stage, result) in incomplete_reads {
+        assert!(matches!(result, Ok(0)), "{stage}: {result:?}");
+    }
     complete_read.unwrap();
     assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
     assert_eq!(completed, 1);
