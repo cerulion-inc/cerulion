@@ -7,9 +7,11 @@
 # else `<key>`, and an answer starting `FAIL:` is an error on stderr with exit
 # 1. `gh issue list` answers from the case's `issues` file, one answer for every
 # call, in the TSV shape the script's `--jq` asks for or starting `FAIL:` as an
-# error, and the body of every issue write is appended to one file under a
-# `== <verb>` line, so a case asserts both which calls were made and the exact
-# text they carried. `date` prints FAKE_NOW plus
+# error; it keeps the rows whose title holds the quoted phrase of `--search`,
+# then the first `--limit` of them (30 when not given), and the body of every
+# issue write is appended to one file under a `== <verb>` line, so a case
+# asserts both which calls were made and the exact text they carried. `date`
+# prints FAKE_NOW plus
 # FAKE_DATE_STEP seconds per earlier call; `sleep` returns at once, counts, and
 # ends the script past 500 waits. One case per behaviour; the first failing
 # assertion prints one `FAIL:` line and exits 1. The case count is asserted
@@ -22,7 +24,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=34
+CASES_EXPECTED=35
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-nightly-test.XXXXXX")
@@ -90,7 +92,20 @@ case "$1" in
                     cat "$FAKE_GH_DIR/issues" >&2
                     exit 1
                 fi
-                cat "$FAKE_GH_DIR/issues"
+                search=
+                limit=30
+                prev=
+                for arg in "$@"; do
+                    case "$prev" in
+                        --search) search=$arg ;;
+                        --limit) limit=$arg ;;
+                    esac
+                    prev=$arg
+                done
+                phrase=${search#*\"}
+                phrase=${phrase%\"}
+                awk -F '\t' -v search="$search" -v phrase="$phrase" \
+                    'search == "" || index($2, phrase) > 0' "$FAKE_GH_DIR/issues" | head -n "$limit"
                 ;;
             create | comment)
                 prev=
@@ -332,6 +347,26 @@ The nightly full run of \`main\` passed on its first attempt.
 Nightly: $U/777
 EOF
 ok 'two green runs close the open issue'
+
+# 200 newer open `bug` issues come before the nightly's in a plain listing, and
+# one of them holds the title inside a longer one: the listing asks for the
+# title, and the issue past the first 200 is still the one found and closed.
+new_case issue_past_the_listing_limit
+standard_dispatch
+for ((n = 500; n > 301; n--)); do
+    printf '%s\t%s\t%s\n' "$n" 'Pairing fails on a cold start' '2026-11-16T06:00:00Z'
+done > "$answers/issues"
+printf '%s\t%s\t%s\n' 301 "$TITLE on a release branch" '2026-11-16T06:00:00Z' >> "$answers/issues"
+printf '%s\t%s\t%s\n' 42 "$TITLE" '2026-11-16T05:00:00Z' >> "$answers/issues"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+run_case run
+expect_status 0
+expect_output 'every run passed; closed issue 42'
+expect_call 'issue close 42'
+expect_no_call 'issue close 301'
+expect_call "--search in:title \"$TITLE\""
+ok 'the issue past the first 200 open bug issues is still found by its title'
 
 # ci.yml fails, its failed jobs are rerun once and pass: the issue opens and
 # names the job that failed. Right after the rerun request attempt 2 does not
