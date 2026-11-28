@@ -235,6 +235,7 @@ failed_jobs() {
 open_issue() {
     local listing matches='' count=0 found='' number title updated
     if ! listing=$(gh issue list --state open --label "$LABEL" --limit 200 \
+        --search "in:title \"${TITLE}\"" \
         --json number,title,updatedAt --jq '.[] | [.number, .title, .updatedAt] | @tsv' 2> "$err_file"); then
         die "gh refused the issue listing: $(tr '\n' ' ' < "$err_file")" 2
     fi
