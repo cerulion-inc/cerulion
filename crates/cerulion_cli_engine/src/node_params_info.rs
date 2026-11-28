@@ -296,6 +296,17 @@ mod tests {
             }
         }
         let tmp = tempfile::tempdir().unwrap();
+        let _env_lock = crate::test_env::env_lock();
+        struct RestoreTargetDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreTargetDir {
+            fn drop(&mut self) {
+                if let Some(prior) = self.0.take() {
+                    std::env::set_var("CARGO_TARGET_DIR", prior);
+                }
+            }
+        }
+        let _target_dir = RestoreTargetDir(std::env::var_os("CARGO_TARGET_DIR"));
+        std::env::remove_var("CARGO_TARGET_DIR");
         let declared = declared_params(tmp.path(), "cam", &NeverAsked);
         let DeclaredParams::NotBuilt(reason) = &declared else {
             panic!("an empty workspace has no library, got {declared:?}");
