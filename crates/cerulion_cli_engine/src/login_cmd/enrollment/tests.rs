@@ -109,7 +109,7 @@ impl Service {
         let requests = Arc::clone(&count);
         let stop = Arc::clone(&stopping);
         let thread = std::thread::spawn(move || {
-            while !stop.load(Ordering::SeqCst) {
+            'accept: while !stop.load(Ordering::SeqCst) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -119,36 +119,44 @@ impl Service {
                     Err(error) => panic!("HTTP accept: {error}"),
                 };
                 // macOS accepted sockets inherit the listener's nonblocking
-                // flag. Headers use a bounded blocking read after accept.
+                // flag. Read the request in blocking mode with a timeout.
                 stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
-                reader.read_line(&mut first).unwrap();
+                if !reader.read_line(&mut first).is_ok_and(|size| size > 0) {
+                    continue;
+                }
                 let mut headers = Vec::new();
-                let mut length = 0;
                 loop {
                     let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
+                    if !reader.read_line(&mut line).is_ok_and(|size| size > 0) {
+                        continue 'accept;
+                    }
                     if line == "\r\n" {
                         break;
                     }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse::<usize>().unwrap();
-                    }
                     headers.push(line.to_ascii_lowercase());
                 }
+                let mut length = 0;
+                for line in &headers {
+                    if let Some(value) = line.strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length];
+                if reader.read_exact(&mut bytes).is_err() {
+                    continue;
+                }
+                drop(reader);
                 assert!(headers
                     .iter()
                     .any(|line| line.trim() == format!("authorization: bearer {TOKEN}")));
                 assert!(headers
                     .iter()
                     .any(|line| line.trim() == "cerulion-pairing-protocol: 1"));
-                let mut bytes = vec![0; length];
-                reader.read_exact(&mut bytes).unwrap();
-                drop(reader);
                 requests.fetch_add(1, Ordering::SeqCst);
                 if matches!(mode, Mode::Redirect) {
                     let response = format!("HTTP/1.1 302 Found\r\nLocation: {redirect}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
